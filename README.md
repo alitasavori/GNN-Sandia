@@ -8,10 +8,7 @@ GNN-based voltage magnitude predictor for the IEEE 34-bus distribution feeder.
 
 2. **Enable GPU:** Runtime → Change runtime type → GPU
 
-3. **Install dependencies** (run in first cell):
-   ```python
-   !pip install torch torch-geometric opendssdirect -q
-   ```
+3. **Run the setup cell** at the top — it clones the repo and installs: `torch`, `torch-geometric`, `opendssdirect.py`, `pandas`, `numpy`
 
 4. **Generate datasets** (Option 4 — no upload needed):
    - Run the dataset generation blocks in the notebook in order:
