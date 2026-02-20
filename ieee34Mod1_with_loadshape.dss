@@ -274,5 +274,5 @@ New PVSystem.PV860 phases=3 bus1=860 kV=24.9 kVA=500 Pmpp=500 irradiance=1.0 %Pm
 Set VoltageBases = "69,24.9,4.16, .48"
 CalcVoltageBases
 
-Buscoords "C:/Users/alita/OneDrive/Desktop/quest-ssim/examples/ieee34demo/IEEE34Node_BusXY_JE.csv"
+Buscoords "IEEE34Node_BusXY_JE.csv"
 
