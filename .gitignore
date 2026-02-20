@@ -1,0 +1,23 @@
+# Large datasets (upload to Google Drive for Colab)
+gnn_samples_out/
+gnn_samples_inj/
+gnn_samples_inj_full/
+gnn_samples_loadtype_full/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+venv/
+ssim_venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+nominal_vs_realized_comparison/
+scenario_0001_*.csv
