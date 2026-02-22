@@ -141,7 +141,8 @@ def compute_metrics(yhat, ytrue):
 @torch.no_grad()
 def evaluate(model, loader):
     model.eval()
-    mae_sum = rmse_sum = torch.tensor(0.0, device=DEVICE)
+    mae_sum = torch.tensor(0.0, device=DEVICE)
+    rmse_sum = torch.tensor(0.0, device=DEVICE)
     n_batches = 0
     for data in loader:
         data = data.to(DEVICE)
