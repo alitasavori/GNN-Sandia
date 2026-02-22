@@ -243,18 +243,37 @@ def evaluate(model, loader, batch_transform=None):
     return (mae_sum / max(1, n_batches)).item(), (rmse_sum / max(1, n_batches)).item()
 
 
+def _log_skip_reason(out_dir, edge_csv, node_csv):
+    """Log once why data is missing (avoids spam across 30 configs)."""
+    if not hasattr(_log_skip_reason, "_logged"):
+        missing = []
+        if not os.path.exists(edge_csv):
+            missing.append(edge_csv)
+        if not os.path.exists(node_csv):
+            missing.append(node_csv)
+        print(f"  [SKIP] Missing data files. Expected under {os.path.abspath(out_dir)}:")
+        for p in missing:
+            print(f"    - {p}")
+        print("  Run GNN2 notebook to generate gnn_samples_out, gnn_samples_inj_full, gnn_samples_loadtype_full.")
+        _log_skip_reason._logged = True
+
+
 def train_one(out_dir, feature_cols, ds_label, cfg_name, n_emb, e_emb, h_dim, n_layers,
               use_norm, use_phase_subgraphs, use_phase_onehot, data_frac=0.30):
     seed_all(SEED)
     edge_csv = os.path.join(out_dir, "gnn_edges_phase_static.csv")
     node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
     if not os.path.exists(edge_csv) or not os.path.exists(node_csv):
+        _log_skip_reason(out_dir, edge_csv, node_csv)
         return None, None, None
     required_node_cols = {"sample_id", "node_idx", "vmag_pu"} | set(feature_cols)
     df_e = pd.read_csv(edge_csv)
     df_n = pd.read_csv(node_csv)
     missing = required_node_cols - set(df_n.columns)
     if missing:
+        if not hasattr(train_one, "_warned_missing"):
+            print(f"  [SKIP] {out_dir}: missing columns {missing}")
+            train_one._warned_missing = True
         return None, None, None
 
     df_e["u_idx"] = pd.to_numeric(df_e["u_idx"], errors="raise").astype(int)
@@ -289,6 +308,9 @@ def train_one(out_dir, feature_cols, ds_label, cfg_name, n_emb, e_emb, h_dim, n_
     if use_phase_onehot or use_phase_subgraphs:
         phase_map = load_phase_mapping(out_dir)
         if phase_map is None:
+            if not hasattr(train_one, "_warned_phase"):
+                print(f"  [SKIP] {out_dir}: missing gnn_node_index_master.csv (required for phase_onehot/phase_subgraph)")
+                train_one._warned_phase = True
             return None, None, None
         phase_onehot = F.one_hot(phase_map, num_classes=3).numpy().astype(np.float32)
 
@@ -407,6 +429,12 @@ def _batch_phase_subgraph(data, phase_edges):
 def main():
     print("=" * 70)
     print(f"NARROW EXPLORATION: {int(DATA_FRAC*100)}% data, 10 configs × 3 datasets")
+    print(f"Working dir: {os.path.abspath('.')}")
+    for d, _, _ in DATASETS:
+        exists = "OK" if os.path.isdir(d) else "MISSING"
+        ec = os.path.join(d, "gnn_edges_phase_static.csv")
+        nc = os.path.join(d, "gnn_node_features_and_targets.csv")
+        print(f"  {d}: {exists} (edge_csv={os.path.exists(ec)}, node_csv={os.path.exists(nc)})")
     print("Corrected MAE/RMSE | Depth | Norm | Phase subgraph/onehot")
     print("=" * 70)
     results = []
