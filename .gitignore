@@ -3,6 +3,7 @@ gnn_samples_out/
 gnn_samples_inj/
 gnn_samples_inj_full/
 gnn_samples_loadtype_full/
+gnn_samples_deltav_full/
 
 # Python
 __pycache__/
@@ -20,4 +21,5 @@ ssim_venv/
 
 # Outputs
 nominal_vs_realized_comparison/
+plots/
 scenario_0001_*.csv
