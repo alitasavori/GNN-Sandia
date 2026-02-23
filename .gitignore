@@ -4,6 +4,7 @@ gnn_samples_inj/
 gnn_samples_inj_full/
 gnn_samples_loadtype_full/
 gnn_samples_deltav_full/
+gnn_samples_deltav_5x_full/
 
 # Python
 __pycache__/
