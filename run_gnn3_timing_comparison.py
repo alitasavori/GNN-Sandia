@@ -1,7 +1,11 @@
 """
-Timing comparison: per-step breakdown for OpenDSS and GNN.
-Runs once on CPU and once on GPU. Prints time for each step.
-No plots. Run from repo root.
+Timing comparison: per-step breakdown for OpenDSS vs GNN.
+Comparable totals:
+  - OpenDSS: only what it needs for its profile (apply_full, solve_full, get_voltage).
+             Excludes zero-PV solve for Delta-V (that's GNN-only overhead).
+  - GNN: for Delta-V, includes zero-PV OpenDSS solve + GNN steps (GNN needs vmag_zero).
+         For non-Delta-V, just GNN steps.
+Runs once on CPU and once on GPU. No plots. Run from repo root.
 """
 import os
 import time
@@ -189,28 +193,42 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
 
 
 def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
-    """Print per-step timing."""
+    """Print per-step timing. OpenDSS = profile only. GNN = includes zero-PV for Delta-V."""
     print()
     print("=" * 72)
     print(f"BLOCK {block_id} | {device_name} | 288 steps")
     print("=" * 72)
 
-    print("\nOpenDSS (per-step times, total over 288 steps):")
-    for k, v in dss_steps.items():
-        if not is_deltav and k in ("2_apply_snapshot_zero_pv", "3_solve_zero_pv", "4_get_voltage_zero_pv"):
-            continue  # skip zero-PV steps for non-Delta-V
+    # OpenDSS: only what it needs for its profile (exclude zero-PV for Delta-V)
+    open_dss_keys = ["1_set_time_index", "5_apply_snapshot_full", "6_solve_full", "7_get_voltage_full"]
+    print("\nOpenDSS (profile only: set_time, apply_full, solve, get_voltage):")
+    for k in open_dss_keys:
+        v = dss_steps[k]
         print(f"  {k:30s}: {v*1000:8.2f} ms  ({v:.4f}s)")
-    dss_total = sum(dss_steps.values())
+    dss_total = sum(dss_steps[k] for k in open_dss_keys)
     print(f"  {'TOTAL':30s}: {dss_total*1000:8.2f} ms  ({dss_total:.4f}s)")
 
-    print("\nGNN (per-step times, total over 288 steps):")
-    gnn_total = sum(gnn_steps.values())
+    # GNN: for Delta-V, add zero-PV OpenDSS (GNN needs vmag_zero); else just GNN steps
+    zero_pv_time = 0.0
+    if is_deltav:
+        zero_pv_time = (
+            dss_steps["2_apply_snapshot_zero_pv"]
+            + dss_steps["3_solve_zero_pv"]
+            + dss_steps["4_get_voltage_zero_pv"]
+        )
+        print("\nGNN (includes OpenDSS zero-PV for vmag_zero + GNN steps):")
+    else:
+        print("\nGNN (per-step times):")
+    gnn_total = zero_pv_time + sum(gnn_steps.values())
+    if is_deltav:
+        pct_z = 100.0 * zero_pv_time / gnn_total if gnn_total > 0 else 0
+        print(f"  {'0_dss_zero_pv (for GNN input)':30s}: {zero_pv_time*1000:8.2f} ms  ({zero_pv_time:.4f}s)  ({pct_z:.1f}%)")
     for k, v in gnn_steps.items():
         pct = 100.0 * v / gnn_total if gnn_total > 0 else 0
         print(f"  {k:30s}: {v*1000:8.2f} ms  ({v:.4f}s)  ({pct:.1f}%)")
     print(f"  {'TOTAL':30s}: {gnn_total*1000:8.2f} ms  ({gnn_total:.4f}s)")
 
-    print("\nSummary:")
+    print("\nSummary (comparable: OpenDSS profile vs GNN pipeline):")
     print(f"  OpenDSS total: {dss_total*1000:.2f} ms  |  GNN total: {gnn_total*1000:.2f} ms")
     print(f"  GNN/OpenDSS ratio: {gnn_total/max(dss_total,1e-9):.2f}x")
     print("=" * 72)
@@ -218,9 +236,9 @@ def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
 
 def main():
     print("\n" + "=" * 72)
-    print("TIMING: Per-step breakdown (OpenDSS vs GNN) - All 7 blocks")
-    print("  OpenDSS: set_time_index, apply_snapshot, solve, get_voltage")
-    print("  GNN: build_gnn_x, tensor+Data creation, model forward")
+    print("TIMING: Comparable OpenDSS vs GNN - All 7 blocks")
+    print("  OpenDSS: profile only (set_time, apply_full, solve, get_voltage)")
+    print("  GNN: Delta-V = zero-PV solve + GNN steps; non-Delta-V = GNN steps only")
     print("=" * 72)
 
     for block_id in range(1, 8):

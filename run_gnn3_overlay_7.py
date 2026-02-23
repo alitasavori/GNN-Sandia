@@ -228,10 +228,12 @@ def _parse_phase_from_node_name(name):
 
 
 @torch.no_grad()
-def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=True):
-    """Run 24h overlay for one model. Returns (df, dss_total_s, gnn_total_s)."""
+def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=True, observed_node=None):
+    """Run 24h overlay for one model. Returns (df, dss_total_s, gnn_total_s, mae, rmse).
+    observed_node: bus.phase to plot (default OBSERVED_NODE='840.1')."""
     if device is None:
         device = DEVICE
+    obs_node = observed_node if observed_node is not None else OBSERVED_NODE
 
     model, static = load_model_for_inference(ckpt_path, device=device)
     cfg = static["config"]
@@ -252,10 +254,10 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
     if len(node_names_master) != N_expected:
         raise RuntimeError(f"MASTER node count {len(node_names_master)} != model expects {N_expected}.")
 
-    if OBSERVED_NODE not in set(node_names_master):
-        raise RuntimeError(f"observed_node='{OBSERVED_NODE}' not in MASTER.")
+    if obs_node not in set(node_names_master):
+        raise RuntimeError(f"observed_node='{obs_node}' not in MASTER.")
     node_to_idx = {n: i for i, n in enumerate(node_names_master)}
-    obs_idx = node_to_idx[OBSERVED_NODE]
+    obs_idx = node_to_idx[obs_node]
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -336,7 +338,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             continue
 
         vdict = get_all_node_voltage_pu_and_angle_dict()
-        vm_dss, _ = vdict[OBSERVED_NODE]
+        vm_dss, _ = vdict[obs_node]
 
         if dataset_dir == "gnn_samples_out":
             X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
@@ -392,26 +394,40 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
     dss_total = float(np.nansum(dss_solve_times))
     gnn_total = float(np.nansum(gnn_times))
 
+    # RMSE and MAE vs OpenDSS at observed bus (this 24h run)
+    vd = np.array(vmag_dss, dtype=np.float64)
+    vg = np.array(vmag_gnn, dtype=np.float64)
+    ok = np.isfinite(vd) & np.isfinite(vg)
+    if np.sum(ok) > 0:
+        mae_overlay = float(np.mean(np.abs(vd[ok] - vg[ok])))
+        rmse_overlay = float(np.sqrt(np.mean((vd[ok] - vg[ok]) ** 2)))
+    else:
+        mae_overlay = rmse_overlay = np.nan
+
     if verbose:
         print(f"  {scenario_name}: OpenDSS total={dss_total:.3f}s | GNN total={gnn_total:.3f}s | nonconv={nonconv}")
+        if np.isfinite(mae_overlay):
+            print(f"    @ {obs_node}: MAE={mae_overlay:.6f} pu | RMSE={rmse_overlay:.6f} pu")
 
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(t_hours, vmag_dss, label="OpenDSS |V| (pu)")
     ax.plot(t_hours, vmag_gnn, label="GNN |V| (pu)")
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"Block {scenario_name}: Voltage Profile @ {OBSERVED_NODE} (24h)")
+    ax.set_title(f"Block {scenario_name}: Voltage Profile @ {obs_node} (24h)")
     ax.grid(True)
     ax.legend()
     best_rmse = static.get("best_rmse")
     gnn_desc = f"GNN: h={cfg['h_dim']} layers={cfg['num_layers']} target={target_col}"
     if best_rmse is not None:
-        gnn_desc += f" | RMSE={best_rmse:.6f}"
+        gnn_desc += f" | train RMSE={best_rmse:.6f}"
+    gnn_desc += f"\nOverlay vs OpenDSS @ {obs_node}: MAE={mae_overlay:.6f} pu | RMSE={rmse_overlay:.6f} pu"
     fig.text(0.02, 0.02, gnn_desc, fontsize=8, family="monospace",
              verticalalignment="bottom", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
-    plt.tight_layout(rect=[0, 0.15, 1, 1])
+    plt.tight_layout(rect=[0, 0.2, 1, 1])
     img_path = os.path.join(OUTPUT_DIR, f"overlay_24h_block{scenario_name}.png")
     fig.savefig(img_path, dpi=150, bbox_inches="tight")
+    plt.show()
     plt.close()
     print(f"  [saved] {img_path}")
 
@@ -419,7 +435,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         "hour": t_hours, "vmag_dss_pu": vmag_dss, "vmag_gnn_pu": vmag_gnn,
         "t_dss_solve_s": dss_solve_times, "t_gnn_forward_s": gnn_times,
     })
-    return out, dss_total, gnn_total
+    return out, dss_total, gnn_total, mae_overlay, rmse_overlay
 
 
 def main():
@@ -434,10 +450,10 @@ def main():
             continue
         print(f"\n>>> Block {block_id}")
         try:
-            df, dss_s, gnn_s = voltage_profile_overlay_24h(
+            df, dss_s, gnn_s, mae, rmse = voltage_profile_overlay_24h(
                 ckpt_path, scenario_name=str(block_id), device=DEVICE, verbose=True
             )
-            results[f"block{block_id}"] = (df, dss_s, gnn_s)
+            results[f"block{block_id}"] = (df, dss_s, gnn_s, mae, rmse)
         except Exception as e:
             print(f"  ERROR: {e}")
             import traceback
@@ -446,9 +462,14 @@ def main():
     print("\n" + "=" * 70)
     print("INFERENCE SPEEDS (24h = 288 steps per model)")
     print("=" * 70)
-    for name, (df, dss_s, gnn_s) in results.items():
+    for name, (df, dss_s, gnn_s, mae, rmse) in results.items():
         gnn_mean_ms = df["t_gnn_forward_s"].mean() * 1000
         print(f"  {name}: OpenDSS total={dss_s:.3f}s | GNN total={gnn_s:.3f}s | GNN mean/step={gnn_mean_ms:.2f}ms")
+    print("\n" + "=" * 70)
+    print(f"GNN vs OpenDSS @ {OBSERVED_NODE} (24h profile, MAE/RMSE in pu)")
+    print("=" * 70)
+    for name, (df, dss_s, gnn_s, mae, rmse) in results.items():
+        print(f"  {name}: MAE={mae:.6f} pu | RMSE={rmse:.6f} pu")
     print("=" * 70)
 
 
