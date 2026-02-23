@@ -1,11 +1,6 @@
 """
-Timing comparison: per-step breakdown for OpenDSS vs GNN.
-Comparable totals:
-  - OpenDSS: only what it needs for its profile (apply_full, solve_full, get_voltage).
-             Excludes zero-PV solve for Delta-V (that's GNN-only overhead).
-  - GNN: for Delta-V, includes zero-PV OpenDSS solve + GNN steps (GNN needs vmag_zero).
-         For non-Delta-V, just GNN steps.
-Runs once on CPU and once on GPU. No plots. Run from repo root.
+All-in-one: 24h overlay plots, MAE/RMSE, per-step timing (CPU + GPU).
+Run only this in the notebook to get plots, metrics, and timing.
 """
 import os
 import time
@@ -13,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import opendssdirect as dss
+import matplotlib.pyplot as plt
 from torch_geometric.data import Data
 
 import run_injection_dataset as inj
@@ -20,6 +16,7 @@ import run_loadtype_dataset as lt
 from run_deltav_dataset import _apply_snapshot_zero_pv
 from run_gnn3_overlay_7 import (
     BASE_DIR, CAP_Q_KVAR, DIR_LOADTYPE, OUTPUT_DIR, NPTS, P_BASE, Q_BASE, PV_BASE,
+    OBSERVED_NODE, STEP_MIN,
     build_bus_to_phases_from_master_nodes, build_gnn_x_original, build_gnn_x_injection,
     build_gnn_x_loadtype, get_all_node_voltage_pu_and_angle_dict,
     find_loadshape_csv_in_dss, resolve_csv_path, read_profile_csv_two_col_noheader,
@@ -27,6 +24,8 @@ from run_gnn3_overlay_7 import (
 )
 
 os.chdir(BASE_DIR)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 def timing_one_block_detailed(ckpt_path, device, block_id):
     """Returns dict of step name -> total seconds."""
@@ -47,6 +46,10 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
     node_names_master = master_df["node"].astype(str).tolist()
     if len(node_names_master) != N_expected:
         raise RuntimeError(f"MASTER node count {len(node_names_master)} != model expects {N_expected}.")
+    if OBSERVED_NODE not in set(node_names_master):
+        raise RuntimeError(f"observed_node='{OBSERVED_NODE}' not in MASTER.")
+    node_to_idx = {n: i for i, n in enumerate(node_names_master)}
+    obs_idx = node_to_idx[OBSERVED_NODE]
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -89,6 +92,7 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
         "3_model_forward": 0.0,
     }
     use_cuda_timer = device.type == "cuda" and torch.cuda.is_available()
+    t_hours, vmag_dss, vmag_gnn = [], [], []
 
     for t in range(NPTS):
         # --- OpenDSS step 1 ---
@@ -112,6 +116,9 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
             dss.Solution.Solve()
             dss_steps["3_solve_zero_pv"] += time.perf_counter() - t0
             if not dss.Solution.Converged():
+                t_hours.append(t * STEP_MIN / 60.0)
+                vmag_dss.append(np.nan)
+                vmag_gnn.append(np.nan)
                 continue
 
             t0 = time.perf_counter()
@@ -134,11 +141,15 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
         dss.Solution.Solve()
         dss_steps["6_solve_full"] += time.perf_counter() - t0
         if not dss.Solution.Converged():
+            t_hours.append(t * STEP_MIN / 60.0)
+            vmag_dss.append(np.nan)
+            vmag_gnn.append(np.nan)
             continue
 
         t0 = time.perf_counter()
         vdict = get_all_node_voltage_pu_and_angle_dict()
         dss_steps["7_get_voltage_full"] += time.perf_counter() - t0
+        vm_dss, _ = vdict[OBSERVED_NODE]
 
         # --- GNN step 1: build_gnn_x ---
         t0 = time.perf_counter()
@@ -189,7 +200,58 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
             yhat = model(g)
             gnn_steps["3_model_forward"] += time.perf_counter() - t0
 
-    return dss_steps, gnn_steps, is_deltav
+        if is_deltav:
+            vm_gnn = vmag_zero[obs_idx] + float(yhat[obs_idx, 0].item())
+        else:
+            vm_gnn = float(yhat[obs_idx, 0].item())
+        t_hours.append(t * STEP_MIN / 60.0)
+        vmag_dss.append(float(vm_dss))
+        vmag_gnn.append(vm_gnn)
+
+    return dss_steps, gnn_steps, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static
+
+
+def plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static):
+    """Draw overlay plot and display in notebook."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(t_hours, vmag_dss, label="OpenDSS |V| (pu)")
+    ax.plot(t_hours, vmag_gnn, label="GNN |V| (pu)")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("Voltage magnitude (pu)")
+    ax.set_title(f"Block {block_id}: Voltage Profile @ {OBSERVED_NODE} (24h)")
+    ax.grid(True)
+    ax.legend()
+    target_col = cfg.get("target_col", "vmag_pu")
+    gnn_desc = f"GNN: h={cfg['h_dim']} layers={cfg['num_layers']} target={target_col}"
+    if static.get("best_rmse") is not None:
+        gnn_desc += f" | train RMSE={static['best_rmse']:.6f}"
+    gnn_desc += f"\nOverlay vs OpenDSS @ {OBSERVED_NODE}: MAE={mae:.6f} pu | RMSE={rmse:.6f} pu"
+    fig.text(0.02, 0.02, gnn_desc, fontsize=8, family="monospace",
+             verticalalignment="bottom", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
+    plt.tight_layout(rect=[0, 0.2, 1, 1])
+    img_path = os.path.join(OUTPUT_DIR, f"overlay_24h_block{block_id}.png")
+    fig.savefig(img_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    plt.close()
+    print(f"  [saved] {img_path}")
+
+
+def print_model_details(block_id, cfg, static):
+    """Print full GNN model description for this block."""
+    print("\n  GNN model details:")
+    print(f"    N={cfg.get('N')} nodes, E={cfg.get('E')} edges")
+    print(f"    node_in_dim={cfg.get('node_in_dim')}, edge_in_dim={cfg.get('edge_in_dim')}, out_dim={cfg.get('out_dim')}")
+    print(f"    node_emb_dim={cfg.get('node_emb_dim')}, edge_emb_dim={cfg.get('edge_emb_dim')}")
+    print(f"    h_dim={cfg.get('h_dim')}, num_layers={cfg.get('num_layers')}")
+    print(f"    use_norm={cfg.get('use_norm', False)}, use_phase_onehot={cfg.get('use_phase_onehot', False)}")
+    print(f"    dataset={cfg.get('dataset', '?')}, target_col={cfg.get('target_col', 'vmag_pu')}")
+    if static.get("best_rmse") is not None:
+        print(f"    train best_rmse={static['best_rmse']:.6f} pu")
+    if static.get("best_mae") is not None:
+        print(f"    train best_mae={static['best_mae']:.6f} pu")
+    if static.get("best_epoch") is not None:
+        print(f"    best_epoch={static['best_epoch']}")
+    print()
 
 
 def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
@@ -236,29 +298,54 @@ def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
 
 def main():
     print("\n" + "=" * 72)
-    print("TIMING: Comparable OpenDSS vs GNN - All 7 blocks")
+    print("GNN3 BEST 7: Overlay plots, MAE/RMSE, per-step timing (CPU + GPU)")
     print("  OpenDSS: profile only (set_time, apply_full, solve, get_voltage)")
     print("  GNN: Delta-V = zero-PV solve + GNN steps; non-Delta-V = GNN steps only")
     print("=" * 72)
 
+    results = {}
     for block_id in range(1, 8):
         ckpt_path = os.path.join(OUTPUT_DIR, f"block{block_id}.pt")
         if not os.path.exists(ckpt_path):
             print(f"\n>>> Block {block_id}: SKIP (checkpoint not found)")
             continue
 
-        # Run on CPU
+        # Run on CPU (collects profile data for plot + MAE/RMSE)
         print(f"\n>>> Block {block_id} on CPU...")
-        dss_cpu, gnn_cpu, is_deltav = timing_one_block_detailed(ckpt_path, torch.device("cpu"), block_id)
+        dss_cpu, gnn_cpu, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static = timing_one_block_detailed(
+            ckpt_path, torch.device("cpu"), block_id
+        )
+        # MAE and RMSE vs OpenDSS
+        vd = np.array(vmag_dss, dtype=np.float64)
+        vg = np.array(vmag_gnn, dtype=np.float64)
+        ok = np.isfinite(vd) & np.isfinite(vg)
+        mae = float(np.mean(np.abs(vd[ok] - vg[ok]))) if np.sum(ok) > 0 else np.nan
+        rmse = float(np.sqrt(np.mean((vd[ok] - vg[ok]) ** 2))) if np.sum(ok) > 0 else np.nan
+        print(f"  @ {OBSERVED_NODE}: MAE={mae:.6f} pu | RMSE={rmse:.6f} pu")
+        # Plot and show in notebook
+        plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static)
+        print_model_details(block_id, cfg, static)
         print_timing(block_id, "CPU", dss_cpu, gnn_cpu, is_deltav)
+        results[f"block{block_id}"] = (mae, rmse, dss_cpu, gnn_cpu)
 
         # Run on GPU if available
         if torch.cuda.is_available():
             print(f"\n>>> Block {block_id} on GPU...")
-            dss_gpu, gnn_gpu, _ = timing_one_block_detailed(ckpt_path, torch.device("cuda"), block_id)
+            dss_gpu, gnn_gpu, _, _, _, _, _, _ = timing_one_block_detailed(
+                ckpt_path, torch.device("cuda"), block_id
+            )
             print_timing(block_id, "GPU", dss_gpu, gnn_gpu, is_deltav)
-        else:
-            print(f"\n>>> Block {block_id}: GPU not available, skipping GPU run.")
+            results[f"block{block_id}"] = (mae, rmse, dss_cpu, gnn_cpu, dss_gpu, gnn_gpu)
+
+    # Summary table
+    print("\n" + "=" * 72)
+    print(f"SUMMARY: MAE/RMSE @ {OBSERVED_NODE} | Speeds (CPU)")
+    print("=" * 72)
+    for name, r in results.items():
+        mae, rmse = r[0], r[1]
+        dss_s, gnn_s = r[2], r[3]
+        print(f"  {name}: MAE={mae:.6f} | RMSE={rmse:.6f} | OpenDSS={dss_s*1000:.0f}ms | GNN={gnn_s*1000:.0f}ms")
+    print("=" * 72)
 
 
 if __name__ == "__main__":

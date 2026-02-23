@@ -218,6 +218,8 @@ def load_model_for_inference(path, device=None):
         "edge_id": ckpt["edge_id"],
         "N": int(cfg["N"]),
         "best_rmse": ckpt.get("best_rmse"),
+        "best_mae": ckpt.get("best_mae"),
+        "best_epoch": ckpt.get("best_epoch"),
     }
     return mdl, static
 
