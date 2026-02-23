@@ -45,6 +45,40 @@ def build_bus_to_phases_from_master_nodes(node_names_master):
     return {b: sorted(list(s)) for b, s in bus_to_phases.items()}
 
 
+def build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv):
+    """Original (3 feat): p_load_kw, q_load_kvar, p_pv_kw per node."""
+    X = np.zeros((len(node_names_master), 3), dtype=np.float32)
+    for i, n in enumerate(node_names_master):
+        bus, phs = n.split(".")
+        ph = int(phs)
+        X[i, 0] = float(busphP_load.get((bus, ph), 0.0))
+        X[i, 1] = float(busphQ_load.get((bus, ph), 0.0))
+        X[i, 2] = float(busphP_pv.get((bus, ph), 0.0))
+    return X
+
+
+def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid):
+    """Injection (2 feat): p_inj_kw, q_inj_kvar per node. Source bus uses grid P/Q; others: p_inj=p_pv-p_load, q_inj=-q_load+cap_Q."""
+    P_grid_per_ph = P_grid / 3.0
+    Q_grid_per_ph = Q_grid / 3.0
+    X = np.zeros((len(node_names_master), 2), dtype=np.float32)
+    for i, n in enumerate(node_names_master):
+        bus, phs = n.split(".")
+        ph = int(phs)
+        p_load = float(busphP_load.get((bus, ph), 0.0))
+        q_load = float(busphQ_load.get((bus, ph), 0.0))
+        p_pv = float(busphP_pv.get((bus, ph), 0.0))
+        if bus == "sourcebus":
+            p_inj = P_grid_per_ph
+            q_inj = Q_grid_per_ph
+        else:
+            p_inj = p_pv - p_load
+            q_inj = -q_load + float(CAP_Q_KVAR.get(bus, 0.0))
+        X[i, 0] = p_inj
+        X[i, 1] = q_inj
+    return X
+
+
 def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist,
                          p_sys_balance, q_sys_balance):
     """Load-type (13 feat): electrical_distance, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, p_sys, q_sys."""
@@ -257,6 +291,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
 
     for t in range(NPTS):
         inj.set_time_index(t)
+        dss_time_step = 0.0
 
         if is_deltav:
             totals_z, busphP_load, busphQ_load, busphP_pv_z, busphQ_pv_z, busph_per_type = _apply_snapshot_zero_pv(
@@ -267,13 +302,14 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             )
             t0_dss = time.perf_counter()
             dss.Solution.Solve()
-            dss_solve_times.append(time.perf_counter() - t0_dss)
+            dss_time_step += time.perf_counter() - t0_dss
             if not dss.Solution.Converged():
                 nonconv += 1
                 t_hours.append(t * STEP_MIN / 60.0)
                 vmag_dss.append(np.nan)
                 vmag_gnn.append(np.nan)
                 gnn_times.append(np.nan)
+                dss_solve_times.append(dss_time_step)
                 continue
             vdict_z = get_all_node_voltage_pu_and_angle_dict()
             vmag_zero = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
@@ -288,7 +324,8 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
 
         t0_dss = time.perf_counter()
         dss.Solution.Solve()
-        dss_solve_times.append(time.perf_counter() - t0_dss)
+        dss_time_step += time.perf_counter() - t0_dss
+        dss_solve_times.append(dss_time_step)
 
         if not dss.Solution.Converged():
             nonconv += 1
@@ -301,17 +338,24 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[OBSERVED_NODE]
 
-        sum_p_load = float(sum(busphP_load.values()))
-        sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
-        sum_q_cap = float(sum(CAP_Q_KVAR.values()))
-        p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_cap
-
-        X = build_gnn_x_loadtype(
-            node_names_master, busph_per_type, busphP_pv,
-            node_to_electrical_dist, p_sys_balance, q_sys_balance,
-        )
+        if dataset_dir == "gnn_samples_out":
+            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
+        elif dataset_dir == "gnn_samples_inj_full":
+            pwr = dss.Circuit.TotalPower()
+            P_grid = -float(pwr[0])
+            Q_grid = -float(pwr[1])
+            X = build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
+        else:
+            sum_p_load = float(sum(busphP_load.values()))
+            sum_q_load = float(sum(busphQ_load.values()))
+            sum_p_pv = float(sum(busphP_pv.values()))
+            sum_q_cap = float(sum(CAP_Q_KVAR.values()))
+            p_sys_balance = sum_p_load - sum_p_pv
+            q_sys_balance = sum_q_load - sum_q_cap
+            X = build_gnn_x_loadtype(
+                node_names_master, busph_per_type, busphP_pv,
+                node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            )
         if is_deltav:
             X = np.concatenate([X, vmag_zero[:, None]], axis=-1)
         if use_phase_onehot:
