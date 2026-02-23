@@ -2,9 +2,15 @@
 gnn_samples_out/
 gnn_samples_inj/
 gnn_samples_inj_full/
-gnn_samples_loadtype_full/
-gnn_samples_deltav_full/
-gnn_samples_deltav_5x_full/
+
+# Lightweight CSVs (node index, edges) are tracked; heavy ones ignored:
+gnn_samples_loadtype_full/gnn_node_features_and_targets.csv
+gnn_samples_loadtype_full/gnn_sample_meta.csv
+gnn_samples_loadtype_full/checkpoints/
+gnn_samples_deltav_full/gnn_node_features_and_targets.csv
+gnn_samples_deltav_full/gnn_sample_meta.csv
+gnn_samples_deltav_5x_full/gnn_node_features_and_targets.csv
+gnn_samples_deltav_5x_full/gnn_sample_meta.csv
 
 # Python
 __pycache__/
