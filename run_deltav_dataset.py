@@ -52,8 +52,8 @@ def _apply_snapshot_zero_pv(
 
 
 def generate_gnn_snapshot_dataset_deltav(
-    n_scenarios=400,
-    k_samples_per_scenario=480,
+    n_scenarios=1000,
+    total_samples=57600,
     master_seed=20260130,
 ):
     """
@@ -62,8 +62,11 @@ def generate_gnn_snapshot_dataset_deltav(
     - For each scenario: k_samples with varying PV only; target = vmag_with_pv - vmag_zero_pv
     - Features: dataset-3 load-type features + vmag_zero_pv_pu
     - Edges: same as dataset 3 (R_full, X_full)
-    - Total samples ≈ n_scenarios * k_samples_per_scenario (~192k)
+    - Total samples = total_samples (default 57,600), n_scenarios (default 1,000)
+    - k_per_scenario = total_samples // n_scenarios (57); remainder distributed over first (total_samples % n_scenarios) scenarios
     """
+    k_base = total_samples // n_scenarios
+    n_extra = total_samples % n_scenarios
     dss_path = inj.compile_once()
     inj.setup_daily()
 
@@ -144,10 +147,11 @@ def generate_gnn_snapshot_dataset_deltav(
         sum_q_cap = sum(inj.CAP_Q_KVAR.values())
         q_sys_balance = sum_q_load - sum_q_cap
 
-        # Step 2: Sample k_samples with varying PV only
-        mPV_samples = rng_solve.uniform(mPV_min, mPV_max, size=k_samples_per_scenario)
+        # Step 2: Sample k_samples with varying PV only (k varies to hit total_samples exactly)
+        k_this = k_base + (1 if s < n_extra else 0)
+        mPV_samples = rng_solve.uniform(mPV_min, mPV_max, size=k_this)
 
-        for k in range(k_samples_per_scenario):
+        for k in range(k_this):
             mPV_t = float(mPV_samples[k])
             totals, busphP_load_k, busphQ_load_k, busphP_pv, busphQ_pv, busph_per_type = _apply_snapshot_with_per_type(
                 P_load_total_kw=P_load,
@@ -257,7 +261,7 @@ def generate_gnn_snapshot_dataset_deltav(
 
 if __name__ == "__main__":
     generate_gnn_snapshot_dataset_deltav(
-        n_scenarios=400,
-        k_samples_per_scenario=480,
+        n_scenarios=1000,
+        total_samples=57600,
         master_seed=20260130,
     )
