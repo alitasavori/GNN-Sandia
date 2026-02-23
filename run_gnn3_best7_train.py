@@ -1,7 +1,13 @@
 """
-Train the 7 best models from GNN3 exploration (one per block).
-Saves checkpoints to gnn3_best7_checkpoints/ for use in the 24h overlay.
-Run from repo root. Requires: gnn_samples_loadtype_full, gnn_samples_deltav_full, gnn_samples_deltav_5x_full.
+Train the 7 best models from GNN3 exploration — best per dataset type.
+Each block uses the dataset and architecture that performed best for that dataset:
+  Block 1: Original (gnn_samples_out) — medium (4L, h=32)
+  Block 2: Injection (gnn_samples_inj_full) — deep (4L, h=64)
+  Blocks 3–5: Load-type (gnn_samples_loadtype_full) — top 3 architectures
+  Block 6: Delta-V (gnn_samples_deltav_full)
+  Block 7: Delta-V 5× (gnn_samples_deltav_5x_full)
+Run from repo root. Requires: gnn_samples_out, gnn_samples_inj_full, gnn_samples_loadtype_full,
+gnn_samples_deltav_full, gnn_samples_deltav_5x_full.
 """
 import os
 import re
@@ -32,7 +38,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = "gnn3_best7_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 7 best models: (block_id, name, out_dir, feature_cols, target_col, n_emb, e_emb, h_dim, n_layers, use_norm, use_phase_onehot)
+# Best per dataset type: (block_id, name, out_dir, feature_cols, target_col, n_emb, e_emb, h_dim, n_layers, use_norm, use_phase_onehot)
+ORIGINAL_FEAT = ["p_load_kw", "q_load_kvar", "p_pv_kw"]
+INJECTION_FEAT = ["p_inj_kw", "q_inj_kvar"]
 LOADTYPE_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
     "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
@@ -41,9 +49,9 @@ LOADTYPE_FEAT = [
 DELTAV_FEAT = LOADTYPE_FEAT + ["vmag_zero_pv_pu"]
 
 MODELS = [
-    (1, "light_xwide", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 8, 4, 128, 2, False, False),
-    (2, "light_emb_h96", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False),
-    (3, "light_xwide_emb_depth3", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 128, 3, False, False),
+    (1, "medium", "gnn_samples_out", ORIGINAL_FEAT, "vmag_pu", 8, 4, 32, 4, False, False),
+    (2, "deep", "gnn_samples_inj_full", INJECTION_FEAT, "vmag_pu", 16, 8, 64, 4, False, False),
+    (3, "light_emb_h96", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False),
     (4, "light_emb_h96_phase_onehot_depth3", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 3, False, True),
     (5, "light_emb_h96_phase_onehot_depth3_h112", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 112, 3, False, True),
     (6, "light_xwide_emb_phase_onehot", "gnn_samples_deltav_full", DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True),
