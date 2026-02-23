@@ -94,15 +94,16 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
     use_cuda_timer = device.type == "cuda" and torch.cuda.is_available()
     t_hours, vmag_dss, vmag_gnn = [], [], []
 
-    for t in range(NPTS):
-        # --- OpenDSS step 1 ---
-        t0 = time.perf_counter()
-        inj.set_time_index(t)
-        dss_steps["1_set_time_index"] += time.perf_counter() - t0
-
-        vmag_zero = None
-        if is_deltav:
-            # OpenDSS steps 2, 3, 4 (zero-PV)
+    # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0) so the main
+    # full-solve pass uses the same initial-guess behavior as Load-type blocks,
+    # ensuring identical OpenDSS voltage profiles across all blocks.
+    vmag_zero_precomputed = None
+    if is_deltav:
+        inj.compile_once()
+        inj.setup_daily()
+        vmag_zero_precomputed = []
+        for t in range(NPTS):
+            inj.set_time_index(t)
             t0 = time.perf_counter()
             _apply_snapshot_zero_pv(
                 P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, mL_t=float(mL[t]),
@@ -111,22 +112,35 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
                 sigma_load=0.0, rng=rng_det,
             )
             dss_steps["2_apply_snapshot_zero_pv"] += time.perf_counter() - t0
-
             t0 = time.perf_counter()
             dss.Solution.Solve()
             dss_steps["3_solve_zero_pv"] += time.perf_counter() - t0
             if not dss.Solution.Converged():
-                t_hours.append(t * STEP_MIN / 60.0)
-                vmag_dss.append(np.nan)
-                vmag_gnn.append(np.nan)
+                vmag_zero_precomputed.append(np.full(len(node_names_master), np.nan, dtype=np.float32))
                 continue
-
             t0 = time.perf_counter()
             vdict_z = get_all_node_voltage_pu_and_angle_dict()
-            vmag_zero = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
+            vmag_z = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
             dss_steps["4_get_voltage_zero_pv"] += time.perf_counter() - t0
+            vmag_zero_precomputed.append(vmag_z)
+        # Re-compile so main pass starts fresh (full solve uses prev-timestep guess, like Load-type)
+        inj.compile_once()
+        inj.setup_daily()
 
-        # OpenDSS steps 5, 6, 7 (full)
+    for t in range(NPTS):
+        # --- OpenDSS step 1 ---
+        t0 = time.perf_counter()
+        inj.set_time_index(t)
+        dss_steps["1_set_time_index"] += time.perf_counter() - t0
+
+        vmag_zero = vmag_zero_precomputed[t] if is_deltav else None
+        if is_deltav and not np.isfinite(vmag_zero).all():
+            t_hours.append(t * STEP_MIN / 60.0)
+            vmag_dss.append(np.nan)
+            vmag_gnn.append(np.nan)
+            continue
+
+        # OpenDSS steps 5, 6, 7 (full) — no zero-PV solve here; same initial-guess behavior as Load-type
         t0 = time.perf_counter()
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
             P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
@@ -255,7 +269,7 @@ def print_model_details(block_id, cfg, static):
 
 
 def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
-    """Print per-step timing. OpenDSS = profile only. GNN = includes zero-PV for Delta-V."""
+    """Print per-step timing. OpenDSS = profile only. GNN = Delta-V uses zero-PV from separate pass."""
     print()
     print("=" * 72)
     print(f"BLOCK {block_id} | {device_name} | 288 steps")
@@ -296,11 +310,27 @@ def print_timing(block_id, device_name, dss_steps, gnn_steps, is_deltav):
     print("=" * 72)
 
 
+def _compute_totals(dss_steps, gnn_steps, is_deltav):
+    """Compute OpenDSS and GNN total seconds for summary table."""
+    open_dss_keys = ["1_set_time_index", "5_apply_snapshot_full", "6_solve_full", "7_get_voltage_full"]
+    dss_total = sum(dss_steps[k] for k in open_dss_keys)
+    zero_pv_time = 0.0
+    if is_deltav:
+        zero_pv_time = (
+            dss_steps["2_apply_snapshot_zero_pv"]
+            + dss_steps["3_solve_zero_pv"]
+            + dss_steps["4_get_voltage_zero_pv"]
+        )
+    gnn_total = zero_pv_time + sum(gnn_steps.values())
+    return dss_total, gnn_total
+
+
 def main():
     print("\n" + "=" * 72)
     print("GNN3 BEST 7: Overlay plots, MAE/RMSE, per-step timing (CPU + GPU)")
     print("  OpenDSS: profile only (set_time, apply_full, solve, get_voltage)")
-    print("  GNN: Delta-V = zero-PV solve + GNN steps; non-Delta-V = GNN steps only")
+    print("  Delta-V: vmag_zero from separate 24h pass (PV=0); full solve only in main loop")
+    print("  (ensures identical OpenDSS voltage profiles across all blocks)")
     print("=" * 72)
 
     results = {}
@@ -326,7 +356,8 @@ def main():
         plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static)
         print_model_details(block_id, cfg, static)
         print_timing(block_id, "CPU", dss_cpu, gnn_cpu, is_deltav)
-        results[f"block{block_id}"] = (mae, rmse, dss_cpu, gnn_cpu)
+        dss_total_cpu, gnn_total_cpu = _compute_totals(dss_cpu, gnn_cpu, is_deltav)
+        results[f"block{block_id}"] = (mae, rmse, dss_total_cpu, gnn_total_cpu)
 
         # Run on GPU if available
         if torch.cuda.is_available():
@@ -335,7 +366,8 @@ def main():
                 ckpt_path, torch.device("cuda"), block_id
             )
             print_timing(block_id, "GPU", dss_gpu, gnn_gpu, is_deltav)
-            results[f"block{block_id}"] = (mae, rmse, dss_cpu, gnn_cpu, dss_gpu, gnn_gpu)
+            dss_total_gpu, gnn_total_gpu = _compute_totals(dss_gpu, gnn_gpu, is_deltav)
+            results[f"block{block_id}"] = (mae, rmse, dss_total_cpu, gnn_total_cpu, dss_total_gpu, gnn_total_gpu)
 
     # Summary table
     print("\n" + "=" * 72)

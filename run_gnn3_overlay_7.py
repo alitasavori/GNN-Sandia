@@ -293,30 +293,42 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
     nonconv = 0
     use_cuda_timer = device.startswith("cuda") and torch.cuda.is_available()
 
-    for t in range(NPTS):
-        inj.set_time_index(t)
-        dss_time_step = 0.0
-
-        if is_deltav:
-            totals_z, busphP_load, busphQ_load, busphP_pv_z, busphQ_pv_z, busph_per_type = _apply_snapshot_zero_pv(
+    # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0) so the main
+    # full-solve pass uses the same initial-guess behavior as Load-type blocks.
+    vmag_zero_precomputed = None
+    if is_deltav:
+        vmag_zero_precomputed = []
+        for t in range(NPTS):
+            inj.set_time_index(t)
+            _apply_snapshot_zero_pv(
                 P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, mL_t=float(mL[t]),
                 loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
                 pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
                 sigma_load=0.0, rng=rng_det,
             )
-            t0_dss = time.perf_counter()
             dss.Solution.Solve()
-            dss_time_step += time.perf_counter() - t0_dss
             if not dss.Solution.Converged():
-                nonconv += 1
-                t_hours.append(t * STEP_MIN / 60.0)
-                vmag_dss.append(np.nan)
-                vmag_gnn.append(np.nan)
-                gnn_times.append(np.nan)
-                dss_solve_times.append(dss_time_step)
+                vmag_zero_precomputed.append(np.full(len(node_names_master), np.nan, dtype=np.float32))
                 continue
             vdict_z = get_all_node_voltage_pu_and_angle_dict()
-            vmag_zero = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
+            vmag_z = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
+            vmag_zero_precomputed.append(vmag_z)
+        inj.compile_once()
+        inj.setup_daily()
+
+    for t in range(NPTS):
+        inj.set_time_index(t)
+        dss_time_step = 0.0
+
+        vmag_zero = vmag_zero_precomputed[t] if is_deltav else None
+        if is_deltav and not np.isfinite(vmag_zero).all():
+            nonconv += 1
+            t_hours.append(t * STEP_MIN / 60.0)
+            vmag_dss.append(np.nan)
+            vmag_gnn.append(np.nan)
+            gnn_times.append(np.nan)
+            dss_solve_times.append(0.0)
+            continue
 
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
             P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
