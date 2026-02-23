@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 import opendssdirect as dss
 import matplotlib.pyplot as plt
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 
 import run_injection_dataset as inj
 import run_loadtype_dataset as lt
@@ -27,8 +27,8 @@ os.chdir(BASE_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def timing_one_block_detailed(ckpt_path, device, block_id):
-    """Returns dict of step name -> total seconds."""
+def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True):
+    """Returns dict of step name -> total seconds. use_batched_gnn: batch all 288 GNN forwards."""
     model, static = load_model_for_inference(ckpt_path, device=device)
     cfg = static["config"]
     target_col = cfg.get("target_col", "vmag_pu")
@@ -93,6 +93,9 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
     }
     use_cuda_timer = device.type == "cuda" and torch.cuda.is_available()
     t_hours, vmag_dss, vmag_gnn = [], [], []
+    # For batched: collect (t, X_t) for converged steps, run one batch at end
+    batched_X_list = []
+    batched_t_list = []
 
     # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0) so the main
     # full-solve pass uses the same initial-guess behavior as Load-type blocks,
@@ -191,36 +194,83 @@ def timing_one_block_detailed(ckpt_path, device, block_id):
             X = np.concatenate([X, ph_oh], axis=-1)
         gnn_steps["1_build_gnn_x"] += time.perf_counter() - t0
 
-        # --- GNN step 2: tensor + Data creation ---
+        t_hours.append(t * STEP_MIN / 60.0)
+        vmag_dss.append(float(vm_dss))
+
+        if use_batched_gnn:
+            batched_X_list.append(X.copy())
+            batched_t_list.append(t)
+            vmag_gnn.append(np.nan)  # fill after batch
+        else:
+            # --- GNN step 2: tensor + Data creation ---
+            t0 = time.perf_counter()
+            x_t = torch.tensor(X, dtype=torch.float32, device=device)
+            g = Data(x=x_t, edge_index=edge_index, edge_attr=edge_attr, edge_id=edge_id, num_nodes=N_expected)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
+
+            # --- GNN step 3: model forward ---
+            if use_cuda_timer:
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                yhat = model(g)
+                end.record()
+                torch.cuda.synchronize()
+                gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
+            else:
+                t0 = time.perf_counter()
+                yhat = model(g)
+                gnn_steps["3_model_forward"] += time.perf_counter() - t0
+
+            if is_deltav:
+                vm_gnn = vmag_zero[obs_idx] + float(yhat[obs_idx, 0].item())
+            else:
+                vm_gnn = float(yhat[obs_idx, 0].item())
+            vmag_gnn.append(vm_gnn)
+
+    # Batched GNN forward (all 288 timesteps in one call)
+    if use_batched_gnn and batched_X_list:
         t0 = time.perf_counter()
-        x_t = torch.tensor(X, dtype=torch.float32, device=device)
-        g = Data(x=x_t, edge_index=edge_index, edge_attr=edge_attr, edge_id=edge_id, num_nodes=N_expected)
+        data_list = [
+            Data(
+                x=torch.tensor(X_t, dtype=torch.float32, device=device),
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                edge_id=edge_id,
+                num_nodes=N_expected,
+            )
+            for X_t in batched_X_list
+        ]
+        batch = Batch.from_data_list(data_list)
         if device.type == "cuda":
             torch.cuda.synchronize()
         gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
 
-        # --- GNN step 3: model forward ---
+        t0 = time.perf_counter()
         if use_cuda_timer:
             torch.cuda.synchronize()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            yhat = model(g)
+        yhat = model(batch)
+        if use_cuda_timer:
             end.record()
             torch.cuda.synchronize()
             gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
         else:
-            t0 = time.perf_counter()
-            yhat = model(g)
             gnn_steps["3_model_forward"] += time.perf_counter() - t0
 
-        if is_deltav:
-            vm_gnn = vmag_zero[obs_idx] + float(yhat[obs_idx, 0].item())
-        else:
-            vm_gnn = float(yhat[obs_idx, 0].item())
-        t_hours.append(t * STEP_MIN / 60.0)
-        vmag_dss.append(float(vm_dss))
-        vmag_gnn.append(vm_gnn)
+        # Extract predictions for observed node: output[i*N + obs_idx] for batch i
+        yhat_np = yhat.cpu().numpy()
+        for i, t in enumerate(batched_t_list):
+            pred = float(yhat_np[i * N_expected + obs_idx, 0])
+            if is_deltav:
+                vmag_zero_t = vmag_zero_precomputed[t]
+                pred = vmag_zero_t[obs_idx] + pred
+            vmag_gnn[t] = pred
 
     return dss_steps, gnn_steps, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static
 
@@ -329,8 +379,8 @@ def main():
     print("\n" + "=" * 72)
     print("GNN3 BEST 7: Overlay plots, MAE/RMSE, per-step timing (CPU + GPU)")
     print("  OpenDSS: profile only (set_time, apply_full, solve, get_voltage)")
+    print("  GNN: batched inference (288 timesteps in one forward pass)")
     print("  Delta-V: vmag_zero from separate 24h pass (PV=0); full solve only in main loop")
-    print("  (ensures identical OpenDSS voltage profiles across all blocks)")
     print("=" * 72)
 
     results = {}
