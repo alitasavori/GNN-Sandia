@@ -264,7 +264,7 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True)
             gnn_steps["3_model_forward"] += time.perf_counter() - t0
 
         # Extract predictions for observed node: output[i*N + obs_idx] for batch i
-        yhat_np = yhat.cpu().numpy()
+        yhat_np = yhat.detach().cpu().numpy()
         for i, t in enumerate(batched_t_list):
             pred = float(yhat_np[i * N_expected + obs_idx, 0])
             if is_deltav:
