@@ -29,7 +29,7 @@ CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAE_CSV = os.path.join(OUTPUT_DIR, "mae_per_node_unidir_vs_bidir.csv")
-PV_SCALE = 1.5  # Increase PV for profile to make backflow more visible (1.0 = baseline)
+PV_SCALE = 3.0  # Increase PV for profile to make backflow more visible (1.0 = baseline)
 
 
 def get_worst_node():
