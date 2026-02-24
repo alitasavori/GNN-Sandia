@@ -160,7 +160,7 @@ def main():
         ax = axes[i, j]
         ax.plot(t_hours, V_dss[:, idx], "b-", label="OpenDSS", linewidth=1.5)
         ax.plot(t_hours, V_uni[:, idx], "orange", linestyle="--", label="unidir", alpha=0.9)
-        ax.plot(t_hours, V_bidir[:, idx], "g-", linestyle=":", label="bidir", alpha=0.9)
+        ax.plot(t_hours, V_bidir[:, idx], "g:", label="bidir", alpha=0.9)
         ax.set_title(f"{node_names[idx]} | unidir MAE={mae_uni[idx]:.4f} bidir={mae_bidir[idx]:.4f}")
         ax.set_ylabel("|V| (pu)")
         ax.grid(True)
