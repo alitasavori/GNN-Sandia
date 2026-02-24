@@ -40,7 +40,7 @@ CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
 OBSERVED_NODE = "840.1"
-PV_SCALE = 3.0  # Increase PV for 24h profile to make backflow more visible
+PV_SCALE = 2.0  # Increase PV for 24h profile to make backflow more visible
 
 TARGET_SAMPLES = 10000
 SEED = 20260130
