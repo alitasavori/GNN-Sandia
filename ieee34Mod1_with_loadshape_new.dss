@@ -13,7 +13,7 @@ New Transformer.SubXF Phases=3 Windings=2 Xhl=0.01    ! normally 8
 ~ wdg=2 bus=800       conn=wye   kv=24.9  kva=25000   %r=0.0005
 
 ! import line codes with phase impedance matrices
-Redirect "IEEELineCodes.DSS"
+Redirect        "IEEELineCodes.dss"   ! revised according to Later test feeder doc
 
 ! ============================================================================
 ! LOAD SHAPE - Time-varying daily load pattern (5-minute resolution, 288 points)
@@ -245,14 +245,14 @@ Load.d846_848sb.vminpu=.85
 Load.d846_848rb.vminpu=.85
 
 ! ============================================================================
+! PV SOLAR SYSTEMS - Removed from DSS file
+! ============================================================================
 ! PV SYSTEMS - Solar irradiance from 5-minute CSV file
 ! ============================================================================
 ! Irradiance loadshape (5-minute resolution, 288 points, matches load shape)
 New Loadshape.IrradShape npts=288 interval=0 csvfile="5MinuteIrradiance.csv"
 
-
 ! PV System at Bus 840 - 500 kW (MPPT mode only, no Volt-Var)
-! %Cutin=0 to test: disable inverter cut-in (default 2% can zero output at low irradiance)
 New PVSystem.PV840 phases=3 bus1=840 kV=24.9 kVA=500 Pmpp=500 irradiance=1.0 %Pmpp=100 temperature=25 pf=1.0 daily=IrradShape
 
 ! PV System at Bus 860 - 500 kW (MPPT mode only, no Volt-Var)
@@ -274,5 +274,4 @@ New PVSystem.PV860 phases=3 bus1=860 kV=24.9 kVA=500 Pmpp=500 irradiance=1.0 %Pm
 Set VoltageBases = "69,24.9,4.16, .48"
 CalcVoltageBases
 
-Buscoords "IEEE34Node_BusXY_JE.csv"
-
+BusCoords "IEEE34Node_BusXY_JE.csv"
