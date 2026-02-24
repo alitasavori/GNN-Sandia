@@ -15,7 +15,7 @@ import run_injection_dataset as inj
 import run_loadtype_dataset as lt
 from run_deltav_dataset import _apply_snapshot_zero_pv
 from run_gnn3_overlay_7 import (
-    BASE_DIR, CAP_Q_KVAR, DIR_LOADTYPE, OUTPUT_DIR, NPTS, P_BASE, Q_BASE, PV_BASE,
+    BASE_DIR, CAP_Q_KVAR, DIR_LOADTYPE, OUTPUT_DIR, NPTS,
     OBSERVED_NODE, STEP_MIN,
     build_bus_to_phases_from_master_nodes, build_gnn_x_original, build_gnn_x_injection,
     build_gnn_x_loadtype, get_all_node_voltage_pu_and_angle_dict,
@@ -25,6 +25,9 @@ from run_gnn3_overlay_7 import (
 
 os.chdir(BASE_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# High load (2312/1264) operation point
+P_BASE, Q_BASE, PV_BASE = 2312.0, 1264.0, 1000.0
 
 
 def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True):
