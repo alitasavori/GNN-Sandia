@@ -210,28 +210,27 @@ def train_unidir():
 
 
 def train_bidir():
-    """Train same architecture on bidirectional loadtype dataset (~20k samples)."""
+    """Train same architecture on bidirectional loadtype dataset. Uses EXACT same sample_ids as unidir."""
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
     edge_csv = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
     node_csv = os.path.join(DIR_LOADTYPE, "gnn_node_features_and_targets.csv")
+    unidir_node_csv = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
     if not os.path.exists(edge_csv) or not os.path.exists(node_csv):
         raise FileNotFoundError(f"Missing {DIR_LOADTYPE}. Run run_loadtype_dataset.py first.")
+    if not os.path.exists(unidir_node_csv):
+        raise FileNotFoundError(f"Run create_unidir_dataset first (creates {OUT_DIR}/).")
 
     df_e = pd.read_csv(edge_csv)
-    df_n = pd.read_csv(node_csv)
+    df_n_full = pd.read_csv(node_csv)
+    df_n_uni = pd.read_csv(unidir_node_csv)
     required = {"sample_id", "node_idx", "vmag_pu"} | set(LOADTYPE_FEAT)
-    if required - set(df_n.columns):
-        raise ValueError(f"Missing columns: {required - set(df_n.columns)}")
+    if required - set(df_n_full.columns):
+        raise ValueError(f"Missing columns: {required - set(df_n_full.columns)}")
 
-    df_e["u_idx"] = pd.to_numeric(df_e["u_idx"], errors="raise").astype(int)
-    df_e["v_idx"] = pd.to_numeric(df_e["v_idx"], errors="raise").astype(int)
-    df_e["R_full"] = pd.to_numeric(df_e["R_full"], errors="coerce")
-    df_e["X_full"] = pd.to_numeric(df_e["X_full"], errors="coerce")
-    df_e = df_e.dropna(subset=["u_idx", "v_idx", "R_full", "X_full"]).reset_index(drop=True)
-    df_e["edge_id"] = np.arange(len(df_e), dtype=int)
-
+    keep_ids = df_n_uni["sample_id"].unique()
+    df_n = df_n_full[df_n_full["sample_id"].isin(keep_ids)].copy()
     for c in LOADTYPE_FEAT + ["vmag_pu"]:
         df_n[c] = pd.to_numeric(df_n[c], errors="coerce")
     df_n = df_n.dropna(subset=list(required))
@@ -239,12 +238,15 @@ def train_bidir():
     counts = df_n.groupby("sample_id")["node_idx"].count()
     good_ids = counts[counts == counts.max()].index
     df_n = df_n[df_n["sample_id"].isin(good_ids)].copy().sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
+    if len(df_n) == 0:
+        raise RuntimeError("No complete samples in bidir subset. Unidir dataset may have incomplete samples.")
 
-    n_samples_want = max(1, TARGET_SAMPLES // N)
-    all_ids = df_n["sample_id"].unique()
-    rng = np.random.default_rng(SEED)
-    keep_ids = rng.choice(all_ids, size=min(n_samples_want, len(all_ids)), replace=False)
-    df_n = df_n[df_n["sample_id"].isin(keep_ids)].copy().sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
+    df_e["u_idx"] = pd.to_numeric(df_e["u_idx"], errors="raise").astype(int)
+    df_e["v_idx"] = pd.to_numeric(df_e["v_idx"], errors="raise").astype(int)
+    df_e["R_full"] = pd.to_numeric(df_e["R_full"], errors="coerce")
+    df_e["X_full"] = pd.to_numeric(df_e["X_full"], errors="coerce")
+    df_e = df_e.dropna(subset=["u_idx", "v_idx", "R_full", "X_full"]).reset_index(drop=True)
+    df_e["edge_id"] = np.arange(len(df_e), dtype=int)
 
     E = len(df_e)
     S = df_n["sample_id"].nunique()
