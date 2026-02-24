@@ -26,6 +26,9 @@ from run_gnn3_overlay_7 import (
 os.chdir(BASE_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Plot voltage profile at this node
+OBSERVED_NODE = "816.1"
+
 
 def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True):
     """Returns dict of step name -> total seconds. use_batched_gnn: batch all 288 GNN forwards."""
