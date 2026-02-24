@@ -41,7 +41,7 @@ CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
 OBSERVED_NODE = "840.1"
 
-TARGET_SAMPLES = 20000
+TARGET_SAMPLES = 10000
 SEED = 20260130
 TEST_FRAC = 0.20
 BATCH_SIZE = 64
@@ -115,7 +115,7 @@ def create_unidir_dataset():
     df_e_uni.to_csv(EDGE_CSV, index=False)
     df_idx.to_csv(NODE_INDEX_CSV, index=False)
 
-    n_samples_want = max(1, TARGET_SAMPLES // N)
+    n_samples_want = min(TARGET_SAMPLES, len(all_ids))
     all_ids = df_n["sample_id"].unique()
     rng = np.random.default_rng(SEED)
     keep_ids = rng.choice(all_ids, size=min(n_samples_want, len(all_ids)), replace=False)
