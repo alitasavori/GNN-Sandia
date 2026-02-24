@@ -36,7 +36,7 @@ NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
 NODE_INDEX_CSV = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
-OBSERVED_NODE = "816.1"
+OBSERVED_NODE = "840.1"
 
 TARGET_SAMPLES = 20000
 SEED = 20260130
