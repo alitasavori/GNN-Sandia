@@ -1,7 +1,9 @@
 """
 Fourth dataset generation: delta-V prediction (voltage change due to PV).
-Scenario structure: constant loads per scenario; one zero-PV solve stores vmag_zero_pv as node feature;
-samples vary only PV; target = vmag_with_pv - vmag_zero_pv (delta V).
+Scenario structure: 1000 scenarios with different (P_load, Q_load, P_pv); for each scenario,
+samples use timesteps t from the 24h load/irradiance profile (mL[t], mPV[t]) so training
+matches test-time temporal structure. vmag_zero is computed at each t with loads at that t.
+Target = vmag_with_pv - vmag_zero_pv (delta V).
 Output: gnn_samples_deltav_full/
 """
 import os
@@ -55,16 +57,22 @@ def generate_gnn_snapshot_dataset_deltav(
     n_scenarios=1000,
     total_samples=57600,
     master_seed=20260130,
+    loadshape_name="5minDayShape",
+    irradshape_name="IrradShape",
+    bins_by_profile=None,
+    include_anchors=True,
 ):
     """
-    Generate delta-V dataset:
-    - Each scenario: constant loads (P_load, Q_load); solve with PV=0 -> vmag_zero_pv per node
-    - For each scenario: k_samples with varying PV only; target = vmag_with_pv - vmag_zero_pv
-    - Features: dataset-3 load-type features + vmag_zero_pv_pu
-    - Edges: same as dataset 3 (R_full, X_full)
+    Generate delta-V dataset with 24h profile alignment:
+    - Each scenario: different (P_load, Q_load, P_pv) from BASELINE × RANGES
+    - For each scenario: k timesteps sampled from 24h profile via select_times_three_profiles
+    - At each t: vmag_zero = solve with mL[t], PV=0; vmag_with_pv = solve with mL[t], mPV[t]
+    - Target = vmag_with_pv - vmag_zero (matches test-time temporal structure)
     - Total samples = total_samples (default 57,600), n_scenarios (default 1,000)
-    - k_per_scenario = total_samples // n_scenarios (57); remainder distributed over first (total_samples % n_scenarios) scenarios
     """
+    if bins_by_profile is None:
+        bins_by_profile = {"load": 10, "pv": 10, "net": 10}
+
     k_base = total_samples // n_scenarios
     n_extra = total_samples % n_scenarios
     dss_path = inj.compile_once()
@@ -81,6 +89,13 @@ def generate_gnn_snapshot_dataset_deltav(
     inj.extract_static_phase_edges_to_csv(node_names_master=node_names_master, edge_csv_path=EDGE_CSV)
     node_to_electrical_dist = _compute_electrical_distance_from_source(node_names_master, EDGE_CSV)
 
+    csvL_token, _ = inj.find_loadshape_csv_in_dss(dss_path, loadshape_name)
+    csvPV_token, _ = inj.find_loadshape_csv_in_dss(dss_path, irradshape_name)
+    csvL = inj.resolve_csv_path(csvL_token, dss_path)
+    csvPV = inj.resolve_csv_path(csvPV_token, dss_path)
+    mL = inj.read_profile_csv_two_col_noheader(csvL, npts=inj.NPTS, debug=False)
+    mPV = inj.read_profile_csv_two_col_noheader(csvPV, npts=inj.NPTS, debug=False)
+
     rng_master = np.random.default_rng(master_seed)
     rows_sample = []
     rows_node = []
@@ -88,9 +103,6 @@ def generate_gnn_snapshot_dataset_deltav(
     kept = 0
     skipped_nonconv = 0
     skipped_badV = 0
-
-    # PV multiplier range for sampling (e.g. 0.1 to 1.0 to avoid pure zero)
-    mPV_min, mPV_max = 0.1, 1.0
 
     for s in range(n_scenarios):
         inj.dss.Basic.ClearAll()
@@ -104,7 +116,6 @@ def generate_gnn_snapshot_dataset_deltav(
         loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
         pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
 
-        # Sample scenario: constant loads (P_load, Q_load, P_pv baseline for scaling)
         sc = inj.sample_scenario_from_baseline(inj.BASELINE, inj.RANGES, rng_master)
         P_load = sc["P_load_total_kw"]
         Q_load = sc["Q_load_total_kvar"]
@@ -112,52 +123,59 @@ def generate_gnn_snapshot_dataset_deltav(
         sigL = sc["sigma_load"]
         sigPV = sc["sigma_pv"]
 
+        prof_load = mL
+        prof_pv = mPV
+        prof_net = (P_load * mL) - (P_pv_baseline * mPV)
+        k_this = k_base + (1 if s < n_extra else 0)
+        rng_times = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
+        times = inj.select_times_three_profiles(
+            prof_load=prof_load, prof_pv=prof_pv, prof_net=prof_net,
+            K_total=k_this, bins_by_profile=bins_by_profile,
+            include_anchors=include_anchors, rng=rng_times,
+        )
+        times = [int(t) for t in times]
+
         rng_solve = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
 
-        # Step 1: Zero-PV solve — constant loads (mL=1.0), PV=0
-        totals_z, busphP_load, busphQ_load, busphP_pv_z, busphQ_pv_z, busph_per_type = _apply_snapshot_zero_pv(
-            P_load_total_kw=P_load,
-            Q_load_total_kvar=Q_load,
-            mL_t=1.0,
-            loads_dss=loads_dss,
-            dev_to_dss_load=dev_to_dss_load,
-            dev_to_busph_load=dev_to_busph_load,
-            pv_dss=pv_dss,
-            pv_to_dss=pv_to_dss,
-            pv_to_busph=pv_to_busph,
-            sigma_load=sigL,
-            rng=rng_solve,
-        )
-        inj.dss.Solution.Solve()
-        if not inj.dss.Solution.Converged():
-            print(f"[scenario {s+1}/{n_scenarios}] ZERO-PV solve did not converge, skipping scenario")
-            continue
+        for t in times:
+            mL_t = float(mL[t])
+            mPV_t = float(mPV[t])
+            if mPV_t < 0.01:
+                mPV_t = 0.01
 
-        vmag_zero_m, vang_zero_m = inj.get_all_node_voltage_pu_and_angle_filtered(node_names_master)
-        vmag_zero_arr = np.asarray(vmag_zero_m, dtype=float)
-        if (not np.isfinite(vmag_zero_arr).all()) or (vmag_zero_arr.min() < inj.VMAG_PU_MIN) or (vmag_zero_arr.max() > inj.VMAG_PU_MAX):
-            print(f"[scenario {s+1}/{n_scenarios}] Zero-PV voltages out of range, skipping scenario")
-            continue
+            inj.set_time_index(t)
 
-        vmag_zero_pu = {n: float(v) for n, v in zip(node_names_master, vmag_zero_m)}
+            totals_z, busphP_load, busphQ_load, busphP_pv_z, busphQ_pv_z, busph_per_type = _apply_snapshot_zero_pv(
+                P_load_total_kw=P_load,
+                Q_load_total_kvar=Q_load,
+                mL_t=mL_t,
+                loads_dss=loads_dss,
+                dev_to_dss_load=dev_to_dss_load,
+                dev_to_busph_load=dev_to_busph_load,
+                pv_dss=pv_dss,
+                pv_to_dss=pv_to_dss,
+                pv_to_busph=pv_to_busph,
+                sigma_load=sigL,
+                rng=rng_solve,
+            )
+            inj.dss.Solution.Solve()
+            if not inj.dss.Solution.Converged():
+                skipped_nonconv += 1
+                continue
 
-        # Load features are constant for the scenario (from zero-PV apply)
-        sum_p_load = float(sum(busphP_load.values()))
-        sum_q_load = float(sum(busphQ_load.values()))
-        sum_q_cap = sum(inj.CAP_Q_KVAR.values())
-        q_sys_balance = sum_q_load - sum_q_cap
+            vmag_zero_m, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names_master)
+            vmag_zero_arr = np.asarray(vmag_zero_m, dtype=float)
+            if (not np.isfinite(vmag_zero_arr).all()) or (vmag_zero_arr.min() < inj.VMAG_PU_MIN) or (vmag_zero_arr.max() > inj.VMAG_PU_MAX):
+                skipped_badV += 1
+                continue
 
-        # Step 2: Sample k_samples with varying PV only (k varies to hit total_samples exactly)
-        k_this = k_base + (1 if s < n_extra else 0)
-        mPV_samples = rng_solve.uniform(mPV_min, mPV_max, size=k_this)
+            vmag_zero_pu = {n: float(v) for n, v in zip(node_names_master, vmag_zero_m)}
 
-        for k in range(k_this):
-            mPV_t = float(mPV_samples[k])
             totals, busphP_load_k, busphQ_load_k, busphP_pv, busphQ_pv, busph_per_type = _apply_snapshot_with_per_type(
                 P_load_total_kw=P_load,
                 Q_load_total_kvar=Q_load,
                 P_pv_total_kw=P_pv_baseline,
-                mL_t=1.0,
+                mL_t=mL_t,
                 mPV_t=mPV_t,
                 loads_dss=loads_dss,
                 dev_to_dss_load=dev_to_dss_load,
@@ -182,12 +200,18 @@ def generate_gnn_snapshot_dataset_deltav(
                 continue
 
             vmag_with_pv = {n: float(vmag_m[i]) for i, n in enumerate(node_names_master)}
+            sum_p_load = float(sum(busphP_load_k.values()))
             sum_p_pv = float(sum(busphP_pv.values()))
+            sum_q_load = float(sum(busphQ_load_k.values()))
+            sum_q_cap = sum(inj.CAP_Q_KVAR.values())
+            q_sys_balance = sum_q_load - sum_q_cap
             p_sys_balance = sum_p_load - sum_p_pv
 
             rows_sample.append({
                 "sample_id": sample_id,
                 "scenario_id": s,
+                "time_idx": t,
+                "m_load": mL_t,
                 "m_pv": mPV_t,
                 "P_load_total_kw": float(P_load),
                 "Q_load_total_kvar": float(Q_load),
@@ -244,7 +268,7 @@ def generate_gnn_snapshot_dataset_deltav(
             sample_id += 1
             kept += 1
 
-        print(f"[scenario {s+1}/{n_scenarios}] kept={kept} skip_nonconv={skipped_nonconv} skip_badV={skipped_badV} Pload={P_load:.1f} Qload={Q_load:.1f} Ppv_base={P_pv_baseline:.1f}")
+        print(f"[scenario {s+1}/{n_scenarios}] kept={kept} skip_nonconv={skipped_nonconv} skip_badV={skipped_badV} Pload={P_load:.1f} Qload={Q_load:.1f} Ppv_base={P_pv_baseline:.1f} times={len(times)}")
 
     df_sample = pd.DataFrame(rows_sample)
     df_node = pd.DataFrame(rows_node)
