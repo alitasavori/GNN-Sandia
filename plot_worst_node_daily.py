@@ -29,6 +29,7 @@ CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAE_CSV = os.path.join(OUTPUT_DIR, "mae_per_node_unidir_vs_bidir.csv")
+PV_SCALE = 1.5  # Increase PV for profile to make backflow more visible (1.0 = baseline)
 
 
 def get_worst_node():
@@ -76,7 +77,7 @@ def run_24h_one_node(obs_node):
     for t in range(NPTS):
         inj.set_time_index(t)
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE * PV_SCALE,
             mL_t=float(mL[t]), mPV_t=float(mPV[t]),
             loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
             pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
@@ -131,7 +132,7 @@ def main():
     ax.plot(t_hours, v_bidir, "g:", label=f"GNN bidirectional (MAE={mae_bidir:.4f})", linewidth=1.5)
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"24h voltage profile @ {obs_node} (worst node for unidirectional)")
+    ax.set_title(f"24h voltage profile @ {obs_node} (worst node, PV={PV_SCALE:.1f}× baseline)")
     ax.grid(True)
     ax.legend()
     plt.tight_layout()

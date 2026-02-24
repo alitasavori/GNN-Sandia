@@ -29,6 +29,7 @@ CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOP_N_PLOT = 9  # Plot voltage profiles for top N nodes where unidir fails worst
+PV_SCALE = 1.5  # Increase PV for profile to make backflow more visible (1.0 = baseline)
 
 
 def run_24h_all_nodes():
@@ -69,7 +70,7 @@ def run_24h_all_nodes():
     for t in range(NPTS):
         inj.set_time_index(t)
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE * PV_SCALE,
             mL_t=float(mL[t]), mPV_t=float(mPV[t]),
             loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
             pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
@@ -169,7 +170,7 @@ def main():
         i, j = k // ncol, k % ncol
         axes[i, j].axis("off")
     axes[-1, 1].set_xlabel("Hour of day")
-    plt.suptitle("Voltage profiles: nodes where unidirectional fails worst (24h)")
+    plt.suptitle(f"Voltage profiles: nodes where unidirectional fails worst (24h, PV={PV_SCALE:.1f}×)")
     plt.tight_layout()
     p2 = os.path.join(OUTPUT_DIR, "voltage_profiles_worst_unidir_nodes.png")
     fig2.savefig(p2, dpi=150, bbox_inches="tight")

@@ -40,6 +40,7 @@ CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
 OBSERVED_NODE = "840.1"
+PV_SCALE = 1.5  # Increase PV for 24h profile to make backflow more visible
 
 TARGET_SAMPLES = 10000
 SEED = 20260130
@@ -343,7 +344,7 @@ def evaluate_profile(obs_node=OBSERVED_NODE):
     for t in range(NPTS):
         inj.set_time_index(t)
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE * PV_SCALE,
             mL_t=float(mL[t]), mPV_t=float(mPV[t]),
             loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
             pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
@@ -393,7 +394,7 @@ def evaluate_profile(obs_node=OBSERVED_NODE):
     ax.plot(t_hours, vmag_bidir, label=f"GNN bidirectional |V| (MAE={mae_bidir:.4f})")
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"Unidirectional vs Bidirectional GNN vs OpenDSS @ {obs_node} (24h)")
+    ax.set_title(f"Unidirectional vs Bidirectional GNN vs OpenDSS @ {obs_node} (24h, PV={PV_SCALE:.1f}×)")
     ax.grid(True)
     ax.legend()
     plt.tight_layout()
