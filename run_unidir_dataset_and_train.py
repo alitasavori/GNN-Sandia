@@ -115,10 +115,10 @@ def create_unidir_dataset():
     df_e_uni.to_csv(EDGE_CSV, index=False)
     df_idx.to_csv(NODE_INDEX_CSV, index=False)
 
-    n_samples_want = min(TARGET_SAMPLES, len(all_ids))
     all_ids = df_n["sample_id"].unique()
+    n_samples_want = min(TARGET_SAMPLES, len(all_ids))
     rng = np.random.default_rng(SEED)
-    keep_ids = rng.choice(all_ids, size=min(n_samples_want, len(all_ids)), replace=False)
+    keep_ids = rng.choice(all_ids, size=n_samples_want, replace=False)
     df_n_sub = df_n[df_n["sample_id"].isin(keep_ids)].copy().sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
 
     df_n_sub.to_csv(NODE_CSV, index=False)
