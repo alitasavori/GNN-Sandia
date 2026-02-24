@@ -62,6 +62,11 @@ def main(node=OBSERVED_NODE, operation_points=None, save_path=None):
     if operation_points is None:
         operation_points = OPERATION_POINTS
 
+    # Create output directory early (before any cwd changes)
+    if save_path:
+        save_path = os.path.abspath(save_path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     dss_path = inj.compile_once()
     inj.setup_daily()
 
@@ -107,7 +112,6 @@ def main(node=OBSERVED_NODE, operation_points=None, save_path=None):
     plt.tight_layout()
 
     if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  [saved] {save_path}")
     plt.show()
