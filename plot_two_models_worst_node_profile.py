@@ -3,7 +3,9 @@ Standalone evaluation: load two trained models, run 24h profile for all nodes,
 find the node where the two models differ most (by |MAE_1 - MAE_2|), and plot
 the voltage profile for that node (OpenDSS vs Model 1 vs Model 2).
 Uses PV_SCALE=1.0 to stay in distribution with training.
-Run from repo root. Set PRESET or pass as argv[1]: injection_vs_loadtype | loadtype_full_vs_per_type
+Run from repo root. Set PRESET or pass as argv[1]:
+  injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph
+For phase_onehot_vs_subgraph: model 2 is phase A only; worst nodes restricted to phase A.
 """
 import os
 import sys
@@ -11,6 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 
 import run_injection_dataset as inj
@@ -22,6 +25,11 @@ from run_gnn3_overlay_7 import (
     find_loadshape_csv_in_dss, resolve_csv_path, read_profile_csv_two_col_noheader,
     load_model_for_inference,
 )
+try:
+    from gnn_narrow_exploration import load_phase_mapping
+except ImportError:
+    load_phase_mapping = None
+from run_gnn3_best7_train import PFIdentityGNN
 try:
     from run_gnn3_overlay_7 import build_gnn_x_loadtype_per_type
 except ImportError:
@@ -71,8 +79,15 @@ def get_preset_config(preset):
             "Loadtype full (elec_dist + m1..m5 + p_sys, q_sys)",
             "Loadtype per-type (m1..m5, q_cap, p_pv only)",
         )
+    elif preset == "phase_onehot_vs_subgraph":
+        return (
+            os.path.join(OUTPUT_DIR, "block_phase_onehot.pt"),
+            os.path.join(OUTPUT_DIR, "block_phase_subgraph.pt"),
+            "Phase one-hot (13+3 feat)",
+            "Phase A only (13 feat)",
+        )
     else:
-        raise ValueError(f"Unknown PRESET={preset}; use injection_vs_loadtype | loadtype_full_vs_per_type")
+        raise ValueError(f"Unknown PRESET={preset}; use injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph")
 
 
 # Preset: "injection_vs_loadtype" | "loadtype_full_vs_per_type" (override via argv[1])
@@ -80,7 +95,7 @@ PRESET = sys.argv[1] if len(sys.argv) > 1 else "loadtype_full_vs_per_type"
 CKPT_1, CKPT_2, LABEL_1, LABEL_2 = get_preset_config(PRESET)
 PV_SCALE = 1.0  # PV multiplier = 1
 TOP_N_WORST = 5  # Number of worst nodes to plot
-EXTRA_NODES = ["812.1"] if PRESET == "loadtype_full_vs_per_type" else []  # Always plot these for loadtype_full_vs_per_type
+EXTRA_NODES = ["812.1"] if PRESET == "loadtype_full_vs_per_type" else []
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -178,28 +193,131 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
     return t_hours, node_names_master, V_dss, V_1, V_2
 
 
+def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
+    """Run 24h for phase one-hot vs phase A only. Model 2 predicts only phase A nodes. Returns (t_hours, node_names, V_dss, V_1, V_2, phase_a_indices)."""
+    if load_phase_mapping is None:
+        raise ImportError("phase_onehot_vs_subgraph requires gnn_narrow_exploration (load_phase_mapping)")
+
+    ckpt_oh = torch.load(ckpt_1_path, map_location="cpu")
+    ckpt_sg = torch.load(ckpt_2_path, map_location="cpu")
+    cfg_oh, cfg_sg = ckpt_oh["config"], ckpt_sg["config"]
+    N = int(cfg_oh["N"])
+    phase_a_indices = ckpt_sg["phase_a_indices"]
+    N_phase_a = len(phase_a_indices)
+
+    model_1 = load_model_for_inference(ckpt_1_path, device=DEVICE)[0]
+    ei_sg = ckpt_sg["edge_index"].to(DEVICE)
+    ea_sg = ckpt_sg["edge_attr"].to(DEVICE)
+    eid_sg = ckpt_sg["edge_id"].to(DEVICE)
+    model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_sg["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
+                             node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
+    model_2.load_state_dict(ckpt_sg["state_dict"])
+    model_2.eval()
+
+    node_index_csv = os.path.join(DIR_LOADTYPE, "gnn_node_index_master.csv")
+    master_df = pd.read_csv(node_index_csv)
+    node_names_master = master_df["node"].astype(str).tolist()
+    edge_csv_dist = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
+    node_to_electrical_dist = lt._compute_electrical_distance_from_source(node_names_master, edge_csv_dist)
+    phase_map = load_phase_mapping(DIR_LOADTYPE)
+    ph_oh = F.one_hot(phase_map, num_classes=3).float().numpy()
+
+    ei = ckpt_oh["edge_index"].to(DEVICE)
+    ea = ckpt_oh["edge_attr"].to(DEVICE)
+    eid = ckpt_oh["edge_id"].to(DEVICE)
+
+    dss_path = inj.compile_once()
+    inj.setup_daily()
+    csvL_token, _ = find_loadshape_csv_in_dss(dss_path, "5minDayShape")
+    csvPV_token, _ = find_loadshape_csv_in_dss(dss_path, "IrradShape")
+    mL = read_profile_csv_two_col_noheader(resolve_csv_path(csvL_token, dss_path), npts=NPTS)
+    mPV = read_profile_csv_two_col_noheader(resolve_csv_path(csvPV_token, dss_path), npts=NPTS)
+
+    bus_to_phases = build_bus_to_phases_from_master_nodes(node_names_master)
+    loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
+    pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+    rng = np.random.default_rng(0)
+
+    V_dss = np.full((NPTS, N), np.nan)
+    V_1 = np.full((NPTS, N), np.nan)
+    V_2 = np.full((NPTS, N), np.nan)
+
+    for t in range(NPTS):
+        inj.set_time_index(t)
+        _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE * PV_SCALE,
+            mL_t=float(mL[t]), mPV_t=float(mPV[t]),
+            loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
+            pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
+            sigma_load=0.0, sigma_pv=0.0, rng=rng,
+        )
+        inj.dss.Solution.Solve()
+        if not inj.dss.Solution.Converged():
+            continue
+        vdict = get_all_node_voltage_pu_and_angle_dict()
+        for i, n in enumerate(node_names_master):
+            if n in vdict:
+                V_dss[t, i], _ = vdict[n]
+
+        sum_p_load = float(sum(busphP_load.values()))
+        sum_q_load = float(sum(busphQ_load.values()))
+        sum_p_pv = float(sum(busphP_pv.values()))
+        p_sys_balance = sum_p_load - sum_p_pv
+        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+
+        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
+                                 node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        X_oh = np.concatenate([X, ph_oh], axis=-1).astype(np.float32)
+        x_1 = torch.tensor(X_oh, dtype=torch.float32, device=DEVICE)
+        x_2_phase_a = torch.tensor(X[:, phase_a_indices, :], dtype=torch.float32, device=DEVICE)
+
+        g_1 = Data(x=x_1, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
+        g_2 = Data(x=x_2_phase_a, edge_index=ei_sg, edge_attr=ea_sg, edge_id=eid_sg, num_nodes=N_phase_a)
+
+        with torch.no_grad():
+            V_1[t, :] = model_1(g_1)[:, 0].cpu().numpy()
+            pred_2 = model_2(g_2)[:, 0].cpu().numpy()
+            for j, gidx in enumerate(phase_a_indices):
+                V_2[t, gidx] = pred_2[j]
+
+    t_hours = np.arange(NPTS) * STEP_MIN / 60.0
+    return t_hours, node_names_master, V_dss, V_1, V_2, phase_a_indices
+
+
 def main():
     if not os.path.exists(CKPT_1) or not os.path.exists(CKPT_2):
         raise FileNotFoundError(f"Missing checkpoints. Train first: {CKPT_1}, {CKPT_2}")
 
     print(f"Running 24h profile for all nodes ({LABEL_1} vs {LABEL_2}, PV=1.0×)...")
-    t_hours, node_names, V_dss, V_1, V_2 = run_24h_all_nodes(CKPT_1, CKPT_2)
+    if PRESET == "phase_onehot_vs_subgraph":
+        t_hours, node_names, V_dss, V_1, V_2, phase_a_indices = run_24h_phase_onehot_vs_subgraph(CKPT_1, CKPT_2)
+    else:
+        t_hours, node_names, V_dss, V_1, V_2 = run_24h_all_nodes(CKPT_1, CKPT_2)
+        phase_a_indices = None
     N = len(node_names)
 
-    mae_1 = np.zeros(N)
-    mae_2 = np.zeros(N)
+    mae_1 = np.full(N, np.nan)
+    mae_2 = np.full(N, np.nan)
     for i in range(N):
         ok = np.isfinite(V_dss[:, i])
         if np.sum(ok) > 0:
             mae_1[i] = np.mean(np.abs(V_dss[ok, i] - V_1[ok, i]))
-            mae_2[i] = np.mean(np.abs(V_dss[ok, i] - V_2[ok, i]))
-        else:
-            mae_1[i] = np.nan
-            mae_2[i] = np.nan
+            if phase_a_indices is None or i in phase_a_indices:
+                if phase_a_indices is None or np.any(np.isfinite(V_2[ok, i])):
+                    mae_2[i] = np.mean(np.abs(V_dss[ok, i] - V_2[ok, i]))
 
-    mae_diff = np.abs(mae_1 - mae_2)
-    order = np.argsort(-mae_diff)
-    worst_indices = list(order[:TOP_N_WORST])
+    mae_diff = np.full(N, np.nan)
+    if phase_a_indices is not None:
+        phase_a_set = set(phase_a_indices)
+        for i in phase_a_indices:
+            if np.isfinite(mae_1[i]) and np.isfinite(mae_2[i]):
+                mae_diff[i] = np.abs(mae_1[i] - mae_2[i])
+        order = np.argsort(-np.nan_to_num(mae_diff, nan=-np.inf))
+        worst_indices = [idx for idx in order if idx in phase_a_set and np.isfinite(mae_diff[idx])][:TOP_N_WORST]
+    else:
+        mae_diff = np.abs(mae_1 - mae_2)
+        order = np.argsort(-np.nan_to_num(mae_diff, nan=-np.inf))
+        worst_indices = list(order[:TOP_N_WORST])
     node_to_idx = {n: i for i, n in enumerate(node_names)}
     for en in EXTRA_NODES:
         if en in node_to_idx:
@@ -214,7 +332,8 @@ def main():
     }).sort_values("mae_diff", ascending=False)
     csv_path = os.path.join(OUTPUT_DIR, f"mae_per_node_{PRESET}.csv")
     df.to_csv(csv_path, index=False)
-    print(f"Top {TOP_N_WORST} worst nodes (|MAE_1 - MAE_2|):")
+    suffix_phase = " (phase A only)" if PRESET == "phase_onehot_vs_subgraph" else ""
+    print(f"Top {TOP_N_WORST} worst nodes (|MAE_1 - MAE_2|){suffix_phase}:")
     for k, idx in enumerate(worst_indices):
         print(f"  {k+1}. {node_names[idx]}: {LABEL_1} MAE={mae_1[idx]:.4f} | {LABEL_2} MAE={mae_2[idx]:.4f}")
     print(f"Saved -> {csv_path}")
