@@ -80,6 +80,7 @@ PRESET = sys.argv[1] if len(sys.argv) > 1 else "loadtype_full_vs_per_type"
 CKPT_1, CKPT_2, LABEL_1, LABEL_2 = get_preset_config(PRESET)
 PV_SCALE = 1.0  # PV multiplier = 1
 TOP_N_WORST = 5  # Number of worst nodes to plot
+EXTRA_NODES = ["812.1"] if PRESET == "loadtype_full_vs_per_type" else []  # Always plot these for loadtype_full_vs_per_type
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -198,7 +199,13 @@ def main():
 
     mae_diff = np.abs(mae_1 - mae_2)
     order = np.argsort(-mae_diff)
-    worst_indices = order[:TOP_N_WORST]
+    worst_indices = list(order[:TOP_N_WORST])
+    node_to_idx = {n: i for i, n in enumerate(node_names)}
+    for en in EXTRA_NODES:
+        if en in node_to_idx:
+            idx = node_to_idx[en]
+            if idx not in worst_indices:
+                worst_indices.append(idx)
 
     df = pd.DataFrame({
         "node": node_names,
@@ -219,11 +226,13 @@ def main():
         ax.plot(t_hours, V_2[:, idx], "g:", label=f"{LABEL_2} (MAE={mae_2[idx]:.4f})", linewidth=1.5)
         ax.set_xlabel("Hour of day")
         ax.set_ylabel("Voltage magnitude (pu)")
-        ax.set_title(f"24h voltage @ {node_names[idx]} (worst #{k+1}, PV={PV_SCALE:.1f}×)")
+        suffix = f"worst #{k+1}" if k < TOP_N_WORST else "requested"
+        ax.set_title(f"24h voltage @ {node_names[idx]} ({suffix}, PV={PV_SCALE:.1f}×)")
         ax.grid(True)
         ax.legend()
         plt.tight_layout()
-        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_{PRESET}_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
+        fname = f"overlay_24h_{PRESET}_worst_{k+1}_{node_names[idx].replace('.', '_')}.png" if k < TOP_N_WORST else f"overlay_24h_{PRESET}_{node_names[idx].replace('.', '_')}.png"
+        out_path = os.path.join(OUTPUT_DIR, fname)
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.show()
         plt.close()
