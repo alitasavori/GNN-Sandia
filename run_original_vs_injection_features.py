@@ -55,8 +55,8 @@ def derive_features_from_loadtype(df_n):
         df["bus"] = df["node"].astype(str).str.split(".").str[0]
     df["p_load_kw"] = df["m1_p_kw"] + df["m2_p_kw"] + df["m4_p_kw"] + df["m5_p_kw"]
     df["q_load_kvar"] = df["m1_q_kvar"] + df["m2_q_kvar"] + df["m4_q_kvar"] + df["m5_q_kvar"]
-    P_grid = df.groupby("sample_id").apply(lambda g: g["p_sys_balance_kw"].iloc[0]).to_dict()
-    Q_grid = df.groupby("sample_id").apply(lambda g: g["q_sys_balance_kvar"].iloc[0]).to_dict()
+    P_grid = df.groupby("sample_id")["p_sys_balance_kw"].first().to_dict()
+    Q_grid = df.groupby("sample_id")["q_sys_balance_kvar"].first().to_dict()
     P_grid_ph = {sid: P_grid[sid] / 3.0 for sid in P_grid}
     Q_grid_ph = {sid: Q_grid[sid] / 3.0 for sid in Q_grid}
     p_inj, q_inj = [], []

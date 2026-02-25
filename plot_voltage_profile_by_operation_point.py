@@ -21,7 +21,7 @@ from run_gnn3_overlay_7 import (
 os.chdir(BASE_DIR)
 
 # Default nodes to plot (bus.phase)
-DEFAULT_NODES = ["840.1", "844.1", "848.1", "836.1"]
+DEFAULT_NODES = ["816.1"]
 
 # Operation points: (label, P_BASE, Q_BASE, PV_BASE) — expand to find oscillation-free combos
 OPERATION_POINTS = [

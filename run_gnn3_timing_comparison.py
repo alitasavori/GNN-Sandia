@@ -30,7 +30,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 OBSERVED_NODE = "816.1"
 
 
-def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True):
+def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True, pv_scale=1.0):
     """Returns dict of step name -> total seconds. use_batched_gnn: batch all 288 GNN forwards."""
     model, static = load_model_for_inference(ckpt_path, device=device)
     cfg = static["config"]
@@ -147,9 +147,10 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True)
             continue
 
         # OpenDSS steps 5, 6, 7 (full) — no zero-PV solve here; same initial-guess behavior as Load-type
+        pv_nominal = PV_BASE * pv_scale
         t0 = time.perf_counter()
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=pv_nominal,
             mL_t=float(mL[t]), mPV_t=float(mPV[t]),
             loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
             pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
@@ -278,14 +279,14 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True)
     return dss_steps, gnn_steps, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static
 
 
-def plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static):
+def plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static, pv_suffix=""):
     """Draw overlay plot and display in notebook."""
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(t_hours, vmag_dss, label="OpenDSS |V| (pu)")
     ax.plot(t_hours, vmag_gnn, label="GNN |V| (pu)")
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"Block {block_id}: Voltage Profile @ {OBSERVED_NODE} (24h)")
+    ax.set_title(f"Block {block_id}: Voltage Profile @ {OBSERVED_NODE} (24h){pv_suffix}")
     ax.grid(True)
     ax.legend()
     target_col = cfg.get("target_col", "vmag_pu")
@@ -296,7 +297,7 @@ def plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg,
     fig.text(0.02, 0.02, gnn_desc, fontsize=8, family="monospace",
              verticalalignment="bottom", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
     plt.tight_layout(rect=[0, 0.2, 1, 1])
-    img_path = os.path.join(OUTPUT_DIR, f"overlay_24h_block{block_id}.png")
+    img_path = os.path.join(OUTPUT_DIR, f"overlay_24h_block{block_id}{pv_suffix}.png")
     fig.savefig(img_path, dpi=150, bbox_inches="tight")
     plt.show()
     plt.close()
@@ -378,9 +379,10 @@ def _compute_totals(dss_steps, gnn_steps, is_deltav):
     return dss_total, gnn_total
 
 
-def main():
+def main(pv_scale=1.0):
+    pv_suffix = f"_pv{pv_scale:.1f}" if pv_scale != 1.0 else ""
     print("\n" + "=" * 72)
-    print("GNN3 BEST 7: Overlay plots, MAE/RMSE, per-step timing (CPU + GPU)")
+    print(f"GNN3 BEST 7: Overlay plots, MAE/RMSE, per-step timing (PV scale={pv_scale:.1f})")
     print("  OpenDSS: profile only (set_time, apply_full, solve, get_voltage)")
     print("  GNN: batched inference (288 timesteps in one forward pass)")
     print("  Delta-V: vmag_zero from separate 24h pass (PV=0); full solve only in main loop")
@@ -394,9 +396,9 @@ def main():
             continue
 
         # Run on CPU (collects profile data for plot + MAE/RMSE)
-        print(f"\n>>> Block {block_id} on CPU...")
+        print(f"\n>>> Block {block_id} on CPU (PV scale={pv_scale:.1f})...")
         dss_cpu, gnn_cpu, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static = timing_one_block_detailed(
-            ckpt_path, torch.device("cpu"), block_id
+            ckpt_path, torch.device("cpu"), block_id, pv_scale=pv_scale
         )
         # MAE and RMSE vs OpenDSS
         vd = np.array(vmag_dss, dtype=np.float64)
@@ -406,7 +408,7 @@ def main():
         rmse = float(np.sqrt(np.mean((vd[ok] - vg[ok]) ** 2))) if np.sum(ok) > 0 else np.nan
         print(f"  @ {OBSERVED_NODE}: MAE={mae:.6f} pu | RMSE={rmse:.6f} pu")
         # Plot and show in notebook
-        plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static)
+        plot_overlay_and_show(block_id, t_hours, vmag_dss, vmag_gnn, mae, rmse, cfg, static, pv_suffix=pv_suffix)
         print_model_details(block_id, cfg, static)
         print_timing(block_id, "CPU", dss_cpu, gnn_cpu, is_deltav)
         dss_total_cpu, gnn_total_cpu = _compute_totals(dss_cpu, gnn_cpu, is_deltav)
@@ -414,9 +416,9 @@ def main():
 
         # Run on GPU if available
         if torch.cuda.is_available():
-            print(f"\n>>> Block {block_id} on GPU...")
+            print(f"\n>>> Block {block_id} on GPU (PV scale={pv_scale:.1f})...")
             dss_gpu, gnn_gpu, _, _, _, _, _, _ = timing_one_block_detailed(
-                ckpt_path, torch.device("cuda"), block_id
+                ckpt_path, torch.device("cuda"), block_id, pv_scale=pv_scale
             )
             print_timing(block_id, "GPU", dss_gpu, gnn_gpu, is_deltav)
             dss_total_gpu, gnn_total_gpu = _compute_totals(dss_gpu, gnn_gpu, is_deltav)
@@ -424,7 +426,7 @@ def main():
 
     # Summary table
     print("\n" + "=" * 72)
-    print(f"SUMMARY: MAE/RMSE @ {OBSERVED_NODE} | Speeds (CPU)")
+    print(f"SUMMARY: MAE/RMSE @ {OBSERVED_NODE} | Speeds (CPU) | PV scale={pv_scale:.1f}")
     print("=" * 72)
     for name, r in results.items():
         mae, rmse = r[0], r[1]
@@ -434,4 +436,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("all", "all_pv"):
+        # Run 3 times: PV 30% less, baseline, PV 30% more
+        for pv in [0.7, 1.0, 1.3]:
+            main(pv_scale=pv)
+    else:
+        pv_scale = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+        main(pv_scale=pv_scale)
