@@ -26,12 +26,12 @@ os.chdir(BASE_DIR)
 
 OUTPUT_DIR = "gnn3_best7_output"
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
-# For Original vs Injection (1st vs 2nd dataset): use block1.pt and block2.pt
-# For same-data comparison: use block_original_features.pt and block_injection_features.pt
-CKPT_1 = os.path.join(OUTPUT_DIR, "block1.pt")       # 1st dataset (Original)
-CKPT_2 = os.path.join(OUTPUT_DIR, "block2.pt")       # 2nd dataset (Injection)
-LABEL_1 = "Original (block 1)"
-LABEL_2 = "Injection (block 2)"
+# Default: models from run_original_vs_injection_features.py (same data, different features)
+# For block1 vs block2: use "block1.pt", "block2.pt"
+CKPT_1 = os.path.join(OUTPUT_DIR, "block_original_features.pt")
+CKPT_2 = os.path.join(OUTPUT_DIR, "block_injection_features.pt")
+LABEL_1 = "Original features"
+LABEL_2 = "Injection features"
 PV_SCALE = 1.0  # In distribution with training (0.6–1.2×)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
