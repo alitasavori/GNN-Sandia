@@ -33,6 +33,7 @@ CKPT_2 = os.path.join(OUTPUT_DIR, "block_injection_features.pt")
 LABEL_1 = "Original features"
 LABEL_2 = "Injection features"
 PV_SCALE = 1.0  # In distribution with training (0.6–1.2×)
+TOP_N_WORST = 5  # Number of worst nodes to plot
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -134,8 +135,8 @@ def main():
             mae_2[i] = np.nan
 
     mae_diff = np.abs(mae_1 - mae_2)
-    worst_idx = int(np.nanargmax(mae_diff))
-    worst_node = node_names[worst_idx]
+    order = np.argsort(-mae_diff)
+    worst_indices = order[:TOP_N_WORST]
 
     df = pd.DataFrame({
         "node": node_names,
@@ -144,20 +145,32 @@ def main():
     }).sort_values("mae_diff", ascending=False)
     csv_path = os.path.join(OUTPUT_DIR, "mae_per_node_two_models.csv")
     df.to_csv(csv_path, index=False)
-    print(f"Worst node (max |MAE_1 - MAE_2|): {worst_node} | {LABEL_1} MAE={mae_1[worst_idx]:.4f} | {LABEL_2} MAE={mae_2[worst_idx]:.4f}")
+    print(f"Top {TOP_N_WORST} worst nodes (|MAE_1 - MAE_2|):")
+    for k, idx in enumerate(worst_indices):
+        print(f"  {k+1}. {node_names[idx]}: {LABEL_1} MAE={mae_1[idx]:.4f} | {LABEL_2} MAE={mae_2[idx]:.4f}")
     print(f"Saved -> {csv_path}")
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(t_hours, V_dss[:, worst_idx], "b-", label="OpenDSS |V| (pu)", linewidth=2)
-    ax.plot(t_hours, V_1[:, worst_idx], color="orange", linestyle="--", label=f"{LABEL_1} (MAE={mae_1[worst_idx]:.4f})", linewidth=1.5)
-    ax.plot(t_hours, V_2[:, worst_idx], "g:", label=f"{LABEL_2} (MAE={mae_2[worst_idx]:.4f})", linewidth=1.5)
-    ax.set_xlabel("Hour of day")
-    ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"24h voltage @ {worst_node} (worst node, PV={PV_SCALE:.1f}×)")
-    ax.grid(True)
-    ax.legend()
+    ncol = 3
+    nrow = (TOP_N_WORST + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 4 * nrow), sharex=True)
+    axes = np.atleast_2d(axes)
+    for k, idx in enumerate(worst_indices):
+        i, j = k // ncol, k % ncol
+        ax = axes[i, j]
+        ax.plot(t_hours, V_dss[:, idx], "b-", label="OpenDSS", linewidth=1.5)
+        ax.plot(t_hours, V_1[:, idx], color="orange", linestyle="--", label=LABEL_1, alpha=0.9)
+        ax.plot(t_hours, V_2[:, idx], "g:", label=LABEL_2, alpha=0.9)
+        ax.set_title(f"{node_names[idx]} | MAE1={mae_1[idx]:.4f} MAE2={mae_2[idx]:.4f}")
+        ax.set_ylabel("|V| (pu)")
+        ax.grid(True)
+        ax.legend(loc="lower left", fontsize=8)
+    for k in range(len(worst_indices), nrow * ncol):
+        i, j = k // ncol, k % ncol
+        axes[i, j].axis("off")
+    axes[-1, 1].set_xlabel("Hour of day")
+    plt.suptitle(f"24h voltage: top {TOP_N_WORST} worst nodes (PV={PV_SCALE:.1f}×)")
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "overlay_24h_two_models_worst_node.png")
+    out_path = os.path.join(OUTPUT_DIR, "overlay_24h_two_models_worst_nodes.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.show()
     plt.close()
