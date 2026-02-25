@@ -3,7 +3,8 @@ Standalone evaluation: load two trained models, run 24h profile for all nodes,
 find the node where the two models differ most (by |MAE_1 - MAE_2|), and plot
 the voltage profile for that node (OpenDSS vs Model 1 vs Model 2).
 Uses PV_SCALE=1.0 to stay in distribution with training.
-Run from repo root. Requires: block_unidir.pt, block_bidir_unidir_compare.pt
+Run from repo root. Requires: block_injection_features.pt, block_loadtype_per_type.pt
+(Train with: %run run_injection_vs_loadtype_per_type.py)
 """
 import os
 import numpy as np
@@ -16,7 +17,7 @@ import run_injection_dataset as inj
 import run_loadtype_dataset as lt
 from run_gnn3_overlay_7 import (
     BASE_DIR, CAP_Q_KVAR, NPTS, P_BASE, Q_BASE, PV_BASE, STEP_MIN,
-    build_bus_to_phases_from_master_nodes, build_gnn_x_loadtype,
+    build_bus_to_phases_from_master_nodes, build_gnn_x_injection, build_gnn_x_loadtype_per_type,
     get_all_node_voltage_pu_and_angle_dict,
     find_loadshape_csv_in_dss, resolve_csv_path, read_profile_csv_two_col_noheader,
     load_model_for_inference,
@@ -25,15 +26,24 @@ from run_gnn3_overlay_7 import (
 os.chdir(BASE_DIR)
 
 OUTPUT_DIR = "gnn3_best7_output"
-OUT_DIR = "gnn_samples_loadtype_unidir"
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
-CKPT_1 = os.path.join(OUTPUT_DIR, "block_unidir.pt")
-CKPT_2 = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
-LABEL_1 = "Unidirectional"
-LABEL_2 = "Bidirectional"
+CKPT_1 = os.path.join(OUTPUT_DIR, "block_injection_features.pt")
+CKPT_2 = os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt")
+LABEL_1 = "Injection (p_inj, q_inj)"
+LABEL_2 = "Loadtype per-type (m1..m5, q_cap, p_pv)"
 PV_SCALE = 1.0  # PV multiplier = 1
 TOP_N_WORST = 5  # Number of worst nodes to plot
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid):
+    """Build node features based on node_in_dim (2=injection, 10=loadtype per-type)."""
+    if node_in_dim == 2:
+        return build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
+    elif node_in_dim == 10:
+        return build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
+    else:
+        raise ValueError(f"Unknown node_in_dim={node_in_dim}; expected 2 or 10.")
 
 
 def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
@@ -41,20 +51,16 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
     model_1, static_1 = load_model_for_inference(ckpt_1_path, device=DEVICE)
     model_2, static_2 = load_model_for_inference(ckpt_2_path, device=DEVICE)
     N = static_1["N"]
+    dim_1 = int(static_1["config"]["node_in_dim"])
+    dim_2 = int(static_2["config"]["node_in_dim"])
 
-    ei_1 = static_1["edge_index"].to(DEVICE)
-    ea_1 = static_1["edge_attr"].to(DEVICE)
-    eid_1 = static_1["edge_id"].to(DEVICE)
-    ei_2 = static_2["edge_index"].to(DEVICE)
-    ea_2 = static_2["edge_attr"].to(DEVICE)
-    eid_2 = static_2["edge_id"].to(DEVICE)
+    ei = static_1["edge_index"].to(DEVICE)
+    ea = static_1["edge_attr"].to(DEVICE)
+    eid = static_1["edge_id"].to(DEVICE)
 
-    node_index_csv = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
+    node_index_csv = os.path.join(DIR_LOADTYPE, "gnn_node_index_master.csv")
     master_df = pd.read_csv(node_index_csv)
     node_names_master = master_df["node"].astype(str).tolist()
-
-    edge_csv_dist = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
-    node_to_electrical_dist = lt._compute_electrical_distance_from_source(node_names_master, edge_csv_dist)
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -92,14 +98,16 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
         sum_p_pv = float(sum(busphP_pv.values()))
-        p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+        P_grid = sum_p_load - sum_p_pv
+        Q_grid = sum_q_load - sum(CAP_Q_KVAR.values())
 
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist, p_sys_balance, q_sys_balance)
-        x_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        X_1 = build_x_for_model(dim_1, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid)
+        X_2 = build_x_for_model(dim_2, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid)
 
-        g_1 = Data(x=x_t, edge_index=ei_1, edge_attr=ea_1, edge_id=eid_1, num_nodes=N)
-        g_2 = Data(x=x_t, edge_index=ei_2, edge_attr=ea_2, edge_id=eid_2, num_nodes=N)
+        x_1 = torch.tensor(X_1, dtype=torch.float32, device=DEVICE)
+        x_2 = torch.tensor(X_2, dtype=torch.float32, device=DEVICE)
+        g_1 = Data(x=x_1, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
+        g_2 = Data(x=x_2, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
         with torch.no_grad():
             V_1[t, :] = model_1(g_1)[:, 0].cpu().numpy()
             V_2[t, :] = model_2(g_2)[:, 0].cpu().numpy()
@@ -112,7 +120,7 @@ def main():
     if not os.path.exists(CKPT_1) or not os.path.exists(CKPT_2):
         raise FileNotFoundError(f"Missing checkpoints. Train first: {CKPT_1}, {CKPT_2}")
 
-    print("Running 24h profile for all nodes (Unidirectional vs Bidirectional, PV=1.0×)...")
+    print("Running 24h profile for all nodes (Injection vs Loadtype per-type, PV=1.0×)...")
     t_hours, node_names, V_dss, V_1, V_2 = run_24h_all_nodes(CKPT_1, CKPT_2)
     N = len(node_names)
 
@@ -136,7 +144,7 @@ def main():
         "mae_1": mae_1, "mae_2": mae_2,
         "mae_diff": mae_diff,
     }).sort_values("mae_diff", ascending=False)
-    csv_path = os.path.join(OUTPUT_DIR, "mae_per_node_unidir_vs_bidir_two_models.csv")
+    csv_path = os.path.join(OUTPUT_DIR, "mae_per_node_injection_vs_loadtype_per_type.csv")
     df.to_csv(csv_path, index=False)
     print(f"Top {TOP_N_WORST} worst nodes (|MAE_1 - MAE_2|):")
     for k, idx in enumerate(worst_indices):
@@ -154,7 +162,7 @@ def main():
         ax.grid(True)
         ax.legend()
         plt.tight_layout()
-        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_unidir_vs_bidir_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
+        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_injection_vs_loadtype_per_type_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.show()
         plt.close()
