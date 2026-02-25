@@ -219,7 +219,7 @@ def run_24h_and_plot():
     edge_csv_dist = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
     node_to_electrical_dist = lt._compute_electrical_distance_from_source(node_names_master, edge_csv_dist)
     phase_map = load_phase_mapping(DIR_LOADTYPE).to(DEVICE)
-    ph_oh = F.one_hot(phase_map, num_classes=3).float().numpy()
+    ph_oh = F.one_hot(phase_map, num_classes=3).float().cpu().numpy()
 
     ei = ckpt_oh["edge_index"].to(DEVICE)
     ea = ckpt_oh["edge_attr"].to(DEVICE)
