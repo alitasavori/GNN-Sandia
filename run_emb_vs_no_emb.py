@@ -22,10 +22,36 @@ import run_injection_dataset as inj
 import run_loadtype_dataset as lt
 from run_gnn3_overlay_7 import (
     BASE_DIR, CAP_Q_KVAR, NPTS, P_BASE, Q_BASE, PV_BASE, STEP_MIN,
-    build_bus_to_phases_from_master_nodes, build_gnn_x_loadtype_per_type,
+    build_bus_to_phases_from_master_nodes,
     get_all_node_voltage_pu_and_angle_dict,
     find_loadshape_csv_in_dss, resolve_csv_path, read_profile_csv_two_col_noheader,
 )
+try:
+    from run_gnn3_overlay_7 import build_gnn_x_loadtype_per_type
+except ImportError:
+    def build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv):
+        """Load-type per-type (10 feat): m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv."""
+        X = np.zeros((len(node_names_master), 10), dtype=np.float32)
+        for i, n in enumerate(node_names_master):
+            bus, phs = n.split(".")
+            ph = int(phs)
+            m1_p = float(busph_per_type[1][0].get((bus, ph), 0.0))
+            m1_q = float(busph_per_type[1][1].get((bus, ph), 0.0))
+            m2_p = float(busph_per_type[2][0].get((bus, ph), 0.0))
+            m2_q = float(busph_per_type[2][1].get((bus, ph), 0.0))
+            m4_p = float(busph_per_type[4][0].get((bus, ph), 0.0))
+            m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
+            m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
+            m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
+            q_cap = float(CAP_Q_KVAR.get(bus, 0.0))
+            p_pv = float(busphP_pv.get((bus, ph), 0.0))
+            X[i, 0], X[i, 1] = m1_p, m1_q
+            X[i, 2], X[i, 3] = m2_p, m2_q
+            X[i, 4], X[i, 5] = m4_p, m4_q
+            X[i, 6], X[i, 7] = m5_p, m5_q
+            X[i, 8] = q_cap
+            X[i, 9] = p_pv
+        return X
 from run_gnn3_best7_train import PFIdentityGNN
 
 os.chdir(BASE_DIR)
