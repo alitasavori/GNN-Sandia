@@ -91,7 +91,7 @@ def get_preset_config(preset):
         return (
             os.path.join(OUTPUT_DIR, "block_14feat_vmagzero.pt"),
             os.path.join(OUTPUT_DIR, "block_14feat_phase_a.pt"),
-            "14 feat (loadtype+vmag_zero)",
+            "Phase A + vmag_zero (14 feat)",
             "Phase A only (13 feat)",
         )
     else:
@@ -293,25 +293,26 @@ def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
 
 
 def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
-    """Run 24h for 14feat (loadtype+vmag_zero) vs phase A only. Returns (t_hours, node_names, V_dss, V_1, V_2, phase_a_indices)."""
+    """Run 24h for Phase A+vmag_zero vs Phase A only (both phase A only). Returns (t_hours, node_names, V_dss, V_1, V_2, phase_a_indices)."""
     if load_phase_mapping is None:
         raise ImportError("14feat_vs_phase_a requires gnn_narrow_exploration (load_phase_mapping)")
 
     ckpt_14 = torch.load(ckpt_1_path, map_location="cpu")
     ckpt_ph = torch.load(ckpt_2_path, map_location="cpu")
     cfg_14, cfg_ph = ckpt_14["config"], ckpt_ph["config"]
-    N = int(cfg_14["N"])
     phase_a_indices = ckpt_ph["phase_a_indices"]
     N_phase_a = len(phase_a_indices)
-
-    model_1 = PFIdentityGNN(num_nodes=N, num_edges=int(cfg_14["E"]), node_in_dim=14, edge_in_dim=2, out_dim=1,
-                            node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
-    model_1.load_state_dict(ckpt_14["state_dict"])
-    model_1.eval()
+    N = ckpt_ph["N_full"]
 
     ei_ph = ckpt_ph["edge_index"].to(DEVICE)
     ea_ph = ckpt_ph["edge_attr"].to(DEVICE)
     eid_ph = ckpt_ph["edge_id"].to(DEVICE)
+
+    model_1 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_14["E"]), node_in_dim=14, edge_in_dim=2, out_dim=1,
+                            node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
+    model_1.load_state_dict(ckpt_14["state_dict"])
+    model_1.eval()
+
     model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_ph["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
                             node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_2.load_state_dict(ckpt_ph["state_dict"])
@@ -322,10 +323,6 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
     node_names_master = master_df["node"].astype(str).tolist()
     edge_csv_dist = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
     node_to_electrical_dist = lt._compute_electrical_distance_from_source(node_names_master, edge_csv_dist)
-
-    ei = ckpt_14["edge_index"].to(DEVICE)
-    ea = ckpt_14["edge_attr"].to(DEVICE)
-    eid = ckpt_14["edge_id"].to(DEVICE)
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -388,17 +385,18 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
         X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
                                  node_to_electrical_dist, p_sys_balance, q_sys_balance)
         vmag_zero = vmag_zero_precomputed[t]
-        X_14 = np.concatenate([X, vmag_zero[:, None]], axis=-1).astype(np.float32)
-        x_1 = torch.tensor(X_14, dtype=torch.float32, device=DEVICE)
-        x_2_phase_a = torch.tensor(X[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
+        X_14_full = np.concatenate([X, vmag_zero[:, None]], axis=-1).astype(np.float32)
+        x_1 = torch.tensor(X_14_full[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
+        x_2 = torch.tensor(X[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
 
-        g_1 = Data(x=x_1, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
-        g_2 = Data(x=x_2_phase_a, edge_index=ei_ph, edge_attr=ea_ph, edge_id=eid_ph, num_nodes=N_phase_a)
+        g_1 = Data(x=x_1, edge_index=ei_ph, edge_attr=ea_ph, edge_id=eid_ph, num_nodes=N_phase_a)
+        g_2 = Data(x=x_2, edge_index=ei_ph, edge_attr=ea_ph, edge_id=eid_ph, num_nodes=N_phase_a)
 
         with torch.no_grad():
-            V_1[t, :] = model_1(g_1)[:, 0].cpu().numpy()
+            pred_1 = model_1(g_1)[:, 0].cpu().numpy()
             pred_2 = model_2(g_2)[:, 0].cpu().numpy()
             for j, gidx in enumerate(phase_a_indices):
+                V_1[t, gidx] = pred_1[j]
                 V_2[t, gidx] = pred_2[j]
 
     t_hours = np.arange(NPTS) * STEP_MIN / 60.0
