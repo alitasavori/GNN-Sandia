@@ -269,7 +269,7 @@ def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
                                  node_to_electrical_dist, p_sys_balance, q_sys_balance)
         X_oh = np.concatenate([X, ph_oh], axis=-1).astype(np.float32)
         x_1 = torch.tensor(X_oh, dtype=torch.float32, device=DEVICE)
-        x_2_phase_a = torch.tensor(X[:, phase_a_indices, :], dtype=torch.float32, device=DEVICE)
+        x_2_phase_a = torch.tensor(X[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
 
         g_1 = Data(x=x_1, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
         g_2 = Data(x=x_2_phase_a, edge_index=ei_sg, edge_attr=ea_sg, edge_id=eid_sg, num_nodes=N_phase_a)
