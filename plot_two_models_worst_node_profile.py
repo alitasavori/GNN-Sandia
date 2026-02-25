@@ -150,31 +150,22 @@ def main():
         print(f"  {k+1}. {node_names[idx]}: {LABEL_1} MAE={mae_1[idx]:.4f} | {LABEL_2} MAE={mae_2[idx]:.4f}")
     print(f"Saved -> {csv_path}")
 
-    ncol = 3
-    nrow = (TOP_N_WORST + ncol - 1) // ncol
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 4 * nrow), sharex=True)
-    axes = np.atleast_2d(axes)
     for k, idx in enumerate(worst_indices):
-        i, j = k // ncol, k % ncol
-        ax = axes[i, j]
-        ax.plot(t_hours, V_dss[:, idx], "b-", label="OpenDSS", linewidth=1.5)
-        ax.plot(t_hours, V_1[:, idx], color="orange", linestyle="--", label=LABEL_1, alpha=0.9)
-        ax.plot(t_hours, V_2[:, idx], "g:", label=LABEL_2, alpha=0.9)
-        ax.set_title(f"{node_names[idx]} | MAE1={mae_1[idx]:.4f} MAE2={mae_2[idx]:.4f}")
-        ax.set_ylabel("|V| (pu)")
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(t_hours, V_dss[:, idx], "b-", label="OpenDSS |V| (pu)", linewidth=2)
+        ax.plot(t_hours, V_1[:, idx], color="orange", linestyle="--", label=f"{LABEL_1} (MAE={mae_1[idx]:.4f})", linewidth=1.5)
+        ax.plot(t_hours, V_2[:, idx], "g:", label=f"{LABEL_2} (MAE={mae_2[idx]:.4f})", linewidth=1.5)
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("Voltage magnitude (pu)")
+        ax.set_title(f"24h voltage @ {node_names[idx]} (worst #{k+1}, PV={PV_SCALE:.1f}×)")
         ax.grid(True)
-        ax.legend(loc="lower left", fontsize=8)
-    for k in range(len(worst_indices), nrow * ncol):
-        i, j = k // ncol, k % ncol
-        axes[i, j].axis("off")
-    axes[-1, 1].set_xlabel("Hour of day")
-    plt.suptitle(f"24h voltage: top {TOP_N_WORST} worst nodes (PV={PV_SCALE:.1f}×)")
-    plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "overlay_24h_two_models_worst_nodes.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    plt.close()
-    print(f"Saved -> {out_path}")
+        ax.legend()
+        plt.tight_layout()
+        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_two_models_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close()
+        print(f"Saved -> {out_path}")
 
 
 if __name__ == "__main__":
