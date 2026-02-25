@@ -4,7 +4,7 @@ find the node where the two models differ most (by |MAE_1 - MAE_2|), and plot
 the voltage profile for that node (OpenDSS vs Model 1 vs Model 2).
 Uses PV_SCALE=1.0 to stay in distribution with training.
 Run from repo root. Set PRESET or pass as argv[1]:
-  injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph | 14feat_vs_phase_a
+  injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph | 14feat_vs_phase_a | emb_vs_no_emb
 For phase_onehot_vs_subgraph, 14feat_vs_phase_a: model 2 is phase A only; worst nodes restricted to phase A.
 """
 import os
@@ -31,6 +31,10 @@ try:
 except ImportError:
     load_phase_mapping = None
 from run_gnn3_best7_train import PFIdentityGNN
+try:
+    from run_emb_vs_no_emb import PFIdentityGNNNoEmb
+except ImportError:
+    PFIdentityGNNNoEmb = None
 try:
     from run_gnn3_overlay_7 import build_gnn_x_loadtype_per_type
 except ImportError:
@@ -94,8 +98,15 @@ def get_preset_config(preset):
             "Phase A + vmag_zero (14 feat)",
             "Phase A only (13 feat)",
         )
+    elif preset == "emb_vs_no_emb":
+        return (
+            os.path.join(OUTPUT_DIR, "block_10feat_with_emb.pt"),
+            os.path.join(OUTPUT_DIR, "block_10feat_no_emb.pt"),
+            "10 feat with embeddings",
+            "10 feat without embeddings",
+        )
     else:
-        raise ValueError(f"Unknown PRESET={preset}; use injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph | 14feat_vs_phase_a")
+        raise ValueError(f"Unknown PRESET={preset}; use injection_vs_loadtype | loadtype_full_vs_per_type | phase_onehot_vs_subgraph | 14feat_vs_phase_a | emb_vs_no_emb")
 
 
 # Preset: "injection_vs_loadtype" | "loadtype_full_vs_per_type" (override via argv[1])
@@ -403,6 +414,75 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
     return t_hours, node_names_master, V_dss, V_1, V_2, phase_a_indices
 
 
+def run_24h_emb_vs_no_emb(ckpt_1_path, ckpt_2_path):
+    """Run 24h for with-emb vs no-emb (both 10 feat, all phases). Returns (t_hours, node_names, V_dss, V_1, V_2)."""
+    if PFIdentityGNNNoEmb is None:
+        raise ImportError("emb_vs_no_emb requires run_emb_vs_no_emb (PFIdentityGNNNoEmb)")
+
+    model_1, static_1 = load_model_for_inference(ckpt_1_path, device=DEVICE)
+    ckpt_2 = torch.load(ckpt_2_path, map_location="cpu")
+    cfg_2 = ckpt_2["config"]
+    N = int(cfg_2["N"])
+    E = int(cfg_2["E"])
+
+    model_2 = PFIdentityGNNNoEmb(num_nodes=N, num_edges=E, node_in_dim=10, edge_in_dim=2, out_dim=1,
+                                  h_dim=32, num_layers=4).to(DEVICE)
+    model_2.load_state_dict(ckpt_2["state_dict"])
+    model_2.eval()
+
+    ei = static_1["edge_index"].to(DEVICE)
+    ea = static_1["edge_attr"].to(DEVICE)
+    eid = static_1["edge_id"].to(DEVICE)
+
+    node_index_csv = os.path.join(DIR_LOADTYPE, "gnn_node_index_master.csv")
+    master_df = pd.read_csv(node_index_csv)
+    node_names_master = master_df["node"].astype(str).tolist()
+
+    dss_path = inj.compile_once()
+    inj.setup_daily()
+    csvL_token, _ = find_loadshape_csv_in_dss(dss_path, "5minDayShape")
+    csvPV_token, _ = find_loadshape_csv_in_dss(dss_path, "IrradShape")
+    mL = read_profile_csv_two_col_noheader(resolve_csv_path(csvL_token, dss_path), npts=NPTS)
+    mPV = read_profile_csv_two_col_noheader(resolve_csv_path(csvPV_token, dss_path), npts=NPTS)
+
+    bus_to_phases = build_bus_to_phases_from_master_nodes(node_names_master)
+    loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
+    pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+    rng = np.random.default_rng(0)
+
+    V_dss = np.full((NPTS, N), np.nan)
+    V_1 = np.full((NPTS, N), np.nan)
+    V_2 = np.full((NPTS, N), np.nan)
+
+    for t in range(NPTS):
+        inj.set_time_index(t)
+        _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE * PV_SCALE,
+            mL_t=float(mL[t]), mPV_t=float(mPV[t]),
+            loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
+            pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
+            sigma_load=0.0, sigma_pv=0.0, rng=rng,
+        )
+        inj.dss.Solution.Solve()
+        if not inj.dss.Solution.Converged():
+            continue
+        vdict = get_all_node_voltage_pu_and_angle_dict()
+        for i, n in enumerate(node_names_master):
+            if n in vdict:
+                V_dss[t, i], _ = vdict[n]
+
+        X = build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
+        x = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        g = Data(x=x, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
+
+        with torch.no_grad():
+            V_1[t, :] = model_1(g)[:, 0].cpu().numpy()
+            V_2[t, :] = model_2(g)[:, 0].cpu().numpy()
+
+    t_hours = np.arange(NPTS) * STEP_MIN / 60.0
+    return t_hours, node_names_master, V_dss, V_1, V_2
+
+
 def main():
     if not os.path.exists(CKPT_1) or not os.path.exists(CKPT_2):
         raise FileNotFoundError(f"Missing checkpoints. Train first: {CKPT_1}, {CKPT_2}")
@@ -412,6 +492,9 @@ def main():
         t_hours, node_names, V_dss, V_1, V_2, phase_a_indices = run_24h_phase_onehot_vs_subgraph(CKPT_1, CKPT_2)
     elif PRESET == "14feat_vs_phase_a":
         t_hours, node_names, V_dss, V_1, V_2, phase_a_indices = run_24h_14feat_vs_phase_a(CKPT_1, CKPT_2)
+    elif PRESET == "emb_vs_no_emb":
+        t_hours, node_names, V_dss, V_1, V_2 = run_24h_emb_vs_no_emb(CKPT_1, CKPT_2)
+        phase_a_indices = None
     else:
         t_hours, node_names, V_dss, V_1, V_2 = run_24h_all_nodes(CKPT_1, CKPT_2)
         phase_a_indices = None
