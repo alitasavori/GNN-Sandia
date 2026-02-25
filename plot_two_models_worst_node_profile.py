@@ -3,10 +3,10 @@ Standalone evaluation: load two trained models, run 24h profile for all nodes,
 find the node where the two models differ most (by |MAE_1 - MAE_2|), and plot
 the voltage profile for that node (OpenDSS vs Model 1 vs Model 2).
 Uses PV_SCALE=1.0 to stay in distribution with training.
-Run from repo root. Requires: block_injection_features.pt, block_loadtype_per_type.pt
-(Train with: %run run_injection_vs_loadtype_per_type.py)
+Run from repo root. Set PRESET or pass as argv[1]: injection_vs_loadtype | loadtype_full_vs_per_type
 """
 import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -17,7 +17,7 @@ import run_injection_dataset as inj
 import run_loadtype_dataset as lt
 from run_gnn3_overlay_7 import (
     BASE_DIR, CAP_Q_KVAR, NPTS, P_BASE, Q_BASE, PV_BASE, STEP_MIN,
-    build_bus_to_phases_from_master_nodes, build_gnn_x_injection,
+    build_bus_to_phases_from_master_nodes, build_gnn_x_injection, build_gnn_x_loadtype,
     get_all_node_voltage_pu_and_angle_dict,
     find_loadshape_csv_in_dss, resolve_csv_path, read_profile_csv_two_col_noheader,
     load_model_for_inference,
@@ -53,23 +53,50 @@ os.chdir(BASE_DIR)
 
 OUTPUT_DIR = "gnn3_best7_output"
 DIR_LOADTYPE = "gnn_samples_loadtype_full"
-CKPT_1 = os.path.join(OUTPUT_DIR, "block_injection_features.pt")
-CKPT_2 = os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt")
-LABEL_1 = "Injection (p_inj, q_inj)"
-LABEL_2 = "Loadtype per-type (m1..m5, q_cap, p_pv)"
+
+
+def get_preset_config(preset):
+    """Return (CKPT_1, CKPT_2, LABEL_1, LABEL_2) for given preset."""
+    if preset == "injection_vs_loadtype":
+        return (
+            os.path.join(OUTPUT_DIR, "block_injection_features.pt"),
+            os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt"),
+            "Injection (p_inj, q_inj)",
+            "Loadtype per-type (m1..m5, q_cap, p_pv)",
+        )
+    elif preset == "loadtype_full_vs_per_type":
+        return (
+            os.path.join(OUTPUT_DIR, "block_loadtype_full.pt"),
+            os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt"),
+            "Loadtype full (elec_dist + m1..m5 + p_sys, q_sys)",
+            "Loadtype per-type (m1..m5, q_cap, p_pv only)",
+        )
+    else:
+        raise ValueError(f"Unknown PRESET={preset}; use injection_vs_loadtype | loadtype_full_vs_per_type")
+
+
+# Preset: "injection_vs_loadtype" | "loadtype_full_vs_per_type" (override via argv[1])
+PRESET = sys.argv[1] if len(sys.argv) > 1 else "loadtype_full_vs_per_type"
+CKPT_1, CKPT_2, LABEL_1, LABEL_2 = get_preset_config(PRESET)
 PV_SCALE = 1.0  # PV multiplier = 1
 TOP_N_WORST = 5  # Number of worst nodes to plot
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid):
-    """Build node features based on node_in_dim (2=injection, 10=loadtype per-type)."""
+def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type,
+                      P_grid, Q_grid, node_to_electrical_dist=None, p_sys_balance=None, q_sys_balance=None):
+    """Build node features based on node_in_dim (2=injection, 10=loadtype per-type, 13=loadtype full)."""
     if node_in_dim == 2:
         return build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
     elif node_in_dim == 10:
         return build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
+    elif node_in_dim == 13:
+        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None:
+            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=13")
+        return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
+                                   node_to_electrical_dist, p_sys_balance, q_sys_balance)
     else:
-        raise ValueError(f"Unknown node_in_dim={node_in_dim}; expected 2 or 10.")
+        raise ValueError(f"Unknown node_in_dim={node_in_dim}; expected 2, 10, or 13.")
 
 
 def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
@@ -87,6 +114,9 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
     node_index_csv = os.path.join(DIR_LOADTYPE, "gnn_node_index_master.csv")
     master_df = pd.read_csv(node_index_csv)
     node_names_master = master_df["node"].astype(str).tolist()
+
+    edge_csv_dist = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
+    node_to_electrical_dist = lt._compute_electrical_distance_from_source(node_names_master, edge_csv_dist)
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -126,9 +156,14 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
         sum_p_pv = float(sum(busphP_pv.values()))
         P_grid = sum_p_load - sum_p_pv
         Q_grid = sum_q_load - sum(CAP_Q_KVAR.values())
+        p_sys_balance = sum_p_load - sum_p_pv
+        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
 
-        X_1 = build_x_for_model(dim_1, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid)
-        X_2 = build_x_for_model(dim_2, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type, P_grid, Q_grid)
+        kw = dict(node_names_master=node_names_master, busphP_load=busphP_load, busphQ_load=busphQ_load,
+                  busphP_pv=busphP_pv, busph_per_type=busph_per_type, P_grid=P_grid, Q_grid=Q_grid,
+                  node_to_electrical_dist=node_to_electrical_dist, p_sys_balance=p_sys_balance, q_sys_balance=q_sys_balance)
+        X_1 = build_x_for_model(dim_1, **kw)
+        X_2 = build_x_for_model(dim_2, **kw)
 
         x_1 = torch.tensor(X_1, dtype=torch.float32, device=DEVICE)
         x_2 = torch.tensor(X_2, dtype=torch.float32, device=DEVICE)
@@ -146,7 +181,7 @@ def main():
     if not os.path.exists(CKPT_1) or not os.path.exists(CKPT_2):
         raise FileNotFoundError(f"Missing checkpoints. Train first: {CKPT_1}, {CKPT_2}")
 
-    print("Running 24h profile for all nodes (Injection vs Loadtype per-type, PV=1.0×)...")
+    print(f"Running 24h profile for all nodes ({LABEL_1} vs {LABEL_2}, PV=1.0×)...")
     t_hours, node_names, V_dss, V_1, V_2 = run_24h_all_nodes(CKPT_1, CKPT_2)
     N = len(node_names)
 
@@ -170,7 +205,7 @@ def main():
         "mae_1": mae_1, "mae_2": mae_2,
         "mae_diff": mae_diff,
     }).sort_values("mae_diff", ascending=False)
-    csv_path = os.path.join(OUTPUT_DIR, "mae_per_node_injection_vs_loadtype_per_type.csv")
+    csv_path = os.path.join(OUTPUT_DIR, f"mae_per_node_{PRESET}.csv")
     df.to_csv(csv_path, index=False)
     print(f"Top {TOP_N_WORST} worst nodes (|MAE_1 - MAE_2|):")
     for k, idx in enumerate(worst_indices):
@@ -188,7 +223,7 @@ def main():
         ax.grid(True)
         ax.legend()
         plt.tight_layout()
-        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_injection_vs_loadtype_per_type_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
+        out_path = os.path.join(OUTPUT_DIR, f"overlay_24h_{PRESET}_worst_{k+1}_{node_names[idx].replace('.', '_')}.png")
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.show()
         plt.close()
