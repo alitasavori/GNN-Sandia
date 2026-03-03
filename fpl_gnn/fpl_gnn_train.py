@@ -1,3 +1,8 @@
+"""
+Train an MLP to predict FPL voltage residual from DER injection (delta_P, delta_Q) at all nodes.
+Input: stacked [delta_P, delta_Q] for all bus-phases, shape (batch, 2*N).
+Output: residual at each node, shape (batch, N).
+"""
 import os
 from typing import Tuple
 
@@ -6,154 +11,96 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-
-from run_gnn3_best7_train import PFIdentityGNN
-
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 20260303
 
 
-def _load_fpl_residual_data(
-    out_dir: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    edge_csv = os.path.join(out_dir, "gnn_edges_phase_static.csv")
-    node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
+class ResidualMLP(nn.Module):
+    """MLP: input 2*N (delta_P, delta_Q all nodes), output N (residual per node)."""
 
-    df_e = pd.read_csv(edge_csv)
-    df_n = pd.read_csv(node_csv)
-    return df_e, df_n, None
+    def __init__(self, input_dim: int, out_dim: int, hidden_dims: Tuple[int, ...] = (128, 128, 64)):
+        super().__init__()
+        dims = [input_dim] + list(hidden_dims) + [out_dim]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 def train_fpl_gnn(
     out_dir: str = os.path.join("fpl_gnn", "gnn_samples_fpl_residual_full"),
-    h_dim: int = 96,
-    num_layers: int = 3,
+    hidden_dims: Tuple[int, ...] = (128, 128, 64),
     batch_size: int = 64,
     epochs: int = 50,
     test_frac: float = 0.2,
-) -> PFIdentityGNN:
+):
     """
-    Train a PFIdentityGNN on FPL residual labels.
+    Train MLP on FPL residual: input = [delta_P, delta_Q] all nodes (2N), output = residual (N).
+    Dataset CSV must have sample_id, node_idx, delta_P_kw, delta_Q_kvar, vmag_resid.
     """
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    df_e, df_n, _ = _load_fpl_residual_data(out_dir)
+    node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
+    if not os.path.exists(node_csv):
+        raise FileNotFoundError(f"Run dataset generation first. Missing {node_csv}")
 
-    feature_cols = ["electrical_distance_ohm", "P_node_kw", "Q_node_kvar"]
-    target_col = "vmag_pu_resid"
-    required = {"sample_id", "node_idx", target_col} | set(feature_cols)
-    if required - set(df_n.columns):
-        raise RuntimeError(f"Missing columns: {required - set(df_n.columns)}")
-
-    for c in ["u_idx", "v_idx", "R_full", "X_full"]:
-        df_e[c] = pd.to_numeric(df_e[c], errors="coerce")
-    for c in feature_cols + [target_col, "sample_id", "node_idx"]:
+    df_n = pd.read_csv(node_csv)
+    for c in ["sample_id", "node_idx", "delta_P_kw", "delta_Q_kvar", "vmag_resid"]:
         df_n[c] = pd.to_numeric(df_n[c], errors="coerce")
+    df_n = df_n.dropna(subset=["sample_id", "node_idx", "delta_P_kw", "delta_Q_kvar", "vmag_resid"])
 
-    df_e = (
-        df_e.replace([np.inf, -np.inf], np.nan)
-        .dropna(subset=["u_idx", "v_idx", "R_full", "X_full"])
-        .reset_index(drop=True)
-    )
-    df_n = (
-        df_n.replace([np.inf, -np.inf], np.nan)
-        .dropna(subset=list(required))
-        .reset_index(drop=True)
-    )
-
-    df_e["edge_id"] = np.arange(len(df_e), dtype=int)
-    E = int(len(df_e))
     N = int(df_n["node_idx"].max()) + 1
-
     df_n = df_n.sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
     counts = df_n.groupby("sample_id")["node_idx"].count()
     good_ids = counts[counts == N].index.to_numpy()
-    df_n = (
-        df_n[df_n["sample_id"].isin(good_ids)]
-        .copy()
-        .sort_values(["sample_id", "node_idx"])
-        .reset_index(drop=True)
-    )
+    df_n = df_n[df_n["sample_id"].isin(good_ids)].sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
 
-    all_ids = df_n["sample_id"].unique()
-    S = len(all_ids)
+    S = df_n["sample_id"].nunique()
+    # Each sample: N rows -> (delta_P, delta_Q) per node -> stack to (2*N,); vmag_resid -> (N,)
+    delta_P = df_n["delta_P_kw"].to_numpy(dtype=np.float32).reshape(S, N)
+    delta_Q = df_n["delta_Q_kvar"].to_numpy(dtype=np.float32).reshape(S, N)
+    resid = df_n["vmag_resid"].to_numpy(dtype=np.float32).reshape(S, N)
 
-    X_all = df_n[feature_cols].to_numpy(dtype=np.float32).reshape(S, N, -1)
-    Y_all = df_n[target_col].to_numpy(dtype=np.float32).reshape(S, N, 1)
+    X_all = np.concatenate([delta_P, delta_Q], axis=1)  # (S, 2*N)
+    Y_all = resid  # (S, N)
 
-    node_in_dim = X_all.shape[-1]
-    edge_index = torch.tensor(
-        df_e[["u_idx", "v_idx"]].to_numpy().T, dtype=torch.long
-    )
-    edge_attr = torch.tensor(
-        df_e[["R_full", "X_full"]].to_numpy(), dtype=torch.float32
-    )
-    edge_id = torch.tensor(df_e["edge_id"].to_numpy(), dtype=torch.long)
+    input_dim = X_all.shape[1]
+    out_dim = N
 
     rng = np.random.default_rng(SEED)
     perm = rng.permutation(S)
     n_test = int(np.floor(test_frac * S))
     test_idx, train_idx = perm[:n_test], perm[n_test:]
 
-    def make_ds(idx):
-        out = []
-        for k in idx:
-            x = torch.tensor(X_all[k], dtype=torch.float32)
-            y = torch.tensor(Y_all[k], dtype=torch.float32)
-            g = Data(
-                x=x,
-                y=y,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                edge_id=edge_id,
-                num_nodes=N,
-            )
-            out.append(g)
-        return out
+    X_train = torch.tensor(X_all[train_idx], dtype=torch.float32)
+    Y_train = torch.tensor(Y_all[train_idx], dtype=torch.float32)
+    X_test = torch.tensor(X_all[test_idx], dtype=torch.float32)
+    Y_test = torch.tensor(Y_all[test_idx], dtype=torch.float32)
 
-    train_loader = DataLoader(make_ds(train_idx), batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(make_ds(test_idx), batch_size=batch_size, shuffle=False)
+    train_ds = torch.utils.data.TensorDataset(X_train, Y_train)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    model = PFIdentityGNN(
-        num_nodes=N,
-        num_edges=E,
-        node_in_dim=node_in_dim,
-        edge_in_dim=2,
-        out_dim=1,
-        node_emb_dim=16,
-        edge_emb_dim=8,
-        h_dim=h_dim,
-        num_layers=num_layers,
-        use_norm=False,
-    ).to(DEVICE)
-
+    model = ResidualMLP(input_dim=input_dim, out_dim=out_dim, hidden_dims=hidden_dims).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
     def compute_metrics(yhat, ytrue):
-        err = (yhat - ytrue).squeeze(-1)
-        mae = err.abs().mean()
-        rmse = torch.sqrt((err ** 2).mean())
+        err = yhat - ytrue
+        mae = err.abs().mean().item()
+        rmse = np.sqrt((err ** 2).mean().item())
         return mae, rmse
 
     @torch.no_grad()
-    def evaluate(loader):
+    def evaluate(X, Y):
         model.eval()
-        mae_sum = torch.tensor(0.0, device=DEVICE)
-        rmse_sum = torch.tensor(0.0, device=DEVICE)
-        n_batches = 0
-        for data in loader:
-            data = data.to(DEVICE)
-            mae, rmse = compute_metrics(model(data), data.y)
-            mae_sum += mae
-            rmse_sum += rmse
-            n_batches += 1
-        return (mae_sum / max(1, n_batches)).item(), (
-            rmse_sum / max(1, n_batches)
-        ).item()
+        yh = model(X.to(DEVICE))
+        return compute_metrics(yh.cpu().numpy(), Y.numpy())
 
     best_rmse = float("inf")
     best_state = None
@@ -162,18 +109,14 @@ def train_fpl_gnn(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        nb = 0
-        for data in train_loader:
-            data = data.to(DEVICE)
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             opt.zero_grad()
-            loss = F.mse_loss(model(data), data.y)
+            loss = F.mse_loss(model(xb), yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
-            total_loss += float(loss.item())
-            nb += 1
-        mae_t, rmse_t = evaluate(test_loader)
+        mae_t, rmse_t = evaluate(X_test, Y_test)
         if (best_rmse - rmse_t) > min_delta:
             best_rmse = rmse_t
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -187,8 +130,6 @@ def train_fpl_gnn(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    mae_f, rmse_f = evaluate(test_loader)
+    mae_f, rmse_f = evaluate(X_test, Y_test)
     print(f"Final: MAE={mae_f:.6f} RMSE={rmse_f:.6f}")
     return model
-
-

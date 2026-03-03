@@ -1,3 +1,22 @@
+"""
+FPL residual dataset with per-scenario draws from normal distributions.
+
+Per scenario:
+- Draw (P_load_total_kw, Q_load_total_kvar, P_der_total_kw, Q_der_total_kvar)
+  from Normal(means, sigma_shared) with clipping at >= 0.
+- sigma_shared is constant across all scenarios and applies to all 4 draws.
+- No per-timestep noise is used in OpenDSS snapshot application (sigma_load=0, sigma_pv=0).
+
+Per scenario per hour (24 samples):
+- Base case (load-only, DER off): solve PF -> v_base.
+- Compute FPL coefficients J = [A|B] for that hour by finite differences
+  around the load-only base (inject tiny ΔP and ΔQ at each node).
+- DER case (load + DER): DER P and Q follow the same DER profile over the day.
+  Since P_der and Q_der share the same profile, each scenario has a constant Q/P ratio.
+- Residual label: resid = v_true - (v_base + J @ [ΔP_der; ΔQ_der]).
+
+The downstream model (MLP) learns resid as a function of [ΔP_der; ΔQ_der].
+"""
 import os
 from typing import Tuple, List, Dict
 
@@ -6,172 +25,255 @@ import pandas as pd
 import opendssdirect as dss
 
 import run_injection_dataset as inj
-from run_loadtype_dataset import _compute_electrical_distance_from_source
+
+# Tiny perturbations for finite-difference A/B (J)
+STEPS_PER_HOUR = inj.NPTS // 24  # 288/24 = 12
+dP_KW = 1.0
+dQ_KVAR = 1.0
 
 
-def build_zbus_and_baseline(
-    t_index: int = 0,
-    dP_kw: float = 1.0,
-    dQ_kvar: float = 1.0,
-) -> Tuple[List[str], np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Approximate an FPL-style linearization around a single baseline operating point.
+def _hour_to_step(h: int) -> int:
+    """Map hour 0..23 to a representative step index (start of hour)."""
+    return h * STEPS_PER_HOUR
 
-    Returns
-    -------
-    node_names : list of str
-        Monitored bus.phase node names in a fixed order.
-    v_base : np.ndarray, shape (N,)
-        Baseline voltage magnitudes in per unit.
-    x_base : np.ndarray, shape (2N,)
-        Baseline stacked injections [P_1..P_N, Q_1..Q_N] in kW/kVAr (PV minus load).
-    J : np.ndarray, shape (N, 2N)
-        Finite-difference sensitivity mapping Delta x -> Delta v_mag.
-    """
-    # Compile feeder and set baseline time index
-    dss_path = inj.compile_once()
+
+def _apply_snapshot_load_only(
+    dss_path: str,
+    node_names: List[str],
+    P_load: float,
+    Q_load: float,
+    hour: int,
+    mL: np.ndarray,
+    loads_dss,
+    dev_to_dss_load,
+    dev_to_busph_load,
+    pv_dss,
+    pv_to_dss,
+    pv_to_busph,
+    sigma_load: float = 0.0,
+    sigma_der: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply load at hour h only; DER = 0. Solve and return (v_base, x_base)."""
+    inj.dss.Basic.ClearAll()
+    dss.Text.Command(f'compile "{dss_path}"')
+    inj._apply_voltage_bases()
     inj.setup_daily()
-    inj.set_time_index(t_index)
-
-    baseline = dict(inj.BASELINE)
-    P_load = baseline["P_load_total_kw"]
-    Q_load = baseline["Q_load_total_kvar"]
-    P_pv = baseline["P_pv_total_kw"]
-    sigL = baseline["sigma_load"]
-    sigPV = baseline["sigma_pv"]
-
-    node_names, _, _, bus_to_phases = inj.get_all_bus_phase_nodes()
-    N = len(node_names)
-    node_to_idx = {n: i for i, n in enumerate(node_names)}
-
-    loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
-    pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+    step = _hour_to_step(hour)
+    inj.set_time_index(step)
     rng = np.random.default_rng(0)
-
-    # Baseline PF
-    _, busphP_load, busphQ_load, busphP_pv, busphQ_pv = inj.apply_snapshot_timeconditioned(
+    _, busphP_load, busphQ_load, _, _ = inj.apply_snapshot_timeconditioned(
         P_load_total_kw=P_load,
         Q_load_total_kvar=Q_load,
-        P_pv_total_kw=P_pv,
-        mL_t=1.0,
-        mPV_t=1.0,
+        P_pv_total_kw=0.0,
+        mL_t=float(mL[step]),
+        mPV_t=0.0,
         loads_dss=loads_dss,
         dev_to_dss_load=dev_to_dss_load,
         dev_to_busph_load=dev_to_busph_load,
         pv_dss=pv_dss,
         pv_to_dss=pv_to_dss,
         pv_to_busph=pv_to_busph,
-        sigma_load=sigL,
-        sigma_pv=sigPV,
+        sigma_load=sigma_load,
+        sigma_pv=sigma_der,
         rng=rng,
     )
     dss.Solution.Solve()
     if not dss.Solution.Converged():
-        raise RuntimeError("Baseline PF did not converge.")
-
-    vmag_base, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
-    v_base = np.asarray(vmag_base, dtype=np.float64)
-
-    P_node = np.zeros(N, dtype=np.float64)
-    Q_node = np.zeros(N, dtype=np.float64)
+        return None, None
+    vmag, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
+    v_base = np.asarray(vmag, dtype=np.float64)
+    N = len(node_names)
+    P_node = np.zeros(N)
+    Q_node = np.zeros(N)
     for i, n in enumerate(node_names):
         bus, phs = n.split(".")
         ph = int(phs)
         p_load = float(busphP_load.get((bus, ph), 0.0))
         q_load = float(busphQ_load.get((bus, ph), 0.0))
-        p_pv = float(busphP_pv.get((bus, ph), 0.0))
-        q_pv = float(busphQ_pv.get((bus, ph), 0.0))
-        P_node[i] = p_pv - p_load
-        Q_node[i] = q_pv - q_load
+        P_node[i] = -p_load
+        Q_node[i] = -q_load
     x_base = np.concatenate([P_node, Q_node], axis=0)
+    return v_base, x_base
 
-    # Finite-difference sensitivities
-    J = np.zeros((N, 2 * N), dtype=np.float64)
 
-    def _solve_with_perturb(idx_node: int, dP: float, dQ: float) -> np.ndarray | None:
+def _apply_snapshot_load_and_der(
+    dss_path: str,
+    node_names: List[str],
+    P_load: float,
+    Q_load: float,
+    P_der: float,
+    Q_der: float,
+    hour: int,
+    mL: np.ndarray,
+    mPV: np.ndarray,
+    loads_dss,
+    dev_to_dss_load,
+    dev_to_busph_load,
+    pv_dss,
+    pv_to_dss,
+    pv_to_busph,
+    sigma_load: float = 0.0,
+    sigma_der: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply load + DER at hour h. DER P and Q follow same profile (mPV). Return (v_true, delta_P, delta_Q) per node."""
+    inj.dss.Basic.ClearAll()
+    dss.Text.Command(f'compile "{dss_path}"')
+    inj._apply_voltage_bases()
+    inj.setup_daily()
+    step = _hour_to_step(hour)
+    inj.set_time_index(step)
+    rng = np.random.default_rng(0)
+    mL_t = float(mL[step])
+    mPV_t = float(mPV[step])
+    _, busphP_load, busphQ_load, busphP_pv, busphQ_pv = inj.apply_snapshot_timeconditioned(
+        P_load_total_kw=P_load,
+        Q_load_total_kvar=Q_load,
+        P_pv_total_kw=P_der,
+        mL_t=mL_t,
+        mPV_t=mPV_t,
+        loads_dss=loads_dss,
+        dev_to_dss_load=dev_to_dss_load,
+        dev_to_busph_load=dev_to_busph_load,
+        pv_dss=pv_dss,
+        pv_to_dss=pv_to_dss,
+        pv_to_busph=pv_to_busph,
+        sigma_load=sigma_load,
+        sigma_pv=sigma_der,
+        rng=rng,
+    )
+    # Set PF per scenario so the DER produces the desired Q/P ratio.
+    # Note: OpenDSS PVSystem uses PF to determine reactive output (subject to kVA limits).
+    pf = 1.0
+    if (P_der * mPV_t) > 1e-9:
+        pf = float((P_der) / np.sqrt(P_der * P_der + Q_der * Q_der))
+        pf = float(np.clip(pf, 0.01, 1.0))
+    for pv_name in pv_dss:
+        dss.PVsystems.Name(pv_name)
+        try:
+            dss.PVsystems.PF(pf)
+        except Exception:
+            # If PF is not available in this build, we still proceed; delta_Q will be synthetic.
+            pass
+    dss.Solution.Solve()
+    if not dss.Solution.Converged():
+        return None, None, None
+    vmag, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
+    v_true = np.asarray(vmag, dtype=np.float64)
+    N = len(node_names)
+    delta_P = np.zeros(N)
+    delta_Q = np.zeros(N)
+    P_der_t = P_der * mPV_t
+    Q_der_t = Q_der * mPV_t
+    k_qp = float(Q_der_t / P_der_t) if abs(P_der_t) > 1e-9 else 0.0
+    for i, n in enumerate(node_names):
+        bus, phs = n.split(".")
+        ph = int(phs)
+        delta_P[i] = float(busphP_pv.get((bus, ph), 0.0))
+        # Enforce that DER P and Q share the same per-node distribution (same profile + same share mapping).
+        delta_Q[i] = float(delta_P[i] * k_qp)
+    return v_true, delta_P, delta_Q
+
+
+def _compute_J_at_hour(
+    dss_path: str,
+    node_names: List[str],
+    v_base: np.ndarray,
+    x_base: np.ndarray,
+    P_load: float,
+    Q_load: float,
+    hour: int,
+    mL: np.ndarray,
+    loads_dss,
+    dev_to_dss_load,
+    dev_to_busph_load,
+    pv_dss,
+    pv_to_dss,
+    pv_to_busph,
+    sigma_load: float = 0.0,
+    sigma_der: float = 0.0,
+) -> np.ndarray:
+    """Finite-difference J at this hour (load-only base). J shape (N, 2N)."""
+    N = len(node_names)
+
+    def _solve_perturb(idx_node: int, dP: float, dQ: float) -> np.ndarray | None:
         inj.dss.Basic.ClearAll()
         dss.Text.Command(f'compile "{dss_path}"')
         inj._apply_voltage_bases()
         inj.setup_daily()
-        inj.set_time_index(t_index)
-
-        node_names_s, _, _, bus_to_phases_s = inj.get_all_bus_phase_nodes()
-        if node_names_s != node_names:
-            raise RuntimeError("Node list changed between baseline and perturbation.")
-        loads_dss_s, dev_to_dss_load_s, dev_to_busph_load_s = inj.build_load_device_maps(bus_to_phases_s)
-        pv_dss_s, pv_to_dss_s, pv_to_busph_s = inj.build_pv_device_maps()
-        rng_s = np.random.default_rng(0)
-
+        step = _hour_to_step(hour)
+        inj.set_time_index(step)
+        rng = np.random.default_rng(0)
         inj.apply_snapshot_timeconditioned(
             P_load_total_kw=P_load,
             Q_load_total_kvar=Q_load,
-            P_pv_total_kw=P_pv,
-            mL_t=1.0,
-            mPV_t=1.0,
-            loads_dss=loads_dss_s,
-            dev_to_dss_load=dev_to_dss_load_s,
-            dev_to_busph_load=dev_to_busph_load_s,
-            pv_dss=pv_dss_s,
-            pv_to_dss=pv_to_dss_s,
-            pv_to_busph=pv_to_busph_s,
-            sigma_load=sigL,
-            sigma_pv=sigPV,
-            rng=rng_s,
+            P_pv_total_kw=0.0,
+            mL_t=float(mL[step]),
+            mPV_t=0.0,
+            loads_dss=loads_dss,
+            dev_to_dss_load=dev_to_dss_load,
+            dev_to_busph_load=dev_to_busph_load,
+            pv_dss=pv_dss,
+            pv_to_dss=pv_to_dss,
+            pv_to_busph=pv_to_busph,
+            sigma_load=sigma_load,
+            sigma_pv=sigma_der,
+            rng=rng,
         )
-
         node = node_names[idx_node]
         bus, phs = node.split(".")
         ph = int(phs)
-        # Extra PQ load of -dP - j dQ -> positive injection at that node.
-        # OpenDSSDirect does not expose Loads.New; use a text command instead.
-        load_name = f"fpl_sens_load_{idx_node}"
+        load_name = f"fpl_sens_{idx_node}"
         cmd = (
-            f"new Load.{load_name} "
-            f"bus={bus}.{ph} phases=1 conn=wye model=1 kv=4.16 "
+            f"new Load.{load_name} bus={bus}.{ph} phases=1 conn=wye model=1 kv=4.16 "
             f"kW={-float(dP)} kvar={-float(dQ)}"
         )
         dss.Text.Command(cmd)
-
         dss.Solution.Solve()
         if not dss.Solution.Converged():
             return None
-        vmag_new, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
-        return np.asarray(vmag_new, dtype=np.float64)
+        vmag, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
+        return np.asarray(vmag, dtype=np.float64)
 
+    J = np.zeros((N, 2 * N), dtype=np.float64)
     for i in range(N):
-        v_plus = _solve_with_perturb(i, dP_kw, 0.0)
-        if v_plus is not None:
-            J[:, i] = (v_plus - v_base) / dP_kw
-        v_plus = _solve_with_perturb(i, 0.0, dQ_kvar)
-        if v_plus is not None:
-            J[:, N + i] = (v_plus - v_base) / dQ_kvar
-
-    return node_names, v_base, x_base, J
+        vp = _solve_perturb(i, dP_KW, 0.0)
+        if vp is not None:
+            J[:, i] = (vp - v_base) / dP_KW
+        vp = _solve_perturb(i, 0.0, dQ_KVAR)
+        if vp is not None:
+            J[:, N + i] = (vp - v_base) / dQ_KVAR
+    return J
 
 
 def generate_fpl_residual_dataset(
     out_dir: str = os.path.join("fpl_gnn", "gnn_samples_fpl_residual_full"),
-    n_scenarios: int = 200,
-    k_snapshots_per_scenario_total: int = 960,
+    n_scenarios: int = 500,
     master_seed: int = 20260303,
+    mu_P_load_kw: float = 1415.2,
+    mu_Q_load_kvar: float = 835.2,
+    mu_P_der_kw: float = 1000.0,
+    mu_Q_der_kvar: float = 0.0,
+    sigma_shared: float = 50.0,
 ):
     """
-    Generate a dataset for FPL+GNN residual learning.
+    Generate FPL residual dataset:
 
-    Per-node features:
-        - electrical_distance_ohm
-        - P_node_kw, Q_node_kvar
-
-    Targets:
-        - vmag_pu_true, vmag_pu_fpl, vmag_pu_resid
+    - 500 scenarios; per scenario (P_load, Q_load, P_der, Q_der) drawn from Normal(means, sigma_shared)
+      with clipping at >= 0. sigma_shared is constant across all scenarios.
+    - 24 hours per scenario; at each hour we compute A/B (J) from load-only base,
+      then solve with DER (P and Q, same profile), store delta_P/delta_Q from DER,
+      and residual = v_true - (v_base + J @ delta_der).
+    - Output: one row per (sample, node) with delta_P_kw, delta_Q_kvar, vmag_resid;
+      and sample-level metadata. For MLP: input = stacked [delta_P, delta_Q] (2N), output = residual (N).
     """
     os.makedirs(out_dir, exist_ok=True)
-    edge_csv = os.path.join(out_dir, "gnn_edges_phase_static.csv")
     node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
     sample_csv = os.path.join(out_dir, "gnn_sample_meta.csv")
     node_index_csv = os.path.join(out_dir, "gnn_node_index_master.csv")
 
-    node_names, v_base, x_base, J = build_zbus_and_baseline(t_index=0)
+    dss_path = inj.compile_once()
+    inj.setup_daily()
+    node_names, _, _, bus_to_phases = inj.get_all_bus_phase_nodes()
     N = len(node_names)
     node_to_idx = {n: i for i, n in enumerate(node_names)}
 
@@ -179,15 +281,6 @@ def generate_fpl_residual_dataset(
         node_index_csv, index=False
     )
 
-    inj.extract_static_phase_edges_to_csv(
-        node_names_master=node_names, edge_csv_path=edge_csv
-    )
-    node_to_electrical_dist = _compute_electrical_distance_from_source(
-        node_names, edge_csv
-    )
-
-    dss_path = inj.compile_once()
-    inj.setup_daily()
     csvL_token, _ = inj.find_loadshape_csv_in_dss(dss_path, "5minDayShape")
     csvPV_token, _ = inj.find_loadshape_csv_in_dss(dss_path, "IrradShape")
     csvL = inj.resolve_csv_path(csvL_token, dss_path)
@@ -195,143 +288,84 @@ def generate_fpl_residual_dataset(
     mL = inj.read_profile_csv_two_col_noheader(csvL, npts=inj.NPTS, debug=False)
     mPV = inj.read_profile_csv_two_col_noheader(csvPV, npts=inj.NPTS, debug=False)
 
-    rng_master = np.random.default_rng(master_seed)
-    rows_sample: list[Dict] = []
-    rows_node: list[Dict] = []
+    loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
+    pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+
+    rng = np.random.default_rng(master_seed)
+    rows_sample: List[Dict] = []
+    rows_node: List[Dict] = []
     sample_id = 0
-    kept = skipped_nonconv = skipped_badV = 0
+    kept = 0
+    skipped = 0
 
     for s in range(n_scenarios):
-        inj.dss.Basic.ClearAll()
-        inj.dss.Text.Command(f'compile "{dss_path}"')
-        inj._apply_voltage_bases()
-        inj.setup_daily()
+        # One draw per scenario from Normal distributions; clip at >= 0
+        P_load = float(max(0.0, rng.normal(mu_P_load_kw, sigma_shared)))
+        Q_load = float(max(0.0, rng.normal(mu_Q_load_kvar, sigma_shared)))
+        P_der = float(max(0.0, rng.normal(mu_P_der_kw, sigma_shared)))
+        Q_der = float(max(0.0, rng.normal(mu_Q_der_kvar, sigma_shared)))
 
-        node_names_s, _, _, bus_to_phases = inj.get_all_bus_phase_nodes()
-        if node_names_s != node_names:
-            raise RuntimeError("Node list changed across scenarios.")
+        # No per-timestep noise (sigma=0) inside OpenDSS application
+        sigL = 0.0
+        sigD = 0.0
 
-        loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(
-            bus_to_phases
-        )
-        pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
-
-        sc = inj.sample_scenario_from_baseline(inj.BASELINE, inj.RANGES, rng_master)
-        P_load = sc["P_load_total_kw"]
-        Q_load = sc["Q_load_total_kvar"]
-        P_pv = sc["P_pv_total_kw"]
-        sigL = sc["sigma_load"]
-        sigPV = sc["sigma_pv"]
-
-        prof_load = mL
-        prof_pv = mPV
-        prof_net = (P_load * mL) - (P_pv * mPV)
-
-        rng_times = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
-        times = inj.select_times_three_profiles(
-            prof_load=prof_load,
-            prof_pv=prof_pv,
-            prof_net=prof_net,
-            K_total=k_snapshots_per_scenario_total,
-            bins_by_profile={"load": 10, "pv": 10, "net": 10},
-            include_anchors=True,
-            rng=rng_times,
-        )
-        times = [int(t) for t in times]
-        rng_solve = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
-
-        for t in times:
-            inj.set_time_index(t)
-            totals, busphP_load, busphQ_load, busphP_pv, busphQ_pv = inj.apply_snapshot_timeconditioned(
-                P_load_total_kw=P_load,
-                Q_load_total_kvar=Q_load,
-                P_pv_total_kw=P_pv,
-                mL_t=float(mL[t]),
-                mPV_t=float(mPV[t]),
-                loads_dss=loads_dss,
-                dev_to_dss_load=dev_to_dss_load,
-                dev_to_busph_load=dev_to_busph_load,
-                pv_dss=pv_dss,
-                pv_to_dss=pv_to_dss,
-                pv_to_busph=pv_to_busph,
-                sigma_load=sigL,
-                sigma_pv=sigPV,
-                rng=rng_solve,
+        for hour in range(24):
+            v_base, x_base = _apply_snapshot_load_only(
+                dss_path, node_names, P_load, Q_load, hour, mL,
+                loads_dss, dev_to_dss_load, dev_to_busph_load,
+                pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
             )
-
-            inj.dss.Solution.Solve()
-            if not inj.dss.Solution.Converged():
-                skipped_nonconv += 1
+            if v_base is None:
+                skipped += 1
                 continue
 
-            vmag_m, vang_m = inj.get_all_node_voltage_pu_and_angle_filtered(
-                node_names
+            J = _compute_J_at_hour(
+                dss_path, node_names, v_base, x_base, P_load, Q_load, hour, mL,
+                loads_dss, dev_to_dss_load, dev_to_busph_load,
+                pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
             )
-            vmag_arr = np.asarray(vmag_m, dtype=np.float64)
-            if (
-                (not np.isfinite(vmag_arr).all())
-                or (vmag_arr.min() < inj.VMAG_PU_MIN)
-                or (vmag_arr.max() > inj.VMAG_PU_MAX)
-            ):
-                skipped_badV += 1
+
+            v_true, delta_P, delta_Q = _apply_snapshot_load_and_der(
+                dss_path, node_names, P_load, Q_load, P_der, Q_der,
+                hour, mL, mPV,
+                loads_dss, dev_to_dss_load, dev_to_busph_load,
+                pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+            )
+            if v_true is None:
+                skipped += 1
                 continue
 
-            P_node = np.zeros(N, dtype=np.float64)
-            Q_node = np.zeros(N, dtype=np.float64)
+            delta_x = np.concatenate([np.asarray(delta_P), np.asarray(delta_Q)], axis=0)
+            v_fpl = v_base + J @ delta_x
+            resid = v_true - v_fpl
+
+            if not np.isfinite(resid).all() or np.any(v_true < inj.VMAG_PU_MIN) or np.any(v_true > inj.VMAG_PU_MAX):
+                skipped += 1
+                continue
+
+            rows_sample.append({
+                "sample_id": sample_id,
+                "scenario_id": s,
+                "hour": hour,
+            })
+
             for i, n in enumerate(node_names):
-                bus, phs = n.split(".")
-                ph = int(phs)
-                p_load = float(busphP_load.get((bus, ph), 0.0))
-                q_load = float(busphQ_load.get((bus, ph), 0.0))
-                p_pv = float(busphP_pv.get((bus, ph), 0.0))
-                q_pv = float(busphQ_pv.get((bus, ph), 0.0))
-                P_node[i] = p_pv - p_load
-                Q_node[i] = q_pv - q_load
-
-            x = np.concatenate([P_node, Q_node], axis=0)
-            dx = x - x_base
-            v_fpl = v_base + J @ dx
-            eps = vmag_arr - v_fpl
-
-            rows_sample.append(
-                {
+                rows_node.append({
                     "sample_id": sample_id,
-                    "scenario_id": s,
-                    "t_index": t,
-                    "t_minutes": t * inj.STEP_MIN,
-                }
-            )
-
-            for i, n in enumerate(node_names):
-                bus, phs = n.split(".")
-                ph = int(phs)
-                elec_dist = float(node_to_electrical_dist.get(n, 0.0))
-                vm, va = float(vmag_arr[i]), float(vang_m[i])
-
-                rows_node.append(
-                    {
-                        "sample_id": sample_id,
-                        "node": n,
-                        "node_idx": int(node_to_idx[n]),
-                        "bus": bus,
-                        "phase": int(ph),
-                        "electrical_distance_ohm": elec_dist,
-                        "P_node_kw": float(P_node[i]),
-                        "Q_node_kvar": float(Q_node[i]),
-                        "vmag_pu_true": vm,
-                        "vmag_pu_fpl": float(v_fpl[i]),
-                        "vmag_pu_resid": float(eps[i]),
-                    }
-                )
+                    "node": n,
+                    "node_idx": node_to_idx[n],
+                    "delta_P_kw": float(delta_P[i]),
+                    "delta_Q_kvar": float(delta_Q[i]),
+                    "vmag_resid": float(resid[i]),
+                    "vmag_true": float(v_true[i]),
+                    "vmag_fpl": float(v_fpl[i]),
+                })
 
             sample_id += 1
             kept += 1
 
-        print(
-            f"[scenario {s+1}/{n_scenarios}] kept={kept} "
-            f"skip_nonconv={skipped_nonconv} skip_badV={skipped_badV} "
-            f"Pload={P_load:.1f} Qload={Q_load:.1f} Ppv={P_pv:.1f}"
-        )
+        if (s + 1) % 50 == 0 or s == 0:
+            print(f"[scenario {s+1}/{n_scenarios}] kept={kept} skipped={skipped} Pload={P_load:.1f} Qload={Q_load:.1f} Pder={P_der:.1f}")
 
     df_sample = pd.DataFrame(rows_sample)
     df_node = pd.DataFrame(rows_node)
@@ -339,9 +373,5 @@ def generate_fpl_residual_dataset(
     df_node.to_csv(node_csv, index=False)
 
     print(f"\n[FPL+RESIDUAL DATASET] Saved to {out_dir}/")
-    print(
-        f"  {node_csv} | samples={df_sample['sample_id'].nunique()} | node-rows={len(df_node)}"
-    )
-    return df_sample, df_node, edge_csv
-
-
+    print(f"  samples={len(df_sample)} node-rows={len(df_node)}")
+    return df_sample, df_node, node_csv
