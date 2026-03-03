@@ -122,17 +122,15 @@ def build_zbus_and_baseline(
         node = node_names[idx_node]
         bus, phs = node.split(".")
         ph = int(phs)
-        # Extra PQ load of -dP - j dQ -> positive injection at that node
-        dss.Loads.New(
-            name="fpl_sens_load",
-            bus=f"{bus}.{ph}",
-            phases=1,
-            conn="Wye",
-            model=1,
-            kv=4.16,
-            kW=-dP,
-            kvar=-dQ,
+        # Extra PQ load of -dP - j dQ -> positive injection at that node.
+        # OpenDSSDirect does not expose Loads.New; use a text command instead.
+        load_name = f"fpl_sens_load_{idx_node}"
+        cmd = (
+            f"new Load.{load_name} "
+            f"bus={bus}.{ph} phases=1 conn=wye model=1 kv=4.16 "
+            f"kW={-float(dP)} kvar={-float(dQ)}"
         )
+        dss.Text.Command(cmd)
 
         dss.Solution.Solve()
         if not dss.Solution.Converged():
