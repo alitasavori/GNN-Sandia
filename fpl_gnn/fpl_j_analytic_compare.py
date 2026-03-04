@@ -111,11 +111,22 @@ def _compute_J_analytic_node_at_hour(
             row = indices[k]
             Y[row, col] = data[k]
 
-    # Sanity check 1: compare against dense SystemY (same YNodeOrder)
+    # Sanity check 1: compare against dense SystemY (same YNodeOrder).
+    # DSS C API often returns SystemY as 2*nY*nY reals (packed re,im); nY*nY complex otherwise.
     try:
-        Y_dense_flat = np.array(dss.Circuit.SystemY(), dtype=np.complex128)
-        if Y_dense_flat.size == nY * nY:
+        raw = np.array(dss.Circuit.SystemY(), dtype=np.float64)
+        size = raw.size
+        if size == 2 * nY * nY:
+            Y_dense_flat = raw[0::2] + 1j * raw[1::2]
             Y_dense = Y_dense_flat.reshape((nY, nY))
+            print(f"    [dbg] SystemY: interpreted as packed re,im (size={size} -> {nY*nY} complex)")
+        elif size == nY * nY:
+            Y_dense = np.asarray(dss.Circuit.SystemY(), dtype=np.complex128).reshape((nY, nY))
+            print(f"    [dbg] SystemY: size={size} (nY*nY complex)")
+        else:
+            Y_dense = None
+            print(f"    [Y-check] SystemY size unexpected: {size} (expected {nY*nY} or {2*nY*nY})")
+        if Y_dense is not None:
             Y_diff = Y - Y_dense
             max_abs_Y = float(np.max(np.abs(Y)))
             max_abs_diff_Y = float(np.max(np.abs(Y_diff)))
@@ -124,11 +135,6 @@ def _compute_J_analytic_node_at_hour(
                 f"    [Y-check] nY={nY}, max|Y|={max_abs_Y:.3e}, "
                 f"max|Y_sparse-Y_dense|={max_abs_diff_Y:.3e}, "
                 f"||Y_sparse-Y_dense||_F={fro_diff_Y:.3e}"
-            )
-        else:
-            print(
-                f"    [Y-check] SystemY size mismatch: "
-                f"{Y_dense_flat.size} vs {nY*nY}"
             )
     except Exception as exc:
         print(f"    [Y-check] SystemY comparison failed: {type(exc).__name__}: {exc}")
@@ -195,8 +201,9 @@ def _compute_J_analytic_node_at_hour(
             except Exception as e:
                 print(f"    [dbg] MVABase set command exception: {type(e).__name__}: {e}")
     if S_base_MVA is None or S_base_MVA <= 0:
-        S_base_MVA = 100.0
-        print("    [units] MVABase not available; using 100.0 MVA (set or fallback)")
+        # 1.0 MVA gives scale_per_kw=1e-3 so analytic J magnitude matches FD (best_fit c* ~ 1)
+        S_base_MVA = 1.0
+        print("    [units] MVABase not available; using 1.0 MVA (distribution-scale match to FD)")
     S_base_VA = S_base_MVA * 1e6
     print(f"    [dbg] Units: S_base_MVA={S_base_MVA}, S_base_VA={S_base_VA:.3e}")
 
