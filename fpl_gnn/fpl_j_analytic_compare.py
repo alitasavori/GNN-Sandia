@@ -150,27 +150,13 @@ def _compute_J_analytic_node_at_hour(
         print(f"        node {k}: {n} -> Y index {idx[k]} (YNodeOrder={y_nodes[idx[k]]})")
 
     Y_LL = Y[np.ix_(idx, idx)]
-    # Sanity check 3: condition number and basic stats of Y_LL
-    try:
-        cond_YLL = float(np.linalg.cond(Y_LL))
-    except Exception:
-        cond_YLL = float("inf")
-    max_abs_YLL = float(np.max(np.abs(Y_LL)))
-    print(
-        f"    [Y_LL] shape={Y_LL.shape}, max|Y_LL|={max_abs_YLL:.3e}, cond(Y_LL)≈{cond_YLL:.3e}"
-    )
 
-    Z_LL = np.linalg.inv(Y_LL)
-
+    # Build per-node voltage and current bases to convert Y_LL to per-unit.
     N = len(node_names)
-    A_node = np.zeros((N, N), dtype=np.float64)
-    B_node = np.zeros((N, N), dtype=np.float64)
+    Vbase_ln = np.zeros(N, dtype=np.float64)  # line-to-neutral base volts per node
+    Ibase = np.zeros(N, dtype=np.float64)     # base amps per node
 
-    # Attempt to get system MVA base from OpenDSS for unit alignment.
-    # FPL A,B in the draft are sensitivities per unit of *per-unit* power.
-    # Our finite-difference J_fd uses kW/kvar. If S_base is in MVA and P is in kW,
-    # then 1 kW = 0.001 MW, and P_pu = P_MW / S_base = (P_kw * 0.001) / S_base.
-    # Therefore dV/dP_kw = (dV/dP_pu) * (0.001 / S_base).
+    # System base MVA (same for all nodes)
     try:
         S_base_MVA = float(dss.Solution.MVABase())
     except Exception:
@@ -179,11 +165,53 @@ def _compute_J_analytic_node_at_hour(
         except Exception:
             S_base_MVA = 1.0
             print("    [units] MVABase not available; falling back to 1.0 MVA")
+    S_base_VA = S_base_MVA * 1e6
 
+    # For each node, get its bus kVBase (line-to-line) and derive line-to-neutral Vbase.
+    buses_seen: Dict[str, float] = {}
+    for k, n in enumerate(node_names):
+        bus_name, _ = n.split(".")
+        if bus_name not in buses_seen:
+            dss.Circuit.SetActiveBus(bus_name)
+            kv_ll = float(dss.Bus.kVBase())
+            buses_seen[bus_name] = kv_ll
+        kv_ll = buses_seen[bus_name]
+        if kv_ll <= 0.0:
+            kv_ll = 1.0  # fallback to avoid zero base
+        Vbase_ll = kv_ll * 1000.0
+        Vbase_ln[k] = Vbase_ll / np.sqrt(3.0)
+        Ibase[k] = S_base_VA / (np.sqrt(3.0) * Vbase_ll)
+
+    # Convert physical Y_LL to per-unit Y_LL_pu using:
+    #   I_pu_i = I_phys_i / Ibase_i
+    #   V_pu_j = V_phys_j / Vbase_ln_j
+    #   => Y_pu_ij = Y_phys_ij * Vbase_ln_j / Ibase_i
+    Y_LL_pu = np.zeros_like(Y_LL, dtype=np.complex128)
+    for i in range(N):
+        for j in range(N):
+            Y_LL_pu[i, j] = Y_LL[i, j] * (Vbase_ln[j] / Ibase[i])
+
+    # Sanity check 3: condition number and basic stats of Y_LL_pu
+    try:
+        cond_YLL_pu = float(np.linalg.cond(Y_LL_pu))
+    except Exception:
+        cond_YLL_pu = float("inf")
+    max_abs_YLL_pu = float(np.max(np.abs(Y_LL_pu)))
+    print(
+        f"    [Y_LL_pu] shape={Y_LL_pu.shape}, max|Y_LL_pu|={max_abs_YLL_pu:.3e}, "
+        f"cond(Y_LL_pu)≈{cond_YLL_pu:.3e}"
+    )
+
+    Z_LL_pu = np.linalg.inv(Y_LL_pu)
+
+    A_node = np.zeros((N, N), dtype=np.float64)
+    B_node = np.zeros((N, N), dtype=np.float64)
+
+    # J_fd uses kW/kvar; the formulas below give dV_pu/dP_pu, so we scale by 0.001/MVABase.
     scale_per_kw = 1e-3 / float(S_base_MVA)
     print(f"    [units] MVABase={S_base_MVA:.3f} MVA, scale_per_kw={scale_per_kw:.3e}")
 
-    # Compute A,B using the node-level formulas.
+    # Compute A,B using the node-level formulas with Z_LL in pu.
     max_abs_A_pu = 0.0
     max_abs_B_pu = 0.0
     for j in range(N):
@@ -193,7 +221,7 @@ def _compute_J_analytic_node_at_hour(
             continue
         for i in range(N):
             vi = v[i]
-            num = np.conj(vj) * Z_LL[j, i] / np.conj(vi)
+            num = np.conj(vj) * Z_LL_pu[j, i] / np.conj(vi)
             a_pu = float(np.real(num) / vj_mag)
             b_pu = float(np.imag(num) / vj_mag)
             max_abs_A_pu = max(max_abs_A_pu, abs(a_pu))
