@@ -103,6 +103,28 @@ def _compute_J_analytic_at_hour(
             row = indices[k]
             Y[row, col] = data[k]
 
+    # Sanity check 1: compare against dense SystemY (same YNodeOrder)
+    try:
+        Y_dense_flat = np.array(dss.Circuit.SystemY(), dtype=np.complex128)
+        if Y_dense_flat.size == nY * nY:
+            Y_dense = Y_dense_flat.reshape((nY, nY))
+            Y_diff = Y - Y_dense
+            max_abs_Y = float(np.max(np.abs(Y)))
+            max_abs_diff_Y = float(np.max(np.abs(Y_diff)))
+            fro_diff_Y = float(np.linalg.norm(Y_diff))
+            print(
+                f"    [Y-check] nY={nY}, max|Y|={max_abs_Y:.3e}, "
+                f"max|Y_sparse-Y_dense|={max_abs_diff_Y:.3e}, "
+                f"||Y_sparse-Y_dense||_F={fro_diff_Y:.3e}"
+            )
+        else:
+            print(
+                f"    [Y-check] SystemY size mismatch: "
+                f"{Y_dense_flat.size} vs {nY*nY}"
+            )
+    except Exception as exc:
+        print(f\"    [Y-check] SystemY comparison failed: {exc}\")
+
     # Map our node_names (bus.phase) to Y-node indices; preserve node_names order
     y_map: Dict[str, int] = {str(n).lower(): i for i, n in enumerate(y_nodes)}
     idx = []
@@ -113,7 +135,23 @@ def _compute_J_analytic_at_hour(
         idx.append(y_map[key])
     idx = np.asarray(idx, dtype=int)
 
+    # Sanity check 2: show a few node-to-Y mappings
+    print(\"    [Y-map] first 5 node_names -> YNodeOrder indices:\")
+    for k in range(min(5, len(node_names))):
+        n = node_names[k]
+        print(f\"        node {k}: {n} -> Y index {idx[k]} (YNodeOrder={y_nodes[idx[k]]})\")
+
     Y_LL = Y[np.ix_(idx, idx)]
+    # Sanity check 3: condition number and basic stats of Y_LL
+    try:
+        cond_YLL = float(np.linalg.cond(Y_LL))
+    except Exception:
+        cond_YLL = float(\"inf\")
+    max_abs_YLL = float(np.max(np.abs(Y_LL)))
+    print(
+        f\"    [Y_LL] shape={Y_LL.shape}, max|Y_LL|={max_abs_YLL:.3e}, cond(Y_LL)≈{cond_YLL:.3e}\"
+    )
+
     Z_LL = np.linalg.inv(Y_LL)
 
     N = len(node_names)
@@ -204,6 +242,17 @@ def compare_analytic_vs_fd_one_scenario(
         if J_analytic is None:
             print(f"[hour {hour:02d}] analytic solve did not converge; skipping")
             continue
+
+        # Per-hour sanity: basic norms of each J
+        max_abs_fd = float(np.max(np.abs(J_fd)))
+        fro_fd = float(np.linalg.norm(J_fd))
+        max_abs_an = float(np.max(np.abs(J_analytic)))
+        fro_an = float(np.linalg.norm(J_analytic))
+
+        print(
+            f"[hour {hour:02d}] J_fd: max|J|={max_abs_fd:.3e}, ||J||_F={fro_fd:.3e}; "
+            f"J_an: max|J|={max_abs_an:.3e}, ||J||_F={fro_an:.3e}"
+        )
 
         diff = J_analytic - J_fd
         max_abs = float(np.max(np.abs(diff)))
