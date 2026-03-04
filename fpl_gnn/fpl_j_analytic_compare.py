@@ -158,6 +158,23 @@ def _compute_J_analytic_at_hour(
     A = np.zeros((N, N), dtype=np.float64)
     B = np.zeros((N, N), dtype=np.float64)
 
+    # Attempt to get system MVA base from OpenDSS for unit alignment.
+    # FPL A,B in the draft are sensitivities per unit of *per-unit* power.
+    # Our finite-difference J_fd uses kW/kvar. If S_base is in MVA and P is in kW,
+    # then 1 kW = 0.001 MW, and P_pu = P_MW / S_base = (P_kw * 0.001) / S_base.
+    # Therefore dV/dP_kw = (dV/dP_pu) * (0.001 / S_base).
+    try:
+        S_base_MVA = float(dss.Solution.MVABase())
+    except Exception:
+        try:
+            S_base_MVA = float(dss.Circuit.MVABase())
+        except Exception:
+            S_base_MVA = 1.0
+            print("    [units] MVABase not available; falling back to 1.0 MVA")
+
+    scale_per_kw = 1e-3 / float(S_base_MVA)
+    print(f"    [units] MVABase={S_base_MVA:.3f} MVA, scale_per_kw={scale_per_kw:.3e}")
+
     for j in range(N):
         vj = v[j]
         vj_mag = float(np.abs(vj))
@@ -165,10 +182,14 @@ def _compute_J_analytic_at_hour(
             continue
         for i in range(N):
             vi = v[i]
-            # Simplified per-node FPL coefficient
+            # Simplified per-node FPL coefficient (|Phi_i| = 1 at node level),
+            # giving sensitivity per unit of *per-unit* power injection.
             num = np.conj(vj) * Z_LL[j, i] / np.conj(vi)
-            A[j, i] = float(np.real(num) / vj_mag)
-            B[j, i] = float(np.imag(num) / vj_mag)
+            a_pu = float(np.real(num) / vj_mag)
+            b_pu = float(np.imag(num) / vj_mag)
+            # Convert to sensitivity per kW/kvar (to match finite-difference J_fd)
+            A[j, i] = a_pu * scale_per_kw
+            B[j, i] = b_pu * scale_per_kw
 
     J_analytic = np.concatenate([A, B], axis=1)
     return J_analytic, A, B
