@@ -123,7 +123,7 @@ def _compute_J_analytic_at_hour(
                 f"{Y_dense_flat.size} vs {nY*nY}"
             )
     except Exception as exc:
-        print(f\"    [Y-check] SystemY comparison failed: {exc}\")
+        print(f"    [Y-check] SystemY comparison failed: {exc}")
 
     # Map our node_names (bus.phase) to Y-node indices; preserve node_names order
     y_map: Dict[str, int] = {str(n).lower(): i for i, n in enumerate(y_nodes)}
@@ -136,20 +136,20 @@ def _compute_J_analytic_at_hour(
     idx = np.asarray(idx, dtype=int)
 
     # Sanity check 2: show a few node-to-Y mappings
-    print(\"    [Y-map] first 5 node_names -> YNodeOrder indices:\")
+    print("    [Y-map] first 5 node_names -> YNodeOrder indices:")
     for k in range(min(5, len(node_names))):
         n = node_names[k]
-        print(f\"        node {k}: {n} -> Y index {idx[k]} (YNodeOrder={y_nodes[idx[k]]})\")
+        print(f"        node {k}: {n} -> Y index {idx[k]} (YNodeOrder={y_nodes[idx[k]]})")
 
     Y_LL = Y[np.ix_(idx, idx)]
     # Sanity check 3: condition number and basic stats of Y_LL
     try:
         cond_YLL = float(np.linalg.cond(Y_LL))
     except Exception:
-        cond_YLL = float(\"inf\")
+        cond_YLL = float("inf")
     max_abs_YLL = float(np.max(np.abs(Y_LL)))
     print(
-        f\"    [Y_LL] shape={Y_LL.shape}, max|Y_LL|={max_abs_YLL:.3e}, cond(Y_LL)≈{cond_YLL:.3e}\"
+        f"    [Y_LL] shape={Y_LL.shape}, max|Y_LL|={max_abs_YLL:.3e}, cond(Y_LL)≈{cond_YLL:.3e}"
     )
 
     Z_LL = np.linalg.inv(Y_LL)
