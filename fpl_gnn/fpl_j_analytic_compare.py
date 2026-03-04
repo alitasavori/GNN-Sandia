@@ -457,7 +457,21 @@ def compare_analytic_vs_fd_one_scenario(
         max_abs = float(np.max(np.abs(diff)))
         fro_norm = float(np.linalg.norm(diff))
 
+        # Best-fit scalar c such that c*J_analytic is closest to J_fd in Frobenius norm:
+        #   c* = <J_fd, J_an> / ||J_an||_F^2
+        num = float(np.vdot(J_analytic, J_fd).real)  # inner product
+        den = float(np.vdot(J_analytic, J_analytic).real) + 1e-16
+        c_star = num / den
+        J_scaled = c_star * J_analytic
+        diff_scaled = J_scaled - J_fd
+        max_abs_scaled = float(np.max(np.abs(diff_scaled)))
+        fro_norm_scaled = float(np.linalg.norm(diff_scaled))
+
         print(f"[hour {hour:02d}] J analytic vs FD: max|ΔJ|={max_abs:.3e}, ||ΔJ||_F={fro_norm:.3e}")
+        print(
+            f"    [hour {hour:02d}] best-fit c*: {c_star:.3e}; "
+            f"scaled: max|ΔJ|={max_abs_scaled:.3e}, ||ΔJ||_F={fro_norm_scaled:.3e}"
+        )
 
         results_by_hour[hour] = dict(
             A_fd=A_fd,
@@ -466,6 +480,9 @@ def compare_analytic_vs_fd_one_scenario(
             B_analytic=B_analytic,
             max_abs_diff=max_abs,
             fro_norm_diff=fro_norm,
+            best_fit_c=c_star,
+            max_abs_diff_scaled=max_abs_scaled,
+            fro_norm_diff_scaled=fro_norm_scaled,
         )
 
     return results_by_hour
