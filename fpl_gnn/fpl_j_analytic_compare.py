@@ -482,7 +482,7 @@ def _plot_analytic_vs_fd(results_by_hour: Dict[int, Dict], out_dir: str = "fpl_g
     # Heatmap: |J_fd|
     ax = axes[0, 0]
     im0 = ax.imshow(np.abs(J_fd), aspect="auto", cmap="viridis")
-    ax.set_title(r"Finite-difference $|\mathbf{J}_{\mathrm{fd}}|$ (hour {:02d})".format(hour))
+    ax.set_title(r"Finite-difference $|\mathbf{{J}}_{{\mathrm{{fd}}}}|$ (hour {:02d})".format(hour))
     ax.set_xlabel("Input (P then Q)")
     ax.set_ylabel("Output node")
     plt.colorbar(im0, ax=ax, label="|J| (pu/kW or pu/kvar)")
@@ -490,7 +490,7 @@ def _plot_analytic_vs_fd(results_by_hour: Dict[int, Dict], out_dir: str = "fpl_g
     # Heatmap: |J_analytic|
     ax = axes[0, 1]
     im1 = ax.imshow(np.abs(J_an), aspect="auto", cmap="viridis")
-    ax.set_title(r"Analytical $|\mathbf{J}_{\mathrm{an}}|$ (hour {:02d})".format(hour))
+    ax.set_title(r"Analytical $|\mathbf{{J}}_{{\mathrm{{an}}}}|$ (hour {:02d})".format(hour))
     ax.set_xlabel("Input (P then Q)")
     ax.set_ylabel("Output node")
     plt.colorbar(im1, ax=ax, label="|J| (pu/kW or pu/kvar)")
@@ -500,7 +500,7 @@ def _plot_analytic_vs_fd(results_by_hour: Dict[int, Dict], out_dir: str = "fpl_g
     diff = J_fd - J_an_scaled
     vmax = max(np.abs(diff).max(), 1e-9)
     im2 = ax.imshow(diff, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-    ax.set_title(r"Difference $\mathbf{J}_{\mathrm{fd}} - c^*\mathbf{J}_{\mathrm{an}}$ ($c^*={:.2f}$)".format(c_star))
+    ax.set_title(r"Difference $\mathbf{{J}}_{{\mathrm{{fd}}}} - c^*\mathbf{{J}}_{{\mathrm{{an}}}}$ ($c^*={:.2f}$)".format(c_star))
     ax.set_xlabel("Input (P then Q)")
     ax.set_ylabel("Output node")
     plt.colorbar(im2, ax=ax, label="ΔJ")
