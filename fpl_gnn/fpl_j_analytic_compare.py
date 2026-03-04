@@ -385,23 +385,26 @@ def compare_analytic_vs_fd_one_scenario(
     loadshape_name: str = "5minDayShape",
 ):
     """
-    For a single scenario (one day, fixed P_load/Q_load), compute bus-level
+    For a single scenario (one day, fixed P_load/Q_load), compute NODE-LEVEL
     FPL coefficients analytically vs finite-difference and compare for each
     hour (0..23).
 
-    Both sides implement the draft's bus-level, multi-phase A,B:
-      - Analytic: uses Z_LL and the formulas in the LaTeX draft.
-      - Finite-difference: injects 1 kW / 1 kvar at each bus (spread across
-        its phases) and observes ΔV at all nodes.
+    Both sides are node-level now:
+      - Analytic: uses Z_LL and the node-level FPL formula (no phase averaging).
+      - Finite-difference: injects 1 kW / 1 kvar at each node (bus.phase) and
+        observes ΔV at all nodes.
 
     Returns:
       dict: hour -> {
-          "A_fd": (N_nodes, N_buses),
-          "B_fd": (N_nodes, N_buses),
-          "A_analytic": (N_nodes, N_buses),
-          "B_analytic": (N_nodes, N_buses),
-          "max_abs_diff": max_ij |J_analytic - J_fd| where J=[A|B],
-          "fro_norm_diff": Frobenius norm of J_analytic - J_fd
+          "J_fd": (N_nodes, 2*N_nodes),
+          "J_analytic": (N_nodes, 2*N_nodes),
+          "A_analytic": (N_nodes, N_nodes),
+          "B_analytic": (N_nodes, N_nodes),
+          "max_abs_diff": max_ij |J_analytic - J_fd|,
+          "fro_norm_diff": Frobenius norm of J_analytic - J_fd,
+          "best_fit_c": scalar minimizing ||c*J_analytic - J_fd||_F,
+          "max_abs_diff_scaled": max_ij |c*J_analytic - J_fd|,
+          "fro_norm_diff_scaled": ||c*J_analytic - J_fd||_F
       }
     """
     del master_seed  # kept for potential future use; not needed currently
@@ -422,17 +425,32 @@ def compare_analytic_vs_fd_one_scenario(
     sigL = 0.0
     sigD = 0.0
 
-    # Build bus map once (time-invariant)
-    bus_names, bus_to_idx = _build_bus_phase_map(node_names)
-    print(f"[global] N_nodes={len(node_names)}, N_buses={len(bus_names)}")
+    N = len(node_names)
+    print(f"[global] N_nodes={N}")
 
     results_by_hour: Dict[int, Dict] = {}
 
     for hour in range(24):
         print(f"\n=== Hour {hour:02d} ===")
 
-        # Analytic A,B from Z_LL (bus-level, multi-phase)
-        J_analytic, A_analytic, B_analytic = _compute_J_analytic_at_hour(
+        # Finite-difference J around load-only base (node-level)
+        v_base, x_base = _apply_snapshot_load_only(
+            dss_path, node_names, P_load_kw, Q_load_kvar, hour, mL,
+            loads_dss, dev_to_dss_load, dev_to_busph_load,
+            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+        )
+        if v_base is None:
+            print(f"[hour {hour:02d}] base solve did not converge; skipping")
+            continue
+
+        J_fd = _compute_J_at_hour(
+            dss_path, node_names, v_base, x_base, P_load_kw, Q_load_kvar, hour, mL,
+            loads_dss, dev_to_dss_load, dev_to_busph_load,
+            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+        )
+
+        # Analytic J from Z_LL (node-level)
+        J_analytic, A_analytic, B_analytic = _compute_J_analytic_node_at_hour(
             dss_path, node_names, P_load_kw, Q_load_kvar, hour, mL,
             loads_dss, dev_to_dss_load, dev_to_busph_load,
             pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
@@ -441,17 +459,6 @@ def compare_analytic_vs_fd_one_scenario(
             print(f"[hour {hour:02d}] analytic solve did not converge; skipping")
             continue
 
-        # Finite-difference A,B at bus level
-        A_fd, B_fd = _compute_J_fd_bus_at_hour(
-            dss_path, node_names, bus_names, bus_to_idx,
-            P_load_kw, Q_load_kvar, hour, mL,
-            loads_dss, dev_to_dss_load, dev_to_busph_load,
-            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
-            dP_bus_kw=1.0, dQ_bus_kvar=1.0,
-        )
-
-        J_fd = np.concatenate([A_fd, B_fd], axis=1)
-
         # Per-hour sanity: basic norms of each J
         max_abs_fd = float(np.max(np.abs(J_fd)))
         fro_fd = float(np.linalg.norm(J_fd))
@@ -459,18 +466,18 @@ def compare_analytic_vs_fd_one_scenario(
         fro_an = float(np.linalg.norm(J_analytic))
 
         print(
-            f"[hour {hour:02d}] J_fd (bus-level): max|J|={max_abs_fd:.3e}, ||J||_F={fro_fd:.3e}; "
+            f"[hour {hour:02d}] J_fd (node-level): max|J|={max_abs_fd:.3e}, ||J||_F={fro_fd:.3e}; "
             f"J_an: max|J|={max_abs_an:.3e}, ||J||_F={fro_an:.3e}"
         )
 
-        # Column-wise sanity for first few buses
-        for bi, bus in enumerate(bus_names[:3]):
-            col_fd_A = A_fd[:, bi]
-            col_an_A = A_analytic[:, bi]
+        # Column-wise sanity for first few input nodes (P columns)
+        for i in range(min(3, N)):
+            col_fd = J_fd[:, i]
+            col_an = J_analytic[:, i]
             print(
-                f"    [hour {hour:02d}] bus {bus}: "
-                f"max|A_fd|={np.max(np.abs(col_fd_A)):.3e}, "
-                f"max|A_an|={np.max(np.abs(col_an_A)):.3e}"
+                f"    [hour {hour:02d}] input node {node_names[i]} (P): "
+                f"max|J_fd|={np.max(np.abs(col_fd)):.3e}, "
+                f"max|J_an|={np.max(np.abs(col_an)):.3e}"
             )
 
         diff = J_analytic - J_fd
@@ -494,8 +501,8 @@ def compare_analytic_vs_fd_one_scenario(
         )
 
         results_by_hour[hour] = dict(
-            A_fd=A_fd,
-            B_fd=B_fd,
+            J_fd=J_fd,
+            J_analytic=J_analytic,
             A_analytic=A_analytic,
             B_analytic=B_analytic,
             max_abs_diff=max_abs,
