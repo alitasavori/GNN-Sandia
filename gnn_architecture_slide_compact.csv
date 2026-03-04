@@ -1,0 +1,8 @@
+layer,input,operation,output
+node_emb,node_id,Embedding(N 8),z
+phi0,x concat z,MLP in-h-h-out,h
+edge_emb,edge_id,Embedding(E 4),r
+message,h_j edge_attr r,psi MLP agg add,m
+update,h m z,MLP concat,h
+repeat,message and update,4 layers,
+readout,h,MLP to 1,v_pu

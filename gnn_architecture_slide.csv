@@ -1,0 +1,20 @@
+component,parameter,value,notes
+hyperparameters,h_dim,32,hidden dimension
+hyperparameters,num_layers,4,message-passing layers
+hyperparameters,node_emb_dim,8,PFIdentityGNN only
+hyperparameters,edge_emb_dim,4,PFIdentityGNN only
+hyperparameters,edge_in_dim,2,R_full and X_full
+hyperparameters,out_dim,1,voltage magnitude (pu)
+MLP,structure,"Linear→ReLU→Linear→ReLU→Linear",2 hidden layers
+MLP,phi0_in,"node_in_dim + node_emb_dim",or node_in_dim for NoEmb
+MLP,phi0_out,h_dim,
+MLP,phi0_hidden,h_dim,
+message,aggregation,add,
+message,psi_input,"[h_j, edge_attr, edge_emb]",or [h_j, edge_attr] for NoEmb
+message,psi_output,h_dim,
+update,input,"[h, m, z]",or [h, m] for NoEmb (z=node emb)
+update,output,h_dim,
+readout,input,h_dim,
+readout,output,1,
+node_embedding,type,nn.Embedding(num_nodes, node_emb_dim),PFIdentityGNN only
+edge_embedding,type,nn.Embedding(num_edges, edge_emb_dim),PFIdentityGNN only
