@@ -131,7 +131,11 @@ def _compute_J_analytic_node_at_hour(
                 f"{Y_dense_flat.size} vs {nY*nY}"
             )
     except Exception as exc:
-        print(f"    [Y-check] SystemY comparison failed: {exc}")
+        print(f"    [Y-check] SystemY comparison failed: {type(exc).__name__}: {exc}")
+    print(
+        f"    [dbg] Y: nY={nY} (full circuit nodes), N={len(node_names)} (our node set), "
+        f"Y_LL shape=({len(node_names)},{len(node_names)})"
+    )
 
     # Map our node_names (bus.phase) to Y-node indices; preserve node_names order
     y_map: Dict[str, int] = {str(n).lower(): i for i, n in enumerate(y_nodes)}
@@ -156,16 +160,45 @@ def _compute_J_analytic_node_at_hour(
     Vbase_ln = np.zeros(N, dtype=np.float64)  # line-to-neutral base volts per node
     Ibase = np.zeros(N, dtype=np.float64)     # base amps per node
 
-    # System base MVA (same for all nodes)
-    try:
-        S_base_MVA = float(dss.Solution.MVABase())
-    except Exception:
+    # System base MVA (same for all nodes).
+    # OpenDSS often leaves MVABase unset after compile, so get can fail or return 0.
+    # Set it explicitly via the text interface if needed, then read.
+    S_base_MVA = None
+    _has_sol = hasattr(dss.Solution, "MVABase")
+    _has_ckt = hasattr(dss.Circuit, "MVABase")
+    print(f"    [dbg] MVABase: hasattr(Solution.MVABase)={_has_sol}, hasattr(Circuit.MVABase)={_has_ckt}")
+    for attempt in range(2):  # try get, then set+get once
         try:
-            S_base_MVA = float(dss.Circuit.MVABase())
-        except Exception:
-            S_base_MVA = 1.0
-            print("    [units] MVABase not available; falling back to 1.0 MVA")
+            if _has_sol:
+                val = dss.Solution.MVABase()
+                print(f"    [dbg] MVABase attempt={attempt} Solution.MVABase() raw={val!r} type={type(val).__name__}")
+                if val is not None and float(val) > 0:
+                    S_base_MVA = float(val)
+                    print(f"    [dbg] MVABase using Solution.MVABase() -> {S_base_MVA}")
+                    break
+        except Exception as e:
+            print(f"    [dbg] MVABase attempt={attempt} Solution.MVABase() exception: {type(e).__name__}: {e}")
+        try:
+            if S_base_MVA is None and _has_ckt:
+                val = dss.Circuit.MVABase()
+                print(f"    [dbg] MVABase attempt={attempt} Circuit.MVABase() raw={val!r} type={type(val).__name__}")
+                if val is not None and float(val) > 0:
+                    S_base_MVA = float(val)
+                    print(f"    [dbg] MVABase using Circuit.MVABase() -> {S_base_MVA}")
+                    break
+        except Exception as e:
+            print(f"    [dbg] MVABase attempt={attempt} Circuit.MVABase() exception: {type(e).__name__}: {e}")
+        if S_base_MVA is None:
+            try:
+                dss.Text.Command("set MVABase=100")
+                print("    [dbg] MVABase sent: set MVABase=100")
+            except Exception as e:
+                print(f"    [dbg] MVABase set command exception: {type(e).__name__}: {e}")
+    if S_base_MVA is None or S_base_MVA <= 0:
+        S_base_MVA = 100.0
+        print("    [units] MVABase not available; using 100.0 MVA (set or fallback)")
     S_base_VA = S_base_MVA * 1e6
+    print(f"    [dbg] Units: S_base_MVA={S_base_MVA}, S_base_VA={S_base_VA:.3e}")
 
     # For each node, get its bus kVBase (line-to-line) and derive line-to-neutral Vbase.
     buses_seen: Dict[str, float] = {}
@@ -181,6 +214,11 @@ def _compute_J_analytic_node_at_hour(
         Vbase_ll = kv_ll * 1000.0
         Vbase_ln[k] = Vbase_ll / np.sqrt(3.0)
         Ibase[k] = S_base_VA / (np.sqrt(3.0) * Vbase_ll)
+
+    print(
+        f"    [dbg] Vbase/Ibase sample: node0 {node_names[0]} Vbase_ln={Vbase_ln[0]:.2f} V Ibase={Ibase[0]:.4f} A; "
+        f"min/max Vbase_ln={Vbase_ln.min():.2f}/{Vbase_ln.max():.2f} Ibase={Ibase.min():.4f}/{Ibase.max():.4f}"
+    )
 
     # Convert physical Y_LL to per-unit Y_LL_pu using:
     #   I_pu_i = I_phys_i / Ibase_i
@@ -210,6 +248,11 @@ def _compute_J_analytic_node_at_hour(
     # J_fd uses kW/kvar; the formulas below give dV_pu/dP_pu, so we scale by 0.001/MVABase.
     scale_per_kw = 1e-3 / float(S_base_MVA)
     print(f"    [units] MVABase={S_base_MVA:.3f} MVA, scale_per_kw={scale_per_kw:.3e}")
+    v_mag = np.abs(v)
+    print(
+        f"    [dbg] FPL voltages: min|v|={v_mag.min():.6f} max|v|={v_mag.max():.6f} mean|v|={v_mag.mean():.6f}; "
+        f"nonzero={np.count_nonzero(v_mag > 1e-9)}/{N}"
+    )
 
     # Compute A,B using the node-level formulas with Z_LL in pu.
     max_abs_A_pu = 0.0
@@ -272,8 +315,12 @@ def compare_analytic_vs_fd_one_scenario(
     """
     del master_seed  # kept for potential future use; not needed currently
 
+    print("[dbg] compare_analytic_vs_fd_one_scenario: P_load_kw={} Q_load_kvar={} loadshape_name={}".format(
+        P_load_kw, Q_load_kvar, loadshape_name
+    ))
     dss_path = inj.compile_once()
     inj.setup_daily()
+    print(f"[dbg] dss_path={dss_path}")
 
     node_names, _, _, bus_to_phases = inj.get_all_bus_phase_nodes()
 
@@ -290,6 +337,7 @@ def compare_analytic_vs_fd_one_scenario(
 
     N = len(node_names)
     print(f"[global] N_nodes={N}")
+    print(f"[dbg] first 3 node_names={node_names[:3]} last 3={node_names[-3:]}")
 
     results_by_hour: Dict[int, Dict] = {}
 
@@ -375,5 +423,23 @@ def compare_analytic_vs_fd_one_scenario(
             fro_norm_diff_scaled=fro_norm_scaled,
         )
 
+    # Ultimate debug summary
+    hours_ok = list(results_by_hour.keys())
+    print(
+        f"[dbg] SUMMARY: hours_computed={len(hours_ok)}/{24} hours_ok={hours_ok[:5]}{'...' if len(hours_ok) > 5 else ''}"
+    )
+    if hours_ok:
+        c_list = [results_by_hour[h]["best_fit_c"] for h in hours_ok]
+        fro_list = [results_by_hour[h]["fro_norm_diff"] for h in hours_ok]
+        fro_scaled_list = [results_by_hour[h]["fro_norm_diff_scaled"] for h in hours_ok]
+        print(
+            f"[dbg] SUMMARY: best_fit_c* min={min(c_list):.4e} max={max(c_list):.4e} mean={np.mean(c_list):.4e}"
+        )
+        print(
+            f"[dbg] SUMMARY: ||ΔJ||_F (unscaled) min={min(fro_list):.4e} max={max(fro_list):.4e} mean={np.mean(fro_list):.4e}"
+        )
+        print(
+            f"[dbg] SUMMARY: ||ΔJ||_F (scaled) min={min(fro_scaled_list):.4e} max={max(fro_scaled_list):.4e} mean={np.mean(fro_scaled_list):.4e}"
+        )
     return results_by_hour
 
