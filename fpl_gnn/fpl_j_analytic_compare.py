@@ -13,10 +13,19 @@ In this experiment we make BOTH methods node-level:
 So J has shape (N_nodes, 2*N_nodes) for both analytic and FD.
 """
 
+import os
 from typing import Dict, List
 
 import numpy as np
 import opendssdirect as dss
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
 
 import run_injection_dataset as inj
 from fpl_gnn.fpl_gnn_dataset import (
@@ -448,5 +457,97 @@ def compare_analytic_vs_fd_one_scenario(
         print(
             f"[dbg] SUMMARY: ||ΔJ||_F (scaled) min={min(fro_scaled_list):.4e} max={max(fro_scaled_list):.4e} mean={np.mean(fro_scaled_list):.4e}"
         )
+    if _HAS_MPL and results_by_hour:
+        _plot_analytic_vs_fd(results_by_hour, out_dir=os.path.join(os.path.dirname(__file__), "..", "fpl_gnn_output"))
+
     return results_by_hour
+
+
+def _plot_analytic_vs_fd(results_by_hour: Dict[int, Dict], out_dir: str = "fpl_gnn_output") -> None:
+    """Plot comparison of analytical vs finite-difference J for report (heatmaps + scatter)."""
+    if not results_by_hour:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    # Pick a representative hour (noon if available, else first)
+    hour = 12 if 12 in results_by_hour else next(iter(results_by_hour.keys()))
+    r = results_by_hour[hour]
+    J_fd = r["J_fd"]
+    J_an = r["J_analytic"]
+    c_star = r["best_fit_c"]
+    N = J_fd.shape[0]
+    J_an_scaled = c_star * J_an
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 9))
+
+    # Heatmap: |J_fd|
+    ax = axes[0, 0]
+    im0 = ax.imshow(np.abs(J_fd), aspect="auto", cmap="viridis")
+    ax.set_title(r"Finite-difference $|\mathbf{J}_{\mathrm{fd}}|$ (hour {:02d})".format(hour))
+    ax.set_xlabel("Input (P then Q)")
+    ax.set_ylabel("Output node")
+    plt.colorbar(im0, ax=ax, label="|J| (pu/kW or pu/kvar)")
+
+    # Heatmap: |J_analytic|
+    ax = axes[0, 1]
+    im1 = ax.imshow(np.abs(J_an), aspect="auto", cmap="viridis")
+    ax.set_title(r"Analytical $|\mathbf{J}_{\mathrm{an}}|$ (hour {:02d})".format(hour))
+    ax.set_xlabel("Input (P then Q)")
+    ax.set_ylabel("Output node")
+    plt.colorbar(im1, ax=ax, label="|J| (pu/kW or pu/kvar)")
+
+    # Heatmap: difference J_fd - c*J_an
+    ax = axes[1, 0]
+    diff = J_fd - J_an_scaled
+    vmax = max(np.abs(diff).max(), 1e-9)
+    im2 = ax.imshow(diff, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax.set_title(r"Difference $\mathbf{J}_{\mathrm{fd}} - c^*\mathbf{J}_{\mathrm{an}}$ ($c^*={:.2f}$)".format(c_star))
+    ax.set_xlabel("Input (P then Q)")
+    ax.set_ylabel("Output node")
+    plt.colorbar(im2, ax=ax, label="ΔJ")
+
+    # Scatter: J_fd vs J_an (flattened)
+    ax = axes[1, 1]
+    fd_flat = J_fd.ravel()
+    an_flat = J_an.ravel()
+    ax.scatter(fd_flat, an_flat, alpha=0.4, s=8, c="C0", label=r"$\mathbf{J}_{\mathrm{an}}$")
+    ax.scatter(fd_flat, (c_star * J_an).ravel(), alpha=0.4, s=8, c="C1", label=r"$c^*\mathbf{J}_{\mathrm{an}}$")
+    lim = max(np.abs(fd_flat).max(), np.abs(an_flat).max(), 1e-9)
+    ax.plot([-lim, lim], [-lim, lim], "k--", lw=1, label="y=x")
+    ax.set_xlabel(r"$\mathbf{J}_{\mathrm{fd}}$ (pu/kW or pu/kvar)")
+    ax.set_ylabel("Analytical J (pu/kW or pu/kvar)")
+    ax.set_title("Entry-wise comparison (hour {:02d})".format(hour))
+    ax.legend(loc="upper left", fontsize=8)
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "j_analytic_vs_fd_comparison.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print("[plot] Saved {}".format(path))
+
+    # Second figure: norms and c* over hours
+    fig2, axes2 = plt.subplots(1, 2, figsize=(9, 4))
+    hours = sorted(results_by_hour.keys())
+    fro_fd = [np.linalg.norm(results_by_hour[h]["J_fd"]) for h in hours]
+    fro_an = [np.linalg.norm(results_by_hour[h]["J_analytic"]) for h in hours]
+    c_list = [results_by_hour[h]["best_fit_c"] for h in hours]
+    axes2[0].plot(hours, fro_fd, "o-", label=r"$\|\mathbf{J}_{\mathrm{fd}}\|_F$")
+    axes2[0].plot(hours, fro_an, "s-", label=r"$\|\mathbf{J}_{\mathrm{an}}\|_F$")
+    axes2[0].set_xlabel("Hour")
+    axes2[0].set_ylabel("Frobenius norm")
+    axes2[0].legend()
+    axes2[0].set_title("Jacobian norms by hour")
+    axes2[0].grid(True, alpha=0.3)
+    axes2[1].plot(hours, c_list, "o-", color="C2")
+    axes2[1].set_xlabel("Hour")
+    axes2[1].set_ylabel(r"Best-fit $c^*$")
+    axes2[1].set_title(r"Scale factor $c^*$ (min $\|\mathbf{J}_{\mathrm{fd}} - c\mathbf{J}_{\mathrm{an}}\|_F$)")
+    axes2[1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    path2 = os.path.join(out_dir, "j_analytic_vs_fd_norms_by_hour.png")
+    plt.savefig(path2, dpi=150, bbox_inches="tight")
+    plt.close()
+    print("[plot] Saved {}".format(path2))
 
