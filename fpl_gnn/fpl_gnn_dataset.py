@@ -1,21 +1,32 @@
 """
-FPL residual dataset with per-scenario draws from normal distributions.
+FPL residual dataset: DER (no PV). Per-scenario draws from Normal(mean, sigma).
 
-Per scenario:
-- Draw (P_load_total_kw, Q_load_total_kvar, P_der_total_kw, Q_der_total_kvar)
-  from Normal(means, sigma_shared) with clipping at >= 0.
-- sigma_shared is constant across all scenarios and applies to all 4 draws.
-- No per-timestep noise is used in OpenDSS snapshot application (sigma_load=0, sigma_pv=0).
+TERMINOLOGY: We use DER (distributed energy resource), not PV. The feeder may
+model DER as OpenDSS PVSystem elements; conceptually they inject P and Q as below.
 
-Per scenario per hour (24 samples):
-- Base case (load-only, DER off): solve PF -> v_base.
-- Compute FPL coefficients J = [A|B] for that hour by finite differences
-  around the load-only base (inject tiny ΔP and ΔQ at each node).
-- DER case (load + DER): DER P and Q follow the same DER profile over the day.
-  Since P_der and Q_der share the same profile, each scenario has a constant Q/P ratio.
-- Residual label: resid = v_true - (v_base + J @ [ΔP_der; ΔQ_der]).
+PER SCENARIO (constants for the whole scenario):
+- Draw once: P_load, Q_load, P_der, Q_der ~ Normal(mean, sigma_shared), clip >= 0.
+- sigma_shared is one common standard deviation for all four; same for all scenarios.
 
-The downstream model (MLP) learns resid as a function of [ΔP_der; ΔQ_der].
+DER INJECTION AT EACH HOUR:
+  DER injects P and Q from:
+    (average value from scenario draw) × (profile coefficient at that time).
+  So at hour h with profile coefficient m_der[h]:
+    P_der(h) = P_der × m_der[h],   Q_der(h) = Q_der × m_der[h].
+  The "average value" is the scenario-level draw (from Normal(mean, sigma)); the
+  profile coefficient is the time-of-day multiplier (same profile for P and Q).
+
+J AND BASE (once per hour):
+- Base case: load only, DER = 0, at the hour. Run AC network solve -> v_base.
+- Compute FPL J = [A|B] by finite differences around that base. J is kept for the full hour.
+
+DER CASE (every 5 minutes = profile resolution):
+- For each 5-min step: load and DER use profile coefficients at that step; run AC solve -> v_true.
+- FPL voltage: v_fpl = v_base + J @ [ΔP_der; ΔQ_der] (same J and v_base for all steps in that hour).
+- Residual (MLP target): resid = v_true - v_fpl.
+
+So we solve and store one sample per 5-min step; J and v_base are reused for all 12 steps in that hour.
+MLP learns resid from [ΔP_der; ΔQ_der].
 """
 import os
 from typing import Tuple, List, Dict
@@ -53,7 +64,7 @@ def _apply_snapshot_load_only(
     sigma_load: float = 0.0,
     sigma_der: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply load at hour h only; DER = 0. Solve and return (v_base, x_base)."""
+    """Apply load at hour h only; DER = 0. Run AC network solve; return (v_base, x_base)."""
     inj.dss.Basic.ClearAll()
     dss.Text.Command(f'compile "{dss_path}"')
     inj._apply_voltage_bases()
@@ -61,6 +72,7 @@ def _apply_snapshot_load_only(
     step = _hour_to_step(hour)
     inj.set_time_index(step)
     rng = np.random.default_rng(0)
+    # DER = 0 (API still uses P_pv_total_kw=0, mPV_t=0).
     _, busphP_load, busphQ_load, _, _ = inj.apply_snapshot_timeconditioned(
         P_load_total_kw=P_load,
         Q_load_total_kvar=Q_load,
@@ -103,7 +115,7 @@ def _apply_snapshot_load_and_der(
     Q_load: float,
     P_der: float,
     Q_der: float,
-    hour: int,
+    step: int,
     mL: np.ndarray,
     mPV: np.ndarray,
     loads_dss,
@@ -115,16 +127,16 @@ def _apply_snapshot_load_and_der(
     sigma_load: float = 0.0,
     sigma_der: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply load + DER at hour h. DER P and Q follow same profile (mPV). Return (v_true, delta_P, delta_Q) per node."""
+    """Apply load + DER at 5-min step. DER P and Q = (scenario P_der, Q_der) × profile at step. Run AC solve; return (v_true, delta_P, delta_Q) per node."""
     inj.dss.Basic.ClearAll()
     dss.Text.Command(f'compile "{dss_path}"')
     inj._apply_voltage_bases()
     inj.setup_daily()
-    step = _hour_to_step(hour)
     inj.set_time_index(step)
     rng = np.random.default_rng(0)
     mL_t = float(mL[step])
     mPV_t = float(mPV[step])
+    # DER P and Q = (scenario P_der, Q_der) × profile coefficient at this step (feeder models DER as PVSystem).
     _, busphP_load, busphQ_load, busphP_pv, busphQ_pv = inj.apply_snapshot_timeconditioned(
         P_load_total_kw=P_load,
         Q_load_total_kvar=Q_load,
@@ -141,19 +153,6 @@ def _apply_snapshot_load_and_der(
         sigma_pv=sigma_der,
         rng=rng,
     )
-    # Set PF per scenario so the DER produces the desired Q/P ratio.
-    # Note: OpenDSS PVSystem uses PF to determine reactive output (subject to kVA limits).
-    pf = 1.0
-    if (P_der * mPV_t) > 1e-9:
-        pf = float((P_der) / np.sqrt(P_der * P_der + Q_der * Q_der))
-        pf = float(np.clip(pf, 0.01, 1.0))
-    for pv_name in pv_dss:
-        dss.PVsystems.Name(pv_name)
-        try:
-            dss.PVsystems.PF(pf)
-        except Exception:
-            # If PF is not available in this build, we still proceed; delta_Q will be synthetic.
-            pass
     dss.Solution.Solve()
     if not dss.Solution.Converged():
         return None, None, None
@@ -192,7 +191,7 @@ def _compute_J_at_hour(
     sigma_load: float = 0.0,
     sigma_der: float = 0.0,
 ) -> np.ndarray:
-    """Finite-difference J at this hour (load-only base). J shape (N, 2N)."""
+    """Finite-difference J at this hour (load-only base). J shape (N, 2N). Perturbations run AC network solve."""
     N = len(node_names)
 
     def _solve_perturb(idx_node: int, dP: float, dQ: float) -> np.ndarray | None:
@@ -203,6 +202,7 @@ def _compute_J_at_hour(
         step = _hour_to_step(hour)
         inj.set_time_index(step)
         rng = np.random.default_rng(0)
+        # DER = 0 for perturbation base.
         inj.apply_snapshot_timeconditioned(
             P_load_total_kw=P_load,
             Q_load_total_kvar=Q_load,
@@ -252,19 +252,17 @@ def generate_fpl_residual_dataset(
     mu_P_load_kw: float = 1415.2,
     mu_Q_load_kvar: float = 835.2,
     mu_P_der_kw: float = 1000.0,
-    mu_Q_der_kvar: float = 0.0,
+    mu_Q_der_kvar: float = 800.0,
     sigma_shared: float = 50.0,
 ):
     """
-    Generate FPL residual dataset:
+    Generate FPL residual dataset (DER only). P and Q from two normals (e.g. mu_Q_der = 0.8*mu_P_der).
 
-    - 500 scenarios; per scenario (P_load, Q_load, P_der, Q_der) drawn from Normal(means, sigma_shared)
-      with clipping at >= 0. sigma_shared is constant across all scenarios.
-    - 24 hours per scenario; at each hour we compute A/B (J) from load-only base,
-      then solve with DER (P and Q, same profile), store delta_P/delta_Q from DER,
-      and residual = v_true - (v_base + J @ delta_der).
-    - Output: one row per (sample, node) with delta_P_kw, delta_Q_kvar, vmag_resid;
-      and sample-level metadata. For MLP: input = stacked [delta_P, delta_Q] (2N), output = residual (N).
+    Scenario draws: P_load, Q_load, P_der, Q_der ~ Normal(mean, sigma_shared), clip >= 0, once per scenario.
+    DER at each 5-min step: (P_der, Q_der) × profile coefficient at that step.
+
+    Per hour: one load-only solve -> v_base; one finite-diff -> J. Per 5-min step in that hour:
+    load+DER solve -> v_true; v_fpl = v_base + J @ [delta_P; delta_Q]; resid = v_true - v_fpl. One sample per step.
     """
     os.makedirs(out_dir, exist_ok=True)
     node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
@@ -325,44 +323,46 @@ def generate_fpl_residual_dataset(
                 pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
             )
 
-            v_true, delta_P, delta_Q = _apply_snapshot_load_and_der(
-                dss_path, node_names, P_load, Q_load, P_der, Q_der,
-                hour, mL, mPV,
-                loads_dss, dev_to_dss_load, dev_to_busph_load,
-                pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
-            )
-            if v_true is None:
-                skipped += 1
-                continue
+            for step in range(hour * STEPS_PER_HOUR, (hour + 1) * STEPS_PER_HOUR):
+                v_true, delta_P, delta_Q = _apply_snapshot_load_and_der(
+                    dss_path, node_names, P_load, Q_load, P_der, Q_der,
+                    step, mL, mPV,
+                    loads_dss, dev_to_dss_load, dev_to_busph_load,
+                    pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+                )
+                if v_true is None:
+                    skipped += 1
+                    continue
 
-            delta_x = np.concatenate([np.asarray(delta_P), np.asarray(delta_Q)], axis=0)
-            v_fpl = v_base + J @ delta_x
-            resid = v_true - v_fpl
+                delta_x = np.concatenate([np.asarray(delta_P), np.asarray(delta_Q)], axis=0)
+                v_fpl = v_base + J @ delta_x
+                resid = v_true - v_fpl
 
-            if not np.isfinite(resid).all() or np.any(v_true < inj.VMAG_PU_MIN) or np.any(v_true > inj.VMAG_PU_MAX):
-                skipped += 1
-                continue
+                if not np.isfinite(resid).all() or np.any(v_true < inj.VMAG_PU_MIN) or np.any(v_true > inj.VMAG_PU_MAX):
+                    skipped += 1
+                    continue
 
-            rows_sample.append({
-                "sample_id": sample_id,
-                "scenario_id": s,
-                "hour": hour,
-            })
-
-            for i, n in enumerate(node_names):
-                rows_node.append({
+                rows_sample.append({
                     "sample_id": sample_id,
-                    "node": n,
-                    "node_idx": node_to_idx[n],
-                    "delta_P_kw": float(delta_P[i]),
-                    "delta_Q_kvar": float(delta_Q[i]),
-                    "vmag_resid": float(resid[i]),
-                    "vmag_true": float(v_true[i]),
-                    "vmag_fpl": float(v_fpl[i]),
+                    "scenario_id": s,
+                    "hour": hour,
+                    "step": step,
                 })
 
-            sample_id += 1
-            kept += 1
+                for i, n in enumerate(node_names):
+                    rows_node.append({
+                        "sample_id": sample_id,
+                        "node": n,
+                        "node_idx": node_to_idx[n],
+                        "delta_P_kw": float(delta_P[i]),
+                        "delta_Q_kvar": float(delta_Q[i]),
+                        "vmag_resid": float(resid[i]),
+                        "vmag_true": float(v_true[i]),
+                        "vmag_fpl": float(v_fpl[i]),
+                    })
+
+                sample_id += 1
+                kept += 1
 
         if (s + 1) % 50 == 0 or s == 0:
             print(f"[scenario {s+1}/{n_scenarios}] kept={kept} skipped={skipped} Pload={P_load:.1f} Qload={Q_load:.1f} Pder={P_der:.1f}")
