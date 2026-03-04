@@ -6,9 +6,14 @@ This module exposes a helper to:
   - Finite differences (existing implementation in fpl_gnn_dataset)
   - Analytical FPL formula based on the network impedance matrix Z_LL
 - Compare the two for each hour of the day.
+
+In this experiment we make BOTH methods node-level:
+- Inputs: per node (bus.phase) P/Q injections
+- Outputs: per node (bus.phase) voltage magnitudes
+So J has shape (N_nodes, 2*N_nodes) for both analytic and FD.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import opendssdirect as dss
@@ -21,29 +26,9 @@ from fpl_gnn.fpl_gnn_dataset import (
 )
 
 
-def _build_bus_phase_map(
-    node_names: List[str],
-) -> Tuple[List[str], Dict[str, List[int]]]:
-    """
-    From node_names like '800.1', '800.2', build:
-      - ordered list of unique bus names
-      - mapping bus -> list of node indices (phases) Φ_i
-    This is used to implement the bus-level, multi-phase formulas in the draft.
-    """
-    bus_to_idx: Dict[str, List[int]] = {}
-    for idx, n in enumerate(node_names):
-        bus, _ = n.split(".")
-        bus_to_idx.setdefault(bus, []).append(idx)
-    bus_names = sorted(bus_to_idx.keys())
-    # Sort each Φ_i by node index for reproducibility
-    for b in bus_names:
-        bus_to_idx[b] = sorted(bus_to_idx[b])
-    return bus_names, bus_to_idx
-
-
-def _compute_J_analytic_at_hour(
+def _compute_J_analytic_node_at_hour(
     dss_path: str,
-    node_names,
+    node_names: List[str],
     P_load: float,
     Q_load: float,
     hour: int,
@@ -58,26 +43,22 @@ def _compute_J_analytic_at_hour(
     sigma_der: float = 0.0,
 ):
     """
-    Compute J via analytical FPL formula (Z_LL-based) for a given hour.
+    Compute NODE-LEVEL analytic J via Z_LL for a given hour.
 
-    This is a faithful implementation of the draft's bus-level, multi-phase
-    coefficients (A_{jφ,i,t}, B_{jφ,i,t}), adapted to our node list:
+    Here both inputs and outputs are at the node (bus.phase) level:
+      - Inputs: ΔP, ΔQ per node (no bus-level averaging over phases).
+      - Outputs: Δ|V| per node.
 
-      - Each node index j corresponds to (bus j, phase φ).
-      - Each bus i has a phase set Φ_i (indices of nodes at that bus).
-      - For each bus i and measurement node jφ:
+    For each pair of nodes (j, i):
+        A[j, i] = Re( v_j* * Z_LL[j, i] / v_i* ) / |v_j|
+        B[j, i] = Im( v_j* * Z_LL[j, i] / v_i* ) / |v_j|
 
-        A_{jφ,i,t} = (1/|Φ_i|) * sum_{ψ in Φ_i} Re[ v_j* Z_LL[jφ, iψ] / v_iψ* ] / |v_j|
-        B_{jφ,i,t} = (1/|Φ_i|) * sum_{ψ in Φ_i} Im[ v_j* Z_LL[jφ, iψ] / v_iψ* ] / |v_j|
-
-    We then convert these from sensitivities per unit of per-unit power
-    (as in the draft) to sensitivities per kW/kvar to match the FD J in
-    our dataset (which uses 1 kW / 1 kvar perturbations).
+    This approximates the fixed-point linearization at the node level.
 
     Returns:
-      J_analytic: (N_nodes, 2*N_buses) = [A | B] in units of pu per kW/kvar
-      A_bus: (N_nodes, N_buses) active-power sensitivities (per kW)
-      B_bus: (N_nodes, N_buses) reactive-power sensitivities (per kvar)
+      J_analytic: (N_nodes, 2*N_nodes) = [A | B] in units of pu per kW/kvar
+      A_node: (N_nodes, N_nodes) active-power sensitivities (per kW)
+      B_node: (N_nodes, N_nodes) reactive-power sensitivities (per kvar)
     """
     # Recreate load-only base for this hour (DER = 0)
     inj.dss.Basic.ClearAll()
@@ -182,17 +163,8 @@ def _compute_J_analytic_at_hour(
     Z_LL = np.linalg.inv(Y_LL)
 
     N = len(node_names)
-
-    # Build bus-level phase sets Φ_i for the draft formulas.
-    bus_names, bus_to_idx = _build_bus_phase_map(node_names)
-    M = len(bus_names)
-    print(f"    [bus-map] N_nodes={N}, N_buses={M}")
-    for b in bus_names[:5]:
-        phases = [node_names[idx] for idx in bus_to_idx[b]]
-        print(f"        bus {b}: Φ_i = {phases}")
-
-    A_bus = np.zeros((N, M), dtype=np.float64)
-    B_bus = np.zeros((N, M), dtype=np.float64)
+    A_node = np.zeros((N, N), dtype=np.float64)
+    B_node = np.zeros((N, N), dtype=np.float64)
 
     # Attempt to get system MVA base from OpenDSS for unit alignment.
     # FPL A,B in the draft are sensitivities per unit of *per-unit* power.
@@ -211,151 +183,171 @@ def _compute_J_analytic_at_hour(
     scale_per_kw = 1e-3 / float(S_base_MVA)
     print(f"    [units] MVABase={S_base_MVA:.3f} MVA, scale_per_kw={scale_per_kw:.3e}")
 
-    # Compute A,B using the bus-level, multi-phase formulas.
+    # Compute A,B using the node-level formulas.
     max_abs_A_pu = 0.0
     max_abs_B_pu = 0.0
-    for bus_idx, bus in enumerate(bus_names):
-        phi_indices = bus_to_idx[bus]
-        if not phi_indices:
+    for j in range(N):
+        vj = v[j]
+        vj_mag = float(np.abs(vj))
+        if vj_mag <= 1e-9:
             continue
-        Phi_card = float(len(phi_indices))
-        for j in range(N):
-            vj = v[j]
-            vj_mag = float(np.abs(vj))
-            if vj_mag <= 1e-9:
-                continue
-            num_sum = 0.0 + 0.0j
-            for idx_i in phi_indices:
-                vi = v[idx_i]
-                num_sum += np.conj(vj) * Z_LL[j, idx_i] / np.conj(vi)
-            num_avg = num_sum / Phi_card
-            a_pu = float(np.real(num_avg) / vj_mag)
-            b_pu = float(np.imag(num_avg) / vj_mag)
+        for i in range(N):
+            vi = v[i]
+            num = np.conj(vj) * Z_LL[j, i] / np.conj(vi)
+            a_pu = float(np.real(num) / vj_mag)
+            b_pu = float(np.imag(num) / vj_mag)
             max_abs_A_pu = max(max_abs_A_pu, abs(a_pu))
             max_abs_B_pu = max(max_abs_B_pu, abs(b_pu))
             # Convert to sensitivity per kW/kvar (to match finite-difference J_fd)
-            A_bus[j, bus_idx] = a_pu * scale_per_kw
-            B_bus[j, bus_idx] = b_pu * scale_per_kw
+            A_node[j, i] = a_pu * scale_per_kw
+            B_node[j, i] = b_pu * scale_per_kw
 
     print(
         f"    [A,B_pu] max|A_pu|={max_abs_A_pu:.3e}, max|B_pu|={max_abs_B_pu:.3e}"
     )
     print(
-        f"    [A,B_kw] max|A|={np.max(np.abs(A_bus)):.3e}, max|B|={np.max(np.abs(B_bus)):.3e}"
+        f"    [A,B_kw] max|A|={np.max(np.abs(A_node)):.3e}, max|B|={np.max(np.abs(B_node)):.3e}"
     )
 
-    J_analytic = np.concatenate([A_bus, B_bus], axis=1)
-    return J_analytic, A_bus, B_bus
+    J_analytic = np.concatenate([A_node, B_node], axis=1)
+    return J_analytic, A_node, B_node
 
 
-def _compute_J_fd_bus_at_hour(
-    dss_path: str,
-    node_names: List[str],
-    bus_names: List[str],
-    bus_to_idx: Dict[str, List[int]],
-    P_load: float,
-    Q_load: float,
-    hour: int,
-    mL: np.ndarray,
-    loads_dss,
-    dev_to_dss_load,
-    dev_to_busph_load,
-    pv_dss,
-    pv_to_dss,
-    pv_to_busph,
-    sigma_load: float = 0.0,
-    sigma_der: float = 0.0,
-    dP_bus_kw: float = 1.0,
-    dQ_bus_kvar: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray]:
+def compare_analytic_vs_fd_one_scenario(
+    P_load_kw: float,
+    Q_load_kvar: float,
+    master_seed: int = 20260304,
+    loadshape_name: str = "5minDayShape",
+):
     """
-    Compute bus-level finite-difference A,B at this hour.
+    For a single scenario (one day, fixed P_load/Q_load), compute NODE-LEVEL
+    FPL coefficients analytically vs finite-difference and compare for each
+    hour (0..23).
 
-    For each bus i:
-      - For A: inject +dP_bus_kw at bus i, equally across Φ_i phases; Q=0.
-      - For B: inject +dQ_bus_kvar at bus i, equally across Φ_i phases; P=0.
+    Both sides are node-level now:
+      - Analytic: uses Z_LL and the node-level FPL formula (no phase averaging).
+      - Finite-difference: injects 1 kW / 1 kvar at each node (bus.phase) and
+        observes ΔV at all nodes.
 
-    Use the same load-only operating point (DER=0) as the analytic J. All solves
-    use kW/kvar injections, so the resulting A_fd,B_fd are in pu per kW/kvar,
-    directly comparable to the scaled analytic A_bus,B_bus.
+    Returns:
+      dict: hour -> {
+          "J_fd": (N_nodes, 2*N_nodes),
+          "J_analytic": (N_nodes, 2*N_nodes),
+          "A_analytic": (N_nodes, N_nodes),
+          "B_analytic": (N_nodes, N_nodes),
+          "max_abs_diff": max_ij |J_analytic - J_fd|,
+          "fro_norm_diff": Frobenius norm of J_analytic - J_fd,
+          "best_fit_c": scalar minimizing ||c*J_analytic - J_fd||_F,
+          "max_abs_diff_scaled": max_ij |c*J_analytic - J_fd|,
+          "fro_norm_diff_scaled": ||c*J_analytic - J_fd||_F
+      }
     """
+    del master_seed  # kept for potential future use; not needed currently
+
+    dss_path = inj.compile_once()
+    inj.setup_daily()
+
+    node_names, _, _, bus_to_phases = inj.get_all_bus_phase_nodes()
+
+    csvL_token, _ = inj.find_loadshape_csv_in_dss(dss_path, loadshape_name)
+    csvL = inj.resolve_csv_path(csvL_token, dss_path)
+    mL = inj.read_profile_csv_two_col_noheader(csvL, npts=inj.NPTS, debug=False)
+
+    loads_dss, dev_to_dss_load, dev_to_busph_load = inj.build_load_device_maps(bus_to_phases)
+    pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+
+    # No per-timestep noise for this comparison
+    sigL = 0.0
+    sigD = 0.0
+
     N = len(node_names)
-    M = len(bus_names)
-    A_fd = np.zeros((N, M), dtype=np.float64)
-    B_fd = np.zeros((N, M), dtype=np.float64)
+    print(f"[global] N_nodes={N}")
 
-    # Base solve (load-only) for this hour
-    v_base, _ = _apply_snapshot_load_only(
-        dss_path, node_names, P_load, Q_load, hour, mL,
-        loads_dss, dev_to_dss_load, dev_to_busph_load,
-        pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigma_load, sigma_der=sigma_der,
-    )
-    if v_base is None:
-        return A_fd, B_fd
-    v_base = np.asarray(v_base, dtype=np.float64)
+    results_by_hour: Dict[int, Dict] = {}
 
-    # Helper to apply base + bus-level perturbation and return v
-    def _solve_bus_perturb(bus_idx: int, dP_kw: float, dQ_kvar: float) -> np.ndarray | None:
-        inj.dss.Basic.ClearAll()
-        dss.Text.Command(f'compile "{dss_path}"')
-        inj._apply_voltage_bases()
-        inj.setup_daily()
-        step = _hour_to_step(hour)
-        inj.set_time_index(step)
-        rng = np.random.default_rng(0)
-        # Base load-only
-        inj.apply_snapshot_timeconditioned(
-            P_load_total_kw=P_load,
-            Q_load_total_kvar=Q_load,
-            P_pv_total_kw=0.0,
-            mL_t=float(mL[step]),
-            mPV_t=0.0,
-            loads_dss=loads_dss,
-            dev_to_dss_load=dev_to_dss_load,
-            dev_to_busph_load=dev_to_busph_load,
-            pv_dss=pv_dss,
-            pv_to_dss=pv_to_dss,
-            pv_to_busph=pv_to_busph,
-            sigma_load=sigma_load,
-            sigma_pv=sigma_der,
-            rng=rng,
+    for hour in range(24):
+        print(f"\n=== Hour {hour:02d} ===")
+
+        # Finite-difference J around load-only base (node-level)
+        v_base, x_base = _apply_snapshot_load_only(
+            dss_path, node_names, P_load_kw, Q_load_kvar, hour, mL,
+            loads_dss, dev_to_dss_load, dev_to_busph_load,
+            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
         )
-        bus = bus_names[bus_idx]
-        phi_indices = bus_to_idx.get(bus, [])
-        if not phi_indices:
-            return None
-        nphi = len(phi_indices)
-        dP_each = float(dP_kw) / float(nphi) if nphi > 0 else 0.0
-        dQ_each = float(dQ_kvar) / float(nphi) if nphi > 0 else 0.0
-        for idx_node in phi_indices:
-            node = node_names[idx_node]
-            bus_name, phs = node.split(".")
-            ph = int(phs)
-            load_name = f"fd_bus_{bus_idx}_{ph}"
-            cmd = (
-                f"new Load.{load_name} bus={bus_name}.{ph} phases=1 conn=wye model=1 kv=4.16 "
-                f"kW={-dP_each} kvar={-dQ_each}"
+        if v_base is None:
+            print(f"[hour {hour:02d}] base solve did not converge; skipping")
+            continue
+
+        J_fd = _compute_J_at_hour(
+            dss_path, node_names, v_base, x_base, P_load_kw, Q_load_kvar, hour, mL,
+            loads_dss, dev_to_dss_load, dev_to_busph_load,
+            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+        )
+
+        # Analytic J from Z_LL (node-level)
+        J_analytic, A_analytic, B_analytic = _compute_J_analytic_node_at_hour(
+            dss_path, node_names, P_load_kw, Q_load_kvar, hour, mL,
+            loads_dss, dev_to_dss_load, dev_to_busph_load,
+            pv_dss, pv_to_dss, pv_to_busph, sigma_load=sigL, sigma_der=sigD,
+        )
+        if J_analytic is None:
+            print(f"[hour {hour:02d}] analytic solve did not converge; skipping")
+            continue
+
+        # Per-hour sanity: basic norms of each J
+        max_abs_fd = float(np.max(np.abs(J_fd)))
+        fro_fd = float(np.linalg.norm(J_fd))
+        max_abs_an = float(np.max(np.abs(J_analytic)))
+        fro_an = float(np.linalg.norm(J_analytic))
+
+        print(
+            f"[hour {hour:02d}] J_fd (node-level): max|J|={max_abs_fd:.3e}, ||J||_F={fro_fd:.3e}; "
+            f"J_an: max|J|={max_abs_an:.3e}, ||J||_F={fro_an:.3e}"
+        )
+
+        # Column-wise sanity for first few input nodes (P columns)
+        for i in range(min(3, N)):
+            col_fd = J_fd[:, i]
+            col_an = J_analytic[:, i]
+            print(
+                f"    [hour {hour:02d}] input node {node_names[i]} (P): "
+                f"max|J_fd|={np.max(np.abs(col_fd)):.3e}, "
+                f"max|J_an|={np.max(np.abs(col_an)):.3e}"
             )
-            dss.Text.Command(cmd)
-        dss.Solution.Solve()
-        if not dss.Solution.Converged():
-            return None
-        vmag, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names)
-        return np.asarray(vmag, dtype=np.float64)
 
-    # Active-power sensitivities (A_fd)
-    for bi, _ in enumerate(bus_names):
-        vp = _solve_bus_perturb(bi, dP_bus_kw, 0.0)
-        if vp is not None:
-            A_fd[:, bi] = (vp - v_base) / dP_bus_kw
+        diff = J_analytic - J_fd
+        max_abs = float(np.max(np.abs(diff)))
+        fro_norm = float(np.linalg.norm(diff))
 
-    # Reactive-power sensitivities (B_fd)
-    for bi, _ in enumerate(bus_names):
-        vp = _solve_bus_perturb(bi, 0.0, dQ_bus_kvar)
-        if vp is not None:
-            B_fd[:, bi] = (vp - v_base) / dQ_bus_kvar
+        # Best-fit scalar c such that c*J_analytic is closest to J_fd in Frobenius norm:
+        #   c* = <J_fd, J_an> / ||J_an||_F^2
+        num = float(np.vdot(J_analytic, J_fd).real)  # inner product
+        den = float(np.vdot(J_analytic, J_analytic).real) + 1e-16
+        c_star = num / den
+        J_scaled = c_star * J_analytic
+        diff_scaled = J_scaled - J_fd
+        max_abs_scaled = float(np.max(np.abs(diff_scaled)))
+        fro_norm_scaled = float(np.linalg.norm(diff_scaled))
 
-    return A_fd, B_fd
+        print(f"[hour {hour:02d}] J analytic vs FD: max|ΔJ|={max_abs:.3e}, ||ΔJ||_F={fro_norm:.3e}")
+        print(
+            f"    [hour {hour:02d}] best-fit c*: {c_star:.3e}; "
+            f"scaled: max|ΔJ|={max_abs_scaled:.3e}, ||ΔJ||_F={fro_norm_scaled:.3e}"
+        )
+
+        results_by_hour[hour] = dict(
+            J_fd=J_fd,
+            J_analytic=J_analytic,
+            A_analytic=A_analytic,
+            B_analytic=B_analytic,
+            max_abs_diff=max_abs,
+            fro_norm_diff=fro_norm,
+            best_fit_c=c_star,
+            max_abs_diff_scaled=max_abs_scaled,
+            fro_norm_diff_scaled=fro_norm_scaled,
+        )
+
+    return results_by_hour
 
 
 def compare_analytic_vs_fd_one_scenario(
