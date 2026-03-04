@@ -148,7 +148,9 @@ def train_one(X_all, Y_all, edge_index, edge_attr, edge_id, N, E, model, ckpt_pa
         for data in train_loader:
             data = data.to(DEVICE)
             opt.zero_grad()
-            F.mse_loss(model(data), data.y).backward()
+            loss = F.mse_loss(model(data), data.y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
         model.eval()
         with torch.no_grad():
@@ -253,6 +255,10 @@ def run_24h_and_plot():
     mae_diff = np.abs(mae_emb - mae_no)
     order = np.argsort(-np.nan_to_num(mae_diff, nan=-np.inf))
     worst_indices = list(order[:5])
+
+    mean_mae_emb = np.nanmean(mae_emb)
+    mean_mae_no = np.nanmean(mae_no)
+    print(f"24h profile: mean MAE (with emb)={mean_mae_emb:.4f} | mean MAE (no emb)={mean_mae_no:.4f}")
 
     df = pd.DataFrame({"node": node_names_master, "mae_emb": mae_emb, "mae_no": mae_no, "mae_diff": mae_diff})
     df = df.sort_values("mae_diff", ascending=False)
