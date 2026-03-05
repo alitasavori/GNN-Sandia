@@ -18,7 +18,7 @@ STEP_MIN = 5
 
 VOLTAGE_BASES_KV = [69.0, 24.9, 4.16, 0.48]
 # Voltage acceptance window used by all dataset generators
-VMAG_PU_MIN = 0.65
+VMAG_PU_MIN = 0.50
 VMAG_PU_MAX = 1.05
 
 BASELINE = dict(
