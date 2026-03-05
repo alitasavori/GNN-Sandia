@@ -25,9 +25,10 @@ import pandas as pd
 import opendssdirect as dss
 import run_injection_dataset as inj
 
-
+# Repo root (so paths work when cwd changes, e.g. in notebook/Colab)
+_REPO_ROOT = os.path.dirname(os.path.abspath(inj.__file__))
 # Unified dataset directory: datasets_gnn2/original
-OUT_DIR = os.path.join("datasets_gnn2", "original")
+OUT_DIR = os.path.join(_REPO_ROOT, "datasets_gnn2", "original")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
@@ -48,6 +49,7 @@ def generate_gnn_snapshot_dataset_original(
     if bins_by_profile is None:
         bins_by_profile = {"load": 10, "pv": 10, "net": 10}
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     dss_path = inj.compile_once()
     inj.setup_daily()
 

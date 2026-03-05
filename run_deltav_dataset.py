@@ -18,7 +18,8 @@ from run_loadtype_dataset import (
     SOURCE_BUSES,
 )
 
-OUT_DIR = os.path.join("datasets_gnn2", "deltav")
+_REPO_ROOT = os.path.dirname(os.path.abspath(inj.__file__))
+OUT_DIR = os.path.join(_REPO_ROOT, "datasets_gnn2", "deltav")
 os.makedirs(OUT_DIR, exist_ok=True)
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
 NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
@@ -76,6 +77,7 @@ def generate_gnn_snapshot_dataset_deltav(
     if bins_by_profile is None:
         bins_by_profile = {"load": 10, "pv": 10, "net": 10}
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     k_base = total_samples // n_scenarios
     n_extra = total_samples % n_scenarios
     dss_path = inj.compile_once()

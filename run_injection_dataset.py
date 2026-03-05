@@ -198,8 +198,8 @@ PV_TO_BUSPH = {
     "pv860": [("860", 1, 1/3), ("860", 2, 1/3), ("860", 3, 1/3)],
 }
 
-# Unified dataset directory: datasets_gnn2/injection
-OUT_DIR_INJ = os.path.join("datasets_gnn2", "injection")
+# Unified dataset directory: datasets_gnn2/injection (absolute so cwd changes don't break saves)
+OUT_DIR_INJ = os.path.join(_SCRIPT_DIR, "datasets_gnn2", "injection")
 os.makedirs(OUT_DIR_INJ, exist_ok=True)
 EDGE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_edges_phase_static.csv")
 NODE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_node_features_and_targets.csv")
@@ -785,6 +785,7 @@ def generate_gnn_snapshot_dataset_injection(
     if bins_by_profile is None:
         bins_by_profile = {"load": 10, "pv": 10, "net": 10}
 
+    os.makedirs(OUT_DIR_INJ, exist_ok=True)
     dss_path = compile_once()
     setup_daily()
 

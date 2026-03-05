@@ -9,6 +9,7 @@ import pandas as pd
 
 import run_injection_dataset as inj
 
+_REPO_ROOT = os.path.dirname(os.path.abspath(inj.__file__))
 # Load model per device (OpenDSS Model 1-5: 1=ConstPQ, 2=ConstZ, 4=CVR, 5=ConstI)
 DEVICE_TO_MODEL = {
     "S860": 1, "S848": 1, "D802_806sb": 1, "D802_806rb": 1, "D802_806sc": 1, "D802_806rc": 1,
@@ -98,8 +99,8 @@ def _apply_snapshot_with_per_type(
     return totals, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type
 
 
-# Unified dataset directory: datasets_gnn2/loadtype
-OUT_DIR = os.path.join("datasets_gnn2", "loadtype")
+# Unified dataset directory: datasets_gnn2/loadtype (absolute so cwd changes don't break saves)
+OUT_DIR = os.path.join(_REPO_ROOT, "datasets_gnn2", "loadtype")
 os.makedirs(OUT_DIR, exist_ok=True)
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
 NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
@@ -170,6 +171,7 @@ def generate_gnn_snapshot_dataset_loadtype(
     if bins_by_profile is None:
         bins_by_profile = {"load": 10, "pv": 10, "net": 10}
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     dss_path = inj.compile_once()
     inj.setup_daily()
 
