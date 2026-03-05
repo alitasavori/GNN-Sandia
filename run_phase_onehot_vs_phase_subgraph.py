@@ -3,7 +3,7 @@ Train two models on the same 10k samples from gnn_samples_loadtype_full:
   (A) Phase one-hot: single GNN, 16 features (13 loadtype + phase_onehot_1,2,3), all nodes
   (B) Phase A only: single GNN trained and evaluated on phase A nodes only (phases B/C ignored)
 Same data, same base features. Comparison and worst-node selection only on phase A nodes.
-Run from repo root. Requires: gnn_samples_loadtype_full
+Run from repo root. Requires: datasets_gnn2/loadtype
 """
 import os
 import numpy as np
@@ -27,7 +27,7 @@ from gnn_narrow_exploration import load_phase_subgraph_edges, load_phase_mapping
 
 os.chdir(BASE_DIR)
 
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_PHASE_ONEHOT = os.path.join(OUTPUT_DIR, "block_phase_onehot.pt")
 CKPT_PHASE_SUBGRAPH = os.path.join(OUTPUT_DIR, "block_phase_subgraph.pt")

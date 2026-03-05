@@ -29,6 +29,10 @@ WEIGHT_DECAY = 1e-5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TARGET_MAE = 0.001
 
+# Unified directory to store trained models from this exploration
+MODEL_ROOT = os.path.join(BASE_DIR, "models_gnn2", "final_exploration")
+os.makedirs(MODEL_ROOT, exist_ok=True)
+
 # 20 nominees based on evidence from the 12 unified runs
 # (name, node_emb, edge_emb, hidden, num_layers)
 CANDIDATES = [
@@ -55,9 +59,9 @@ CANDIDATES = [
 ]
 
 DATASETS = [
-    ("gnn_samples_out", ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
-    ("gnn_samples_inj_full", ["p_inj_kw", "q_inj_kvar"], "Derived"),
-    ("gnn_samples_loadtype_full", [
+    (os.path.join("datasets_gnn2", "original"), ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
+    (os.path.join("datasets_gnn2", "injection"), ["p_inj_kw", "q_inj_kvar"], "Derived"),
+    (os.path.join("datasets_gnn2", "loadtype"), [
         "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
         "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
         "p_sys_balance_kw", "q_sys_balance_kvar"
@@ -240,8 +244,44 @@ def train_one(out_dir, feature_cols, label, cfg_name, node_emb_dim, edge_emb_dim
             break
     if best_state is not None:
         model.load_state_dict(best_state)
+
     mae_f, rmse_f = evaluate(model, test_loader)
-    return mae_f, rmse_f, best_epoch
+
+    # Save best model checkpoint into unified models folder
+    ds_slug = str(label).lower().replace(" ", "_")
+    cfg_slug = str(cfg_name).lower()
+    save_dir = os.path.join(MODEL_ROOT, ds_slug, cfg_slug)
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(save_dir, "model.pt")
+    ckpt = {
+        "state_dict": model.state_dict(),
+        "config": {
+            "num_nodes": N,
+            "num_edges": E,
+            "node_in_dim": node_in_dim,
+            "edge_in_dim": 2,
+            "out_dim": 1,
+            "node_emb_dim": node_emb_dim,
+            "edge_emb_dim": edge_emb_dim,
+            "h_dim": h_dim,
+            "num_layers": num_layers,
+            "dataset_dir": out_dir,
+            "feature_cols": feature_cols,
+            "target_col": "vmag_pu",
+            "label": label,
+            "data_frac": data_frac,
+        },
+        "metrics": {
+            "best_epoch": best_epoch,
+            "best_mae": best_mae,
+            "best_rmse": best_rmse,
+            "final_mae": mae_f,
+            "final_rmse": rmse_f,
+        },
+    }
+    torch.save(ckpt, ckpt_path)
+
+    return mae_f, rmse_f, best_epoch, ckpt_path
 
 
 def main():
@@ -253,11 +293,14 @@ def main():
         for out_dir, feature_cols, ds_label in DATASETS:
             print(f"\n>>> {cfg_name} + {ds_label} (n={n_layers} h={h_dim} emb={n_emb}/{e_emb})")
             try:
-                mae, rmse, best_ep = train_one(out_dir, feature_cols, ds_label, cfg_name, n_emb, e_emb, h_dim, n_layers, data_frac=DATA_FRAC)
+                mae, rmse, best_ep, ckpt_path = train_one(
+                    out_dir, feature_cols, ds_label, cfg_name, n_emb, e_emb, h_dim, n_layers, data_frac=DATA_FRAC
+                )
                 if mae is not None:
                     hit = " *** TARGET HIT ***" if mae < TARGET_MAE else ""
-                    results.append((cfg_name, ds_label, mae, rmse, best_ep, hit))
+                    results.append((cfg_name, ds_label, mae, rmse, best_ep, ckpt_path, hit))
                     print(f"  FINAL: MAE={mae:.6f} RMSE={rmse:.6f} best_epoch={best_ep}{hit}")
+                    print(f"  Saved model -> {ckpt_path}")
                 else:
                     print(f"  SKIP (missing data)")
             except Exception as e:

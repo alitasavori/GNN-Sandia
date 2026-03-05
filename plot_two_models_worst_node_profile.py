@@ -65,7 +65,7 @@ except ImportError:
 os.chdir(BASE_DIR)
 
 OUTPUT_DIR = "gnn3_best7_output"
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 
 
 def get_preset_config(preset):

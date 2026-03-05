@@ -108,9 +108,9 @@ CANDIDATES = [
 ]
 
 DATASETS = [
-    ("gnn_samples_out", ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
-    ("gnn_samples_inj_full", ["p_inj_kw", "q_inj_kvar"], "Derived"),
-    ("gnn_samples_loadtype_full", [
+    (os.path.join("datasets_gnn2", "original"), ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
+    (os.path.join("datasets_gnn2", "injection"), ["p_inj_kw", "q_inj_kvar"], "Derived"),
+    (os.path.join("datasets_gnn2", "loadtype"), [
         "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
         "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
         "p_sys_balance_kw", "q_sys_balance_kvar"

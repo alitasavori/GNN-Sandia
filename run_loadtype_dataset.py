@@ -1,7 +1,7 @@
 """
 Third dataset generation: per-node load-type features (M1/M2/M4/M5 P&Q, cap Q, PV P, grid P/Q).
 Standalone script — same scenario/snapshot flow as run_injection_dataset.py, but self-contained.
-Output: gnn_samples_loadtype_full/
+Output: datasets_gnn2/loadtype/
 """
 import os
 import numpy as np
@@ -27,6 +27,8 @@ DEVICE_TO_MODEL = {
     "D836_840sa": 5, "D836_840ra": 5, "D836_840sb": 5, "D836_840rb": 5,
 }
 
+# Buses whose node-level rows are excluded from training/evaluation datasets
+EXCLUDED_UPSTREAM_BUSES = ("sourcebus", "800")
 
 def _apply_snapshot_with_per_type(
     P_load_total_kw, Q_load_total_kvar, P_pv_total_kw,
@@ -96,8 +98,8 @@ def _apply_snapshot_with_per_type(
     return totals, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type
 
 
-# Reuse config and mappings from injection dataset
-OUT_DIR = "gnn_samples_loadtype_full"
+# Unified dataset directory: datasets_gnn2/loadtype
+OUT_DIR = os.path.join("datasets_gnn2", "loadtype")
 os.makedirs(OUT_DIR, exist_ok=True)
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
 NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
@@ -266,6 +268,8 @@ def generate_gnn_snapshot_dataset_loadtype(
             for n in node_names_master:
                 bus, phs = n.split(".")
                 ph = int(phs)
+                if bus in EXCLUDED_UPSTREAM_BUSES:
+                    continue
 
                 # Load by type (8 features)
                 m1_p = float(busph_per_type[1][0].get((bus, ph), 0.0))

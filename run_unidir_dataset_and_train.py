@@ -30,7 +30,7 @@ import opendssdirect as dss
 
 os.chdir(BASE_DIR)
 
-OUT_DIR = "gnn_samples_loadtype_unidir"
+OUT_DIR = os.path.join("datasets_gnn2", "loadtype_unidir")
 os.makedirs(OUT_DIR, exist_ok=True)
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
 NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
@@ -38,7 +38,7 @@ NODE_INDEX_CSV = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OBSERVED_NODE = "840.1"
 PV_SCALE = 1.0  # PV multiplier for 24h profile evaluation (1 = nominal)
 
@@ -67,7 +67,7 @@ def _parse_phase_from_node_name(name):
 
 def create_unidir_dataset():
     """Create unidirectional dataset: subset loadtype to ~20k samples, unidirectional edges."""
-    src_dir = "gnn_samples_loadtype_full"
+    src_dir = os.path.join("datasets_gnn2", "loadtype")
     src_node = os.path.join(src_dir, "gnn_node_features_and_targets.csv")
     src_edge = os.path.join(src_dir, "gnn_edges_phase_static.csv")
     src_index = os.path.join(src_dir, "gnn_node_index_master.csv")

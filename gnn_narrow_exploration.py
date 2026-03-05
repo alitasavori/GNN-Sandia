@@ -49,9 +49,9 @@ CANDIDATES = [
 ]
 
 DATASETS = [
-    ("gnn_samples_out", ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
-    ("gnn_samples_inj_full", ["p_inj_kw", "q_inj_kvar"], "Derived"),
-    ("gnn_samples_loadtype_full", [
+    (os.path.join("datasets_gnn2", "original"), ["p_load_kw", "q_load_kvar", "p_pv_kw"], "Original"),
+    (os.path.join("datasets_gnn2", "injection"), ["p_inj_kw", "q_inj_kvar"], "Derived"),
+    (os.path.join("datasets_gnn2", "loadtype"), [
         "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
         "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
         "p_sys_balance_kw", "q_sys_balance_kvar"
@@ -254,7 +254,7 @@ def _log_skip_reason(out_dir, edge_csv, node_csv):
         print(f"  [SKIP] Missing data files. Expected under {os.path.abspath(out_dir)}:")
         for p in missing:
             print(f"    - {p}")
-        print("  Run GNN2 notebook to generate gnn_samples_out, gnn_samples_inj_full, gnn_samples_loadtype_full.")
+        print("  Run dataset scripts to generate datasets_gnn2/original, datasets_gnn2/injection, datasets_gnn2/loadtype.")
         _log_skip_reason._logged = True
 
 

@@ -3,7 +3,7 @@ Train medium architecture (best for original) on same 10k samples with:
   (A) Original features: p_load_kw, q_load_kvar, p_pv_kw
   (B) Injection features: p_inj_kw, q_inj_kvar
 Derives both from loadtype dataset. Saves models, runs 24h profile vs OpenDSS.
-Run from repo root. Requires: gnn_samples_loadtype_full
+Run from repo root. Requires: datasets_gnn2/loadtype
 """
 import os
 import numpy as np
@@ -27,7 +27,7 @@ from run_gnn3_best7_train import PFIdentityGNN
 
 os.chdir(BASE_DIR)
 
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_ORIGINAL = os.path.join(OUTPUT_DIR, "block_original_features.pt")
 CKPT_INJECTION = os.path.join(OUTPUT_DIR, "block_injection_features.pt")

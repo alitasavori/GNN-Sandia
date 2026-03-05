@@ -1,11 +1,11 @@
 """
-Train two models on the same 10k samples from gnn_samples_loadtype_full.
+Train two models on the same 10k samples from datasets_gnn2/loadtype.
 Both use 10 features (loadtype per-type): m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv.
 Both trained and evaluated on all phases (full graph):
   (A) With node and edge embedding vectors (PFIdentityGNN)
   (B) Without node and edge embedding vectors (PFIdentityGNNNoEmb)
 Same data, same graph. Find 5 worst nodes, plot vs OpenDSS.
-Run from repo root. Requires: gnn_samples_loadtype_full
+Run from repo root. Requires: datasets_gnn2/loadtype
 """
 import os
 import numpy as np
@@ -56,7 +56,7 @@ from run_gnn3_best7_train import PFIdentityGNN
 
 os.chdir(BASE_DIR)
 
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_WITH_EMB = os.path.join(OUTPUT_DIR, "block_10feat_with_emb.pt")
 CKPT_NO_EMB = os.path.join(OUTPUT_DIR, "block_10feat_no_emb.pt")

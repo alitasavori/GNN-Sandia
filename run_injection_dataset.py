@@ -1,7 +1,7 @@
 """
 Standalone script for GNN injection dataset generation.
 Contains all helpers from the main dataset generation block (cell 3 of GNN2.ipynb).
-Outputs to gnn_samples_inj_full/ with p_inj_kw, q_inj_kvar features.
+Outputs to datasets_gnn2/injection/ with p_inj_kw, q_inj_kvar features.
 """
 import os
 import re
@@ -17,24 +17,32 @@ NPTS = 288
 STEP_MIN = 5
 
 VOLTAGE_BASES_KV = [69.0, 24.9, 4.16, 0.48]
-VMAG_PU_MIN = 0.50
-VMAG_PU_MAX = 1.50
+# Voltage acceptance window used by all dataset generators
+VMAG_PU_MIN = 0.65
+VMAG_PU_MAX = 1.05
 
 BASELINE = dict(
-    P_load_total_kw=1415.2,
-    Q_load_total_kvar=835.2,
-    P_pv_total_kw=1000.0,
+    # Reference powers used in all dataset generators (already scaled)
+    # These are the nominal totals before time profiles and scenario multipliers:
+    P_load_total_kw=849.12,   # kW
+    Q_load_total_kvar=501.12, # kVAR
+    P_pv_total_kw=1400.0,     # kW
     sigma_load=0.05,
     sigma_pv=0.05,
 )
 
 RANGES = dict(
-    P_load_total_kw=(0.8, 1.2),
-    Q_load_total_kvar=(0.8, 1.2),
-    P_pv_total_kw=(0.6, 1.2),
-    sigma_load=(0.5, 1.5),
-    sigma_pv=(0.5, 1.5),
+    # Very tight ranges around baseline to keep voltages close to nominal
+    P_load_total_kw=(0.95, 1.05),
+    Q_load_total_kvar=(0.95, 1.05),
+    P_pv_total_kw=(0.95, 1.05),
+    # Conservative noise (std dev) on multiplicative factors
+    sigma_load=(0.0, 0.05),
+    sigma_pv=(0.0, 0.05),
 )
+
+# Buses whose node-level rows are excluded from training/evaluation datasets
+EXCLUDED_UPSTREAM_BUSES = ("sourcebus", "800")
 
 # ============================================================
 # DEVICE-LEVEL P/Q SHARES
@@ -186,8 +194,8 @@ PV_TO_BUSPH = {
     "pv860": [("860", 1, 1/3), ("860", 2, 1/3), ("860", 3, 1/3)],
 }
 
-# Output for injection dataset
-OUT_DIR_INJ = "gnn_samples_inj_full"
+# Unified dataset directory: datasets_gnn2/injection
+OUT_DIR_INJ = os.path.join("datasets_gnn2", "injection")
 os.makedirs(OUT_DIR_INJ, exist_ok=True)
 EDGE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_edges_phase_static.csv")
 NODE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_node_features_and_targets.csv")
@@ -446,6 +454,9 @@ def extract_static_phase_edges_to_csv(node_names_master, edge_csv_path, make_bid
     seen = set()
 
     def _add_edge(from_node, to_node, b_from, b_to, ph, elem_name, linecode, nph_line, length, r_per, x_per, c_per):
+        # Skip edges incident to excluded upstream buses to keep them out of static graph
+        if b_from in EXCLUDED_UPSTREAM_BUSES or b_to in EXCLUDED_UPSTREAM_BUSES:
+            return
         if from_node not in node_to_idx or to_node not in node_to_idx:
             return
         u = int(node_to_idx[from_node])
@@ -869,6 +880,8 @@ def generate_gnn_snapshot_dataset_injection(
             for n in node_names_master:
                 bus, phs = n.split(".")
                 ph = int(phs)
+                if bus in EXCLUDED_UPSTREAM_BUSES:
+                    continue
                 p_load_node = float(busphP_load.get((bus, ph), 0.0))
                 q_load_node = float(busphQ_load.get((bus, ph), 0.0))
                 p_pv_node = float(busphP_pv.get((bus, ph), 0.0))

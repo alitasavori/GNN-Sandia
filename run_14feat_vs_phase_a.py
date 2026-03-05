@@ -1,11 +1,11 @@
 """
-Train two models on the same 10k samples from gnn_samples_deltav_full.
+Train two models on the same 10k samples from datasets_gnn2/deltav.
 Both trained and evaluated on phase A only:
   (A) Phase A + vmag_zero: 14 features (13 loadtype + vmag_zero_pv_pu), phase A subgraph
   (B) Phase A only: 13 features (no vmag_zero), phase A subgraph
 Same data. Worst-node selection among phase A nodes.
-Requires: gnn_samples_deltav_full (run run_deltav_dataset.py first),
-          gnn_samples_loadtype_full (for node index and edges).
+Requires: datasets_gnn2/deltav (run run_deltav_dataset.py first),
+          datasets_gnn2/loadtype (for node index and edges).
 Run from repo root.
 """
 import os
@@ -31,8 +31,8 @@ from gnn_narrow_exploration import load_phase_subgraph_edges, load_phase_mapping
 
 os.chdir(BASE_DIR)
 
-DIR_DELTAV = "gnn_samples_deltav_full"
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_DELTAV = os.path.join("datasets_gnn2", "deltav")
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_14FEAT = os.path.join(OUTPUT_DIR, "block_14feat_vmagzero.pt")
 CKPT_PHASE_A = os.path.join(OUTPUT_DIR, "block_14feat_phase_a.pt")

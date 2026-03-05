@@ -1,6 +1,6 @@
 """
 Delta-V exploration: best architectures from Load-type (dataset 3) on the fourth dataset.
-Uses gnn_samples_deltav_full with target vmag_delta_pu (voltage change due to PV).
+Uses datasets_gnn2/deltav with target vmag_delta_pu (voltage change due to PV).
 Features: Load-type (13) + vmag_zero_pv_pu = 14 features.
 30% data, MSE loss, no dropout.
 """
@@ -31,7 +31,7 @@ WEIGHT_DECAY = 1e-5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Fourth dataset: Load-type features + vmag_zero_pv_pu; target = vmag_delta_pu
-OUT_DIR = "gnn_samples_deltav_full"
+OUT_DIR = os.path.join("datasets_gnn2", "deltav")
 FEATURE_COLS = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
     "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",

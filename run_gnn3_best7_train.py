@@ -1,13 +1,12 @@
 """
 Train the 7 best models from GNN3 exploration — best per dataset type.
 Each block uses the dataset and architecture that performed best for that dataset:
-  Block 1: Original (gnn_samples_out) — medium (4L, h=32)
-  Block 2: Injection (gnn_samples_inj_full) — deep (4L, h=64)
-  Blocks 3–5: Load-type (gnn_samples_loadtype_full) — top 3 architectures
-  Block 6: Delta-V (gnn_samples_deltav_full)
-  Block 7: Delta-V 5× (gnn_samples_deltav_5x_full)
-Run from repo root. Requires: gnn_samples_out, gnn_samples_inj_full, gnn_samples_loadtype_full,
-gnn_samples_deltav_full, gnn_samples_deltav_5x_full.
+  Block 1: Original (datasets_gnn2/original) — medium (4L, h=32)
+  Block 2: Injection (datasets_gnn2/injection) — deep (4L, h=64)
+  Blocks 3–5: Load-type (datasets_gnn2/loadtype) — top 3 architectures
+  Block 6: Delta-V (datasets_gnn2/deltav)
+Run from repo root. Requires: datasets_gnn2/original, datasets_gnn2/injection,
+datasets_gnn2/loadtype, datasets_gnn2/deltav.
 """
 import os
 import re
@@ -49,13 +48,12 @@ LOADTYPE_FEAT = [
 DELTAV_FEAT = LOADTYPE_FEAT + ["vmag_zero_pv_pu"]
 
 MODELS = [
-    (1, "medium", "gnn_samples_out", ORIGINAL_FEAT, "vmag_pu", 8, 4, 32, 4, False, False),
-    (2, "deep", "gnn_samples_inj_full", INJECTION_FEAT, "vmag_pu", 16, 8, 64, 4, False, False),
-    (3, "light_emb_h96", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False),
-    (4, "light_emb_h96_phase_onehot_depth3", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 3, False, True),
-    (5, "light_emb_h96_phase_onehot_depth3_h112", "gnn_samples_loadtype_full", LOADTYPE_FEAT, "vmag_pu", 16, 8, 112, 3, False, True),
-    (6, "light_xwide_emb_phase_onehot", "gnn_samples_deltav_full", DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True),
-    (7, "light_xwide_emb_phase_onehot", "gnn_samples_deltav_5x_full", DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True),
+    (1, "medium", os.path.join("datasets_gnn2", "original"), ORIGINAL_FEAT, "vmag_pu", 8, 4, 32, 4, False, False),
+    (2, "deep", os.path.join("datasets_gnn2", "injection"), INJECTION_FEAT, "vmag_pu", 16, 8, 64, 4, False, False),
+    (3, "light_emb_h96", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False),
+    (4, "light_emb_h96_phase_onehot_depth3", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 3, False, True),
+    (5, "light_emb_h96_phase_onehot_depth3_h112", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 112, 3, False, True),
+    (6, "light_xwide_emb_phase_onehot", os.path.join("datasets_gnn2", "deltav"), DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True),
 ]
 
 

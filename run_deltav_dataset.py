@@ -4,7 +4,7 @@ Scenario structure: 1000 scenarios with different (P_load, Q_load, P_pv); for ea
 samples use timesteps t from the 24h load/irradiance profile (mL[t], mPV[t]) so training
 matches test-time temporal structure. vmag_zero is computed at each t with loads at that t.
 Target = vmag_with_pv - vmag_zero_pv (delta V).
-Output: gnn_samples_deltav_full/
+Output: datasets_gnn2/deltav/
 """
 import os
 import numpy as np
@@ -18,12 +18,15 @@ from run_loadtype_dataset import (
     SOURCE_BUSES,
 )
 
-OUT_DIR = "gnn_samples_deltav_full"
+OUT_DIR = os.path.join("datasets_gnn2", "deltav")
 os.makedirs(OUT_DIR, exist_ok=True)
 EDGE_CSV = os.path.join(OUT_DIR, "gnn_edges_phase_static.csv")
 NODE_CSV = os.path.join(OUT_DIR, "gnn_node_features_and_targets.csv")
 SAMPLE_CSV = os.path.join(OUT_DIR, "gnn_sample_meta.csv")
 NODE_INDEX_CSV = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
+
+# Buses whose node-level rows are excluded from training/evaluation datasets
+EXCLUDED_UPSTREAM_BUSES = ("sourcebus", "800")
 
 
 def _apply_snapshot_zero_pv(
@@ -225,6 +228,8 @@ def generate_gnn_snapshot_dataset_deltav(
             for n in node_names_master:
                 bus, phs = n.split(".")
                 ph = int(phs)
+                if bus in EXCLUDED_UPSTREAM_BUSES:
+                    continue
 
                 m1_p = float(busph_per_type[1][0].get((bus, ph), 0.0))
                 m1_q = float(busph_per_type[1][1].get((bus, ph), 0.0))

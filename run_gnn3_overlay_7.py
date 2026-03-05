@@ -25,7 +25,7 @@ os.chdir(BASE_DIR)
 
 CAP_Q_KVAR = {"844": 100.0, "848": 150.0}
 SOURCE_BUSES = ("sourcebus", "800")
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 NPTS = 288
 STEP_MIN = 5
@@ -379,9 +379,9 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[obs_node]
 
-        if dataset_dir == "gnn_samples_out":
+    if dataset_dir == os.path.join("datasets_gnn2", "original"):
             X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
-        elif dataset_dir == "gnn_samples_inj_full":
+    elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
             pwr = dss.Circuit.TotalPower()
             P_grid = -float(pwr[0])
             Q_grid = -float(pwr[1])

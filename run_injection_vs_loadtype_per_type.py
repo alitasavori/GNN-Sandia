@@ -1,10 +1,10 @@
 """
-Train two models on the same 10k samples from gnn_samples_loadtype_full:
+Train two models on the same 10k samples from datasets_gnn2/loadtype:
   (A) Injection features: p_inj_kw, q_inj_kvar (2 feat)
   (B) Load-type per-type: m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar,
       m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw (10 feat)
 Same data, same graph, same architecture. Saves models for plot_two_models_worst_node_profile.py.
-Run from repo root. Requires: gnn_samples_loadtype_full
+Run from repo root. Requires: datasets_gnn2/loadtype
 """
 import os
 import numpy as np
@@ -19,7 +19,7 @@ from run_gnn3_best7_train import PFIdentityGNN
 
 os.chdir(BASE_DIR)
 
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_INJECTION = os.path.join(OUTPUT_DIR, "block_injection_features.pt")
 CKPT_LOADTYPE_PER_TYPE = os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt")

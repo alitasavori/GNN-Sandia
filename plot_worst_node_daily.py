@@ -22,9 +22,10 @@ from run_gnn3_overlay_7 import (
 
 os.chdir(BASE_DIR)
 
-OUT_DIR = "gnn_samples_loadtype_unidir"
+# Unified dataset directory: datasets_gnn2/loadtype_unidir
+OUT_DIR = os.path.join("datasets_gnn2", "loadtype_unidir")
 OUTPUT_DIR = "gnn3_best7_output"
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 CKPT_PATH = os.path.join(OUTPUT_DIR, "block_unidir.pt")
 CKPT_PATH_BIDIR = os.path.join(OUTPUT_DIR, "block_bidir_unidir_compare.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

@@ -1,7 +1,7 @@
 """
-Temporary: Train and save only the two last models (Block 6 & 7) with the new Delta-V datasets.
-Same logic as run_gnn3_best7_train.py but only blocks 6 (gnn_samples_deltav_full) and 7 (gnn_samples_deltav_5x_full).
-Run after regenerating datasets with run_deltav_dataset.py and run_deltav_5x_dataset.py.
+Temporary: Train and save only the Delta-V model (Block 6) with the Delta-V dataset.
+Same logic as run_gnn3_best7_train.py but restricted to block 6 (datasets_gnn2/deltav).
+Run after regenerating the dataset with run_deltav_dataset.py.
 """
 import os
 
@@ -18,11 +18,11 @@ from run_gnn3_best7_train import (
 
 def main():
     print("=" * 70)
-    print("GNN3 DELTA-V ONLY: Train blocks 6 & 7 on new datasets")
+    print("GNN3 DELTA-V ONLY: Train block 6 on Delta-V dataset")
     print("=" * 70)
     for tup in MODELS:
         block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph = tup
-        if block_id not in (6, 7):
+        if block_id != 6:
             continue
         print(f"\n>>> Block {block_id}: {name} + {out_dir} (target={target})")
         train_one(block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph)

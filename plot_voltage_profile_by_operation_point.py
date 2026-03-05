@@ -91,7 +91,7 @@ def main(nodes=None, operation_points=None, save_path=None, node=None):
     mL = read_profile_csv_two_col_noheader(resolve_csv_path(csvL_token, dss_path), npts=NPTS)
     mPV = read_profile_csv_two_col_noheader(resolve_csv_path(csvPV_token, dss_path), npts=NPTS)
 
-    node_index_csv = os.path.join("gnn_samples_loadtype_full", "gnn_node_index_master.csv")
+    node_index_csv = os.path.join("datasets_gnn2", "loadtype", "gnn_node_index_master.csv")
     if not os.path.exists(node_index_csv):
         raise FileNotFoundError(f"Missing {node_index_csv}. Run loadtype dataset generation first.")
     master_df = pd.read_csv(node_index_csv)

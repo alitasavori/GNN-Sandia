@@ -19,11 +19,10 @@
 
 | # | Name | Output Dir | Samples | Features | Target | Purpose |
 |---|------|------------|---------|----------|--------|--------|
-| 1 | **Original** | `gnn_samples_out` | ~192k | p_load, q_load, p_pv (3) | vmag_pu | Baseline; raw P/Q per node |
-| 2 | **Injection** | `gnn_samples_inj_full` | ~192k | p_inj, q_inj (2) | vmag_pu | Net injection (P_inj = P_PV − P_load) |
-| 3 | **Load-type** | `gnn_samples_loadtype_full` | ~192k | 13 features* | vmag_pu | Load model breakdown (M1/M2/M4/M5), electrical distance |
-| 4 | **Delta-V** | `gnn_samples_deltav_full` | 57,600 | 14 (Load-type + vmag_zero) | vmag_delta_pu | Voltage change due to PV |
-| 5 | **Delta-V 5×** | `gnn_samples_deltav_5x_full` | 57,600 | 14 (same) | vmag_delta_pu | Same as 4, but PV scaled 5× for larger delta-V |
+| 1 | **Original** | `datasets_gnn2/original` | ~192k | p_load, q_load, p_pv (3) | vmag_pu | Baseline; raw P/Q per node |
+| 2 | **Injection** | `datasets_gnn2/injection` | ~192k | p_inj, q_inj (2) | vmag_pu | Net injection (P_inj = P_PV − P_load) |
+| 3 | **Load-type** | `datasets_gnn2/loadtype` | ~192k | 13 features* | vmag_pu | Load model breakdown (M1/M2/M4/M5), electrical distance |
+| 4 | **Delta-V** | `datasets_gnn2/deltav` | 57,600 | 14 (Load-type + vmag_zero) | vmag_delta_pu | Voltage change due to PV |
 
 *Load-type features: electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, p_sys_balance, q_sys_balance
 
@@ -55,7 +54,6 @@
 | `run_injection_dataset.py` | Injection | 200 scenarios, 960 snapshots |
 | `run_loadtype_dataset.py` | Load-type | 200 scenarios, 960 snapshots |
 | `run_deltav_dataset.py` | Delta-V | 1000 scenarios, 57,600 samples, 24h profile |
-| `run_deltav_5x_dataset.py` | Delta-V 5× | Same as Delta-V, PV×5 |
 
 ---
 
@@ -82,7 +80,6 @@
 | 4 | gnn_boost_exploration | 10 to beat Block 3 | Same 3 | — |
 | 5 | gnn_refine_exploration | 8 from Block 4 | Same 3 | light_emb_h96_phase_onehot_depth3_h112 |
 | 6 | gnn_deltav_exploration | 9 best Load-type | Delta-V | light_xwide_emb_phase_onehot |
-| 7 | gnn_deltav_5x_exploration | 9 best | Delta-V 5× | light_xwide_emb_phase_onehot |
 
 **Exploration:** 30% data for exploration; 100% for final training.
 
@@ -144,14 +141,14 @@ GNN2/
 ├── run_injection_dataset.py      # Dataset 2
 ├── run_loadtype_dataset.py      # Dataset 3
 ├── run_deltav_dataset.py        # Dataset 4
-├── run_deltav_5x_dataset.py     # Dataset 5
+<!-- run_deltav_5x_dataset.py (Delta-V 5×) removed -->
 ├── gnn_final_exploration.py     # Block 1
 ├── gnn_further_exploration.py   # Block 2
 ├── gnn_narrow_exploration.py    # Block 3
 ├── gnn_boost_exploration.py     # Block 4
 ├── gnn_refine_exploration.py    # Block 5
 ├── gnn_deltav_exploration.py    # Block 6
-├── gnn_deltav_5x_exploration.py # Block 7
+<!-- gnn_deltav_5x_exploration.py (Delta-V 5× exploration) removed -->
 ├── run_gnn3_best7_train.py      # Train all 7
 ├── run_gnn3_deltav_only_train.py# Train blocks 6 & 7 only
 ├── run_gnn3_timing_comparison.py # Overlay, MAE/RMSE, PV scenarios

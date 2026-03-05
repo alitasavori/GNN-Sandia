@@ -89,11 +89,10 @@ def main():
     add_table_slide(prs, "Five Datasets",
         ["#", "Name", "Output", "Features", "Target"],
         [
-            ["1", "Original", "gnn_samples_out", "p_load, q_load, p_pv (3)", "vmag_pu"],
-            ["2", "Injection", "gnn_samples_inj_full", "p_inj, q_inj (2)", "vmag_pu"],
-            ["3", "Load-type", "gnn_samples_loadtype_full", "13 (M1/M2/M4/M5, dist, balance)", "vmag_pu"],
-            ["4", "Delta-V", "gnn_samples_deltav_full", "14 (+ vmag_zero)", "vmag_delta_pu"],
-            ["5", "Delta-V 5×", "gnn_samples_deltav_5x_full", "14 (same)", "vmag_delta_pu"],
+            ["1", "Original", "datasets_gnn2/original", "p_load, q_load, p_pv (3)", "vmag_pu"],
+            ["2", "Injection", "datasets_gnn2/injection", "p_inj, q_inj (2)", "vmag_pu"],
+            ["3", "Load-type", "datasets_gnn2/loadtype", "13 (M1/M2/M4/M5, dist, balance)", "vmag_pu"],
+            ["4", "Delta-V", "datasets_gnn2/deltav", "14 (+ vmag_zero)", "vmag_delta_pu"],
         ])
 
     # 5. Output Files

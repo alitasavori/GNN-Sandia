@@ -1,12 +1,12 @@
 """
-Train two models on the same 10k samples from gnn_samples_loadtype_full:
+Train two models on the same 10k samples from datasets_gnn2/loadtype:
   (A) Loadtype full (13 feat): electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q,
       m5_p, m5_q, q_cap, p_pv, p_sys_balance_kw, q_sys_balance_kvar
       (electrical_distance + p_sys/q_sys are global context; others are local per-node)
   (B) Loadtype per-type (10 feat): m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv
       (all local per-node)
 Same data, same graph, same architecture. Saves models for plot_two_models_worst_node_profile.py.
-Run from repo root. Requires: gnn_samples_loadtype_full
+Run from repo root. Requires: datasets_gnn2/loadtype
 """
 import os
 import numpy as np
@@ -21,7 +21,7 @@ from run_gnn3_best7_train import PFIdentityGNN
 
 os.chdir(BASE_DIR)
 
-DIR_LOADTYPE = "gnn_samples_loadtype_full"
+DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 CKPT_LOADTYPE_FULL = os.path.join(OUTPUT_DIR, "block_loadtype_full.pt")
 CKPT_LOADTYPE_PER_TYPE = os.path.join(OUTPUT_DIR, "block_loadtype_per_type.pt")

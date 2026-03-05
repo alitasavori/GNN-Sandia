@@ -174,9 +174,9 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
 
         # --- GNN step 1: build_gnn_x ---
         t0 = time.perf_counter()
-        if dataset_dir == "gnn_samples_out":
+        if dataset_dir == os.path.join("datasets_gnn2", "original"):
             X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
-        elif dataset_dir == "gnn_samples_inj_full":
+        elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
             pwr = dss.Circuit.TotalPower()
             P_grid = -float(pwr[0])
             Q_grid = -float(pwr[1])
