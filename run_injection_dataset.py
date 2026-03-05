@@ -217,8 +217,9 @@ def _apply_voltage_bases():
     dss.Text.Command(f'set voltagebases="{vb}"')
     dss.Text.Command("calcvoltagebases")
     # IEEE34_PV.dss uses InvControl (VoltVar); allow enough control iterations
+    # (otherwise many solves are marked non-converged and skip_nonconv is high)
     try:
-        dss.Text.Command("set maxcontroliter=1000")
+        dss.Text.Command("set maxcontroliter=5000")
     except Exception:
         pass
 
