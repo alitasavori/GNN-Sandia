@@ -1,0 +1,519 @@
+% Rewritten report: concise, math-forward, organized, and complete (figures preserved)
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,bm}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{booktabs}
+
+\title{GNN2 Dataset Generation: Node-Power, Injection, Load-Type, and Delta-V Datasets}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Goal and indexing}
+
+Let $\Phi=\{1,2,3\}$ and let each \emph{node} be a bus--phase pair $i=(b,ph)$. Let
+$\mathcal{N}$ denote the set of retained bus--phase nodes and $N=|\mathcal{N}|$.
+A \emph{sample} is indexed by scenario (day) $s$ and time index $t$:
+\[
+s\in\{1,\dots,n_{\mathrm{scen}}\},\qquad t\in\{0,\dots,T-1\},\qquad T=288.
+\]
+Each kept sample provides node features $x_{i}^{(s,t)}$ and AC targets
+\[
+|V_i^{(s,t)}|~(\texttt{vmag\_pu}),\qquad \angle V_i^{(s,t)}|~(\texttt{vang\_deg}).
+\]
+
+\section{Static phase-level graph (shared by all datasets)}
+
+All datasets share a single directed phase graph
+\[
+\mathcal{G}=(\mathcal{N},\mathcal{E}),
+\]
+written to:
+\[
+\texttt{gnn\_node\_index\_master.csv},\qquad \texttt{gnn\_edges\_phase\_static.csv}.
+\]
+These are generated once by:
+\[
+\texttt{get\_all\_bus\_phase\_nodes},\qquad \texttt{extract\_static\_phase\_edges\_to\_csv}.
+\]
+
+\subsection*{Edge construction: lines and transformers (incl.\ regulators)}
+
+For any physical connection between buses $b_1,b_2$ on phase set $\Phi_e\subseteq\Phi$,
+create bidirectional directed edges:
+\[
+\forall\,ph\in\Phi_e:\quad (b_1,ph)\to(b_2,ph),\ (b_2,ph)\to(b_1,ph).
+\]
+This applies to OpenDSS \texttt{Line} elements and all \texttt{Transformer} elements,
+including regulator transformers (e.g., \texttt{regA1}, \texttt{regB1}, \dots).
+
+\subsection*{Static edge attributes}
+
+Each directed edge $e=(i\to j)$ stores identifiers and electrical parameters:
+\[
+i=(b_1,ph),\quad j=(b_2,ph),\quad ph\in\Phi,\qquad
+\texttt{elem}(e)\in\{\ell,\tau\},
+\]
+\[
+\texttt{nph}(\texttt{elem}),\qquad \texttt{code}(e)\in\{\texttt{linecode},\texttt{xfmr}\}.
+\]
+For a line $\ell$ with length $L_\ell$ and per-unit-length parameters $(R_\ell,X_\ell,C_\ell)$
+(from \texttt{Rmatrix/Xmatrix/Cmatrix} or \texttt{R1/X1}):
+\[
+R_{\mathrm{full}}=R_\ell L_\ell,\qquad X_{\mathrm{full}}=X_\ell L_\ell,\qquad C_{\mathrm{full}}=C_\ell L_\ell.
+\]
+(Transformers store analogous series parameters in ohmic units.)
+All edge attributes are static (independent of $(s,t)$).
+
+\section{Circuit and device nominal shares (fixed)}
+
+The feeder is defined by \texttt{IEEE34\_PV.dss} (folder \texttt{new dss from dr mirzaei}), with
+daily load and irradiance profiles \texttt{5minDayShape.csv} and \texttt{5MinuteIrradiance.csv}.
+PV systems are at buses 850 and 860 (\texttt{PV850}, \texttt{PV860}); one has Volt-Var control (IEEE 1547-2018).
+
+Load-device shares are computed once from the same feeder structure (same load names and nominal kW/kVAR per device).
+Let $P_d^{(0)},Q_d^{(0)}$ be nominal device powers and
+$P_{\mathrm{tot}}^{(0)}=\sum_d P_d^{(0)}$, $Q_{\mathrm{tot}}^{(0)}=\sum_d Q_d^{(0)}$.
+Define
+\[
+\alpha_d^P=\frac{P_d^{(0)}}{P_{\mathrm{tot}}^{(0)}},\qquad
+\alpha_d^Q=\frac{Q_d^{(0)}}{Q_{\mathrm{tot}}^{(0)}},\qquad
+\sum_d\alpha_d^P=\sum_d\alpha_d^Q=1,
+\]
+stored as \texttt{DEVICE\_P\_SHARE}, \texttt{DEVICE\_Q\_SHARE}.
+PV power is split by \texttt{PV\_PMMP\_SHARE} and \texttt{PV\_TO\_BUSPH} (buses 850 and 860).
+
+\section{Scenario sampling (day-level randomization)}
+
+The baseline totals $P_{\mathrm{load}}^{(0)},Q_{\mathrm{load}}^{(0)},P_{\mathrm{pv}}^{(0)}$ are the nominal values from \texttt{IEEE34\_PV.dss} (1769~kW, 1044~kVAR, 1000~kW). Each scenario $s$ draws global scalars once:
+\begin{align*}
+P_{\mathrm{load}} &= P_{\mathrm{load}}^{(0)}\theta_{P_{\mathrm{load}}},&
+Q_{\mathrm{load}} &= Q_{\mathrm{load}}^{(0)}\theta_{Q_{\mathrm{load}}},&
+P_{\mathrm{pv}} &= P_{\mathrm{pv}}^{(0)}\theta_{P_{\mathrm{pv}}},\\
+\sigma_{\mathrm{load}}&=\sigma_{\mathrm{load}}^{(0)}\theta_{\sigma_{\mathrm{load}}},&
+\sigma_{\mathrm{pv}}&=\sigma_{\mathrm{pv}}^{(0)}\theta_{\sigma_{\mathrm{pv}}},
+\end{align*}
+with $\theta_x\sim\mathrm{Uniform}(\underline r_x,\overline r_x)$ from \texttt{RANGES} (e.g.\ $[0.95,1.05]$ for P/Q, $\sigma$ in $[0,0.05]$) and clipping so that
+\[
+\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}}\in[0,0.05].
+\]
+
+\section{Daily profiles and time grid}
+
+\[
+T=288,\qquad \Delta t=5~\mathrm{min},\qquad t\in\{0,\dots,T-1\}.
+\]
+Let $m_L[t]$ be the DSS loadshape multiplier (e.g., \texttt{5minDayShape}) and
+$m_{\mathrm{PV}}[t]$ the irradiance multiplier (e.g., \texttt{IrradShape}). Define totals:
+\[
+P_{\mathrm{load}}(t)=P_{\mathrm{load}}m_L[t],\qquad
+Q_{\mathrm{load}}(t)=Q_{\mathrm{load}}m_L[t],\qquad
+P_{\mathrm{pv}}(t)=P_{\mathrm{pv}}m_{\mathrm{PV}}[t],
+\]
+and the stratification signal
+\[
+p_{\mathrm{net}}[t]=P_{\mathrm{load}}m_L[t]-P_{\mathrm{pv}}m_{\mathrm{PV}}[t].
+\]
+
+\section{Stratified time-step selection}
+
+Select $K_{\mathrm{total}}$ times per scenario, split across profiles:
+\[
+K_{\mathrm{load}}+K_{\mathrm{pv}}+K_{\mathrm{net}}=K_{\mathrm{total}}.
+\]
+For each profile, sort indices by profile value, partition into $B$ equal-population bins
+(e.g.\ $B=10$), include anchors (argmin/argmax), and sample without replacement from bins to
+meet the quota. Union the three sets, de-duplicate, then trim/augment to size $K_{\mathrm{total}}$.
+Result:
+\[
+\mathcal{T}_s\subseteq\{0,\dots,T-1\},\qquad |\mathcal{T}_s|\le K_{\mathrm{total}}.
+\]
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\textwidth]{GNN files/figures/time_selection_stratified.png}
+  \caption{Stratified time-step selection across load, PV, and net profiles.}
+  \label{fig:time-selection-stratified}
+\end{figure}
+
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\textwidth]{GNN files/figures/time_selection_union.png}
+  \caption{Union of selected time indices across profiles.}
+  \label{fig:time-selection-union}
+\end{figure}
+
+\section{Device-to-node application at time $t$ (shared core)}
+
+All datasets apply device-level powers then aggregate to bus--phase nodes using fixed
+weights.
+
+\subsection*{Loads (device-level with multiplicative noise)}
+
+For each load device $d$:
+\[
+P_d(t)=P_{\mathrm{load}}(t)\alpha_d^P(1+\varepsilon_d^P),\qquad
+Q_d(t)=Q_{\mathrm{load}}(t)\alpha_d^Q(1+\varepsilon_d^Q),
+\]
+\[
+\varepsilon_d^P,\varepsilon_d^Q\stackrel{\mathrm{i.i.d.}}{\sim}\mathcal{N}(0,\sigma_{\mathrm{load}}),\qquad
+(1+\varepsilon)\leftarrow\max\{0,1+\varepsilon\}.
+\]
+These $(P_d(t),Q_d(t))$ are written to OpenDSS.
+
+\subsection*{Device-to-node aggregation (loads and PV)}
+
+Each device maps to one or more nodes with weights $w_{d,i}\ge 0$, $\sum_i w_{d,i}=1$
+(from \texttt{DEVICE\_TO\_BUSPH} and \texttt{PV\_TO\_BUSPH}). Node-wise aggregation:
+\[
+P_{\mathrm{load},i}(t)=\sum_d P_d(t)w_{d,i},\qquad
+Q_{\mathrm{load},i}(t)=\sum_d Q_d(t)w_{d,i},
+\]
+and similarly $P_{\mathrm{pv},i}(t)$ for PV.
+
+\subsection*{PV (device-level setpoint and post-solve actual P/Q)}
+
+With PV shares $\beta_d$ (\texttt{PV\_PMMP\_SHARE} for buses 850 and 860), we set each PV system's Pmpp so that the nominal (active) output after the DSS irradiance shape matches
+\[
+P_{\mathrm{pv}}(t)\beta_d(1+\varepsilon_d^{\mathrm{pv}}),\qquad
+\varepsilon_d^{\mathrm{pv}}\sim\mathcal{N}(0,\sigma_{\mathrm{pv}}),\qquad
+(1+\varepsilon_d^{\mathrm{pv}})\leftarrow\max\{0,1+\varepsilon_d^{\mathrm{pv}}\}.
+\]
+OpenDSS then solves the AC power flow; one PV has Volt-Var control, so reactive power $Q_{\mathrm{pv}}$ is determined by the solution (voltage-dependent). \textbf{After each converged solve}, we read the \emph{actual} P and Q from each PV system via \texttt{CktElement.TotalPowers()}, aggregate to bus--phase nodes using \texttt{PV\_TO\_BUSPH}, and use these actual $(P_{\mathrm{pv},i}(t),Q_{\mathrm{pv},i}(t))$ in all dataset node features and system-balance terms. Thus PV reactive power (including Volt-Var) is included consistently across datasets.
+
+\subsection*{Capacitors}
+
+Fixed capacitor kvar per bus is read from \texttt{CAP\_Q\_KVAR}. Define per-node
+\[
+Q_{\mathrm{cap},i}=\begin{cases}
+Q_{\mathrm{cap}}(b) & i=(b,ph)\ \text{at capacitor bus }b,\\
+0 & \text{otherwise.}
+\end{cases}
+\]
+
+\section{AC solve and rejection (shared)}
+
+For each candidate $(s,t)$:
+\begin{enumerate}[noitemsep]
+\item Apply device powers at time $t$.
+\item Solve AC PF (one solve, or two solves for delta-V). If OpenDSS raises the ``Max Control Iterations'' warning (e.g.\ \#485 from InvControl/Volt-Var), it is caught and the solution is still used when the solver reports converged.
+\item Reject if any required solve fails to converge.
+\item Read actual PV P and Q from each \texttt{PVSystem} and aggregate to nodes (\texttt{get\_pv\_actual\_pq\_by\_busph}).
+\item Read $\{|V_i|,\angle V_i\}_{i\in\mathcal{N}}$.
+\item Reject if any $|V_i|\notin[V_{\min},V_{\max}]$ or non-finite. The acceptance window is $[V_{\min},V_{\max}]=[0.85,1.10]$~pu (\texttt{VMAG\_PU\_MIN}, \texttt{VMAG\_PU\_MAX}).
+\end{enumerate}
+Kept samples are written as (i) per-sample metadata and (ii) per-(sample,node) tables. Output directories are \texttt{datasets\_gnn2/original}, \texttt{datasets\_gnn2/injection}, \texttt{datasets\_gnn2/loadtype}, \texttt{datasets\_gnn2/deltav} (paths resolved from repo root).
+
+\section{Dataset 0: Original node-power dataset (\texttt{datasets\_gnn2/original})}
+
+Features (per node $i$); load from device aggregation, PV from \emph{actual} post-solve P and Q:
+\[
+P_{\mathrm{load},i}(t)\ (\texttt{p\_load\_kw}),\quad
+Q_{\mathrm{load},i}(t)\ (\texttt{q\_load\_kvar}),\quad
+P_{\mathrm{pv},i}(t)\ (\texttt{p\_pv\_kw}),\quad
+Q_{\mathrm{pv},i}(t)\ (\texttt{q\_pv\_kvar}).
+\]
+(No explicit capacitor feature.) Targets:
+\[
+|V_i(t)|\ (\texttt{vmag\_pu}),\qquad \angle V_i(t)\ (\texttt{vang\_deg}).
+\]
+Graph: \texttt{gnn\_edges\_phase\_static.csv}. Script: \texttt{run\_original\_dataset.py}.
+
+\subsection*{Upstream-node exclusion (applies to all datasets)}
+
+Exclude the stiff source nodes
+\[
+\{\texttt{sourcebus.1},\texttt{sourcebus.2},\texttt{sourcebus.3},
+  \texttt{800.1},\texttt{800.2},\texttt{800.3}\}.
+\]
+From the full feeder ($N=95$ bus--phase nodes), this yields 89 learning nodes. The static edge
+extractor omits edges incident to \texttt{sourcebus} or \texttt{800}.
+
+\section{Dataset 1: Injection dataset}
+
+Targets: $|V_i(t)|$ and $\angle V_i(t)$. Node features are net injections
+$(P_{\mathrm{inj},i}(t),Q_{\mathrm{inj},i}(t))$.
+
+\subsection*{Post-solve upstream grid power}
+
+OpenDSS reports feeder power via \texttt{TotalPower}:
+\[
+P_{\mathrm{total}}^{\mathrm{DSS}}(t)+jQ_{\mathrm{total}}^{\mathrm{DSS}}(t)=\mathtt{TotalPower}(t).
+\]
+Using the sign convention (positive = supplied by grid):
+\[
+P_{\mathrm{grid}}(t)=-P_{\mathrm{total}}^{\mathrm{DSS}}(t),\qquad
+Q_{\mathrm{grid}}(t)=-Q_{\mathrm{total}}^{\mathrm{DSS}}(t).
+\]
+
+\subsection*{Node injection features}
+
+PV P and Q are the \emph{actual} post-solve values (including Volt-Var Q). For node $i$:
+\[
+P_{\mathrm{inj},i}(t)=
+\begin{cases}
+P_{\mathrm{grid}}(t)/3 & \text{source bus (3 phases)},\\
+P_{\mathrm{pv},i}(t)-P_{\mathrm{load},i}(t) & \text{otherwise},
+\end{cases}
+\qquad
+Q_{\mathrm{inj},i}(t)=
+\begin{cases}
+Q_{\mathrm{grid}}(t)/3 & \text{source bus (3 phases)},\\
+Q_{\mathrm{pv},i}(t)-Q_{\mathrm{load},i}(t)+Q_{\mathrm{cap},i} & \text{otherwise}.
+\end{cases}
+\]
+The node table also stores \texttt{p\_pv\_kw} and \texttt{q\_pv\_kvar} (actual) for consistency.
+
+\subsection*{Standard outputs}
+
+\begin{itemize}[noitemsep]
+\item \texttt{gnn\_node\_index\_master.csv}, \texttt{gnn\_edges\_phase\_static.csv}
+\item \texttt{gnn\_sample\_meta.csv}
+\item \texttt{gnn\_node\_features\_and\_targets.csv}: \texttt{p\_inj\_kw}, \texttt{q\_inj\_kvar}, \texttt{p\_pv\_kw}, \texttt{q\_pv\_kvar}, \texttt{vmag\_pu}, \texttt{vang\_deg}
+\end{itemize}
+Script: \texttt{run\_injection\_dataset.py}. Output directory: \texttt{datasets\_gnn2/injection}.
+
+\section{Dataset 2: Load-type dataset}
+
+Targets: $|V_i(t)|$ and $\angle V_i(t)$. Features decompose load by OpenDSS model type
+$m(d)\in\{1,2,4,5\}$:
+\[
+m=1:\text{PQ},\quad m=2:\text{Z},\quad m=4:\text{CVR},\quad m=5:\text{I}.
+\]
+Per node $i$ and type $m$:
+\[
+P^{(m)}_{\mathrm{load},i}(t)=\sum_{d:\,m(d)=m}P_d(t)w_{d,i},\qquad
+Q^{(m)}_{\mathrm{load},i}(t)=\sum_{d:\,m(d)=m}Q_d(t)w_{d,i}.
+\]
+Store the eight channels \texttt{m1\_p\_kw}, \texttt{m1\_q\_kvar}, \dots, \texttt{m5\_p\_kw},
+\texttt{m5\_q\_kvar}.
+
+\subsection*{PV, capacitor, system-balance, distance features}
+
+PV (actual post-solve) and capacitor:
+\[
+P_{\mathrm{pv},i}(t)\ (\texttt{p\_pv\_kw}),\qquad
+Q_{\mathrm{pv},i}(t)\ (\texttt{q\_pv\_kvar}),\qquad
+Q_{\mathrm{cap},i}\ (\texttt{q\_cap\_kvar}).
+\]
+System balance uses \emph{actual} PV P and Q after the solve (so Volt-Var Q is included), replicated to all nodes:
+\[
+P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}(t)-\sum_i P_{\mathrm{pv},i}(t),\qquad
+Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}(t)-\sum_i Q_{\mathrm{pv},i}(t)-\sum_b Q_{\mathrm{cap}}(b),
+\]
+stored as \texttt{p\_sys\_balance\_kw}, \texttt{q\_sys\_balance\_kvar}.
+
+Electrical distance uses Dijkstra with per-edge weight
+\[
+w_e=\sqrt{R_e^2+X_e^2},\qquad
+d_i=\min_{\text{paths }s\to i}\sum_{e\in\text{path}}w_e,\quad s\in\{\texttt{sourcebus},800\},
+\]
+stored as \texttt{electrical\_distance\_ohm}.
+
+\subsection*{Feature vector}
+
+\[
+\Bigl(
+d_i,\ \{P^{(m)}_{\mathrm{load},i},Q^{(m)}_{\mathrm{load},i}\}_{m\in\{1,2,4,5\}},\
+Q_{\mathrm{cap},i},\ P_{\mathrm{pv},i},\ Q_{\mathrm{pv},i},\ P_{\mathrm{sys}},Q_{\mathrm{sys}}
+\Bigr).
+\]
+Script: \texttt{run\_loadtype\_dataset.py}. Output directory: \texttt{datasets\_gnn2/loadtype}.
+
+\section{Grid power vs.\ system-balance (post-solve)}
+
+Injection dataset uses post-solve
+\[
+(P_{\mathrm{grid}},Q_{\mathrm{grid}})=-\mathtt{TotalPower}
+\]
+(contains losses, regulators, nonlinearities) and uses it only at the source node; elsewhere $P_{\mathrm{inj}},Q_{\mathrm{inj}}$ use actual PV and load P/Q.
+
+Load-type and delta-V datasets use \emph{post-solve} actual PV P and Q to form system balance replicated to all nodes:
+\[
+P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}-\sum_i P_{\mathrm{pv},i},\qquad
+Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}-\sum_i Q_{\mathrm{pv},i}-\sum_b Q_{\mathrm{cap}}(b),
+\]
+so Volt-Var reactive power is included; losses are still not reflected in the balance.
+
+\section{Dataset 3: Delta-V dataset (\texttt{datasets\_gnn2/deltav})}
+
+Target (per node):
+\[
+\Delta |V_i(t)| = |V_i^{(\mathrm{with\,PV})}(t)|-|V_i^{(0)}(t)|\quad (\texttt{vmag\_delta\_pu}).
+\]
+
+\subsection*{Two PF solves}
+
+Zero-PV:
+\[
+\text{PV off}\Rightarrow |V_i^{(0)}(t)|\ \ (\texttt{vmag\_zero\_pv\_pu}).
+\]
+With-PV:
+\[
+\text{PV on}\Rightarrow |V_i^{(\mathrm{with\,PV})}(t)|;\quad
+\text{then read actual PV P/Q and}\quad
+\Delta|V_i(t)|=|V_i^{(\mathrm{with\,PV})}(t)|-|V_i^{(0)}(t)|.
+\]
+
+\subsection*{Features}
+
+Same as load-type features (including \texttt{q\_pv\_kvar} and system balance with actual PV Q) plus baseline voltage:
+\[
+d_i,\ \{P^{(m)}_{\mathrm{load},i},Q^{(m)}_{\mathrm{load},i}\}_{m},\ Q_{\mathrm{cap},i},\
+P_{\mathrm{pv},i},\ Q_{\mathrm{pv},i},\ P_{\mathrm{sys}},Q_{\mathrm{sys}},\ |V_i^{(0)}(t)|.
+\]
+
+\subsection*{Targets and rejection}
+
+Reject if either solve fails or if any voltage in either solve violates $[V_{\min},V_{\max}]=[0.85,1.10]$~pu or is non-finite. Script: \texttt{run\_deltav\_dataset.py}.
+
+\section{Training use}
+
+All datasets share the same $(\mathcal{N},\mathcal{E})$ and edge attributes. The learning
+task differs only by node features/targets:
+\[
+\text{Dataset 0/1/2: } x_{i}^{(s,t)}\mapsto |V_i^{(s,t)}| \ (\text{and optionally } \angle V_i^{(s,t)}),
+\qquad
+\text{Dataset 3: } x_{i}^{(s,t)}\mapsto \Delta|V_i^{(s,t)}|.
+\]
+
+\paragraph{PV profile floor at very low irradiance.}
+In the delta-V dataset, define a floor for the \emph{with-PV} multiplier:
+\[
+\tilde m_{\mathrm{PV}}[t]=\max\{m_{\mathrm{PV}}[t],\,0.01\},
+\qquad
+m_{\mathrm{PV}}[t]=0\ \text{in the zero-PV solve}.
+\]
+This prevents low-irradiance snapshots where nominal PV is nonzero but realized PV is zero,
+which would force $\Delta|V_i(t)|\approx 0$ and degrade numerical consistency.
+
+\section{Excluding upstream nodes with nearly fixed voltage}
+
+OpenDSS clamps the source:
+\[
+\texttt{New object = circuit.ieee34-1 \ \textasciitilde{} basekv = 69 \ pu = 1.05 \ angle = 30 \ mvasc3 = 200000},
+\]
+so \texttt{sourcebus} is fixed at $1.05$ pu. The substation transformer to bus~800 has small
+impedance ($\%\!r=0.0005$, $X_{\mathrm{hl}}=0.01$), so the upstream nodes exhibit negligible
+variation and are excluded (see the exclusion set in Dataset~0). Figure~\ref{fig:upstream-daily-voltage}
+illustrates the near-constant daily profiles.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\textwidth]{GNN files/figures/upstream_daily_voltage.png}
+  \caption{Daily voltage magnitude profiles at upstream nodes:
+  \texttt{sourcebus.1}, \texttt{800.1}, \texttt{802.1}. These remain near the 1.05 pu slack
+  voltage and are excluded from training to avoid trivially constrained nodes.}
+  \label{fig:upstream-daily-voltage}
+\end{figure}
+
+
+
+\section{Voltage limits and operating-point adjustment}
+
+During early experiments we observed that, even before applying any scenario scaling or noise, the IEEE~34-node feeder operated with significantly depressed voltages at certain interior buses. Using the nominal totals from the OpenDSS file (baseline values $P_{\mathrm{load}}^{(0)} = 1769~\mathrm{kW}$, $Q_{\mathrm{load}}^{(0)} = 1044~\mathrm{kVAR}$, and $P_{\mathrm{pv}}^{(0)} = 1000~\mathrm{kW}$(from dss file)) and the 24~h load and irradiance profiles, we ran a diagnostic sweep over all 288 five-minute timesteps. For each timestep $t$ we solved the AC power flow with these baseline powers (no scenario multipliers, $\sigma_{\mathrm{load}} = \sigma_{\mathrm{pv}} = 0$) and recorded the minimum voltage magnitude
+\[
+v_{\min} = \min_{t \in \{0,\dots,287\}} \min_{i \notin \{\texttt{sourcebus},\,800\}} |V_i(t)|.
+\]
+This baseline check revealed that the feeder reaches voltages as low as $|V_i| \approx 0.74$~pu at some downstream nodes (e.g.\ bus~890, phase~a) during the evening peak, well below the desired operating band $[0.95,1.05]$~pu for our learning task.
+
+To mitigate this, we first attempted to shift the operating point by globally reducing load and increasing PV. Specifically, we introduced scaling factors
+\[
+P_{\mathrm{load}}^{\mathrm{base}} = \alpha_{\mathrm{L}} P_{\mathrm{load}}^{(0)}, \quad
+Q_{\mathrm{load}}^{\mathrm{base}} = \alpha_{\mathrm{L}} Q_{\mathrm{load}}^{(0)}, \quad
+P_{\mathrm{pv}}^{\mathrm{base}} = \alpha_{\mathrm{PV}} P_{\mathrm{pv}}^{(0)},
+\]
+and explored combinations such as
+\[
+\alpha_{\mathrm{L}} = 0.60, \qquad \alpha_{\mathrm{PV}} = 1.40,
+\]
+so that the dataset ``baseline'' powers became
+\[
+P_{\mathrm{load}}^{\mathrm{base}} = 0.60\, P_{\mathrm{load}}^{(0)}, \quad
+Q_{\mathrm{load}}^{\mathrm{base}} = 0.60\, Q_{\mathrm{load}}^{(0)}, \quad
+P_{\mathrm{pv}}^{\mathrm{base}} = 1.40\, P_{\mathrm{pv}}^{(0)}.
+\]
+For each $(\alpha_{\mathrm{L}}, \alpha_{\mathrm{PV}})$ pair we recomputed the 24~h profile (again with $\sigma_{\mathrm{load}}=\sigma_{\mathrm{pv}}=0$) and evaluated the resulting minimum voltage magnitude $v_{\min}$. Even for aggressively ``light'' operation, such as $(\alpha_{\mathrm{L}},\alpha_{\mathrm{PV}}) = (0.60,1.40)$, the best we obtained was $v_{\min} \approx 0.87$~pu: voltages improved, but some nodes in the long, weakly fed sections of the feeder still dipped significantly below $0.95$~pu. In other words, there is no reasonable uniform scaling of total load and PV that guarantees $|V_i(t)| \ge 0.95$~pu \emph{everywhere} on this feeder.
+
+Given this structural limitation of the network, we adopted a two-part strategy for the datasets instead:
+(i) we tightened the scenario ranges so that per-scenario multipliers stay very close to the chosen baseline,
+\[
+P_{\mathrm{load}}(s) \in [0.95,1.05]\,P_{\mathrm{load}}^{\mathrm{base}}, \quad
+Q_{\mathrm{load}}(s) \in [0.95,1.05]\,Q_{\mathrm{load}}^{\mathrm{base}}, \quad
+P_{\mathrm{pv}}(s) \in [0.95,1.05]\,P_{\mathrm{pv}}^{\mathrm{base}},
+\]
+with conservative noise levels $\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}} \in [0,0.05]$ (\texttt{RANGES}); and
+(ii) we enforced a strict voltage acceptance window in the sample rejection rules:
+\[
+|V_i(t)| \in [V_{\min}, V_{\max}] = [0.85,1.10]~\text{pu} \quad \forall i,t
+\]
+(\texttt{VMAG\_PU\_MIN}, \texttt{VMAG\_PU\_MAX}).
+Any snapshot for which \emph{any} non-upstream node violates this band is discarded and not included in the training datasets. Thus, although the underlying IEEE~34 feeder can exhibit voltages well below $0.95$~pu under heavy loading, the curated datasets used for GNN training only contain operating points with near-nominal voltages, consistent with the intended application regime.
+
+
+\section{Effect of Baseline Scaling on Feeder Voltages}
+
+The IEEE~34-node feeder used in this work is defined in \texttt{IEEE34\_PV.dss} (folder \texttt{new dss from dr mirzaei}), where the upstream slack bus is fixed at
+\[
+\texttt{New object = circuit.ieee34-1 \ \textasciitilde{} basekv = 69 \ pu = 1.05 \ angle = 30 \ mvasc3 = 200000},
+\]
+so the \emph{sourcebus} is clamped at \(1.05\)~pu. All downstream node voltages are determined by the AC power-flow solution (lines, transformers, regulators, capacitors, and PV injections); there is \emph{no} global hard cap enforcing \(|V_i| \le 1.05\)~pu throughout the feeder.
+
+To understand the intrinsic voltage range of the feeder, we first considered the original OpenDSS nominal totals,
+\[
+P_{\mathrm{load}}^{(0)} = 1769.0~\text{kW}, \qquad
+Q_{\mathrm{load}}^{(0)} = 1044.0~\text{kVAR}, \qquad
+P_{\mathrm{pv}}^{(0)} = 1000.0~\text{kW},
+\]
+and ran a diagnostic sweep over a full day (288 five-minute timesteps). At each timestep \(t\) we applied these totals using the daily profiles \(m_L[t]\) and \(m_{\mathrm{PV}}[t]\), with zero noise \((\sigma_{\mathrm{load}} = \sigma_{\mathrm{pv}} = 0)\), solved the AC power flow, and recorded the minimum and maximum nodal voltages over all non-upstream nodes:
+\[
+v_{\min}^{\mathrm{orig}} = \min_{t,i \notin \{\texttt{sourcebus},\,800\}} |V_i(t)|, \qquad
+v_{\max}^{\mathrm{orig}} = \max_{t,i \notin \{\texttt{sourcebus},\,800\}} |V_i(t)|.
+\]
+Under these original averages we obtained
+\[
+v_{\min}^{\mathrm{orig}} \approx 0.68~\text{pu}, \qquad
+v_{\max}^{\mathrm{orig}} \approx 1.05~\text{pu},
+\]
+showing that the unmodified feeder experiences substantial undervoltage (down to about \(0.68\)~pu) at some downstream buses.
+
+Because such low voltages are far outside the operating range we wish to learn, we introduced a scaled baseline for the dataset generators, reducing load and increasing PV:
+\[
+P_{\mathrm{load}}^{\mathrm{base}} = 0.60\, P_{\mathrm{load}}^{(0)}, \qquad
+Q_{\mathrm{load}}^{\mathrm{base}} = 0.60\, Q_{\mathrm{load}}^{(0)}, \qquad
+P_{\mathrm{pv}}^{\mathrm{base}} = 1.40\, P_{\mathrm{pv}}^{(0)},
+\]
+which numerically corresponds to
+\[
+P_{\mathrm{load}}^{\mathrm{base}} = 849.12~\text{kW}, \quad
+Q_{\mathrm{load}}^{\mathrm{base}} = 501.12~\text{kVAR}, \quad
+P_{\mathrm{pv}}^{\mathrm{base}} = 1400.0~\text{kW}.
+\]
+Repeating the same 24~h sweep with these new averages (again with \(\sigma_{\mathrm{load}}=\sigma_{\mathrm{pv}}=0\)) yields
+\[
+v_{\min}^{\mathrm{new}} \approx 0.87~\text{pu}, \qquad
+v_{\max}^{\mathrm{new}} \approx 1.11~\text{pu}.
+\]
+Thus, the scaled baseline significantly improves the worst-case voltage (from about \(0.68\)~pu up to \(0.87\)~pu), but some nodes—especially near capacitors and PV—now rise above \(1.05\)~pu, reaching approximately \(1.106\)~pu. This behavior is consistent with the physics of the feeder: OpenDSS only fixes the slack bus at \(1.05\)~pu; downstream voltages can legitimately exceed \(1.05\)~pu when local reactive support and PV injections offset voltage drops along the lines.
+
+\paragraph{Current configuration.}
+The pipeline now uses the new DSS (\texttt{IEEE34\_PV.dss}) and nominal totals from that file as the baseline:
+$P_{\mathrm{load}}^{(0)}=1769$~kW, $Q_{\mathrm{load}}^{(0)}=1044$~kVAR, $P_{\mathrm{pv}}^{(0)}=1000$~kW (\texttt{BASELINE}).
+Scenario multipliers sample from \texttt{RANGES} (e.g.\ $[0.95,1.05]$ for P/Q, $\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}}\in[0,0.05]$).
+The voltage acceptance window is $[V_{\min},V_{\max}]=[0.85,1.10]$~pu.
+PV actual P and Q (including Volt-Var reactive power) are read after each solve and written into all datasets.
+
+\subsubsection*{Problem and Resolution}
+The analysis initially relied on an earlier IEEE 34-bus DSS model and its load and PV profiles, which did not align with the intended network layout, DER placement, or time-varying behaviour. To address this, the previous OpenDSS model and profiles were replaced with the IEEE 34-bus model and 5-minute daily load and irradiance profiles provided by Dr.\ Mirzaei (\texttt{IEEE34\_PV.dss}, \texttt{5minDayShape.csv}, \texttt{5MinuteIrradiance.csv}). Using this updated model and profiles, the daily voltage range was evaluated over 288 steps (5-minute resolution) with a chosen baseline (e.g.\ 849.12\,kW load, 501.12\,kVAR, 1400\,kW PV for one diagnostic run). The global minimum voltage was 0.8978\,pu at bus 890, phase 1, at 16:50, with phases 2 and 3 at the same bus at 0.923\,pu and 0.921\,pu at that time; the maximum was 1.0545\,pu at bus 848, phase 3. The problem is therefore resolved by adopting this DSS model and profiles instead of the previous one for all subsequent analysis; the codebase now uses the new DSS and the nominal totals 1769/1044/1000 with voltage window $[0.85,1.10]$~pu.
+
+
+\end{document}

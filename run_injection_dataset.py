@@ -770,6 +770,29 @@ def apply_snapshot_timeconditioned(
     )
     return totals, busphP_load, busphQ_load, busphP_pv, busphQ_pv
 
+
+def get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph):
+    """
+    After solve: read actual P and Q from each PV system (includes Volt-Var Q), aggregate by (bus, ph).
+    OpenDSS reports generation as negative; we use injection convention (+ = into feeder).
+    Returns (busphP_pv_actual, busphQ_pv_actual) dicts.
+    """
+    busphP = {}
+    busphQ = {}
+    for pv_key, dss_name in pv_to_dss.items():
+        dss.Circuit.SetActiveElement(f"PVSystem.{dss_name}")
+        pwr = dss.CktElement.TotalPowers()
+        if len(pwr) >= 2:
+            P_tot = -float(pwr[0])  # OpenDSS: negative = generation
+            Q_tot = -float(pwr[1])
+        else:
+            P_tot, Q_tot = 0.0, 0.0
+        for (bus, ph, w) in pv_to_busph.get(pv_key, []):
+            busphP[(bus, ph)] = busphP.get((bus, ph), 0.0) + P_tot * w
+            busphQ[(bus, ph)] = busphQ.get((bus, ph), 0.0) + Q_tot * w
+    return busphP, busphQ
+
+
 # ============================================================
 # Injection dataset generation (P_inj, Q_inj with upstream grid + capacitors)
 # ============================================================
@@ -861,6 +884,7 @@ def generate_gnn_snapshot_dataset_injection(
                 skipped_nonconv += 1
                 continue
 
+            busphP_pv_actual, busphQ_pv_actual = get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
             vmag_m, vang_m = get_all_node_voltage_pu_and_angle_filtered(node_names_master)
             vmag_arr = np.asarray(vmag_m, dtype=float)
             if (not np.isfinite(vmag_arr).all()) or (vmag_arr.min() < VMAG_PU_MIN) or (vmag_arr.max() > VMAG_PU_MAX):
@@ -897,7 +921,8 @@ def generate_gnn_snapshot_dataset_injection(
                     continue
                 p_load_node = float(busphP_load.get((bus, ph), 0.0))
                 q_load_node = float(busphQ_load.get((bus, ph), 0.0))
-                p_pv_node = float(busphP_pv.get((bus, ph), 0.0))
+                p_pv_node = float(busphP_pv_actual.get((bus, ph), 0.0))
+                q_pv_node = float(busphQ_pv_actual.get((bus, ph), 0.0))
                 vm, va = vdict_m.get(n, (np.nan, np.nan))
 
                 if bus == "sourcebus":
@@ -905,12 +930,13 @@ def generate_gnn_snapshot_dataset_injection(
                     q_inj = Q_grid_per_ph
                 else:
                     p_inj = p_pv_node - p_load_node
-                    q_inj = -q_load_node + float(CAP_Q_KVAR.get(bus, 0.0))
+                    q_inj = q_pv_node - q_load_node + float(CAP_Q_KVAR.get(bus, 0.0))
 
                 rows_node.append({
                     "sample_id": sample_id, "node": n, "node_idx": int(node_to_idx_master[n]),
                     "bus": bus, "phase": int(ph),
                     "p_inj_kw": p_inj, "q_inj_kvar": q_inj,
+                    "p_pv_kw": p_pv_node, "q_pv_kvar": q_pv_node,
                     "vmag_pu": float(vm), "vang_deg": float(va),
                 })
 

@@ -246,6 +246,9 @@ def generate_gnn_snapshot_dataset_loadtype(
                 skipped_nonconv += 1
                 continue
 
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(
+                pv_to_dss, pv_to_busph
+            )
             vmag_m, vang_m = inj.get_all_node_voltage_pu_and_angle_filtered(node_names_master)
             vmag_arr = np.asarray(vmag_m, dtype=float)
             if (not np.isfinite(vmag_arr).all()) or (vmag_arr.min() < inj.VMAG_PU_MIN) or (vmag_arr.max() > inj.VMAG_PU_MAX):
@@ -254,13 +257,14 @@ def generate_gnn_snapshot_dataset_loadtype(
 
             vdict_m = {n: (float(vm), float(va)) for n, vm, va in zip(node_names_master, vmag_m, vang_m)}
 
-            # System-wide balance (same for all nodes; pre-solve estimate of grid injection)
+            # System-wide balance (same for all nodes; actual P/Q from PV after solve)
             sum_p_load = float(sum(busphP_load.values()))
             sum_q_load = float(sum(busphQ_load.values()))
-            sum_p_pv = float(sum(busphP_pv.values()))
+            sum_p_pv = float(sum(busphP_pv_actual.values()))
+            sum_q_pv = float(sum(busphQ_pv_actual.values()))
             sum_q_cap = sum(inj.CAP_Q_KVAR.values())
             p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load - sum_q_cap  # PV Q ≈ 0
+            q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
 
             rows_sample.append({
                 "sample_id": sample_id, "scenario_id": s, "t_index": t, "t_minutes": t * inj.STEP_MIN,
@@ -290,8 +294,9 @@ def generate_gnn_snapshot_dataset_loadtype(
                 # CAP_Q_KVAR is already per-phase (100 for 844, 150 for 848); no extra division
                 q_cap_node = float(inj.CAP_Q_KVAR.get(bus, 0.0))
 
-                # PV P (nominal)
-                p_pv_node = float(busphP_pv.get((bus, ph), 0.0))
+                # PV P and Q (actual after solve, includes Volt-Var Q)
+                p_pv_node = float(busphP_pv_actual.get((bus, ph), 0.0))
+                q_pv_node = float(busphQ_pv_actual.get((bus, ph), 0.0))
 
                 # System balance P, Q (same for all nodes — global context of grid injection)
                 p_sys_node = p_sys_balance
@@ -310,6 +315,7 @@ def generate_gnn_snapshot_dataset_loadtype(
                     "m5_p_kw": m5_p, "m5_q_kvar": m5_q,
                     "q_cap_kvar": q_cap_node,
                     "p_pv_kw": p_pv_node,
+                    "q_pv_kvar": q_pv_node,
                     "p_sys_balance_kw": p_sys_node, "q_sys_balance_kvar": q_sys_node,
                     "vmag_pu": float(vm), "vang_deg": float(va),
                 })
@@ -326,7 +332,7 @@ def generate_gnn_snapshot_dataset_loadtype(
 
     print(f"\n[LOADTYPE DATASET] Saved to {OUT_DIR}/")
     print(f"  {NODE_CSV} | samples={df_sample['sample_id'].nunique()} | node-rows={len(df_node)}")
-    print(f"  Features per node: electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, p_sys_balance, q_sys_balance")
+    print(f"  Features per node: electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, q_pv_kvar, p_sys_balance, q_sys_balance")
     print(f"  Skipped: nonconv={skipped_nonconv} badV={skipped_badV}")
     return df_sample, df_node
 

@@ -152,6 +152,9 @@ def generate_gnn_snapshot_dataset_original(
                 skipped_nonconv += 1
                 continue
 
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(
+                pv_to_dss, pv_to_busph
+            )
             vmag_m, vang_m = inj.get_all_node_voltage_pu_and_angle_filtered(
                 node_names_master
             )
@@ -201,7 +204,8 @@ def generate_gnn_snapshot_dataset_original(
                     continue
                 p_load_node = float(busphP_load.get((bus, ph), 0.0))
                 q_load_node = float(busphQ_load.get((bus, ph), 0.0))
-                p_pv_node = float(busphP_pv.get((bus, ph), 0.0))
+                p_pv_node = float(busphP_pv_actual.get((bus, ph), 0.0))
+                q_pv_node = float(busphQ_pv_actual.get((bus, ph), 0.0))
                 vm, va = vdict_m.get(n, (np.nan, np.nan))
 
                 rows_node.append(
@@ -214,6 +218,7 @@ def generate_gnn_snapshot_dataset_original(
                         "p_load_kw": p_load_node,
                         "q_load_kvar": q_load_node,
                         "p_pv_kw": p_pv_node,
+                        "q_pv_kvar": q_pv_node,
                         "vmag_pu": float(vm),
                         "vang_deg": float(va),
                     }
@@ -239,7 +244,7 @@ def generate_gnn_snapshot_dataset_original(
         f"node-rows={len(df_node)}"
     )
     print(
-        "  Features per node: p_load_kw, q_load_kvar, p_pv_kw; "
+        "  Features per node: p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar; "
         "upstream buses sourcebus/800 excluded"
     )
     print(f"  Skipped: nonconv={skipped_nonconv} badV={skipped_badV}")
