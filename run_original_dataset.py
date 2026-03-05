@@ -144,7 +144,10 @@ def generate_gnn_snapshot_dataset_original(
                 )
             )
 
-            dss.Solution.Solve()
+            try:
+                dss.Solution.Solve()
+            except Exception:
+                pass  # e.g. #485 Max Control Iterations Exceeded (InvControl); solution may still be valid
             if not dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue

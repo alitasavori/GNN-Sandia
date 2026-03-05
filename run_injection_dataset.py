@@ -218,7 +218,7 @@ def _apply_voltage_bases():
     dss.Text.Command("calcvoltagebases")
     # IEEE34_PV.dss uses InvControl (VoltVar); allow enough control iterations
     try:
-        dss.Text.Command("set maxcontroliter=500")
+        dss.Text.Command("set maxcontroliter=1000")
     except Exception:
         pass
 
@@ -853,7 +853,10 @@ def generate_gnn_snapshot_dataset_injection(
                 sigma_load=sigL, sigma_pv=sigPV, rng=rng_solve
             )
 
-            dss.Solution.Solve()
+            try:
+                dss.Solution.Solve()
+            except Exception:
+                pass  # e.g. #485 Max Control Iterations Exceeded; solution may still be valid
             if not dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue

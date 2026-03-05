@@ -163,7 +163,10 @@ def generate_gnn_snapshot_dataset_deltav(
                 sigma_load=sigL,
                 rng=rng_solve,
             )
-            inj.dss.Solution.Solve()
+            try:
+                inj.dss.Solution.Solve()
+            except Exception:
+                pass  # e.g. #485 Max Control Iterations Exceeded; solution may still be valid
             if not inj.dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue
@@ -193,7 +196,10 @@ def generate_gnn_snapshot_dataset_deltav(
                 rng=rng_solve,
             )
 
-            inj.dss.Solution.Solve()
+            try:
+                inj.dss.Solution.Solve()
+            except Exception:
+                pass  # e.g. #485 Max Control Iterations Exceeded; solution may still be valid
             if not inj.dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue

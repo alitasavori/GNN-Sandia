@@ -238,7 +238,10 @@ def generate_gnn_snapshot_dataset_loadtype(
                 sigma_load=sigL, sigma_pv=sigPV, rng=rng_solve,
             )
 
-            inj.dss.Solution.Solve()
+            try:
+                inj.dss.Solution.Solve()
+            except Exception:
+                pass  # e.g. #485 Max Control Iterations Exceeded; solution may still be valid
             if not inj.dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue
