@@ -45,7 +45,7 @@ def equal_pop_bin_edges(profile, B):
     return np.array(edges)
 
 def main():
-    dss_path = os.path.join(os.path.dirname(__file__), "ieee34Mod1_with_loadshape.dss")
+    dss_path = os.path.join(os.path.dirname(__file__), "new dss from dr mirzaei", "IEEE34_PV.dss")
     if not os.path.isfile(dss_path):
         print("DSS not found; using synthetic profiles for demo.")
         t = np.linspace(0, 24, NPTS, endpoint=False)

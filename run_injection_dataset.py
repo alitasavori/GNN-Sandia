@@ -12,21 +12,22 @@ import opendssdirect as dss
 # ============================================================
 # CONFIG
 # ============================================================
-DSS_FILE = "ieee34Mod1_with_loadshape.dss"
+# New DSS model and profiles from "new dss from dr mirzaei" (IEEE34_PV.dss, 5minDayShape.csv, 5MinuteIrradiance.csv)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DSS_FILE = os.path.join(_SCRIPT_DIR, "new dss from dr mirzaei", "IEEE34_PV.dss")
 NPTS = 288
 STEP_MIN = 5
 
 VOLTAGE_BASES_KV = [69.0, 24.9, 4.16, 0.48]
-# Voltage acceptance window used by all dataset generators
-VMAG_PU_MIN = 0.50
-VMAG_PU_MAX = 1.05
+# Voltage acceptance window used by all dataset generators (new DSS thresholds)
+VMAG_PU_MIN = 0.85
+VMAG_PU_MAX = 1.10
 
+# Nominal totals from new DSS (IEEE34_PV.dss): 1769 kW load, 1044 kVAR, 1000 kW PV
 BASELINE = dict(
-    # Reference powers used in all dataset generators (already scaled)
-    # These are the nominal totals before time profiles and scenario multipliers:
-    P_load_total_kw=849.12,   # kW
-    Q_load_total_kvar=501.12, # kVAR
-    P_pv_total_kw=1400.0,     # kW
+    P_load_total_kw=1769.0,   # kW (spot 1047 + distributed 722)
+    Q_load_total_kvar=1044.0, # kVAR
+    P_pv_total_kw=1000.0,     # kW (PV850=500 + PV860=500)
     sigma_load=0.05,
     sigma_pv=0.05,
 )
@@ -46,6 +47,8 @@ EXCLUDED_UPSTREAM_BUSES = ("sourcebus", "800")
 
 # ============================================================
 # DEVICE-LEVEL P/Q SHARES
+# Same distribution as new DSS (IEEE34_PV): same load names and kW/kVAR per device.
+# Only PV buses changed (850/860 in new DSS; see PV_PMMP_SHARE below).
 # ============================================================
 DEVICE_P_SHARE = {
     "S890": 0.2544,
@@ -188,9 +191,10 @@ DEVICE_TO_BUSPH = {
     "D858_834sc": [("858", 3, 0.5), ("858", 1, 0.5)],
 }
 
-PV_PMMP_SHARE = {"pv840": 0.5, "pv860": 0.5}
+# PV at buses 850 and 860 (IEEE34_PV.dss from Dr. Mirzaei)
+PV_PMMP_SHARE = {"pv850": 0.5, "pv860": 0.5}
 PV_TO_BUSPH = {
-    "pv840": [("840", 1, 1/3), ("840", 2, 1/3), ("840", 3, 1/3)],
+    "pv850": [("850", 1, 1/3), ("850", 2, 1/3), ("850", 3, 1/3)],
     "pv860": [("860", 1, 1/3), ("860", 2, 1/3), ("860", 3, 1/3)],
 }
 
@@ -212,6 +216,11 @@ def _apply_voltage_bases():
     vb = ",".join(str(v) for v in VOLTAGE_BASES_KV)
     dss.Text.Command(f'set voltagebases="{vb}"')
     dss.Text.Command("calcvoltagebases")
+    # IEEE34_PV.dss uses InvControl (VoltVar); allow enough control iterations
+    try:
+        dss.Text.Command("set maxcontroliter=500")
+    except Exception:
+        pass
 
 def compile_once():
     dss.Basic.ClearAll()
