@@ -512,6 +512,96 @@ Scenario multipliers sample from \texttt{RANGES} (e.g.\ $[0.95,1.05]$ for P/Q, $
 The voltage acceptance window is $[V_{\min},V_{\max}]=[0.85,1.10]$~pu.
 PV actual P and Q (including Volt-Var reactive power) are read after each solve and written into all datasets.
 
+\subsection*{OpenDSS iteration types, ZIP vs.\ control, and runtime observation}
+
+OpenDSS uses two distinct iteration mechanisms; confusing them explains both why ZIP does not affect control-iteration limits and why the current pipeline is slower than past runs.
+
+\paragraph{Power-flow iterations (MaxIterations).}
+The AC power-flow solver (e.g.\ Newton--Raphson) solves one nonlinear system that includes the network equations and all device models. Loads modeled as ZIP have $P$ and $Q$ given by voltage-dependent formulas (e.g.\ $P = P_0(a_Z V^2 + a_I V + a_P)$). At each \emph{power-flow} iteration the solver updates the voltage vector and re-evaluates these formulas; there is no separate outer loop. So ZIP is embedded \emph{inside} the single solve and consumes \textbf{MaxIterations} (default 15), not control iterations. The solver iterates until voltages (and hence ZIP-derived $P$, $Q$) converge.
+
+\paragraph{Control iterations (MaxControlIterations).}
+A separate outer loop implements \emph{controls} that change device setpoints between solves: (1) solve AC PF $\to$ (2) controls (CapControl, RegControl, InvControl, etc.) read the solution and change taps, switch states, or reactive setpoints $\to$ (3) solve again with updated setpoints $\to$ repeat until no control actions or the limit is reached. This loop is capped by \textbf{MaxControlIterations} (default in OpenDSS is often 10). Capacitor and regulator controls usually settle in a few steps; inverter Volt-Var (InvControl) updates $Q$ on a smooth voltage--reactive curve and can require many iterations or oscillate, so the same limit is hit much more often when Volt-Var is present.
+
+\paragraph{Debugging and comparison in this pipeline.}
+The dataset scripts set \texttt{maxcontroliter} (e.g.\ 20000) in \texttt{run\_injection\_dataset.py} and log it at startup (\texttt{[DSS] maxcontroliter=20000}). Samples are rejected when \texttt{Solution.Converged()} is false (\texttt{skip\_nonconv}) or when voltages fall outside $[V_{\min},V_{\max}]$ (\texttt{skip\_badV}). With Volt-Var enabled, a large fraction of candidate $(s,t)$ snapshots can hit the control-iteration limit and be marked non-converged even when the underlying power flow would be acceptable; raising \texttt{maxcontroliter} and reducing per-snapshot noise (e.g.\ $\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}}\in[0,0.02]$) improves \texttt{kept} and reduces \texttt{skip\_badV}, but \texttt{skip\_nonconv} remains significant. OpenDSS does not support ``iterate until convergence'' without a finite cap; the limit is required to avoid infinite loops when controls do not settle.
+
+\paragraph{Observation: why past OpenDSS runs were faster than current GNN dataset generation.}
+In the past, runs often used the same feeder without inverter Volt-Var control (or with only capacitor/regulator controls). Those controls typically converge in a small number of steps (well under the default MaxControlIterations). So each solve required few control iterations and completed quickly. The current pipeline uses \texttt{IEEE34\_PV.dss} with InvControl (Volt-Var). Every snapshot now runs the control loop until inverter setpoints settle or the cap is hit; many snapshots hit the cap and are rejected as non-converged. Thus (i) each solve is more expensive (many more control iterations per solve), and (ii) more candidate snapshots must be tried to obtain the same number of kept samples. This combination can explain why OpenDSS in the past was noticeably faster than the present GNN dataset generation, where Volt-Var is active and \texttt{maxcontroliter} is large.
+
+\paragraph{Baseline daily profile: most steps do not converge.}
+When we run the \emph{baseline} daily profile (nominal totals from the DSS file: $P_{\mathrm{load}}=1769$~kW, $Q_{\mathrm{load}}=1044$~kVAR, $P_{\mathrm{pv}}=1000$~kW; \texttt{IEEE34\_PV.dss}, \texttt{5minDayShape.csv}, \texttt{5MinuteIrradiance.csv}; $\sigma_{\mathrm{load}}=\sigma_{\mathrm{pv}}=0$) over all 288 five-minute timesteps, not all solves converge. We observe 86 converged and 202 non-converged. Increasing \texttt{maxcontroliter} from 500 to 20000 does not change these counts: we still get 86 converged and 202 non-converged. We then instrumented the run to record the number of control iterations used for each \emph{converged} solve. The 86 that converge do so in 2--10 iterations (typically 2; a few timesteps need up to 10). The 202 that do not converge do not settle even when the limit is 20000---so the failure is not due to hitting a low iteration cap but likely due to the Volt-Var/network loop oscillating or failing to reach a fixed point at those operating points. The open question remains: why do most of the baseline daily steps (202/288) not converge, and how could the InvControl or network be adjusted so that the daily profile is fully converged for downstream analysis (e.g.\ smooth daily voltage plots and consistent dataset generation)?
+
+\paragraph{Confirmation: Volt-Var is the cause.}
+To confirm that the non-convergence is due to the PV Volt-Var control (and not the feeder or power flow itself), we ran the same baseline daily profile (same DSS, same 288 steps, same baseline 1769/1044/1000 and profiles) with the InvControl for PV850 \emph{disabled} by commenting out the \texttt{New InvControl.InvCtrl\_PV850} line in a temporary copy of \texttt{IEEE34\_PV.dss}. With Volt-Var disabled, \textbf{288/288} steps converged and \textbf{0} non-converged; each converged step used 1 control iteration (no Volt-Var loop). With Volt-Var enabled we get 86/288 converged and 202 non-converged. So the problem is confirmed to be the PV Volt-Var control (InvControl), not the base power flow or the rest of the circuit. The script \texttt{run\_daily\_voltage\_no\_voltvar.py} reproduces this experiment.
+
+\paragraph{Scaled vs.\ nominal baseline: daily profiles and reactive power.}
+We compared the daily voltage profile and PV850 reactive power with two baselines: (i) nominal totals $P_{\mathrm{load}}=1769$~kW, $Q_{\mathrm{load}}=1044$~kVAR, $P_{\mathrm{pv}}=1000$~kW; and (ii) scaled totals $P_{\mathrm{load}}=849.12$~kW, $Q_{\mathrm{load}}=501.12$~kVAR, $P_{\mathrm{pv}}=1400$~kW (lighter load, higher PV). Both runs use Volt-Var enabled and the same 288-step daily profiles. Figure~\ref{fig:daily-voltage-baseline} shows the nominal case; Figure~\ref{fig:daily-voltage-scaled} shows the scaled case.
+
+\paragraph{Non-convergence timing: from a certain hour onward, not scattered.}
+In both cases, non-convergence does \emph{not} occur randomly throughout the day. With the nominal baseline, the simulation converges only until approximately 7--7.5~h; at that point PV850 reactive power jumps sharply from 0 to about $-67$~kVAR and the solver stops converging. With the scaled baseline, convergence extends much further (until approximately 16.8--17.5~h). The failure coincides with the inverter entering or rapidly traversing the steep part of the Volt-Var curve (where small voltage changes cause large $Q$ changes) or hitting its reactive limits. Early in the day, the operating point lies in a ``stable'' region---either inside the Volt-Var deadband or firmly on one side with steady $Q$---so the control loop settles. Non-convergence appears when the operating point moves into the transition region while the network is stressed, causing the iterative control loop to oscillate or fail to reach a fixed point.
+
+\paragraph{Why reactive injection differs between baselines.}
+In the nominal case, PV850 reactive power stays near 0~kVAR until about 6.75~h, then drops sharply to about $-67$~kVAR just before the crash. Voltages are relatively low; for much of the early day they sit inside the Volt-Var deadband, so $Q \approx 0$. Only when voltage crosses the upper threshold does the controller suddenly demand negative $Q$, and it effectively saturates at its limit. In the scaled case, PV850 absorbs roughly $-525$~kVAR from the start of the day. The larger PV (1400~kW vs.\ 1000~kW) gives a higher apparent-power rating and thus larger reactive capability; the lighter load and higher PV push voltages above the upper Volt-Var knee early, so the controller immediately commands strong $Q$ absorption to bring voltage down. The scaled case therefore shows large negative $Q$ from hour~0, whereas the nominal case shows $Q \approx 0$ until the late-morning transition.
+
+\paragraph{Possible fix via Volt-Var tuning.}
+The non-convergence is tied to how the Volt-Var droop interacts with the feeder during the afternoon transition, not to a fundamental power-flow failure. A plausible fix is to soften the Volt-Var behavior: widen the deadband, reduce the slope (less aggressive $Q$ change per $\Delta V$), spread the breakpoints ($V_1$--$V_4$, $Q_1$--$Q_4$) so transitions are gentler, or add ramp limits on $Q$ change per control iteration if supported. Adjusting the InvControl parameters in \texttt{IEEE34\_PV.dss} could reduce or eliminate the non-convergence during those critical hours.
+
+\paragraph{Attempt: relax \texttt{VoltageChangeTolerance}.}
+The InvControl loop declares convergence based on the change in monitored voltage between successive control iterations. The default setting in \texttt{IEEE34\_PV.dss} was \texttt{VoltageChangeTolerance=0.0001} (very strict). We tested \texttt{VoltageChangeTolerance=0.001} and regenerated the two Volt-Var-ON daily profiles. The nominal baseline still failed to converge beyond about 7--7.5~h (the profile remains truncated), while the scaled baseline produced a smooth full-day profile (no gaps), indicating that relaxing the tolerance can help the control loop settle for some operating points but does not fully resolve the nominal-baseline instability.
+
+\paragraph{Second attempt: \texttt{VoltageChangeTolerance=0.01}.}
+We loosened the tolerance once more to \texttt{VoltageChangeTolerance=0.01} and ran the same two Volt-Var-ON daily profiles again. The nominal baseline (1769/1044/1000) still failed to converge beyond approximately 7--7.5~h; the profile remained truncated. The scaled baseline (849.12/501.12/1400) again produced a smooth full-day profile. So further relaxing the convergence criterion did not resolve the nominal-baseline non-convergence. The control loop at those stressed operating points appears to oscillate or fail to reach a fixed point rather than merely requiring a looser stopping tolerance; addressing it would require softening the Volt-Var curve (slope, deadband, or reactive limits) rather than the InvControl tolerance alone.
+
+\paragraph{Third attempt: Volt-Var on both PVs.}
+Finally, we enabled Volt-Var control on both PV systems (PV850 and PV860) using the same Volt-Var curve and \texttt{VoltageChangeTolerance=0.001}, and re-ran the baseline and scaled daily profiles. The nominal baseline still failed to converge beyond approximately 7--7.5~h (the time series for voltages and PV Q remained truncated), while the scaled baseline again produced a smooth, fully converged 24~h profile. Thus adding a second Volt-Var-controlled inverter did not resolve the nominal-baseline non-convergence; the instability appears to be inherent to the interaction between the Volt-Var droop and the feeder at those stressed operating points.
+
+\paragraph{Gentler Volt-Var slope and final baseline choice for dataset generation.}
+We then made the Volt-Var curve less aggressive by reducing its slope while keeping the same deadband and reactive limits. Specifically, we widened the ramp regions from $0.92 \to 0.98$ and $1.02 \to 1.08$ (in pu) to $0.88 \to 0.98$ and $1.02 \to 1.12$, keeping the same $\pm 44\%$ (of inverter kVA) reactive limits and \texttt{VoltageChangeTolerance=0.001}. With this gentler Volt-Var slope, both the \emph{nominal} and \emph{scaled} daily runs converged for all 288 timesteps. However, the nominal operating point still produced a very depressed minimum voltage ($v_{\min}\approx 0.73$~pu at bus 890.1), whereas the scaled operating point achieved a substantially higher minimum voltage ($v_{\min}\approx 0.885$~pu at bus 890.1). Therefore we keep the scaled baseline $(849.12/501.12/1400)$ as the scenario-sampling baseline for dataset generation.
+For completeness, the daily extremes with Volt-Var enabled are:
+\[
+\text{Nominal }(1769/1044/1000):\quad v_{\min}=0.730181~\text{pu at }890.1\text{ (17:40)},\ \ v_{\max}=1.049550~\text{pu at }802.3,
+\]
+\[
+\text{Scaled }(849.12/501.12/1400):\quad v_{\min}=0.884645~\text{pu at }890.1\text{ (17:55)},\ \ v_{\max}=1.054475~\text{pu at }848.3.
+\]
+
+\paragraph{Dataset generation log (scaled baseline, gentler Volt-Var).}
+After adopting the scaled baseline and the gentler Volt-Var curve, the original-dataset pipeline produced fully kept samples with no non-converged or bad-voltage rejections in the scenarios tested. An excerpt from the run log (first few scenarios) is:
+\begin{verbatim}
+[scenario 1/200] kept=288  skip_nonconv=0  skip_badV=0  ...  ctrl_iter: n=288 min=2 max=23 mean=4.1
+[scenario 2/200] kept=576  skip_nonconv=0  skip_badV=0  ...  ctrl_iter: n=288 min=2 max=23 mean=3.8
+[scenario 3/200] kept=864  skip_nonconv=0  skip_badV=0  ...  ctrl_iter: n=288 min=2 max=23 mean=3.8
+\end{verbatim}
+This indicates that (for the scaled baseline and tight scenario ranges) Volt-Var control converges in a modest number of control iterations (typically 2--35) and yields voltages within the acceptance window $[0.85,1.10]$~pu for these scenarios.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\textwidth]{GNN files/figures/daily_voltage_profile_nominal_1769_1044_1000_gentler_slope_voltvar_on.png}
+  \caption{Daily voltage profile and PV850 reactive power with \emph{nominal} baseline 1769/1044/1000 and the gentler Volt-Var curve (\texttt{VoltageChangeTolerance=0.001}).}
+  \label{fig:daily-voltage-nominal-gentler}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\textwidth]{GNN files/figures/daily_voltage_profile_scaled_849_501_1400_gentler_slope_voltvar_on.png}
+  \caption{Daily voltage profile and PV850 reactive power with \emph{scaled} baseline 849.12/501.12/1400 and the gentler Volt-Var curve (\texttt{VoltageChangeTolerance=0.001}).}
+  \label{fig:daily-voltage-scaled-gentler}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\textwidth]{GNN files/figures/daily_voltage_profile_baseline_voltvar_on_relaxed_convergence.png}
+  \caption{Daily voltage profile (top) and PV850 reactive power (bottom) with nominal baseline 1769/1044/1000~kW/kVAR/kW, Volt-Var ON (\texttt{VoltageChangeTolerance=0.001}). Non-convergence occurs from approximately 7.5~h onward.}
+  \label{fig:daily-voltage-baseline}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\textwidth]{GNN files/figures/daily_voltage_profile_new_dss_voltvar_on_relaxed_convergence.png}
+  \caption{Daily voltage profile (top) and PV850 reactive power (bottom) with scaled baseline 849.12/501.12/1400~kW/kVAR/kW, Volt-Var ON (\texttt{VoltageChangeTolerance=0.001}). PV850 absorbs large negative $Q$ from the start of the day; the profile is smooth for the full day in this setting.}
+  \label{fig:daily-voltage-scaled}
+\end{figure}
+
 \subsubsection*{Problem and Resolution}
 The analysis initially relied on an earlier IEEE 34-bus DSS model and its load and PV profiles, which did not align with the intended network layout, DER placement, or time-varying behaviour. To address this, the previous OpenDSS model and profiles were replaced with the IEEE 34-bus model and 5-minute daily load and irradiance profiles provided by Dr.\ Mirzaei (\texttt{IEEE34\_PV.dss}, \texttt{5minDayShape.csv}, \texttt{5MinuteIrradiance.csv}). Using this updated model and profiles, the daily voltage range was evaluated over 288 steps (5-minute resolution) with a chosen baseline (e.g.\ 849.12\,kW load, 501.12\,kVAR, 1400\,kW PV for one diagnostic run). The global minimum voltage was 0.8978\,pu at bus 890, phase 1, at 16:50, with phases 2 and 3 at the same bus at 0.923\,pu and 0.921\,pu at that time; the maximum was 1.0545\,pu at bus 848, phase 3. The problem is therefore resolved by adopting this DSS model and profiles instead of the previous one for all subsequent analysis; the codebase now uses the new DSS and the nominal totals 1769/1044/1000 with voltage window $[0.85,1.10]$~pu.
 

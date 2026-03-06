@@ -194,11 +194,12 @@ New PVSystem.PV860 phases=3 bus1=860 kV=24.9 kVA=500 Pmpp=500 irradiance=1.0 %Pm
 ! ============================================================================
 ! VOLT-VAR CONTROL for PV850 (IEEE 1547-2018 Category B)
 ! ============================================================================
-! Voltage points (pu): [0.50, 0.92, 0.98, 1.02, 1.08, 1.50]
+! Voltage points (pu): [0.50, 0.88, 0.98, 1.02, 1.12, 1.50]
 ! Reactive power (%kVA): [44%, 44%, 0%, 0%, -44%, -44%]
-New XYCurve.VoltVar_Curve npts=6 xarray=[0.50, 0.92, 0.98, 1.02, 1.08, 1.50] yarray=[44, 44, 0, 0, -44, -44]
+New XYCurve.VoltVar_Curve npts=6 xarray=[0.50, 0.88, 0.98, 1.02, 1.12, 1.50] yarray=[44, 44, 0, 0, -44, -44]
 
-New InvControl.InvCtrl_PV850 mode=VOLTVAR voltage_curvex_ref=rated DERList=[PVSystem.PV850] vvc_curve1=VoltVar_Curve VoltageChangeTolerance=0.0001 RefReactivePower=VARAVAL
+New InvControl.InvCtrl_PV850 mode=VOLTVAR voltage_curvex_ref=rated DERList=[PVSystem.PV850] vvc_curve1=VoltVar_Curve VoltageChangeTolerance=0.001 RefReactivePower=VARAVAL
+! New InvControl.InvCtrl_PV860 mode=VOLTVAR voltage_curvex_ref=rated DERList=[PVSystem.PV860] vvc_curve1=VoltVar_Curve VoltageChangeTolerance=0.001 RefReactivePower=VARAVAL
 
 ! ============================================================================
 ! SYSTEM SETTINGS

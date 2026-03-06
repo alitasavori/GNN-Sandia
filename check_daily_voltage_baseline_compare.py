@@ -23,6 +23,18 @@ import opendssdirect as dss
 import run_injection_dataset as inj
 
 
+def _print_control_iters(control_iters_converged):
+    """Print control iteration count for each converged step (t -> n_iter)."""
+    if not control_iters_converged:
+        return
+    print("  control iterations per converged step (t -> n_iter):")
+    for t, n_ctrl in control_iters_converged:
+        print(f"    t={t} n_iter={n_ctrl}")
+    vals = [x[1] for x in control_iters_converged if x[1] is not None]
+    if vals:
+        print(f"  (min={min(vals)}, max={max(vals)}, count={len(vals)})")
+
+
 def daily_vmin_vmax(P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=None):
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -53,6 +65,8 @@ def daily_vmin_vmax(P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=None):
     node_vmax = None
     t_vmin = None
     phase_voltages_at_vmin = None  # dict phase -> pu for bus where vmin occurred
+    n_nonconv = 0
+    control_iters_converged = []  # (t, n_iter) for each converged step
 
     for t in range(inj.NPTS):
         inj.set_time_index(t)
@@ -78,7 +92,15 @@ def daily_vmin_vmax(P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=None):
         except Exception:
             pass  # e.g. Max Control Iterations Exceeded warning raised as exception
         if not dss.Solution.Converged():
+            n_nonconv += 1
             continue
+
+        try:
+            val = getattr(dss.Solution, "ControlIterations", None)
+            n_ctrl = val() if callable(val) else val
+        except Exception:
+            n_ctrl = None
+        control_iters_converged.append((t, n_ctrl))
 
         vmag_m, _ = inj.get_all_node_voltage_pu_and_angle_filtered(node_names_master)
         node_to_v = {n: float(v) for n, v in zip(node_names_master, vmag_m)}
@@ -104,7 +126,7 @@ def daily_vmin_vmax(P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=None):
                 vmax = vmf
                 node_vmax = n
 
-    return vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin
+    return vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin, n_nonconv, control_iters_converged
 
 
 def main():
@@ -117,9 +139,12 @@ def main():
     print(f"P_load_total_kw = {P_load_orig:.1f}")
     print(f"Q_load_total_kvar = {Q_load_orig:.1f}")
     print(f"P_pv_total_kw = {P_pv_orig:.1f}")
-    vmin_orig, vmax_orig, node_min_orig, node_max_orig, t_min_orig, pv_min_orig = daily_vmin_vmax(P_load_orig, Q_load_orig, P_pv_orig)
+    vmin_orig, vmax_orig, node_min_orig, node_max_orig, t_min_orig, pv_min_orig, n_nonconv_orig, iters_orig = daily_vmin_vmax(P_load_orig, Q_load_orig, P_pv_orig)
     print(f"  vmin = {vmin_orig:.6f} pu  (bus {node_min_orig.split('.')[0]}, phase {node_min_orig.split('.')[1]})" if node_min_orig else f"  vmin = {vmin_orig:.6f} pu")
-    print(f"  vmax = {vmax_orig:.6f} pu  (bus {node_max_orig.split('.')[0]}, phase {node_max_orig.split('.')[1]})" if node_max_orig else f"  vmax = {vmax_orig:.6f} pu\n")
+    print(f"  vmax = {vmax_orig:.6f} pu  (bus {node_max_orig.split('.')[0]}, phase {node_max_orig.split('.')[1]})" if node_max_orig else f"  vmax = {vmax_orig:.6f} pu")
+    print(f"  daily profile: {inj.NPTS - n_nonconv_orig}/{inj.NPTS} converged, {n_nonconv_orig} non-converged")
+    _print_control_iters(iters_orig)
+    print("")
 
     # Current dataset baseline (already scaled) from inj.BASELINE
     P_load_new = float(inj.BASELINE["P_load_total_kw"])
@@ -130,9 +155,11 @@ def main():
     print(f"P_load_total_kw = {P_load_new:.2f}")
     print(f"Q_load_total_kvar = {Q_load_new:.2f}")
     print(f"P_pv_total_kw = {P_pv_new:.2f}")
-    vmin_new, vmax_new, node_min_new, node_max_new, t_min_new, pv_min_new = daily_vmin_vmax(P_load_new, Q_load_new, P_pv_new)
+    vmin_new, vmax_new, node_min_new, node_max_new, t_min_new, pv_min_new, n_nonconv_new, iters_new = daily_vmin_vmax(P_load_new, Q_load_new, P_pv_new)
     print(f"  vmin = {vmin_new:.6f} pu  (bus {node_min_new.split('.')[0]}, phase {node_min_new.split('.')[1]})" if node_min_new else f"  vmin = {vmin_new:.6f} pu")
     print(f"  vmax = {vmax_new:.6f} pu  (bus {node_max_new.split('.')[0]}, phase {node_max_new.split('.')[1]})" if node_max_new else f"  vmax = {vmax_new:.6f} pu")
+    print(f"  daily profile: {inj.NPTS - n_nonconv_new}/{inj.NPTS} converged, {n_nonconv_new} non-converged")
+    _print_control_iters(iters_new)
 
 
 if __name__ == "__main__":

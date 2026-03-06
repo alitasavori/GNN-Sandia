@@ -1,0 +1,122 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,bm}
+\usepackage[margin=1in]{geometry}
+
+\begin{document}
+
+\section*{Inspection tools for GNN2}
+
+Let $\mathcal{N}$ be the set of bus--phase nodes ($i\in\mathcal{N}$), and let
+each sample (snapshot) be indexed by $s$ with time index $t$.
+
+\subsection*{1.\ Spatial inspection (vmag-only GNN)}
+
+Dataset: \texttt{datasets\_gnn2/original}. Model: checkpoint
+\texttt{models\_gnn2/original/pf\_identity\_gnn\_vmag\_only\_best.pt}.
+
+For each test snapshot $(s,t)$ and node $i$:
+\begin{align*}
+  x_i^{(s,t)} &= \bigl(P_{\mathrm{load},i}^{(s,t)},\;
+                      Q_{\mathrm{load},i}^{(s,t)},\;
+                      P_{\mathrm{pv},i}^{(s,t)}\bigr),\\
+  \hat v_i^{(s,t)} &= f_\theta\bigl(x^{(s,t)},\mathcal{G}\bigr)_i,\\
+  v_i^{(s,t)} &= |V_i^{(s,t)}|\quad(\texttt{vmag\_pu}),\\
+  e_i^{(s,t)} &= \bigl|\hat v_i^{(s,t)}-v_i^{(s,t)}\bigr|.
+\end{align*}
+The script:
+\begin{itemize}
+  \item rebuilds the exact train/test split over samples (same seed and test fraction as training),
+  \item evaluates $f_\theta$ on all test snapshots,
+  \item ranks nodes by $e_i^{(s,t)}$ (worst bus--phase), buses by
+        $\max_{ph} e_{(b,ph)}^{(s,t)}$, and snapshots by
+        $\frac{1}{|\mathcal{N}|}\sum_i e_i^{(s,t)}$,
+  \item produces histograms of $\{e_i^{(s,t)}\}$ and error vs.\ time-of-day
+        using \texttt{gnn\_sample\_meta.csv},
+  \item writes a detailed table
+        $\{i,s,t,\hat v_i^{(s,t)},v_i^{(s,t)},e_i^{(s,t)}\}$
+        to \texttt{test\_node\_errors\_detailed.csv}.
+\end{itemize}
+Thus spatial inspection quantifies and localizes the vmag error of the trained
+GNN over the original dataset.
+
+\subsection*{2.\ Dataset/graph inspection}
+
+Dataset directories:
+\[
+\texttt{datasets\_gnn2/original},\quad
+\texttt{datasets\_gnn2/injection},\quad
+\texttt{datasets\_gnn2/loadtype},\quad
+\texttt{datasets\_gnn2/deltav}.
+\]
+Common inputs per dataset:
+\[
+\texttt{gnn\_edges\_phase\_static.csv},\quad
+\texttt{gnn\_node\_features\_and\_targets.csv},\quad
+\texttt{gnn\_sample\_meta.csv}.
+\]
+
+Let $\mathcal{G}=(\mathcal{N},\mathcal{E})$ be the static phase graph with
+directed edges $e=(i\to j,ph)$.
+
+\paragraph{(a) Bidirectionality.}
+The script checks that
+\[
+(i\to j,ph)\in\mathcal{E}\ \Longrightarrow\ (j\to i,ph)\in\mathcal{E}
+\]
+using \texttt{u\_idx}, \texttt{v\_idx}, \texttt{phase} from the edge CSV.
+
+\paragraph{(b) Transformer/regulator edges.}
+For each phase $ph\in\{1,2,3\}$ the following pairs must be present in both
+directions:
+\[
+832.ph \leftrightarrow 888.ph,\quad
+814.ph \leftrightarrow 814\mathrm{r}.ph,\quad
+852.ph \leftrightarrow 852\mathrm{r}.ph.
+\]
+These correspond to \texttt{XFM1}, \texttt{regA1/2/3}, and
+\texttt{regB1/2/3} in the DSS model.
+
+\paragraph{(c) First-sample node features.}
+For the smallest sample index $s_0$, the script prints all node rows
+$\{x_i^{(s_0,t)},y_i^{(s_0,t)}\}$ from
+\texttt{gnn\_node\_features\_and\_targets.csv} to visually confirm indexing and
+feature layout.
+
+\paragraph{(d) Aggregated P/Q checks.}
+\emph{Injection dataset (Dataset~2).}
+For one sample $(s,t)$, with node injections
+$(P_{\mathrm{inj},i},Q_{\mathrm{inj},i})$ and upstream grid power
+$(P_{\mathrm{grid}},Q_{\mathrm{grid}})$ from sample meta:
+\[
+P_{\mathrm{res}}=\sum_i P_{\mathrm{inj},i}+P_{\mathrm{grid}},\qquad
+Q_{\mathrm{res}}=\sum_i Q_{\mathrm{inj},i}+Q_{\mathrm{grid}},
+\]
+which should be small and correspond to losses.
+
+\emph{Load-type and delta-V datasets (Datasets 3 and 4).}
+Using post-solve load and PV powers and capacitor Q:
+\begin{align*}
+P_{\mathrm{sys}}(t)
+  &=\sum_i P_{\mathrm{load},i}(t)-\sum_i P_{\mathrm{pv},i}(t),\\
+Q_{\mathrm{sys}}(t)
+  &=\sum_i Q_{\mathrm{load},i}(t)-\sum_i Q_{\mathrm{pv},i}(t)
+    -\sum_b Q_{\mathrm{cap}}(b),
+\end{align*}
+the script recomputes these from node features and compares with the stored
+\texttt{p\_sys\_balance\_kw}, \texttt{q\_sys\_balance\_kvar}. For Dataset~4 it
+also summarizes the zero-PV and delta-V targets:
+\[
+|V_i^{(0)}(t)|=\texttt{vmag\_zero\_pv\_pu},\qquad
+\Delta|V_i(t)|=\texttt{vmag\_delta\_pu}.
+\]
+
+\paragraph{(e) Edge static features.}
+Finally, the script prints a sample of rows
+$(\texttt{from\_node},\texttt{to\_node},R_{\mathrm{full}},X_{\mathrm{full}},C_{\mathrm{full}})$
+so that line vs.\ transformer/regulator impedances (in~ohms) can be checked
+directly against the DSS model.
+
+\end{document}
+

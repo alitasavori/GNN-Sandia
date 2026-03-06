@@ -13,7 +13,12 @@ import opendssdirect as dss
 # CONFIG
 # ============================================================
 # New DSS model and profiles from "new dss from dr mirzaei" (IEEE34_PV.dss, 5minDayShape.csv, 5MinuteIrradiance.csv)
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    # When executed via exec(...) in a notebook, __file__ is undefined.
+    # Assume the working directory is the repo/script directory.
+    _SCRIPT_DIR = os.getcwd()
 DSS_FILE = os.path.join(_SCRIPT_DIR, "new dss from dr mirzaei", "IEEE34_PV.dss")
 NPTS = 288
 STEP_MIN = 5
@@ -22,14 +27,18 @@ VOLTAGE_BASES_KV = [69.0, 24.9, 4.16, 0.48]
 # Voltage acceptance window used by all dataset generators (new DSS thresholds)
 VMAG_PU_MIN = 0.85
 VMAG_PU_MAX = 1.10
+# Volt-Var control iteration limit (InvControl in IEEE34_PV.dss)
+MAX_CONTROL_ITER = 20000
 
-# Nominal totals from new DSS (IEEE34_PV.dss): 1769 kW load, 1044 kVAR, 1000 kW PV
+# Baseline totals used for scenario sampling (can differ from raw DSS sums).
+# Current choice: scaled averages from diagnostic sweep:
+#   P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=1400.0
 BASELINE = dict(
-    P_load_total_kw=1769.0,   # kW (spot 1047 + distributed 722)
-    Q_load_total_kvar=1044.0, # kVAR
-    P_pv_total_kw=1000.0,     # kW (PV850=500 + PV860=500)
-    sigma_load=0.05,
-    sigma_pv=0.05,
+    P_load_total_kw=849.12,
+    Q_load_total_kvar=501.12,
+    P_pv_total_kw=1400.0,
+    sigma_load=0.02,
+    sigma_pv=0.02,
 )
 
 RANGES = dict(
@@ -37,9 +46,9 @@ RANGES = dict(
     P_load_total_kw=(0.95, 1.05),
     Q_load_total_kvar=(0.95, 1.05),
     P_pv_total_kw=(0.95, 1.05),
-    # Conservative noise (std dev) on multiplicative factors
-    sigma_load=(0.0, 0.05),
-    sigma_pv=(0.0, 0.05),
+    # Reduced noise (std dev) on multiplicative factors
+    sigma_load=(0.0, 0.02),
+    sigma_pv=(0.0, 0.02),
 )
 
 # Buses whose node-level rows are excluded from training/evaluation datasets
@@ -219,7 +228,10 @@ def _apply_voltage_bases():
     # IEEE34_PV.dss uses InvControl (VoltVar); allow enough control iterations
     # (otherwise many solves are marked non-converged and skip_nonconv is high)
     try:
-        dss.Text.Command("set maxcontroliter=5000")
+        dss.Text.Command(f"set maxcontroliter={MAX_CONTROL_ITER}")
+        if not getattr(_apply_voltage_bases, "_logged", False):
+            print(f"[DSS] maxcontroliter={MAX_CONTROL_ITER}")
+            _apply_voltage_bases._logged = True
     except Exception:
         pass
 
@@ -866,6 +878,7 @@ def generate_gnn_snapshot_dataset_injection(
         )
         times = [int(t) for t in times]
         rng_solve = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
+        control_iters_converged_this_scenario: list[float] = []
 
         for t in times:
             set_time_index(t)
@@ -884,6 +897,14 @@ def generate_gnn_snapshot_dataset_injection(
             if not dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue
+
+            try:
+                val = getattr(dss.Solution, "ControlIterations", None)
+                n_ctrl = val() if callable(val) else val
+                if n_ctrl is not None:
+                    control_iters_converged_this_scenario.append(float(n_ctrl))
+            except Exception:
+                pass
 
             busphP_pv_actual, busphQ_pv_actual = get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
             vmag_m, vang_m = get_all_node_voltage_pu_and_angle_filtered(node_names_master)
@@ -944,7 +965,16 @@ def generate_gnn_snapshot_dataset_injection(
             sample_id += 1
             kept += 1
 
-        print(f"[scenario {s+1}/{n_scenarios}] kept={kept} skip_nonconv={skipped_nonconv} skip_badV={skipped_badV} Pload={P_load:.1f} Qload={Q_load:.1f} Ppv={P_pv:.1f}")
+        ctrl_summary = ""
+        if control_iters_converged_this_scenario:
+            arr = np.array(control_iters_converged_this_scenario, dtype=float)
+            ctrl_summary = (
+                f" ctrl_iter: n={len(arr)} min={int(arr.min())} max={int(arr.max())} mean={float(arr.mean()):.1f}"
+            )
+        print(
+            f"[scenario {s+1}/{n_scenarios}] kept={kept} skip_nonconv={skipped_nonconv} "
+            f"skip_badV={skipped_badV} Pload={P_load:.1f} Qload={Q_load:.1f} Ppv={P_pv:.1f}{ctrl_summary}"
+        )
 
     df_sample = pd.DataFrame(rows_sample)
     df_node = pd.DataFrame(rows_node)

@@ -122,6 +122,7 @@ def generate_gnn_snapshot_dataset_original(
         )
         times = [int(t) for t in times]
         rng_solve = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
+        control_iters_converged_this_scenario = []
 
         for t in times:
             inj.set_time_index(t)
@@ -151,6 +152,14 @@ def generate_gnn_snapshot_dataset_original(
             if not dss.Solution.Converged():
                 skipped_nonconv += 1
                 continue
+
+            try:
+                val = getattr(dss.Solution, "ControlIterations", None)
+                n_ctrl = val() if callable(val) else val
+                if n_ctrl is not None:
+                    control_iters_converged_this_scenario.append(n_ctrl)
+            except Exception:
+                pass
 
             busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(
                 pv_to_dss, pv_to_busph
@@ -227,10 +236,16 @@ def generate_gnn_snapshot_dataset_original(
             sample_id += 1
             kept += 1
 
+        ctrl_summary = ""
+        if control_iters_converged_this_scenario:
+            arr = np.array(control_iters_converged_this_scenario, dtype=float)
+            ctrl_summary = (
+                f" ctrl_iter: n={len(arr)} min={int(arr.min())} max={int(arr.max())} mean={float(arr.mean()):.1f}"
+            )
         print(
             f"[scenario {s+1}/{n_scenarios}] kept={kept} "
             f"skip_nonconv={skipped_nonconv} skip_badV={skipped_badV} "
-            f"Pload={P_load:.1f} Qload={Q_load:.1f} Ppv={P_pv:.1f}"
+            f"Pload={P_load:.1f} Qload={Q_load:.1f} Ppv={P_pv:.1f}{ctrl_summary}"
         )
 
     df_sample = pd.DataFrame(rows_sample)

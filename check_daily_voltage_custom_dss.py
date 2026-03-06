@@ -6,7 +6,7 @@ Reports vmin and vmax over all non-upstream nodes for the daily profile.
 import os
 import sys
 import run_injection_dataset as inj
-from check_daily_voltage_baseline_compare import daily_vmin_vmax
+from check_daily_voltage_baseline_compare import daily_vmin_vmax, _print_control_iters
 
 
 def run_one(dss_path, P_load_kw=None, Q_load_kvar=None, P_pv_kw=None):
@@ -36,10 +36,10 @@ def run_one(dss_path, P_load_kw=None, Q_load_kvar=None, P_pv_kw=None):
         }
     try:
         inj.DSS_FILE = dss_path
-        vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin = daily_vmin_vmax(
-            P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=500
+        vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin, n_nonconv, control_iters_converged = daily_vmin_vmax(
+            P_load_kw, Q_load_kvar, P_pv_kw, max_control_iter=5
         )
-        return vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin
+        return vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin, n_nonconv, control_iters_converged
     finally:
         inj.DSS_FILE = old_dss
         if old_pv_share is not None:
@@ -79,9 +79,12 @@ def main():
         name = os.path.basename(path)
         print("--- {} ---".format(name))
         try:
-            vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin = run_one(
+            vmin, vmax, node_vmin, node_vmax, t_vmin, phase_voltages_at_vmin, n_nonconv, control_iters_converged = run_one(
                 path, P_load_kw=P, Q_load_kvar=Q, P_pv_kw=PV
             )
+            n_conv = inj.NPTS - n_nonconv
+            print("  daily profile: {}/{} converged, {} non-converged".format(n_conv, inj.NPTS, n_nonconv))
+            _print_control_iters(control_iters_converged)
             print("  vmin = {:.6f} pu".format(vmin))
             if node_vmin:
                 parts = node_vmin.split(".")
