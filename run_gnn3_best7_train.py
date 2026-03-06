@@ -198,7 +198,7 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
     counts = df_n.groupby("sample_id")["node_idx"].count()
     N = int(counts.mode()[0])
     if N != 89:
-        raise RuntimeError(f\"Expected 89 nodes per sample after excluding upstream buses, got {N}.\")
+        raise RuntimeError(f"Expected 89 nodes per sample after excluding upstream buses, got {N}.")
 
     good_ids = counts[counts == N].index.to_numpy()
     df_n = (
