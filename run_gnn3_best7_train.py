@@ -191,16 +191,32 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
     df_e["edge_id"] = np.arange(len(df_e), dtype=int)
 
     E = int(len(df_e))
-    N = int(df_n["node_idx"].max()) + 1
+
+    # Enforce consistency with dataset generation: upstream buses are excluded,
+    # so each valid snapshot must contain exactly 89 node rows (one per kept node).
     df_n = df_n.sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
     counts = df_n.groupby("sample_id")["node_idx"].count()
+    N = int(counts.mode()[0])
+    if N != 89:
+        raise RuntimeError(f\"Expected 89 nodes per sample after excluding upstream buses, got {N}.\")
+
     good_ids = counts[counts == N].index.to_numpy()
-    df_n = df_n[df_n["sample_id"].isin(good_ids)].copy().sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
+    df_n = (
+        df_n[df_n["sample_id"].isin(good_ids)]
+        .copy()
+        .sort_values(["sample_id", "node_idx"])
+        .reset_index(drop=True)
+    )
     all_ids = df_n["sample_id"].unique()
     n_keep = max(1, int(len(all_ids) * DATA_FRAC))
     rng = np.random.default_rng(SEED)
     keep_ids = rng.choice(all_ids, size=n_keep, replace=False)
-    df_n = df_n[df_n["sample_id"].isin(keep_ids)].copy().sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
+    df_n = (
+        df_n[df_n["sample_id"].isin(keep_ids)]
+        .copy()
+        .sort_values(["sample_id", "node_idx"])
+        .reset_index(drop=True)
+    )
     S = df_n["sample_id"].nunique()
     X_all = df_n[feature_cols].to_numpy(dtype=np.float32).reshape(S, N, -1)
     Y_all = df_n[target_col].to_numpy(dtype=np.float32).reshape(S, N, 1)
