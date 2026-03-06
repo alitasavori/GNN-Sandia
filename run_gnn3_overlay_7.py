@@ -29,6 +29,7 @@ DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 NPTS = 288
 STEP_MIN = 5
+# Nominal totals for overlay timing plots. For dataset-aligned comparison use run_injection_dataset.BASELINE (849.12, 501.12, 1400).
 P_BASE, Q_BASE, PV_BASE = 1415.2, 835.2, 1000.0
 OBSERVED_NODE = "840.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

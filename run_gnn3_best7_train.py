@@ -241,11 +241,26 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
     Y_all = df_n[target_col].to_numpy(dtype=np.float32).reshape(S, N, 1)
 
     if use_phase_onehot:
-        phase_map = load_phase_mapping(out_dir)
-        if phase_map is None:
-            print(f"  [SKIP] Block {block_id}: No phase mapping")
+        master_path = os.path.join(out_dir, "gnn_node_index_master.csv")
+        if not os.path.exists(master_path):
+            print(f"  [SKIP] Block {block_id}: Missing {master_path}")
             return None
-        ph_oh = F.one_hot(phase_map, num_classes=3).numpy().astype(np.float32)
+        master_df = pd.read_csv(master_path)
+        master_df["node_idx"] = pd.to_numeric(master_df["node_idx"], errors="raise").astype(int)
+        phase_old = {}
+        for _, row in master_df.iterrows():
+            idx = int(row["node_idx"])
+            if idx in old_to_new:
+                phase_old[idx] = _parse_phase_from_node_name(row["node"]) - 1
+        if len(phase_old) != N:
+            raise RuntimeError(
+                f"Phase mapping mismatch: expected {N} kept nodes, found phases for {len(phase_old)}."
+            )
+        phase_vec = np.empty(N, dtype=np.int64)
+        for old_idx, new_idx in old_to_new.items():
+            phase_vec[new_idx] = phase_old[old_idx]
+        phase_tensor = torch.tensor(phase_vec, dtype=torch.long)
+        ph_oh = F.one_hot(phase_tensor, num_classes=3).numpy().astype(np.float32)
         X_all = np.concatenate([X_all, np.broadcast_to(ph_oh[None, :, :], (S, N, 3))], axis=-1)
 
     node_in_dim = X_all.shape[-1]
