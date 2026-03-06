@@ -187,19 +187,35 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
         df_n[c] = pd.to_numeric(df_n[c], errors="coerce")
     df_e = df_e.replace([np.inf, -np.inf], np.nan).dropna(subset=["u_idx", "v_idx", "R_full", "X_full"]).copy()
     df_n = df_n.replace([np.inf, -np.inf], np.nan).dropna(subset=list(required)).copy()
-    df_e = df_e.reset_index(drop=True).copy()
-    df_e["edge_id"] = np.arange(len(df_e), dtype=int)
 
-    E = int(len(df_e))
-
-    # Enforce consistency with dataset generation: upstream buses are excluded,
-    # so each valid snapshot must contain exactly 89 node rows (one per kept node).
+    # Sort node rows and determine how many non-upstream nodes are present per snapshot.
     df_n = df_n.sort_values(["sample_id", "node_idx"]).reset_index(drop=True)
     counts = df_n.groupby("sample_id")["node_idx"].count()
     N = int(counts.mode()[0])
     if N != 89:
         raise RuntimeError(f"Expected 89 nodes per sample after excluding upstream buses, got {N}.")
 
+    # Build a contiguous node index mapping over the kept (non-upstream) nodes.
+    kept_node_ids = sorted(df_n["node_idx"].unique())
+    if len(kept_node_ids) != N:
+        raise RuntimeError(
+            f"Mismatch between mode node count ({N}) and unique kept node indices ({len(kept_node_ids)})."
+        )
+    old_to_new = {old: new for new, old in enumerate(kept_node_ids)}
+
+    # Restrict edges to the kept nodes and remap u_idx/v_idx to 0..N-1.
+    df_e = df_e[df_e["u_idx"].isin(kept_node_ids) & df_e["v_idx"].isin(kept_node_ids)].copy()
+    df_e["u_idx"] = df_e["u_idx"].map(old_to_new)
+    df_e["v_idx"] = df_e["v_idx"].map(old_to_new)
+    df_e = df_e.reset_index(drop=True).copy()
+    df_e["edge_id"] = np.arange(len(df_e), dtype=int)
+    E = int(len(df_e))
+
+    # Remap node_idx in the node table to 0..N-1.
+    df_n["node_idx"] = df_n["node_idx"].map(old_to_new)
+
+    # Keep only snapshots that have a complete set of N=89 nodes.
+    counts = df_n.groupby("sample_id")["node_idx"].count()
     good_ids = counts[counts == N].index.to_numpy()
     df_n = (
         df_n[df_n["sample_id"].isin(good_ids)]
@@ -207,6 +223,8 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
         .sort_values(["sample_id", "node_idx"])
         .reset_index(drop=True)
     )
+
+    # Subsample snapshots according to DATA_FRAC.
     all_ids = df_n["sample_id"].unique()
     n_keep = max(1, int(len(all_ids) * DATA_FRAC))
     rng = np.random.default_rng(SEED)
@@ -218,6 +236,7 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
         .reset_index(drop=True)
     )
     S = df_n["sample_id"].nunique()
+
     X_all = df_n[feature_cols].to_numpy(dtype=np.float32).reshape(S, N, -1)
     Y_all = df_n[target_col].to_numpy(dtype=np.float32).reshape(S, N, 1)
 
