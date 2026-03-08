@@ -38,7 +38,7 @@ OUTPUT_DIR = "gnn3_best7_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Best per dataset type: (block_id, name, out_dir, feature_cols, target_col, n_emb, e_emb, h_dim, n_layers, use_norm, use_phase_onehot)
-ORIGINAL_FEAT = ["p_load_kw", "q_load_kvar", "p_pv_kw"]
+ORIGINAL_FEAT = ["p_load_kw", "q_load_kvar", "p_pv_kw", "q_pv_kvar"]
 INJECTION_FEAT = ["p_inj_kw", "q_inj_kvar"]
 LOADTYPE_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",

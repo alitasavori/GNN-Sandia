@@ -23,7 +23,6 @@ from run_gnn3_best7_train import PFIdentityGNN
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
 
-CAP_Q_KVAR = {"844": 100.0, "848": 150.0}
 SOURCE_BUSES = ("sourcebus", "800")
 DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
@@ -46,20 +45,24 @@ def build_bus_to_phases_from_master_nodes(node_names_master):
     return {b: sorted(list(s)) for b, s in bus_to_phases.items()}
 
 
-def build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv):
-    """Original (3 feat): p_load_kw, q_load_kvar, p_pv_kw per node."""
-    X = np.zeros((len(node_names_master), 3), dtype=np.float32)
+def build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv, busphQ_pv=None):
+    """Original: p_load_kw, q_load_kvar, p_pv_kw [, q_pv_kvar] per node. If busphQ_pv is None, returns 3 cols (backward compat)."""
+    n_nodes = len(node_names_master)
+    n_feat = 4 if busphQ_pv is not None else 3
+    X = np.zeros((n_nodes, n_feat), dtype=np.float32)
     for i, n in enumerate(node_names_master):
         bus, phs = n.split(".")
         ph = int(phs)
         X[i, 0] = float(busphP_load.get((bus, ph), 0.0))
         X[i, 1] = float(busphQ_load.get((bus, ph), 0.0))
         X[i, 2] = float(busphP_pv.get((bus, ph), 0.0))
+        if n_feat == 4:
+            X[i, 3] = float(busphQ_pv.get((bus, ph), 0.0))
     return X
 
 
-def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid):
-    """Injection (2 feat): p_inj_kw, q_inj_kvar per node. Source bus uses grid P/Q; others: p_inj=p_pv-p_load, q_inj=-q_load+cap_Q."""
+def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid, busphQ_pv=None):
+    """Injection (2 feat): p_inj_kw, q_inj_kvar per node. Source bus uses grid P/Q; others: p_inj=p_pv-p_load, q_inj=q_pv-q_load+cap (matches training)."""
     P_grid_per_ph = P_grid / 3.0
     Q_grid_per_ph = Q_grid / 3.0
     X = np.zeros((len(node_names_master), 2), dtype=np.float32)
@@ -69,12 +72,13 @@ def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv
         p_load = float(busphP_load.get((bus, ph), 0.0))
         q_load = float(busphQ_load.get((bus, ph), 0.0))
         p_pv = float(busphP_pv.get((bus, ph), 0.0))
+        q_pv = float(busphQ_pv.get((bus, ph), 0.0)) if busphQ_pv is not None else 0.0
         if bus == "sourcebus":
             p_inj = P_grid_per_ph
             q_inj = Q_grid_per_ph
         else:
             p_inj = p_pv - p_load
-            q_inj = -q_load + float(CAP_Q_KVAR.get(bus, 0.0))
+            q_inj = q_pv - q_load + float(inj.CAP_Q_KVAR.get(bus, 0.0))
         X[i, 0] = p_inj
         X[i, 1] = q_inj
     return X
@@ -94,7 +98,7 @@ def build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv):
         m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
         m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
         m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
-        q_cap = float(CAP_Q_KVAR.get(bus, 0.0))
+        q_cap = float(inj.CAP_Q_KVAR.get(bus, 0.0))
         p_pv = float(busphP_pv.get((bus, ph), 0.0))
         X[i, 0], X[i, 1] = m1_p, m1_q
         X[i, 2], X[i, 3] = m2_p, m2_q
@@ -120,7 +124,7 @@ def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_e
         m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
         m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
         m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
-        q_cap = float(CAP_Q_KVAR.get(bus, 0.0))
+        q_cap = float(inj.CAP_Q_KVAR.get(bus, 0.0))
         p_pv = float(busphP_pv.get((bus, ph), 0.0))
         X[i, 0] = float(node_to_electrical_dist.get(n, 0.0))
         X[i, 1], X[i, 2] = m1_p, m1_q
@@ -221,7 +225,7 @@ def read_profile_csv_two_col_noheader(csv_path, npts=NPTS):
 def load_model_for_inference(path, device=None):
     if device is None:
         device = DEVICE
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     mdl = PFIdentityGNN(
         num_nodes=int(cfg["N"]),
@@ -380,9 +384,10 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[obs_node]
 
-    if dataset_dir == os.path.join("datasets_gnn2", "original"):
-            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
-    elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
+        if dataset_dir == os.path.join("datasets_gnn2", "original"):
+            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv,
+                                     busphQ_pv=busphQ_pv if node_in_dim == 4 else None)
+        elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
             pwr = dss.Circuit.TotalPower()
             P_grid = -float(pwr[0])
             Q_grid = -float(pwr[1])
@@ -391,7 +396,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             sum_p_load = float(sum(busphP_load.values()))
             sum_q_load = float(sum(busphQ_load.values()))
             sum_p_pv = float(sum(busphP_pv.values()))
-            sum_q_cap = float(sum(CAP_Q_KVAR.values()))
+            sum_q_cap = float(sum(inj.CAP_Q_KVAR.values()))
             p_sys_balance = sum_p_load - sum_p_pv
             q_sys_balance = sum_q_load - sum_q_cap
             X = build_gnn_x_loadtype(

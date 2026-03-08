@@ -222,7 +222,7 @@ Q_{\mathrm{load},i}(t)\ (\texttt{q\_load\_kvar}),\quad
 P_{\mathrm{pv},i}(t)\ (\texttt{p\_pv\_kw}),\quad
 Q_{\mathrm{pv},i}(t)\ (\texttt{q\_pv\_kvar}).
 \]
-(No explicit capacitor feature.) Targets:
+All of these are \emph{per-node} (no global features replicated to every node). (No explicit capacitor feature.) Targets:
 \[
 |V_i(t)|\ (\texttt{vmag\_pu}),\qquad \angle V_i(t)\ (\texttt{vang\_deg}).
 \]
@@ -241,7 +241,7 @@ extractor omits edges incident to \texttt{sourcebus} or \texttt{800}.
 \section{Dataset 1: Injection dataset}
 
 Targets: $|V_i(t)|$ and $\angle V_i(t)$. Node features are net injections
-$(P_{\mathrm{inj},i}(t),Q_{\mathrm{inj},i}(t))$.
+$(P_{\mathrm{inj},i}(t),Q_{\mathrm{inj},i}(t))$, both \emph{per-node}; there are no global features in this dataset.
 
 \subsection*{Post-solve upstream grid power}
 
@@ -310,14 +310,14 @@ System balance uses \emph{actual} PV P and Q after the solve (so Volt-Var Q is i
 P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}(t)-\sum_i P_{\mathrm{pv},i}(t),\qquad
 Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}(t)-\sum_i Q_{\mathrm{pv},i}(t)-\sum_b Q_{\mathrm{cap}}(b),
 \]
-stored as \texttt{p\_sys\_balance\_kw}, \texttt{q\_sys\_balance\_kvar}.
+stored as \texttt{p\_sys\_balance\_kw}, \texttt{q\_sys\_balance\_kvar}. So in the load-type dataset, all features except $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are \emph{per-node}; $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are \emph{global} (the same scalar value is replicated to every node to provide system-wide context).
 
 Electrical distance uses Dijkstra with per-edge weight
 \[
 w_e=\sqrt{R_e^2+X_e^2},\qquad
 d_i=\min_{\text{paths }s\to i}\sum_{e\in\text{path}}w_e,\quad s\in\{\texttt{sourcebus},800\},
 \]
-stored as \texttt{electrical\_distance\_ohm}.
+stored as \texttt{electrical\_distance\_ohm}. It is used in both the load-type and delta-V datasets (not only the third). The distance is computed \emph{from} the source bus(es); for that, the \emph{full} node list (including \texttt{sourcebus} and 800) must be passed to the distance routine so that the source nodes exist and Dijkstra runs from them. The 89 retained nodes then receive their correct ``distance from grid''; discarding the upstream buses from the training set only removes those six nodes from the table, and does not remove the source from the distance computation, so the 89 nodes keep meaningful distances.
 
 \subsection*{Feature vector}
 
@@ -327,7 +327,7 @@ d_i,\ \{P^{(m)}_{\mathrm{load},i},Q^{(m)}_{\mathrm{load},i}\}_{m\in\{1,2,4,5\}},
 Q_{\mathrm{cap},i},\ P_{\mathrm{pv},i},\ Q_{\mathrm{pv},i},\ P_{\mathrm{sys}},Q_{\mathrm{sys}}
 \Bigr).
 \]
-Script: \texttt{run\_loadtype\_dataset.py}. Output directory: \texttt{datasets\_gnn2/loadtype}.
+The subscript $i$ denotes per-node quantities; $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ have no subscript and are the same for all nodes. Script: \texttt{run\_loadtype\_dataset.py}. Output directory: \texttt{datasets\_gnn2/loadtype}.
 
 \section{Grid power vs.\ system-balance (post-solve)}
 
@@ -343,6 +343,42 @@ P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}-\sum_i P_{\mathrm{pv},i},\qquad
 Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}-\sum_i Q_{\mathrm{pv},i}-\sum_b Q_{\mathrm{cap}}(b),
 \]
 so Volt-Var reactive power is included; losses are still not reflected in the balance.
+
+\subsection*{What is read from DSS after the solve vs.\ what is calculated}
+
+The only quantities \emph{read directly from OpenDSS} after each AC solve are:
+\begin{itemize}[noitemsep]
+\item \textbf{PV actual P and Q:} from \texttt{CktElement.TotalPowers()} for each \texttt{PVSystem}, then aggregated to bus--phase nodes via \texttt{get\_pv\_actual\_pq\_by\_busph}. These are post-solve (include Volt-Var reactive power).
+\item \textbf{Grid total P and Q:} from \texttt{Circuit.TotalPower()} $\Rightarrow$ $(P_{\mathrm{grid}},Q_{\mathrm{grid}})$. Also post-solve.
+\end{itemize}
+All other feature ingredients are either from the applied snapshot (load P/Q, per-type load, nominal capacitor Q, electrical distance) or \emph{calculated in code}:
+\begin{itemize}[noitemsep]
+\item \textbf{System balance} $P_{\mathrm{sys}}$, $Q_{\mathrm{sys}}$ is \emph{not} read from DSS. It is computed as
+  $\sum_i P_{\mathrm{load},i}-\sum_i P_{\mathrm{pv},i}^{\mathrm{actual}}$ and
+  $\sum_i Q_{\mathrm{load},i}-\sum_i Q_{\mathrm{pv},i}^{\mathrm{actual}}-\sum_b Q_{\mathrm{cap}}(b)$,
+  where load sums come from the snapshot and PV sums from the post-solve actual PV P/Q read above.
+\end{itemize}
+
+\subsection*{Use of TotalPower: injection only, and only for the source bus}
+
+\texttt{TotalPower()} is used \emph{only} in the injection-dataset pipeline. There it defines $P_{\mathrm{inj}},Q_{\mathrm{inj}}$ at the \emph{source bus} (e.g.\ $P_{\mathrm{inj}}=P_{\mathrm{grid}}/3$, $Q_{\mathrm{inj}}=Q_{\mathrm{grid}}/3$). The load-type and delta-V datasets do \emph{not} call \texttt{TotalPower()}; their system balance is formed only from sums of load (snapshot), actual PV (post-solve read), and nominal capacitor Q.
+
+\subsection*{Effect of excluding upstream nodes on the injection dataset}
+
+Upstream nodes (\texttt{sourcebus}, 800) are excluded from all datasets, leaving 89 learning nodes. As a result, \emph{no stored row} in the injection dataset corresponds to the source bus. So no row has $P_{\mathrm{inj}}$ or $Q_{\mathrm{inj}}$ set from $P_{\mathrm{grid}}$ or $Q_{\mathrm{grid}}$. Every stored injection row uses $P_{\mathrm{inj},i}=P_{\mathrm{pv},i}-P_{\mathrm{load},i}$ and $Q_{\mathrm{inj},i}=Q_{\mathrm{pv},i}-Q_{\mathrm{load},i}+Q_{\mathrm{cap},i}$. Thus, by discarding the two buses connected to the grid, we effectively discard any direct use of total (grid) power in the injection dataset; grid power is not an explicit input to the trained model.
+
+\subsection*{Pre-solve vs.\ post-solve summary by dataset}
+
+\begin{itemize}[noitemsep]
+\item \textbf{Original:} Load P/Q are from the snapshot (pre-solve). PV P (and stored Q) are \emph{post-solve} actual from DSS.
+\item \textbf{Injection:} $P_{\mathrm{inj}},Q_{\mathrm{inj}}$ use load from the snapshot (pre-solve) and actual PV P/Q from DSS (post-solve). At the source bus they would use $P_{\mathrm{grid}},Q_{\mathrm{grid}}$ from \texttt{TotalPower()}, but that node is excluded, so no stored row uses grid power.
+\item \textbf{Load-type:} Electrical distance, per-type load (m1/m2/m4/m5), and $Q_{\mathrm{cap}}$ are pre-solve (or static). $P_{\mathrm{pv},i}$ is post-solve actual. $P_{\mathrm{sys}},Q_{\mathrm{sys}}$ are calculated from snapshot load sums and post-solve PV sums (so post-solve in content but not read as a single quantity from DSS). Features are per-node except $P_{\mathrm{sys}},Q_{\mathrm{sys}}$, which are global (replicated to every node).
+\item \textbf{Delta-V:} Same as load-type, plus $|V_i^{(0)}|$ from the zero-PV solve (post-solve). Again, only $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are global; all others are per-node.
+\end{itemize}
+
+\subsection*{Plotting and comparison code}
+
+The scripts used to plot daily voltage profiles and to compare two trained models (e.g.\ \texttt{compare\_two\_models\_daily.py}) follow the same conventions as dataset generation: the same scaled baseline (\texttt{BASELINE}), the same DSS and profiles, post-solve actual PV P/Q and \texttt{TotalPower()} for grid P/Q, system balance computed as above (not read from DSS), and electrical distance computed from the \emph{full} node list (including source buses) so that the 89 retained nodes receive correct ``distance from grid'' before building load-type or delta-V features for inference.
 
 \section{Dataset 3: Delta-V dataset (\texttt{datasets\_gnn2/deltav})}
 
@@ -371,6 +407,7 @@ Same as load-type features (including \texttt{q\_pv\_kvar} and system balance wi
 d_i,\ \{P^{(m)}_{\mathrm{load},i},Q^{(m)}_{\mathrm{load},i}\}_{m},\ Q_{\mathrm{cap},i},\
 P_{\mathrm{pv},i},\ Q_{\mathrm{pv},i},\ P_{\mathrm{sys}},Q_{\mathrm{sys}},\ |V_i^{(0)}(t)|.
 \]
+As in the load-type dataset, all entries are \emph{per-node} except $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$, which are \emph{global} (replicated to every node).
 
 \subsection*{Targets and rejection}
 

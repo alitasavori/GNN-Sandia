@@ -34,6 +34,7 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
     """Returns dict of step name -> total seconds. use_batched_gnn: batch all 288 GNN forwards."""
     model, static = load_model_for_inference(ckpt_path, device=device)
     cfg = static["config"]
+    node_in_dim = int(cfg.get("node_in_dim", 3))
     target_col = cfg.get("target_col", "vmag_pu")
     use_phase_onehot = bool(cfg.get("use_phase_onehot", False))
     dataset_dir = cfg.get("dataset", DIR_LOADTYPE)
@@ -175,7 +176,8 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
         # --- GNN step 1: build_gnn_x ---
         t0 = time.perf_counter()
         if dataset_dir == os.path.join("datasets_gnn2", "original"):
-            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv)
+            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv,
+                                    busphQ_pv=busphQ_pv if node_in_dim == 4 else None)
         elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
             pwr = dss.Circuit.TotalPower()
             P_grid = -float(pwr[0])
