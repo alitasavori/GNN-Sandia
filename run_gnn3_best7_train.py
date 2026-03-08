@@ -47,13 +47,15 @@ LOADTYPE_FEAT = [
 ]
 DELTAV_FEAT = LOADTYPE_FEAT + ["vmag_zero_pv_pu"]
 
+# (block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph, early_stop)
+# Block 1: early_stop=False so original model trains full 50 epochs (avoids constant-output collapse; matches run_original_vs_injection_features behavior)
 MODELS = [
-    (1, "medium", os.path.join("datasets_gnn2", "original"), ORIGINAL_FEAT, "vmag_pu", 8, 4, 32, 4, False, False),
-    (2, "deep", os.path.join("datasets_gnn2", "injection"), INJECTION_FEAT, "vmag_pu", 16, 8, 64, 4, False, False),
-    (3, "light_emb_h96", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False),
-    (4, "light_emb_h96_phase_onehot_depth3", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 3, False, True),
-    (5, "light_emb_h96_phase_onehot_depth3_h112", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 112, 3, False, True),
-    (6, "light_xwide_emb_phase_onehot", os.path.join("datasets_gnn2", "deltav"), DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True),
+    (1, "medium", os.path.join("datasets_gnn2", "original"), ORIGINAL_FEAT, "vmag_pu", 8, 4, 32, 4, False, False, False),
+    (2, "deep", os.path.join("datasets_gnn2", "injection"), INJECTION_FEAT, "vmag_pu", 16, 8, 64, 4, False, False, True),
+    (3, "light_emb_h96", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 2, False, False, True),
+    (4, "light_emb_h96_phase_onehot_depth3", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 96, 3, False, True, True),
+    (5, "light_emb_h96_phase_onehot_depth3_h112", os.path.join("datasets_gnn2", "loadtype"), LOADTYPE_FEAT, "vmag_pu", 16, 8, 112, 3, False, True, True),
+    (6, "light_xwide_emb_phase_onehot", os.path.join("datasets_gnn2", "deltav"), DELTAV_FEAT, "vmag_delta_pu", 16, 8, 128, 2, False, True, True),
 ]
 
 
@@ -163,7 +165,7 @@ def evaluate(model, loader):
     return (mae_sum / max(1, n_batches)).item(), (rmse_sum / max(1, n_batches)).item()
 
 
-def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_emb, h_dim, n_layers, use_norm, use_phase_onehot):
+def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_emb, h_dim, n_layers, use_norm, use_phase_onehot, early_stop=True):
     seed_all(SEED)
     edge_csv = os.path.join(out_dir, "gnn_edges_phase_static.csv")
     node_csv = os.path.join(out_dir, "gnn_node_features_and_targets.csv")
@@ -284,7 +286,7 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
                           use_norm=use_norm).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     best_test, best_state, best_epoch, best_mae, best_rmse = float("inf"), None, None, None, None
-    patience_left = EARLY_STOP_PATIENCE
+    patience_left = EARLY_STOP_PATIENCE if early_stop else 1
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -302,13 +304,13 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
         mae_t, rmse_t = evaluate(model, test_loader)
         if (best_test - rmse_t) > MIN_DELTA:
             best_test, best_state, best_epoch = rmse_t, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, epoch
-            best_mae, best_rmse, patience_left = mae_t, rmse_t, EARLY_STOP_PATIENCE
+            best_mae, best_rmse, patience_left = mae_t, rmse_t, (EARLY_STOP_PATIENCE if early_stop else 1)
         else:
-            if epoch >= MIN_EPOCHS_BEFORE_STOP:
+            if early_stop and epoch >= MIN_EPOCHS_BEFORE_STOP:
                 patience_left -= 1
         if epoch % 10 == 0 or epoch == 1:
             print(f"    Epoch {epoch:02d} | RMSE={rmse_t:.5f} | best={best_test:.5f} | patience={patience_left}")
-        if epoch >= MIN_EPOCHS_BEFORE_STOP and patience_left <= 0:
+        if early_stop and epoch >= MIN_EPOCHS_BEFORE_STOP and patience_left <= 0:
             break
 
     if best_state is None:
@@ -340,9 +342,9 @@ def main():
     print("GNN3 BEST 7: Train and save checkpoints for overlay")
     print("=" * 70)
     for tup in MODELS:
-        block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph = tup
-        print(f"\n>>> Block {block_id}: {name} + {out_dir} (target={target})")
-        train_one(block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph)
+        block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph, early_stop = tup
+        print(f"\n>>> Block {block_id}: {name} + {out_dir} (target={target})" + (" [no early stop]" if not early_stop else ""))
+        train_one(block_id, name, out_dir, feat, target, n_emb, e_emb, h_dim, n_layers, use_norm, use_ph, early_stop=early_stop)
     print("\n" + "=" * 70)
     print("Done. Checkpoints in", os.path.abspath(OUTPUT_DIR))
 

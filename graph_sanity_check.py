@@ -19,7 +19,7 @@ For the selected dataset it performs:
 2) Transformer / regulator edge checks (XFM1 832↔888, RegA 814↔814r, RegB 852↔852r)
 3) Prints node features for the first sample (all nodes)
 4) Aggregated P/Q sanity checks (datasets 2–4)
-5) Prints a sample of edge static features (R_full, X_full, C_full in ohms)
+5) Prints edge static features for all edges (R_full, X_full, C_full in ohms)
 """
 
 from __future__ import annotations
@@ -155,16 +155,20 @@ def check_transformer_reg_edges(df_e: pd.DataFrame) -> None:
 
 
 def show_first_sample_nodes(df_nodes: pd.DataFrame) -> int:
-    print("\n[check] 3) First-sample node features")
+    print("\n[check] 3) First-sample node features (all nodes)")
     if "sample_id" not in df_nodes.columns:
         print("  ! No sample_id column in node file; cannot slice by sample.")
-        print("  Showing first 20 rows instead:")
-        print(df_nodes.head(20))
+        print("  Showing all node rows:")
+        pd.set_option("display.max_rows", None)
+        pd.set_option("display.max_columns", None)
+        print(df_nodes)
         return 0
     first_sample = int(df_nodes["sample_id"].min())
     df_one = df_nodes[df_nodes["sample_id"] == first_sample].copy()
     print(f"  sample_id={first_sample} -> {len(df_one)} node rows")
-    print(df_one.head(20))
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.max_columns", None)
+    print(df_one)
     return first_sample
 
 
@@ -293,10 +297,14 @@ def aggregated_checks_deltav(df_nodes: pd.DataFrame, df_samples: pd.DataFrame, s
 
 
 def show_edge_static_features(df_e: pd.DataFrame) -> None:
-    print("\n[check] 5) Edge static features (sample)")
+    print("\n[check] 5) Edge static features (all edges)")
     cols = ["from_node", "to_node", "line_name", "R_full", "X_full", "C_full"]
     existing = [c for c in cols if c in df_e.columns]
-    print(df_e[existing].head(20))
+    if not existing:
+        existing = list(df_e.columns)
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.max_columns", None)
+    print(df_e[existing])
 
 
 def main() -> None:

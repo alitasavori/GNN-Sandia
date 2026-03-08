@@ -36,6 +36,7 @@ def main() -> None:
         n_layers=4,
         use_norm=False,
         use_phase_onehot=False,
+        early_stop=False,  # train full 50 epochs, keep best by test RMSE (avoids constant-output collapse on daily profile)
     )
 
     if ckpt_path is None:
