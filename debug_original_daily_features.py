@@ -60,6 +60,7 @@ from run_gnn3_overlay_7 import (
     load_model_for_inference,
 )
 from run_gnn3_best7_train import ORIGINAL_FEAT
+from compare_two_models_daily import _resolve_node_list
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -178,21 +179,13 @@ def _load_daily_features_for_node(
     node_in_dim = int(cfg.get("node_in_dim", len(ORIGINAL_FEAT)))
     dataset_dir = cfg.get("dataset", DIR_ORIGINAL)
 
-    # Use the same MASTER as overlay; for original, dataset_dir should be DIR_ORIGINAL.
-    master_csv = os.path.join(dataset_dir, "gnn_node_index_master.csv")
-    if not os.path.exists(master_csv):
-        raise FileNotFoundError(f"Missing {master_csv}")
-    master_df = pd.read_csv(master_csv)
-    master_df["node_idx"] = pd.to_numeric(master_df["node_idx"], errors="raise").astype(int)
-    master_df = master_df.sort_values("node_idx").reset_index(drop=True)
-    node_names_master = master_df["node"].astype(str).tolist()
+    # Use the same 89-node list (excludes upstream buses) as compare_two_models_daily.
+    N_expected = static["N"]
+    node_names_master = _resolve_node_list(ckpt_path, expected_n=N_expected)
     node_to_idx = {n: i for i, n in enumerate(node_names_master)}
     if obs_node not in node_to_idx:
-        raise RuntimeError(f"obs_node='{obs_node}' not in MASTER.")
+        raise RuntimeError(f"obs_node='{obs_node}' not in 89-node MASTER.")
     obs_idx = node_to_idx[obs_node]
-    N_expected = static["N"]
-    if len(node_names_master) != N_expected:
-        raise RuntimeError(f"MASTER node count {len(node_names_master)} != model expects {N_expected}.")
 
     edge_index = static["edge_index"].to(DEVICE)
     edge_attr = static["edge_attr"].to(DEVICE)
