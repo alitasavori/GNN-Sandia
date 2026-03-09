@@ -423,7 +423,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             sum_q_pv = float(sum(busphQ_pv_actual.values()))
             sum_q_cap = inj.total_cap_q_kvar(node_names_master)
             p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
+            q_sys_balance = sum_q_load + sum_q_pv - sum_q_cap
             if node_in_dim not in (12, 14, 15, 17):
                 raise ValueError(
                     f"Strict load-type inference only supports node_in_dim 12, 14, 15, or 17, got {node_in_dim}."

@@ -210,7 +210,7 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
         P_grid = -float(pwr[0])
         Q_grid = -float(pwr[1])
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+        q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
         kw = dict(node_names_master=node_names_master, busphP_load=busphP_load, busphQ_load=busphQ_load,
                   busphP_pv=busphP_pv_actual, busphQ_pv=busphQ_pv_actual, busph_per_type=busph_per_type,
@@ -303,7 +303,7 @@ def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
         sum_p_pv = float(sum(busphP_pv_actual.values()))
         sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+        q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
         if int(cfg_oh["node_in_dim"]) != 17 or int(cfg_sg["node_in_dim"]) != 14:
             raise ValueError(
@@ -421,7 +421,7 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
         sum_p_pv = float(sum(busphP_pv_actual.values()))
         sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+        q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
         if int(cfg_14["node_in_dim"]) != 15 or int(cfg_ph["node_in_dim"]) != 14:
             raise ValueError(

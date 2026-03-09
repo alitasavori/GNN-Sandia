@@ -232,7 +232,7 @@ def generate_gnn_snapshot_dataset_deltav(
             kept_nodes = [n for n in node_names_master if n.split(".")[0] not in EXCLUDED_UPSTREAM_BUSES]
             sum_q_cap = inj.total_cap_q_kvar(kept_nodes)
             p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
+            q_sys_balance = sum_q_load + sum_q_pv - sum_q_cap
 
             rows_sample.append({
                 "sample_id": sample_id,

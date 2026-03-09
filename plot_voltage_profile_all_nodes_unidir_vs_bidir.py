@@ -97,7 +97,7 @@ def run_24h_all_nodes():
         sum_p_pv = float(sum(busphP_pv_actual.values()))
         sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+        q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
         X = build_gnn_x_loadtype(
             node_names_master, busph_per_type, busphP_pv_actual,
             node_to_electrical_dist, p_sys_balance, q_sys_balance,

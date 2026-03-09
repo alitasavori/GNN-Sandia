@@ -227,7 +227,7 @@ def run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv_dis
         P_grid = -float(pwr[0])
         Q_grid = -float(pwr[1])
         p_sys_balance = sum_p_load - sum_p_pv_actual
-        q_sys_balance = sum_q_load - sum_q_pv_actual - sum_q_cap
+        q_sys_balance = sum_q_load + sum_q_pv_actual - sum_q_cap
 
         kw = dict(node_names_master=node_names_master, busphP_load=busphP_load, busphQ_load=busphQ_load,
                   busphP_pv=busphP_pv_actual, busphQ_pv=busphQ_pv_actual, busph_per_type=busph_per_type,
@@ -284,7 +284,7 @@ def run_one_step_and_return_features(ckpt_1_path, ckpt_2_path, node_names_master
     P_grid = -float(pwr[0])
     Q_grid = -float(pwr[1])
     p_sys_balance = sum_p_load - sum_p_pv_actual
-    q_sys_balance = sum_q_load - sum_q_pv_actual - sum_q_cap
+    q_sys_balance = sum_q_load + sum_q_pv_actual - sum_q_cap
     kw = dict(node_names_master=node_names_master, busphP_load=busphP_load, busphQ_load=busphQ_load,
               busphP_pv=busphP_pv_actual, busphQ_pv=busphQ_pv_actual, busph_per_type=busph_per_type,
               P_grid=P_grid, Q_grid=Q_grid, node_to_electrical_dist=node_to_electrical_dist,

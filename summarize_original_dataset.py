@@ -352,7 +352,7 @@ def _run_baseline_feature_profiles() -> tuple[dict[str, dict[str, np.ndarray]], 
             loadtype_sums["q_pv_kvar"] += q_pv
 
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
+        q_sys_balance = sum_q_load + sum_q_pv - sum_q_cap
         for _ in kept_nodes:
             fam["loadtype"]["node_values"]["p_sys_balance_kw"].append(p_sys_balance)
             fam["loadtype"]["node_values"]["q_sys_balance_kvar"].append(q_sys_balance)
