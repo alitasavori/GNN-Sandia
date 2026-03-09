@@ -176,8 +176,15 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
         # --- GNN step 1: build_gnn_x ---
         t0 = time.perf_counter()
         if dataset_dir == os.path.join("datasets_gnn2", "original"):
-            X = build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv,
-                                    busphQ_pv=busphQ_pv if node_in_dim == 4 else None)
+            # Use post-solve actual PV P/Q for ORIGINAL models (matches training).
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
+            X = build_gnn_x_original(
+                node_names_master,
+                busphP_load,
+                busphQ_load,
+                busphP_pv_actual,
+                busphQ_pv=busphQ_pv_actual if node_in_dim == 4 else None,
+            )
         elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
             pwr = dss.Circuit.TotalPower()
             P_grid = -float(pwr[0])
