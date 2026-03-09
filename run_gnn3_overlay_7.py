@@ -68,7 +68,7 @@ def build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv,
 
 
 def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid, busphQ_pv=None):
-    """Injection (2 feat): p_inj_kw, q_inj_kvar per node. Source bus uses grid P/Q; others: p_inj=p_pv-p_load, q_inj=q_pv-q_load+cap (matches training)."""
+    """Injection (2 feat): p_inj_kw, q_inj_kvar per node. Source bus uses grid P/Q; others: p_inj=p_pv-p_load, q_inj=-q_pv-q_load+cap (matches training)."""
     P_grid_per_ph = P_grid / 3.0
     Q_grid_per_ph = Q_grid / 3.0
     X = np.zeros((len(node_names_master), 2), dtype=np.float32)
@@ -84,7 +84,7 @@ def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv
             q_inj = Q_grid_per_ph
         else:
             p_inj = p_pv - p_load
-            q_inj = q_pv - q_load + inj.cap_q_kvar_per_node(bus, ph)
+            q_inj = -q_pv - q_load + inj.cap_q_kvar_per_node(bus, ph)
         X[i, 0] = p_inj
         X[i, 1] = q_inj
     return X

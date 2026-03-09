@@ -985,7 +985,7 @@ def generate_gnn_snapshot_dataset_injection(
                     q_inj = Q_grid_per_ph
                 else:
                     p_inj = p_pv_node - p_load_node
-                    q_inj = q_pv_node - q_load_node + cap_q_kvar_per_node(bus, ph)
+                    q_inj = -q_pv_node - q_load_node + cap_q_kvar_per_node(bus, ph)
 
                 rows_node.append({
                     "sample_id": sample_id, "node": n, "node_idx": int(node_to_idx_master[n]),

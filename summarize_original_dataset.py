@@ -300,7 +300,7 @@ def _run_baseline_feature_profiles() -> tuple[dict[str, dict[str, np.ndarray]], 
             q_pv = float(busphQ_pv.get((bus, ph), 0.0))
             q_cap = inj.cap_q_kvar_per_node(bus, ph)
             p_inj = p_pv - p_load
-            q_inj = q_pv - q_load + q_cap
+            q_inj = -q_pv - q_load + q_cap
 
             fam["original"]["node_values"]["p_load_kw"].append(p_load)
             fam["original"]["node_values"]["q_load_kvar"].append(q_load)
