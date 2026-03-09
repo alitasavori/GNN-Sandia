@@ -116,11 +116,16 @@ def build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv):
 
 
 def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist,
-                         p_sys_balance, q_sys_balance, busphQ_pv=None):
-    """Strict load-type inference features: electrical_distance, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, q_pv, p_sys, q_sys."""
+                         p_sys_balance, q_sys_balance, busphQ_pv=None, include_globals=True):
+    """Strict load-type inference features.
+
+    With globals: electrical_distance, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q,
+    m5_p, m5_q, q_cap, p_pv, q_pv, p_sys, q_sys.
+    Without globals: same layout but without p_sys and q_sys.
+    """
     if busphQ_pv is None:
         raise ValueError("Strict load-type inference requires busphQ_pv (post-solve q_pv_kvar) for every checkpoint.")
-    X = np.zeros((len(node_names_master), 14), dtype=np.float32)
+    X = np.zeros((len(node_names_master), 14 if include_globals else 12), dtype=np.float32)
     for i, n in enumerate(node_names_master):
         bus, phs = n.split(".")
         ph = int(phs)
@@ -143,8 +148,9 @@ def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_e
         X[i, 9] = q_cap
         X[i, 10] = p_pv
         X[i, 11] = q_pv
-        X[i, 12] = p_sys_balance
-        X[i, 13] = q_sys_balance
+        if include_globals:
+            X[i, 12] = p_sys_balance
+            X[i, 13] = q_sys_balance
     return X
 
 
@@ -418,14 +424,15 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             sum_q_cap = inj.total_cap_q_kvar(node_names_master)
             p_sys_balance = sum_p_load - sum_p_pv
             q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
-            if node_in_dim not in (14, 17):
+            if node_in_dim not in (12, 14, 15, 17):
                 raise ValueError(
-                    f"Strict load-type inference only supports node_in_dim 14 or 17, got {node_in_dim}."
+                    f"Strict load-type inference only supports node_in_dim 12, 14, 15, or 17, got {node_in_dim}."
                 )
             X = build_gnn_x_loadtype(
                 node_names_master, busph_per_type, busphP_pv_actual,
                 node_to_electrical_dist, p_sys_balance, q_sys_balance,
                 busphQ_pv=busphQ_pv_actual,
+                include_globals=node_in_dim in (14, 17),
             )
         if is_deltav:
             X = np.concatenate([X, vmag_zero[:, None]], axis=-1)
