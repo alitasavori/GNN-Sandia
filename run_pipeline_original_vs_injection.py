@@ -10,8 +10,9 @@ then compare with a 24h voltage profile (OpenDSS + both models) on in-distributi
 Run from repo root or notebook:
   %run run_pipeline_original_vs_injection.py
 
-If ckpt_original.pt and ckpt_injection.pt already exist in pipeline_original_vs_injection_output/,
-training is still run (to match "same pipeline"). To only evaluate, set SKIP_TRAIN = True below.
+To only plot (no retraining): set SKIP_TRAIN = True and run, or from notebook:
+  from run_pipeline_original_vs_injection import plot_only
+  plot_only()
 """
 from __future__ import annotations
 
@@ -84,13 +85,12 @@ os.makedirs(PIPELINE_OUTPUT, exist_ok=True)
 def train_original():
     """Train model on original dataset (4 features). Same config as run_gnn3_best7_train block 1."""
     print("\n>>> Training Original model (datasets_gnn2/original, 4 feat, medium arch)...")
-    # block_id=1, medium: n_emb=8, e_emb=4, h_dim=32, n_layers=4, use_norm=False, early_stop=False
-    orig_out = os.path.join(BASE_DIR, PIPELINE_OUTPUT)
+    # block_id=1, medium: n_emb=8, e_emb=4, h_dim=32, n_layers=4, use_norm=False, early_stop=True
     save_path = gnn3_train_one(
         1, "medium", DIR_ORIGINAL,
         ORIGINAL_FEAT, "vmag_pu",
         8, 4, 32, 4, False, False,
-        early_stop=False,
+        early_stop=True,
     )
     if save_path is None:
         raise FileNotFoundError("Original training failed. Ensure datasets_gnn2/original exists.")
@@ -160,7 +160,6 @@ def evaluate_three_profile_24h(ckpt_orig, ckpt_inj, device=None):
     if len(node_names_master) != N:
         raise RuntimeError(f"Node count mismatch: master {len(node_names_master)} vs model N={N}")
     node_to_idx = {n: i for i, n in enumerate(node_names_master)}
-    obs_idx = node_to_idx[OBSERVED_NODE]
 
     dss_path = inj.compile_once()
     inj.setup_daily()
@@ -180,7 +179,8 @@ def evaluate_three_profile_24h(ckpt_orig, ckpt_inj, device=None):
     pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
     rng = np.random.default_rng(0)
 
-    t_hours, v_dss, v_orig, v_inj = [], [], [], []
+    t_hours = []
+    rows_dss, rows_orig, rows_inj = [], [], []
     for t in range(NPTS):
         inj.set_time_index(t)
         _, busphP_load, busphQ_load, _, _ = inj.apply_snapshot_timeconditioned(
@@ -205,12 +205,12 @@ def evaluate_three_profile_24h(ckpt_orig, ckpt_inj, device=None):
             pass
         if not dss.Solution.Converged():
             t_hours.append(t * STEP_MIN / 60.0)
-            v_dss.append(np.nan)
-            v_orig.append(np.nan)
-            v_inj.append(np.nan)
+            rows_dss.append(np.full(N, np.nan))
+            rows_orig.append(np.full(N, np.nan))
+            rows_inj.append(np.full(N, np.nan))
             continue
         vdict = get_all_node_voltage_pu_and_angle_dict()
-        vm_dss, _ = vdict[OBSERVED_NODE]
+        vm_dss_row = np.array([float(vdict.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float64)
 
         busphP_pv, busphQ_pv = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         X_orig = build_gnn_x_original(
@@ -229,35 +229,66 @@ def evaluate_three_profile_24h(ckpt_orig, ckpt_inj, device=None):
         g_orig = Data(x=x_orig, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
         g_inj = Data(x=x_inj, edge_index=ei, edge_attr=ea, edge_id=eid, num_nodes=N)
         with torch.no_grad():
-            v_orig.append(float(model_orig(g_orig)[obs_idx, 0].item()))
-            v_inj.append(float(model_inj(g_inj)[obs_idx, 0].item()))
+            vo_row = model_orig(g_orig)[:, 0].cpu().numpy().astype(np.float64)
+            vi_row = model_inj(g_inj)[:, 0].cpu().numpy().astype(np.float64)
 
         t_hours.append(t * STEP_MIN / 60.0)
-        v_dss.append(float(vm_dss))
+        rows_dss.append(vm_dss_row)
+        rows_orig.append(vo_row)
+        rows_inj.append(vi_row)
 
-    vd = np.array(v_dss, dtype=np.float64)
-    vo = np.array(v_orig, dtype=np.float64)
-    vi = np.array(v_inj, dtype=np.float64)
-    ok = np.isfinite(vd)
-    mae_orig = float(np.mean(np.abs(vd[ok] - vo[ok]))) if np.sum(ok) > 0 else np.nan
-    mae_inj = float(np.mean(np.abs(vd[ok] - vi[ok]))) if np.sum(ok) > 0 else np.nan
+    t_hours = np.array(t_hours)
+    V_dss = np.array(rows_dss, dtype=np.float64)   # (NPTS, N)
+    V_orig = np.array(rows_orig, dtype=np.float64)
+    V_inj = np.array(rows_inj, dtype=np.float64)
 
+    # MAE per node (over time)
+    mae_orig_per_node = np.nanmean(np.abs(V_dss - V_orig), axis=0)
+    mae_inj_per_node = np.nanmean(np.abs(V_dss - V_inj), axis=0)
+
+    out_dir = os.path.join(BASE_DIR, PIPELINE_OUTPUT)
+    all_nodes_dir = os.path.join(out_dir, "all_nodes")
+    os.makedirs(all_nodes_dir, exist_ok=True)
+
+    # One plot per node
+    for idx in range(N):
+        n = node_names_master[idx]
+        m1, m2 = float(mae_orig_per_node[idx]), float(mae_inj_per_node[idx])
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(t_hours, V_dss[:, idx], "b-", label="OpenDSS |V| (pu)", linewidth=2)
+        ax.plot(t_hours, V_orig[:, idx], color="orange", linestyle="--", label=f"Original MAE={m1:.4f}", linewidth=1.5)
+        ax.plot(t_hours, V_inj[:, idx], "g:", label=f"Injection MAE={m2:.4f}", linewidth=1.5)
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("Voltage magnitude (pu)")
+        ax.set_title(f"24h @ {n} — in-distribution baseline")
+        ax.grid(True)
+        ax.legend()
+        plt.tight_layout()
+        safe_name = n.replace(".", "_")
+        fig.savefig(os.path.join(all_nodes_dir, f"three_profile_{safe_name}.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+
+    # Summary plot at default node
+    obs_idx = node_to_idx.get(OBSERVED_NODE, 0)
+    mae_orig = float(np.nanmean(mae_orig_per_node))
+    mae_inj = float(np.nanmean(mae_inj_per_node))
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(t_hours, v_dss, "b-", label="OpenDSS |V| (pu)", linewidth=2)
-    ax.plot(t_hours, v_orig, color="orange", linestyle="--", label=f"Original (4 feat) MAE={mae_orig:.4f}", linewidth=1.5)
-    ax.plot(t_hours, v_inj, "g:", label=f"Injection (2 feat) MAE={mae_inj:.4f}", linewidth=1.5)
+    ax.plot(t_hours, V_dss[:, obs_idx], "b-", label="OpenDSS |V| (pu)", linewidth=2)
+    ax.plot(t_hours, V_orig[:, obs_idx], color="orange", linestyle="--", label=f"Original (4 feat) MAE={mae_orig_per_node[obs_idx]:.4f}", linewidth=1.5)
+    ax.plot(t_hours, V_inj[:, obs_idx], "g:", label=f"Injection (2 feat) MAE={mae_inj_per_node[obs_idx]:.4f}", linewidth=1.5)
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Voltage magnitude (pu)")
-    ax.set_title(f"24h profile @ {OBSERVED_NODE} — in-distribution baseline ({P_BASE:.0f}/{Q_BASE:.0f}/{PV_BASE:.0f} kW/kVAR/kW)")
+    ax.set_title(f"24h @ {OBSERVED_NODE} — in-distribution baseline ({P_BASE:.0f}/{Q_BASE:.0f}/{PV_BASE:.0f} kW/kVAR/kW)")
     ax.grid(True)
     ax.legend()
     plt.tight_layout()
-    out_path = os.path.join(PIPELINE_OUTPUT, "three_profile_24h_in_distribution.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, "three_profile_24h_in_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  [saved] {out_path}")
-    print(f"  @ {OBSERVED_NODE}: Original MAE={mae_orig:.6f} | Injection MAE={mae_inj:.6f}")
-    return (t_hours, v_dss, v_orig, v_inj), mae_orig, mae_inj
+
+    print(f"  [saved] {out_dir}/three_profile_24h_in_distribution.png (summary @ {OBSERVED_NODE})")
+    print(f"  [saved] {all_nodes_dir}/ — one plot per node ({N} PNGs)")
+    print(f"  Overall: Original MAE={mae_orig:.6f} | Injection MAE={mae_inj:.6f}")
+    return (t_hours, node_names_master, V_dss, V_orig, V_inj, mae_orig_per_node, mae_inj_per_node)
 
 
 def main():
@@ -294,6 +325,25 @@ def main():
     print("\n>>> Evaluating 24h three-profile (OpenDSS + Original + Injection) @", OBSERVED_NODE)
     evaluate_three_profile_24h(ckpt_orig, ckpt_inj)
     print("=" * 70)
+
+
+def plot_only(ckpt_orig=None, ckpt_inj=None):
+    """Run 24h three-profile comparison and save plot only (no training).
+    Uses existing checkpoints from pipeline_original_vs_injection_output/ if paths not given.
+    Example (notebook): from run_pipeline_original_vs_injection import plot_only; plot_only()
+    """
+    ckpt_orig = ckpt_orig or os.path.join(BASE_DIR, CKPT_ORIGINAL)
+    ckpt_inj = ckpt_inj or os.path.join(BASE_DIR, CKPT_INJECTION)
+    if not os.path.exists(ckpt_orig):
+        ckpt_orig = os.path.join(BASE_DIR, PIPELINE_OUTPUT, "block1.pt")
+    if not os.path.exists(ckpt_inj):
+        ckpt_inj = os.path.join(BASE_DIR, PIPELINE_OUTPUT, "block2.pt")
+    if not os.path.exists(ckpt_orig) or not os.path.exists(ckpt_inj):
+        raise FileNotFoundError(
+            f"Checkpoints not found. Train first (SKIP_TRAIN=False) or pass ckpt_orig=..., ckpt_inj=..."
+        )
+    print(">>> 24h three-profile (OpenDSS + Original + Injection) @", OBSERVED_NODE)
+    evaluate_three_profile_24h(ckpt_orig, ckpt_inj)
 
 
 if __name__ == "__main__":
