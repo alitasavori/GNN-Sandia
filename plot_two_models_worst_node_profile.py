@@ -119,19 +119,34 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type,
-                      P_grid, Q_grid, node_to_electrical_dist=None, p_sys_balance=None, q_sys_balance=None):
-    """Build node features based on node_in_dim (2=injection, 10=loadtype per-type, 13=loadtype full)."""
+                      P_grid, Q_grid, node_to_electrical_dist=None, p_sys_balance=None, q_sys_balance=None,
+                      busphQ_pv=None):
+    """Build node features based on node_in_dim (2=injection, 10=loadtype per-type, 14/17=strict loadtype)."""
     if node_in_dim == 2:
         return build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
     elif node_in_dim == 10:
         return build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
-    elif node_in_dim == 13:
-        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None:
-            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=13")
+    elif node_in_dim == 14:
+        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
+            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=14")
         return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                   node_to_electrical_dist, p_sys_balance, q_sys_balance)
+                                   node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv=busphQ_pv)
+    elif node_in_dim == 17:
+        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
+            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=17")
+        X_14 = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv,
+        )
+        phase_map = np.array([int(n.split(".")[-1]) - 1 for n in node_names_master], dtype=np.int64)
+        ph_oh = np.eye(3, dtype=np.float32)[phase_map]
+        return np.concatenate([X_14, ph_oh], axis=-1)
     else:
-        raise ValueError(f"Unknown node_in_dim={node_in_dim}; expected 2, 10, or 13.")
+        raise ValueError(
+            f"Unknown node_in_dim={node_in_dim}; expected 2, 10, 14, or 17. "
+            "Legacy load-type 13/16 checkpoints are intentionally unsupported."
+        )
 
 
 def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
@@ -186,17 +201,21 @@ def run_24h_all_nodes(ckpt_1_path, ckpt_2_path):
             if n in vdict:
                 V_dss[t, i], _ = vdict[n]
 
+        busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
-        P_grid = sum_p_load - sum_p_pv
-        Q_grid = sum_q_load - sum(CAP_Q_KVAR.values())
+        sum_p_pv = float(sum(busphP_pv_actual.values()))
+        sum_q_pv = float(sum(busphQ_pv_actual.values()))
+        pwr = inj.dss.Circuit.TotalPower()
+        P_grid = -float(pwr[0])
+        Q_grid = -float(pwr[1])
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
         kw = dict(node_names_master=node_names_master, busphP_load=busphP_load, busphQ_load=busphQ_load,
-                  busphP_pv=busphP_pv, busph_per_type=busph_per_type, P_grid=P_grid, Q_grid=Q_grid,
-                  node_to_electrical_dist=node_to_electrical_dist, p_sys_balance=p_sys_balance, q_sys_balance=q_sys_balance)
+                  busphP_pv=busphP_pv_actual, busphQ_pv=busphQ_pv_actual, busph_per_type=busph_per_type,
+                  P_grid=P_grid, Q_grid=Q_grid, node_to_electrical_dist=node_to_electrical_dist,
+                  p_sys_balance=p_sys_balance, q_sys_balance=q_sys_balance)
         X_1 = build_x_for_model(dim_1, **kw)
         X_2 = build_x_for_model(dim_2, **kw)
 
@@ -228,7 +247,7 @@ def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
     ei_sg = ckpt_sg["edge_index"].to(DEVICE)
     ea_sg = ckpt_sg["edge_attr"].to(DEVICE)
     eid_sg = ckpt_sg["edge_id"].to(DEVICE)
-    model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_sg["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
+    model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_sg["E"]), node_in_dim=int(cfg_sg["node_in_dim"]), edge_in_dim=2, out_dim=1,
                              node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_2.load_state_dict(ckpt_sg["state_dict"])
     model_2.eval()
@@ -278,14 +297,23 @@ def run_24h_phase_onehot_vs_subgraph(ckpt_1_path, ckpt_2_path):
             if n in vdict:
                 V_dss[t, i], _ = vdict[n]
 
+        busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
+        sum_p_pv = float(sum(busphP_pv_actual.values()))
+        sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                 node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        if int(cfg_oh["node_in_dim"]) != 17 or int(cfg_sg["node_in_dim"]) != 14:
+            raise ValueError(
+                f"Strict phase comparison expects node_in_dim 17 and 14, got {cfg_oh['node_in_dim']} and {cfg_sg['node_in_dim']}."
+            )
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv_actual,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv_actual,
+        )
         X_oh = np.concatenate([X, ph_oh], axis=-1).astype(np.float32)
         x_1 = torch.tensor(X_oh, dtype=torch.float32, device=DEVICE)
         x_2_phase_a = torch.tensor(X[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
@@ -319,12 +347,12 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
     ea_ph = ckpt_ph["edge_attr"].to(DEVICE)
     eid_ph = ckpt_ph["edge_id"].to(DEVICE)
 
-    model_1 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_14["E"]), node_in_dim=14, edge_in_dim=2, out_dim=1,
+    model_1 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_14["E"]), node_in_dim=int(cfg_14["node_in_dim"]), edge_in_dim=2, out_dim=1,
                             node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_1.load_state_dict(ckpt_14["state_dict"])
     model_1.eval()
 
-    model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_ph["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
+    model_2 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_ph["E"]), node_in_dim=int(cfg_ph["node_in_dim"]), edge_in_dim=2, out_dim=1,
                             node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_2.load_state_dict(ckpt_ph["state_dict"])
     model_2.eval()
@@ -387,14 +415,23 @@ def run_24h_14feat_vs_phase_a(ckpt_1_path, ckpt_2_path):
             if n in vdict:
                 V_dss[t, i], _ = vdict[n]
 
+        busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
+        sum_p_pv = float(sum(busphP_pv_actual.values()))
+        sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
 
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                 node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        if int(cfg_14["node_in_dim"]) != 15 or int(cfg_ph["node_in_dim"]) != 14:
+            raise ValueError(
+                f"Strict phase-A comparison expects node_in_dim 15 and 14, got {cfg_14['node_in_dim']} and {cfg_ph['node_in_dim']}."
+            )
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv_actual,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv_actual,
+        )
         vmag_zero = vmag_zero_precomputed[t]
         X_14_full = np.concatenate([X, vmag_zero[:, None]], axis=-1).astype(np.float32)
         x_1 = torch.tensor(X_14_full[phase_a_indices, :], dtype=torch.float32, device=DEVICE)

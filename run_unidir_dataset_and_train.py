@@ -360,15 +360,17 @@ def evaluate_profile(obs_node=OBSERVED_NODE):
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[obs_node]
 
+        busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
+        sum_p_pv = float(sum(busphP_pv_actual.values()))
+        sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
+        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
         X = build_gnn_x_loadtype(
-            node_names_master, busph_per_type, busphP_pv,
+            node_names_master, busph_per_type, busphP_pv_actual,
             node_to_electrical_dist, p_sys_balance, q_sys_balance,
-            busphQ_pv=busphQ_pv,
+            busphQ_pv=busphQ_pv_actual,
         )
         x_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
 

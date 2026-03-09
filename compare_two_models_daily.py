@@ -66,9 +66,7 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
       node_in_dim=3: ORIGINAL_FEAT (legacy 3) [p_load_kw, q_load_kvar, p_pv_kw]
       node_in_dim=4: ORIGINAL_FEAT (4)       [p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar]
       node_in_dim=10: loadtype per-type (m1_p, m1_q, ..., q_cap, p_pv)
-      node_in_dim=13: legacy LOADTYPE_FEAT  [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, p_sys_balance_kw, q_sys_balance_kvar]
       node_in_dim=14: current LOADTYPE_FEAT [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, q_pv_kvar, p_sys_balance_kw, q_sys_balance_kvar]
-      node_in_dim=16: legacy LOADTYPE_FEAT + 3-dim phase one-hot
       node_in_dim=17: current LOADTYPE_FEAT + 3-dim phase one-hot
     """
     if node_in_dim == 2:
@@ -79,25 +77,12 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
         return build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv, busphQ_pv=busphQ_pv)
     elif node_in_dim == 10:
         return build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
-    elif node_in_dim == 13:
-        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None:
-            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=13")
-        return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                    node_to_electrical_dist, p_sys_balance, q_sys_balance)
     elif node_in_dim == 14:
         if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
             raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=14")
         return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
                                     node_to_electrical_dist, p_sys_balance, q_sys_balance,
                                     busphQ_pv=busphQ_pv)
-    elif node_in_dim == 16:
-        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None:
-            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=16")
-        X_13 = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                    node_to_electrical_dist, p_sys_balance, q_sys_balance)
-        phase_map = np.array([int(n.split(".")[-1]) - 1 for n in node_names_master], dtype=np.int64)
-        ph_oh = np.eye(3, dtype=np.float32)[phase_map]
-        return np.concatenate([X_13, ph_oh], axis=-1)
     elif node_in_dim == 17:
         if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
             raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=17")
@@ -108,7 +93,11 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
         ph_oh = np.eye(3, dtype=np.float32)[phase_map]
         return np.concatenate([X_14, ph_oh], axis=-1)
     else:
-        raise ValueError(f"Unsupported node_in_dim={node_in_dim}; use 2, 3, 4, 10, 13, 14, 16, or 17.")
+        raise ValueError(
+            f"Unsupported node_in_dim={node_in_dim}. "
+            "Only the strict load-type inference workflow is supported now: "
+            "use 14 (loadtype + q_pv) or 17 (loadtype + q_pv + phase one-hot)."
+        )
 
 
 def _resolve_node_list(ckpt_path, expected_n=89):

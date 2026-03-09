@@ -46,6 +46,12 @@ def run_24h_one_node(obs_node):
     model_uni, static_uni = load_model_for_inference(CKPT_PATH, device=DEVICE)
     model_bidir, static_bidir = load_model_for_inference(CKPT_PATH_BIDIR, device=DEVICE)
     N = static_uni["N"]
+    dim_uni = int(static_uni["config"]["node_in_dim"])
+    dim_bidir = int(static_bidir["config"]["node_in_dim"])
+    if dim_uni != 14 or dim_bidir != 14:
+        raise ValueError(
+            f"Strict load-type plotting requires 14-feature checkpoints, got unidir={dim_uni}, bidir={dim_bidir}."
+        )
 
     ei_uni = static_uni["edge_index"].to(DEVICE)
     ea_uni = static_uni["edge_attr"].to(DEVICE)
@@ -94,12 +100,18 @@ def run_24h_one_node(obs_node):
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[obs_node]
 
+        busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
         sum_p_load = float(sum(busphP_load.values()))
         sum_q_load = float(sum(busphQ_load.values()))
-        sum_p_pv = float(sum(busphP_pv.values()))
+        sum_p_pv = float(sum(busphP_pv_actual.values()))
+        sum_q_pv = float(sum(busphQ_pv_actual.values()))
         p_sys_balance = sum_p_load - sum_p_pv
-        q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv_actual,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv_actual,
+        )
         x_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
 
         g_uni = Data(x=x_t, edge_index=ei_uni, edge_attr=ea_uni, edge_id=eid_uni, num_nodes=N)

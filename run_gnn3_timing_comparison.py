@@ -191,15 +191,21 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
             Q_grid = -float(pwr[1])
             X = build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
         else:
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
             sum_p_load = float(sum(busphP_load.values()))
             sum_q_load = float(sum(busphQ_load.values()))
-            sum_p_pv = float(sum(busphP_pv.values()))
-            sum_q_cap = float(sum(CAP_Q_KVAR.values()))
+            sum_p_pv = float(sum(busphP_pv_actual.values()))
+            sum_q_pv = float(sum(busphQ_pv_actual.values()))
             p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load - sum_q_cap
+            q_sys_balance = sum_q_load - sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+            if node_in_dim not in (14, 17):
+                raise ValueError(
+                    f"Strict load-type timing path only supports node_in_dim 14 or 17, got {node_in_dim}."
+                )
             X = build_gnn_x_loadtype(
-                node_names_master, busph_per_type, busphP_pv,
+                node_names_master, busph_per_type, busphP_pv_actual,
                 node_to_electrical_dist, p_sys_balance, q_sys_balance,
+                busphQ_pv=busphQ_pv_actual,
             )
         if is_deltav:
             X = np.concatenate([X, vmag_zero[:, None]], axis=-1)
