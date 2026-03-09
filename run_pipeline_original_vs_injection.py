@@ -11,6 +11,8 @@ Run from repo root or notebook:
   %run run_pipeline_original_vs_injection.py
 
 To only plot (no retraining): set SKIP_TRAIN = True and run, or from notebook:
+  import sys, os
+  sys.path.insert(0, os.getcwd())  # ensure repo root (where this file lives) is on path
   from run_pipeline_original_vs_injection import plot_only
   plot_only()
 """
