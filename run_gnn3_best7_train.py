@@ -42,7 +42,7 @@ ORIGINAL_FEAT = ["p_load_kw", "q_load_kvar", "p_pv_kw", "q_pv_kvar"]
 INJECTION_FEAT = ["p_inj_kw", "q_inj_kvar"]
 LOADTYPE_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
     "p_sys_balance_kw", "q_sys_balance_kvar",
 ]
 DELTAV_FEAT = LOADTYPE_FEAT + ["vmag_zero_pv_pu"]

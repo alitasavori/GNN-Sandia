@@ -1,7 +1,7 @@
 """
 Train two models on the same 10k samples from datasets_gnn2/loadtype:
-  (A) Loadtype full (13 feat): electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q,
-      m5_p, m5_q, q_cap, p_pv, p_sys_balance_kw, q_sys_balance_kvar
+  (A) Loadtype full (14 feat): electrical_distance_ohm, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q,
+      m5_p, m5_q, q_cap, p_pv, q_pv, p_sys_balance_kw, q_sys_balance_kvar
       (electrical_distance + p_sys/q_sys are global context; others are local per-node)
   (B) Loadtype per-type (10 feat): m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv
       (all local per-node)
@@ -37,7 +37,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LOADTYPE_FULL_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
     "p_sys_balance_kw", "q_sys_balance_kvar",
 ]
 LOADTYPE_PER_TYPE_FEAT = [
@@ -99,7 +99,7 @@ def train_one(X_all, Y_all, edge_index, edge_attr, edge_id, N, E, node_in_dim, c
 
 def main():
     print("=" * 70)
-    print("LOADTYPE FULL (13 feat) vs LOADTYPE PER-TYPE (10 feat): same 10k samples, same arch")
+    print("LOADTYPE FULL (14 feat) vs LOADTYPE PER-TYPE (10 feat): same 10k samples, same arch")
     print("=" * 70)
 
     edge_csv = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")

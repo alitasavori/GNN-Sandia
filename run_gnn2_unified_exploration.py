@@ -4,7 +4,7 @@ Unified exploration: multiple architectures × all 3 GNN2 datasets.
 - Datasets (new unified layout):
     * datasets_gnn2/original   : Original (3 features: p_load, q_load, p_pv)
     * datasets_gnn2/injection  : Injection (2 features: p_inj, q_inj)
-    * datasets_gnn2/loadtype   : Load-type (13 features)
+    * datasets_gnn2/loadtype   : Load-type (14 features, includes q_pv)
 - For each architecture config (light/medium/heavy/deep), trains on each dataset.
 - Early stopping: patience 12, min 15 epochs, max 60.
 - Saves checkpoints:
@@ -61,9 +61,9 @@ DATASETS = [
     (os.path.join("datasets_gnn2", "injection"), ["p_inj_kw", "q_inj_kvar"], "Derived (2 feat)"),
     (os.path.join("datasets_gnn2", "loadtype"), [
         "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-        "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+        "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
         "p_sys_balance_kw", "q_sys_balance_kvar"
-    ], "Load-type (13 feat)"),
+    ], "Load-type (14 feat)"),
 ]
 
 

@@ -18,12 +18,14 @@ Static graph:
     which skips edges incident to buses in EXCLUDED_UPSTREAM_BUSES.
 """
 
+import importlib
 import os
 import numpy as np
 import pandas as pd
 
 import opendssdirect as dss
 import run_injection_dataset as inj
+inj = importlib.reload(inj)
 
 # Repo root (so paths work when cwd changes, e.g. in notebook/Colab)
 _REPO_ROOT = os.path.dirname(os.path.abspath(inj.__file__))

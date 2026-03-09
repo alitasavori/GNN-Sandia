@@ -55,7 +55,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LOADTYPE_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
     "p_sys_balance_kw", "q_sys_balance_kvar",
 ]
 
@@ -365,7 +365,11 @@ def evaluate_profile(obs_node=OBSERVED_NODE):
         sum_p_pv = float(sum(busphP_pv.values()))
         p_sys_balance = sum_p_load - sum_p_pv
         q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv,
+        )
         x_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
 
         g_uni = Data(x=x_t, edge_index=ei_uni, edge_attr=ea_uni, edge_id=eid_uni, num_nodes=N)

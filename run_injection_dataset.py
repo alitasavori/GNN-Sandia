@@ -31,12 +31,13 @@ VMAG_PU_MAX = 1.10
 MAX_CONTROL_ITER = 20000
 
 # Baseline totals used for scenario sampling (can differ from raw DSS sums).
-# Current choice: scaled averages from diagnostic sweep:
-#   P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=1400.0
+# Current choice: scaled averages from diagnostic sweep, with PV baseline
+# reduced to stay closer to the present inference regime:
+#   P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=975.0
 BASELINE = dict(
     P_load_total_kw=849.12,
     Q_load_total_kvar=501.12,
-    P_pv_total_kw=1400.0,
+    P_pv_total_kw=975.0,
     sigma_load=0.02,
     sigma_pv=0.02,
 )
@@ -215,8 +216,40 @@ NODE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_node_features_and_targets.csv")
 SAMPLE_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_sample_meta.csv")
 NODE_INDEX_CSV_INJ = os.path.join(OUT_DIR_INJ, "gnn_node_index_master.csv")
 
-# Capacitor Q per phase (kVAR)
+# Capacitor Q per phase-node (kVAR).
+# IEEE34_PV.dss defines 3-phase banks:
+#   844: 300 kVAR total -> 100 kVAR on each phase node
+#   848: 450 kVAR total -> 150 kVAR on each phase node
 CAP_Q_KVAR = {"844": 100.0, "848": 150.0}
+
+
+def cap_q_kvar_per_node(bus: str, ph: int | None = None) -> float:
+    """Reactive support contributed by one phase node at this bus."""
+    return float(CAP_Q_KVAR.get(str(bus), 0.0))
+
+
+def total_cap_q_kvar(node_names_or_bus_to_phases) -> float:
+    """Total capacitor reactive support across the active phase nodes.
+
+    Accepts either:
+    - a list of node names like ["844.1", "844.2", ...], or
+    - a bus_to_phases mapping like {"844": [1,2,3], ...}
+    """
+    total = 0.0
+    if isinstance(node_names_or_bus_to_phases, dict):
+        for bus, phases in node_names_or_bus_to_phases.items():
+            total += len([ph for ph in phases if ph in (1, 2, 3)]) * cap_q_kvar_per_node(str(bus))
+        return float(total)
+
+    for name in node_names_or_bus_to_phases:
+        bus, _, phs = str(name).partition(".")
+        try:
+            ph = int(phs)
+        except Exception:
+            continue
+        if ph in (1, 2, 3):
+            total += cap_q_kvar_per_node(bus, ph)
+    return float(total)
 
 # ============================================================
 # DSS compile + time setup
@@ -399,19 +432,19 @@ def select_times_three_profiles(prof_load, prof_pv, prof_net, K_total, bins_by_p
         remaining_pool = [t for t in union if t not in keep_set]
         need = K_total - len(keep)
         if need < 0:
-            return keep[:K_total]
+            return sorted(keep[:K_total])
         if need == 0:
-            return keep
+            return sorted(keep)
         pick = rng.choice(remaining_pool, size=need, replace=False).tolist()
-        return (keep + pick)[:K_total]
+        return sorted((keep + pick)[:K_total])
     if len(union) < K_total:
         sel = set(union)
         pool = [t for t in range(T) if t not in sel]
         need = K_total - len(union)
         if len(pool) > 0:
             union += rng.choice(pool, size=min(need, len(pool)), replace=False).tolist()
-        return union[:K_total]
-    return union[:K_total]
+        return sorted(union[:K_total])
+    return sorted(union[:K_total])
 
 # ============================================================
 # Node list + bus phases
@@ -952,7 +985,7 @@ def generate_gnn_snapshot_dataset_injection(
                     q_inj = Q_grid_per_ph
                 else:
                     p_inj = p_pv_node - p_load_node
-                    q_inj = q_pv_node - q_load_node + float(CAP_Q_KVAR.get(bus, 0.0))
+                    q_inj = q_pv_node - q_load_node + cap_q_kvar_per_node(bus, ph)
 
                 rows_node.append({
                     "sample_id": sample_id, "node": n, "node_idx": int(node_to_idx_master[n]),

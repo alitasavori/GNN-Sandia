@@ -3,11 +3,13 @@ Third dataset generation: per-node load-type features (M1/M2/M4/M5 P&Q, cap Q, P
 Standalone script — same scenario/snapshot flow as run_injection_dataset.py, but self-contained.
 Output: datasets_gnn2/loadtype/
 """
+import importlib
 import os
 import numpy as np
 import pandas as pd
 
 import run_injection_dataset as inj
+inj = importlib.reload(inj)
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(inj.__file__))
 # Load model per device (OpenDSS Model 1-5: 1=ConstPQ, 2=ConstZ, 4=CVR, 5=ConstI)
@@ -112,6 +114,117 @@ NODE_INDEX_CSV = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
 SOURCE_BUSES = ("sourcebus", "800")
 
 
+def _ensure_active_circuit():
+    try:
+        _ = list(inj.dss.Circuit.AllNodeNames())
+        return
+    except Exception:
+        pass
+    inj.compile_once()
+    inj.setup_daily()
+
+
+def _select_shared_phases(phs1, phs2, nph):
+    if len(phs1) == 0 or len(phs2) == 0:
+        phs = list(range(1, min(3, nph) + 1))
+    else:
+        phs = sorted(list(set(phs1).intersection(set(phs2))))
+        if len(phs) == 0:
+            phs = sorted(list(set(phs1).union(set(phs2))))
+    phs = [ph for ph in phs if ph in (1, 2, 3)]
+    if len(phs) == 0:
+        phs = list(range(1, min(3, nph) + 1))
+    return phs
+
+
+def _infer_reduced_graph_roots(node_names_master):
+    """Infer kept-node roots for the reduced graph after upstream buses are excluded.
+
+    The static edge CSV intentionally omits edges incident to `SOURCE_BUSES`, so the
+    distance graph has no explicit source nodes. Here we recover the first downstream
+    kept nodes directly from the DSS circuit and use them as Dijkstra seeds.
+    """
+    _ensure_active_circuit()
+    node_set = set(node_names_master)
+    roots = {}
+
+    def _register_boundary_edge(bus_a, phs_a, bus_b, phs_b, nph, r_full, x_full):
+        z_mag = float(np.sqrt(float(r_full) * float(r_full) + float(x_full) * float(x_full)))
+        if bus_a in SOURCE_BUSES and bus_b not in SOURCE_BUSES:
+            for ph in _select_shared_phases(phs_a, phs_b, nph):
+                node = f"{bus_b}.{ph}"
+                if node in node_set:
+                    roots[node] = min(float(roots.get(node, float("inf"))), z_mag)
+        if bus_b in SOURCE_BUSES and bus_a not in SOURCE_BUSES:
+            for ph in _select_shared_phases(phs_a, phs_b, nph):
+                node = f"{bus_a}.{ph}"
+                if node in node_set:
+                    roots[node] = min(float(roots.get(node, float("inf"))), z_mag)
+
+    inj.dss.Lines.First()
+    while True:
+        busnames = inj.dss.CktElement.BusNames()
+        if len(busnames) >= 2:
+            b1, phs1 = inj.parse_bus_spec(busnames[0])
+            b2, phs2 = inj.parse_bus_spec(busnames[1])
+            length = float(inj.dss.Lines.Length())
+            nph_line = int(inj.dss.Lines.Phases())
+            linecode = str(inj.dss.Lines.LineCode()).strip()
+            use_linecode = linecode != ""
+            if use_linecode:
+                try:
+                    inj.dss.LineCodes.Name(linecode)
+                    Rm = inj.dss.LineCodes.Rmatrix()
+                    Xm = inj.dss.LineCodes.Xmatrix()
+                    use_linecode = len(Rm) > 0 and len(Xm) > 0
+                except Exception:
+                    use_linecode = False
+            if use_linecode:
+                Rraw = inj.list_to_sq(Rm)
+                Xraw = inj.list_to_sq(Xm)
+                kmat = Rraw.shape[0]
+            else:
+                r1 = float(inj.dss.Lines.R1())
+                x1 = float(inj.dss.Lines.X1())
+                Rraw = np.diag([r1, r1, r1])
+                Xraw = np.diag([x1, x1, x1])
+                kmat = 3
+            phs = _select_shared_phases(phs1, phs2, nph_line)
+            for ph in phs:
+                pos_local = (ph - 1) if kmat >= 3 else phs.index(ph)
+                r_full = float(Rraw[pos_local, pos_local]) * length
+                x_full = float(Xraw[pos_local, pos_local]) * length
+                _register_boundary_edge(b1, phs1, b2, phs2, nph_line, r_full, x_full)
+        if not inj.dss.Lines.Next():
+            break
+
+    inj.dss.Transformers.First()
+    while True:
+        busnames = inj.dss.CktElement.BusNames()
+        if len(busnames) >= 2:
+            b1, phs1 = inj.parse_bus_spec(busnames[0])
+            b2, phs2 = inj.parse_bus_spec(busnames[1])
+            nph = int(inj.dss.CktElement.NumPhases())
+            xhl = float(inj.dss.Transformers.Xhl())
+            inj.dss.Transformers.Wdg(1)
+            kv1 = float(inj.dss.Transformers.kV())
+            kva1 = float(inj.dss.Transformers.kVA())
+            r1_pct = float(inj.dss.Transformers.R())
+            r2_pct = 0.0
+            if inj.dss.Transformers.NumWindings() >= 2:
+                inj.dss.Transformers.Wdg(2)
+                r2_pct = float(inj.dss.Transformers.R())
+            if kv1 > 0 and kva1 > 0:
+                z_base = (kv1 ** 2) / kva1
+                r_full = (r1_pct + r2_pct) / 100.0 * z_base
+                x_full = xhl / 100.0 * z_base
+                _register_boundary_edge(b1, phs1, b2, phs2, nph, r_full, x_full)
+        if not inj.dss.Transformers.Next():
+            break
+
+    return roots
+
+
 def _compute_electrical_distance_from_source(node_names_master, edge_csv_path):
     """
     Compute electrical distance from each node to the source bus.
@@ -131,19 +244,24 @@ def _compute_electrical_distance_from_source(node_names_master, edge_csv_path):
         z_mag = np.sqrt(r * r + x * x)
         adj.setdefault(a, []).append((b, z_mag))
 
-    source_nodes = [n for n in node_names_master if n.split(".")[0] in SOURCE_BUSES]
-    if not source_nodes:
-        source_nodes = [node_names_master[0]] if node_names_master else []
+    source_nodes = [n for n in node_names_master if n.split(".")[0] in SOURCE_BUSES and n in adj]
+    root_nodes = {}
+    if source_nodes:
+        root_nodes = {src: 0.0 for src in source_nodes}
+    else:
+        root_nodes = _infer_reduced_graph_roots(node_names_master)
+    if not root_nodes and node_names_master:
+        root_nodes = {node_names_master[0]: 0.0}
 
     dist = {n: float("inf") for n in node_names_master}
-    for src in source_nodes:
+    for src, d0 in root_nodes.items():
         if src in node_names_master:
-            dist[src] = 0.0
+            dist[src] = float(d0)
 
     # Dijkstra: min-impedance path from all source nodes
-    heap = [(0.0, src) for src in source_nodes if src in node_names_master]
+    heap = [(float(d0), src) for src, d0 in root_nodes.items() if src in node_names_master]
     heapq.heapify(heap)
-    seen = set(source_nodes)
+    seen = set(root_nodes)
 
     while heap:
         d_u, u = heapq.heappop(heap)
@@ -271,7 +389,8 @@ def generate_gnn_snapshot_dataset_loadtype(
             sum_q_load = float(sum(busphQ_load.values()))
             sum_p_pv = float(sum(busphP_pv_actual.values()))
             sum_q_pv = float(sum(busphQ_pv_actual.values()))
-            sum_q_cap = sum(inj.CAP_Q_KVAR.values())
+            kept_nodes = [n for n in node_names_master if n.split(".")[0] not in EXCLUDED_UPSTREAM_BUSES]
+            sum_q_cap = inj.total_cap_q_kvar(kept_nodes)
             p_sys_balance = sum_p_load - sum_p_pv
             q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
 
@@ -301,7 +420,7 @@ def generate_gnn_snapshot_dataset_loadtype(
 
                 # Capacitor Q (nominal per phase at this bus)
                 # CAP_Q_KVAR is already per-phase (100 for 844, 150 for 848); no extra division
-                q_cap_node = float(inj.CAP_Q_KVAR.get(bus, 0.0))
+                q_cap_node = inj.cap_q_kvar_per_node(bus, ph)
 
                 # PV P and Q (actual after solve, includes Volt-Var Q)
                 p_pv_node = float(busphP_pv_actual.get((bus, ph), 0.0))

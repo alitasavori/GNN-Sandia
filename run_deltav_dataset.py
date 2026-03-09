@@ -6,11 +6,13 @@ matches test-time temporal structure. vmag_zero is computed at each t with loads
 Target = vmag_with_pv - vmag_zero_pv (delta V).
 Output: datasets_gnn2/deltav/
 """
+import importlib
 import os
 import numpy as np
 import pandas as pd
 
 import run_injection_dataset as inj
+inj = importlib.reload(inj)
 from run_loadtype_dataset import (
     DEVICE_TO_MODEL,
     _apply_snapshot_with_per_type,
@@ -227,7 +229,8 @@ def generate_gnn_snapshot_dataset_deltav(
             sum_q_load = float(sum(busphQ_load_k.values()))
             sum_p_pv = float(sum(busphP_pv_actual.values()))
             sum_q_pv = float(sum(busphQ_pv_actual.values()))
-            sum_q_cap = sum(inj.CAP_Q_KVAR.values())
+            kept_nodes = [n for n in node_names_master if n.split(".")[0] not in EXCLUDED_UPSTREAM_BUSES]
+            sum_q_cap = inj.total_cap_q_kvar(kept_nodes)
             p_sys_balance = sum_p_load - sum_p_pv
             q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
 
@@ -260,7 +263,7 @@ def generate_gnn_snapshot_dataset_deltav(
                 m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
                 m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
                 m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
-                q_cap_node = float(inj.CAP_Q_KVAR.get(bus, 0.0))
+                q_cap_node = inj.cap_q_kvar_per_node(bus, ph)
                 p_pv_node = float(busphP_pv_actual.get((bus, ph), 0.0))
                 q_pv_node = float(busphQ_pv_actual.get((bus, ph), 0.0))
                 elec_dist = float(node_to_electrical_dist.get(n, 0.0))

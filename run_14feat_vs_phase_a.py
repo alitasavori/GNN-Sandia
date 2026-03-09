@@ -1,8 +1,8 @@
 """
 Train two models on the same 10k samples from datasets_gnn2/deltav.
 Both trained and evaluated on phase A only:
-  (A) Phase A + vmag_zero: 14 features (13 loadtype + vmag_zero_pv_pu), phase A subgraph
-  (B) Phase A only: 13 features (no vmag_zero), phase A subgraph
+  (A) Phase A + vmag_zero: 15 features (14 loadtype + vmag_zero_pv_pu), phase A subgraph
+  (B) Phase A only: 14 features (no vmag_zero), phase A subgraph
 Same data. Worst-node selection among phase A nodes.
 Requires: datasets_gnn2/deltav (run run_deltav_dataset.py first),
           datasets_gnn2/loadtype (for node index and edges).
@@ -49,7 +49,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LOADTYPE_FULL_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
     "p_sys_balance_kw", "q_sys_balance_kvar",
 ]
 FEAT_14 = LOADTYPE_FULL_FEAT + ["vmag_zero_pv_pu"]
@@ -153,12 +153,12 @@ def run_24h_and_plot():
     ea_ph = ckpt_ph["edge_attr"].to(DEVICE)
     eid_ph = ckpt_ph["edge_id"].to(DEVICE)
 
-    model_14 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_14["E"]), node_in_dim=14, edge_in_dim=2, out_dim=1,
+    model_14 = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_14["E"]), node_in_dim=int(cfg_14["node_in_dim"]), edge_in_dim=2, out_dim=1,
                              node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_14.load_state_dict(ckpt_14["state_dict"])
     model_14.eval()
 
-    model_ph = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_ph["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
+    model_ph = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_ph["E"]), node_in_dim=int(cfg_ph["node_in_dim"]), edge_in_dim=2, out_dim=1,
                              node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_ph.load_state_dict(ckpt_ph["state_dict"])
     model_ph.eval()
@@ -228,8 +228,11 @@ def run_24h_and_plot():
         p_sys_balance = sum_p_load - sum_p_pv
         q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
 
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                 node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv,
+        )
         vmag_zero = vmag_zero_precomputed[t]
         X_14_full = np.concatenate([X, vmag_zero[:, None]], axis=-1).astype(np.float32)
         x_14 = torch.tensor(X_14_full[phase_a_indices, :], dtype=torch.float32, device=DEVICE)
@@ -267,7 +270,7 @@ def run_24h_and_plot():
     df.to_csv(csv_path, index=False)
     print(f"Top 5 worst nodes (phase A only, |MAE_14 - MAE_ph|):")
     for k, idx in enumerate(worst_indices):
-        print(f"  {k+1}. {node_names_master[idx]}: +vmag_zero MAE={mae_14[idx]:.4f} | 13feat MAE={mae_ph[idx]:.4f}")
+        print(f"  {k+1}. {node_names_master[idx]}: +vmag_zero MAE={mae_14[idx]:.4f} | 14feat MAE={mae_ph[idx]:.4f}")
     print(f"Saved -> {csv_path}")
 
     for k, idx in enumerate(worst_indices):
@@ -338,9 +341,9 @@ def main():
 
     print(f"\n>>> Training on {S} samples, phase A only (medium: 4L, h=32)...")
     train_phase_a_only(X_14_ph, Y_ph, ei_local, ea_local, eid_local, phase_a_indices, N, 14, CKPT_14FEAT,
-                       "Phase A + vmag_zero (14 feat)")
+                       "Phase A + vmag_zero (15 feat)")
     train_phase_a_only(X_13_ph, Y_ph, ei_local, ea_local, eid_local, phase_a_indices, N, 13, CKPT_PHASE_A,
-                       "Phase A only (13 feat)")
+                       "Phase A only (14 feat)")
 
     print("\n>>> Running 24h profile and plotting 5 worst nodes (phase A only)...")
     run_24h_and_plot()

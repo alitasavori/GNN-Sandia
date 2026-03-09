@@ -44,7 +44,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LOADTYPE_FULL_FEAT = [
     "electrical_distance_ohm", "m1_p_kw", "m1_q_kvar", "m2_p_kw", "m2_q_kvar",
-    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw",
+    "m4_p_kw", "m4_q_kvar", "m5_p_kw", "m5_q_kvar", "q_cap_kvar", "p_pv_kw", "q_pv_kvar",
     "p_sys_balance_kw", "q_sys_balance_kvar",
 ]
 
@@ -154,7 +154,7 @@ def train_phase_a_only(X_all, Y_all, phase_map_np, phase_edges, N, ckpt_path):
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = PFIdentityGNN(num_nodes=N_phase_a, num_edges=E_phase_a, node_in_dim=13, edge_in_dim=2, out_dim=1,
+    model = PFIdentityGNN(num_nodes=N_phase_a, num_edges=E_phase_a, node_in_dim=int(X_ph.shape[-1]), edge_in_dim=2, out_dim=1,
                           node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     best_rmse, best_state = float("inf"), None
@@ -173,7 +173,7 @@ def train_phase_a_only(X_all, Y_all, phase_map_np, phase_edges, N, ckpt_path):
         if rmse < best_rmse:
             best_rmse, best_state = rmse, {k: v.cpu().clone() for k, v in model.state_dict().items()}
         if epoch % 10 == 0 or epoch == 1:
-            print(f"    [Phase A only (13 feat)] Epoch {epoch:02d} | test RMSE={rmse:.5f} | best={best_rmse:.5f}")
+            print(f"    [Phase A only (14 feat)] Epoch {epoch:02d} | test RMSE={rmse:.5f} | best={best_rmse:.5f}")
 
     model.load_state_dict(best_state)
     ckpt = {
@@ -208,7 +208,7 @@ def run_24h_and_plot():
     ei_sg = ckpt_sg["edge_index"].to(DEVICE)
     ea_sg = ckpt_sg["edge_attr"].to(DEVICE)
     eid_sg = ckpt_sg["edge_id"].to(DEVICE)
-    model_sg = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_sg["E"]), node_in_dim=13, edge_in_dim=2, out_dim=1,
+    model_sg = PFIdentityGNN(num_nodes=N_phase_a, num_edges=int(cfg_sg["E"]), node_in_dim=int(cfg_sg["node_in_dim"]), edge_in_dim=2, out_dim=1,
                              node_emb_dim=8, edge_emb_dim=4, h_dim=32, num_layers=4, use_norm=False).to(DEVICE)
     model_sg.load_state_dict(ckpt_sg["state_dict"])
     model_sg.eval()
@@ -265,8 +265,11 @@ def run_24h_and_plot():
         p_sys_balance = sum_p_load - sum_p_pv
         q_sys_balance = sum_q_load - sum(CAP_Q_KVAR.values())
 
-        X = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
-                                 node_to_electrical_dist, p_sys_balance, q_sys_balance)
+        X = build_gnn_x_loadtype(
+            node_names_master, busph_per_type, busphP_pv,
+            node_to_electrical_dist, p_sys_balance, q_sys_balance,
+            busphQ_pv=busphQ_pv,
+        )
         X_oh = np.concatenate([X, ph_oh], axis=-1).astype(np.float32)
         x_oh = torch.tensor(X_oh, dtype=torch.float32, device=DEVICE)
         x_sg_phase_a = torch.tensor(X[:, phase_a_indices, :], dtype=torch.float32, device=DEVICE)

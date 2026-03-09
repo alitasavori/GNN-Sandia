@@ -5,6 +5,7 @@ Run from repo root. Requires: trained checkpoints in gnn3_best7_output/,
 opendssdirect, run_injection_dataset, run_loadtype_dataset, run_deltav_dataset.
 Saves overlay plots to gnn3_best7_output/ (same folder as checkpoints).
 """
+import importlib
 import os
 import re
 import time
@@ -16,6 +17,8 @@ import torch
 from torch_geometric.data import Data
 
 import run_injection_dataset as inj
+if not hasattr(inj, "total_cap_q_kvar") or not hasattr(inj, "cap_q_kvar_per_node"):
+    inj = importlib.reload(inj)
 import run_loadtype_dataset as lt
 from run_deltav_dataset import _apply_snapshot_zero_pv
 from run_gnn3_best7_train import PFIdentityGNN
@@ -28,8 +31,11 @@ DIR_LOADTYPE = os.path.join("datasets_gnn2", "loadtype")
 OUTPUT_DIR = "gnn3_best7_output"
 NPTS = 288
 STEP_MIN = 5
-# Nominal totals for overlay timing plots. For dataset-aligned comparison use run_injection_dataset.BASELINE (849.12, 501.12, 1400).
-P_BASE, Q_BASE, PV_BASE = 1415.2, 835.2, 1000.0
+# Use the shared dataset/inference baseline so overlays stay aligned with the
+# current training-data regime.
+P_BASE = float(inj.BASELINE["P_load_total_kw"])
+Q_BASE = float(inj.BASELINE["Q_load_total_kvar"])
+PV_BASE = float(inj.BASELINE["P_pv_total_kw"])
 OBSERVED_NODE = "840.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -78,7 +84,7 @@ def build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv
             q_inj = Q_grid_per_ph
         else:
             p_inj = p_pv - p_load
-            q_inj = q_pv - q_load + float(inj.CAP_Q_KVAR.get(bus, 0.0))
+            q_inj = q_pv - q_load + inj.cap_q_kvar_per_node(bus, ph)
         X[i, 0] = p_inj
         X[i, 1] = q_inj
     return X
@@ -98,7 +104,7 @@ def build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv):
         m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
         m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
         m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
-        q_cap = float(inj.CAP_Q_KVAR.get(bus, 0.0))
+        q_cap = inj.cap_q_kvar_per_node(bus, ph)
         p_pv = float(busphP_pv.get((bus, ph), 0.0))
         X[i, 0], X[i, 1] = m1_p, m1_q
         X[i, 2], X[i, 3] = m2_p, m2_q
@@ -110,9 +116,10 @@ def build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv):
 
 
 def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_electrical_dist,
-                         p_sys_balance, q_sys_balance):
-    """Load-type (13 feat): electrical_distance, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, p_sys, q_sys."""
-    X = np.zeros((len(node_names_master), 13), dtype=np.float32)
+                         p_sys_balance, q_sys_balance, busphQ_pv=None):
+    """Load-type (13/14 feat): electrical_distance, m1_p, m1_q, m2_p, m2_q, m4_p, m4_q, m5_p, m5_q, q_cap, p_pv, [q_pv], p_sys, q_sys."""
+    has_q_pv = busphQ_pv is not None
+    X = np.zeros((len(node_names_master), 14 if has_q_pv else 13), dtype=np.float32)
     for i, n in enumerate(node_names_master):
         bus, phs = n.split(".")
         ph = int(phs)
@@ -124,8 +131,9 @@ def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_e
         m4_q = float(busph_per_type[4][1].get((bus, ph), 0.0))
         m5_p = float(busph_per_type[5][0].get((bus, ph), 0.0))
         m5_q = float(busph_per_type[5][1].get((bus, ph), 0.0))
-        q_cap = float(inj.CAP_Q_KVAR.get(bus, 0.0))
+        q_cap = inj.cap_q_kvar_per_node(bus, ph)
         p_pv = float(busphP_pv.get((bus, ph), 0.0))
+        q_pv = float(busphQ_pv.get((bus, ph), 0.0)) if has_q_pv else 0.0
         X[i, 0] = float(node_to_electrical_dist.get(n, 0.0))
         X[i, 1], X[i, 2] = m1_p, m1_q
         X[i, 3], X[i, 4] = m2_p, m2_q
@@ -133,8 +141,13 @@ def build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv, node_to_e
         X[i, 7], X[i, 8] = m5_p, m5_q
         X[i, 9] = q_cap
         X[i, 10] = p_pv
-        X[i, 11] = p_sys_balance
-        X[i, 12] = q_sys_balance
+        if has_q_pv:
+            X[i, 11] = q_pv
+            X[i, 12] = p_sys_balance
+            X[i, 13] = q_sys_balance
+        else:
+            X[i, 11] = p_sys_balance
+            X[i, 12] = q_sys_balance
     return X
 
 
@@ -400,15 +413,18 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             Q_grid = -float(pwr[1])
             X = build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
         else:
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
             sum_p_load = float(sum(busphP_load.values()))
             sum_q_load = float(sum(busphQ_load.values()))
-            sum_p_pv = float(sum(busphP_pv.values()))
-            sum_q_cap = float(sum(inj.CAP_Q_KVAR.values()))
+            sum_p_pv = float(sum(busphP_pv_actual.values()))
+            sum_q_pv = float(sum(busphQ_pv_actual.values()))
+            sum_q_cap = inj.total_cap_q_kvar(node_names_master)
             p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load - sum_q_cap
+            q_sys_balance = sum_q_load - sum_q_pv - sum_q_cap
             X = build_gnn_x_loadtype(
-                node_names_master, busph_per_type, busphP_pv,
+                node_names_master, busph_per_type, busphP_pv_actual,
                 node_to_electrical_dist, p_sys_balance, q_sys_balance,
+                busphQ_pv=busphQ_pv_actual if node_in_dim in (14, 17) else None,
             )
         if is_deltav:
             X = np.concatenate([X, vmag_zero[:, None]], axis=-1)

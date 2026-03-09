@@ -4,7 +4,7 @@ then compare with a 24h voltage profile (OpenDSS + both models) on in-distributi
 
 - Uses datasets_gnn2/original and datasets_gnn2/injection (must already exist).
 - Trains two models (same architecture choices as run_gnn3_best7_train blocks 1 & 2).
-- Runs 24h at inj.BASELINE (849.12, 501.12, 1400), sigma=0, same DSS → in-distribution.
+- Runs 24h at inj.BASELINE (849.12, 501.12, 975), sigma=0, same DSS → in-distribution.
 - Plots three profiles: OpenDSS, Original-features model, Injection-features model.
 
 Run from repo root or notebook:
@@ -146,7 +146,7 @@ def _master_nodes_89(dataset_dir):
 def evaluate_three_profile_24h(ckpt_orig, ckpt_inj, device=None):
     """
     Run 24h voltage profile: OpenDSS + Original model + Injection model.
-    Uses BASELINE (849.12, 501.12, 1400), sigma=0 → in-distribution.
+    Uses BASELINE (849.12, 501.12, 975), sigma=0 → in-distribution.
     Same DSS as dataset generation. Returns (t_hours, v_dss, v_orig, v_inj), MAEs.
     """
     if device is None:

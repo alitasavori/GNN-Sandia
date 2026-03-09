@@ -13,7 +13,7 @@ The pickle (--save-results) stores the single-day comparison plus training metri
 present in the checkpoint; it does not store full training history.
 
 Scaled baseline (from run_injection_dataset.BASELINE, used in dataset generation):
-  P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=1400.0
+  P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=975.0
 
 Usage (from repo root):
   python compare_two_models_daily.py <ckpt1.pt> <ckpt2.pt> [--nodes 840.1 848.2 ...] [--top-k 5] [--output-dir DIR]
@@ -22,6 +22,7 @@ Example:
   python compare_two_models_daily.py models_gnn2/injection/best.pt models_gnn2/loadtype/best.pt --nodes 840.1 890.1 --top-k 5
 """
 import argparse
+import importlib
 import os
 import pickle
 import tempfile
@@ -32,6 +33,8 @@ import torch
 from torch_geometric.data import Data
 
 import run_injection_dataset as inj
+if not hasattr(inj, "total_cap_q_kvar") or not hasattr(inj, "cap_q_kvar_per_node"):
+    inj = importlib.reload(inj)
 import run_loadtype_dataset as lt
 from run_gnn3_overlay_7 import (
     BASE_DIR, NPTS, STEP_MIN,
@@ -52,7 +55,7 @@ DEFAULT_OUTPUT_DIR = "gnn3_best7_output"
 # Use the same average scaled values as in dataset generation (run_injection_dataset.BASELINE)
 P_BASE = inj.BASELINE["P_load_total_kw"]      # 849.12
 Q_BASE = inj.BASELINE["Q_load_total_kvar"]    # 501.12
-PV_BASE = inj.BASELINE["P_pv_total_kw"]       # 1400.0
+PV_BASE = inj.BASELINE["P_pv_total_kw"]       # 975.0
 
 
 def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, busphP_pv, busph_per_type,
@@ -63,8 +66,10 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
       node_in_dim=3: ORIGINAL_FEAT (legacy 3) [p_load_kw, q_load_kvar, p_pv_kw]
       node_in_dim=4: ORIGINAL_FEAT (4)       [p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar]
       node_in_dim=10: loadtype per-type (m1_p, m1_q, ..., q_cap, p_pv)
-      node_in_dim=13: LOADTYPE_FEAT  [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, p_sys_balance_kw, q_sys_balance_kvar]
-      node_in_dim=16: LOADTYPE_FEAT + 3-dim phase one-hot (phase 1->0, 2->1, 3->2)
+      node_in_dim=13: legacy LOADTYPE_FEAT  [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, p_sys_balance_kw, q_sys_balance_kvar]
+      node_in_dim=14: current LOADTYPE_FEAT [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, q_pv_kvar, p_sys_balance_kw, q_sys_balance_kvar]
+      node_in_dim=16: legacy LOADTYPE_FEAT + 3-dim phase one-hot
+      node_in_dim=17: current LOADTYPE_FEAT + 3-dim phase one-hot
     """
     if node_in_dim == 2:
         return build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid, busphQ_pv=busphQ_pv)
@@ -79,6 +84,12 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
             raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=13")
         return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
                                     node_to_electrical_dist, p_sys_balance, q_sys_balance)
+    elif node_in_dim == 14:
+        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
+            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=14")
+        return build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
+                                    node_to_electrical_dist, p_sys_balance, q_sys_balance,
+                                    busphQ_pv=busphQ_pv)
     elif node_in_dim == 16:
         if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None:
             raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance required for node_in_dim=16")
@@ -87,8 +98,17 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
         phase_map = np.array([int(n.split(".")[-1]) - 1 for n in node_names_master], dtype=np.int64)
         ph_oh = np.eye(3, dtype=np.float32)[phase_map]
         return np.concatenate([X_13, ph_oh], axis=-1)
+    elif node_in_dim == 17:
+        if node_to_electrical_dist is None or p_sys_balance is None or q_sys_balance is None or busphQ_pv is None:
+            raise ValueError("node_to_electrical_dist, p_sys_balance, q_sys_balance, busphQ_pv required for node_in_dim=17")
+        X_14 = build_gnn_x_loadtype(node_names_master, busph_per_type, busphP_pv,
+                                    node_to_electrical_dist, p_sys_balance, q_sys_balance,
+                                    busphQ_pv=busphQ_pv)
+        phase_map = np.array([int(n.split(".")[-1]) - 1 for n in node_names_master], dtype=np.int64)
+        ph_oh = np.eye(3, dtype=np.float32)[phase_map]
+        return np.concatenate([X_14, ph_oh], axis=-1)
     else:
-        raise ValueError(f"Unsupported node_in_dim={node_in_dim}; use 2, 3, 4, 10, 13, or 16.")
+        raise ValueError(f"Unsupported node_in_dim={node_in_dim}; use 2, 3, 4, 10, 13, 14, 16, or 17.")
 
 
 def _resolve_node_list(ckpt_path, expected_n=89):
@@ -196,7 +216,7 @@ def run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv_dis
         sum_q_load = float(sum(busphQ_load.values()))
         sum_p_pv_actual = float(sum(busphP_pv_actual.values()))
         sum_q_pv_actual = float(sum(busphQ_pv_actual.values()))
-        sum_q_cap = float(sum(inj.CAP_Q_KVAR.values()))
+        sum_q_cap = inj.total_cap_q_kvar(node_names_master)
         pwr = inj.dss.Circuit.TotalPower()
         P_grid = -float(pwr[0])
         Q_grid = -float(pwr[1])
@@ -252,7 +272,8 @@ def run_one_step_and_return_features(ckpt_1_path, ckpt_2_path, node_names_master
     sum_p_load = float(sum(busphP_load.values()))
     sum_q_load = float(sum(busphQ_load.values()))
     sum_p_pv_actual = float(sum(busphP_pv_actual.values()))
-    sum_q_cap = float(sum(inj.CAP_Q_KVAR.values()))
+    sum_q_pv_actual = float(sum(busphQ_pv_actual.values()))
+    sum_q_cap = inj.total_cap_q_kvar(node_names_master)
     pwr = inj.dss.Circuit.TotalPower()
     P_grid = -float(pwr[0])
     Q_grid = -float(pwr[1])
@@ -338,7 +359,7 @@ def run_comparison_for_notebook(ckpt_1_path, ckpt_2_path, nodes_to_plot=None, to
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare two GNN models on 24h profile with scaled baseline (849.12/501.12/1400).")
+    parser = argparse.ArgumentParser(description="Compare two GNN models on 24h profile with scaled baseline (849.12/501.12/975).")
     parser.add_argument("ckpt1", help="Path to first .pt checkpoint")
     parser.add_argument("ckpt2", help="Path to second .pt checkpoint")
     parser.add_argument("--nodes", nargs="*", default=[], help="Node names (e.g. 840.1 848.2) to plot daily profile")
