@@ -93,7 +93,13 @@ PV power is split by \texttt{PV\_PMMP\_SHARE} and \texttt{PV\_TO\_BUSPH} (buses 
 
 \section{Scenario sampling (day-level randomization)}
 
-The baseline totals $P_{\mathrm{load}}^{(0)},Q_{\mathrm{load}}^{(0)},P_{\mathrm{pv}}^{(0)}$ are the nominal values from \texttt{IEEE34\_PV.dss} (1769~kW, 1044~kVAR, 1000~kW). Each scenario $s$ draws global scalars once:
+The baseline totals $P_{\mathrm{load}}^{(0)},Q_{\mathrm{load}}^{(0)},P_{\mathrm{pv}}^{(0)}$ are the scaled averages used in the current code (from a diagnostic sweep of the original feeder), with PV slightly reduced to better match the inference regime:
+\[
+P_{\mathrm{load}}^{(0)} = 849.12~\mathrm{kW},\quad
+Q_{\mathrm{load}}^{(0)} = 501.12~\mathrm{kVAR},\quad
+P_{\mathrm{pv}}^{(0)} = 975.0~\mathrm{kW}.
+\]
+Each scenario $s$ draws global scalars once:
 \begin{align*}
 P_{\mathrm{load}} &= P_{\mathrm{load}}^{(0)}\theta_{P_{\mathrm{load}}},&
 Q_{\mathrm{load}} &= Q_{\mathrm{load}}^{(0)}\theta_{Q_{\mathrm{load}}},&
@@ -101,9 +107,9 @@ P_{\mathrm{pv}} &= P_{\mathrm{pv}}^{(0)}\theta_{P_{\mathrm{pv}}},\\
 \sigma_{\mathrm{load}}&=\sigma_{\mathrm{load}}^{(0)}\theta_{\sigma_{\mathrm{load}}},&
 \sigma_{\mathrm{pv}}&=\sigma_{\mathrm{pv}}^{(0)}\theta_{\sigma_{\mathrm{pv}}},
 \end{align*}
-with $\theta_x\sim\mathrm{Uniform}(\underline r_x,\overline r_x)$ from \texttt{RANGES} (e.g.\ $[0.95,1.05]$ for P/Q, $\sigma$ in $[0,0.05]$) and clipping so that
+with $\theta_x\sim\mathrm{Uniform}(\underline r_x,\overline r_x)$ from \texttt{RANGES} (e.g.\ $[0.95,1.05]$ for P/Q, $\sigma$ in $[0,0.02]$) and clipping so that
 \[
-\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}}\in[0,0.05].
+\sigma_{\mathrm{load}},\sigma_{\mathrm{pv}}\in[0,0.02].
 \]
 
 \section{Daily profiles and time grid}
@@ -268,7 +274,7 @@ P_{\mathrm{pv},i}(t)-P_{\mathrm{load},i}(t) & \text{otherwise},
 Q_{\mathrm{inj},i}(t)=
 \begin{cases}
 Q_{\mathrm{grid}}(t)/3 & \text{source bus (3 phases)},\\
-Q_{\mathrm{pv},i}(t)-Q_{\mathrm{load},i}(t)+Q_{\mathrm{cap},i} & \text{otherwise}.
+-Q_{\mathrm{pv},i}(t)-Q_{\mathrm{load},i}(t)+Q_{\mathrm{cap},i} & \text{otherwise}.
 \end{cases}
 \]
 The node table also stores \texttt{p\_pv\_kw} and \texttt{q\_pv\_kvar} (actual) for consistency.
@@ -308,7 +314,7 @@ Q_{\mathrm{cap},i}\ (\texttt{q\_cap\_kvar}).
 System balance uses \emph{actual} PV P and Q after the solve (so Volt-Var Q is included), replicated to all nodes:
 \[
 P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}(t)-\sum_i P_{\mathrm{pv},i}(t),\qquad
-Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}(t)-\sum_i Q_{\mathrm{pv},i}(t)-\sum_b Q_{\mathrm{cap}}(b),
+Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}(t)+\sum_i Q_{\mathrm{pv},i}(t)-\sum_b Q_{\mathrm{cap}}(b),
 \]
 stored as \texttt{p\_sys\_balance\_kw}, \texttt{q\_sys\_balance\_kvar}. So in the load-type dataset, all features except $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are \emph{per-node}; $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are \emph{global} (the same scalar value is replicated to every node to provide system-wide context).
 
@@ -340,7 +346,7 @@ Injection dataset uses post-solve
 Load-type and delta-V datasets use \emph{post-solve} actual PV P and Q to form system balance replicated to all nodes:
 \[
 P_{\mathrm{sys}}(t)=\sum_i P_{\mathrm{load},i}-\sum_i P_{\mathrm{pv},i},\qquad
-Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}-\sum_i Q_{\mathrm{pv},i}-\sum_b Q_{\mathrm{cap}}(b),
+Q_{\mathrm{sys}}(t)=\sum_i Q_{\mathrm{load},i}+\sum_i Q_{\mathrm{pv},i}-\sum_b Q_{\mathrm{cap}}(b),
 \]
 so Volt-Var reactive power is included; losses are still not reflected in the balance.
 
@@ -355,7 +361,7 @@ All other feature ingredients are either from the applied snapshot (load P/Q, pe
 \begin{itemize}[noitemsep]
 \item \textbf{System balance} $P_{\mathrm{sys}}$, $Q_{\mathrm{sys}}$ is \emph{not} read from DSS. It is computed as
   $\sum_i P_{\mathrm{load},i}-\sum_i P_{\mathrm{pv},i}^{\mathrm{actual}}$ and
-  $\sum_i Q_{\mathrm{load},i}-\sum_i Q_{\mathrm{pv},i}^{\mathrm{actual}}-\sum_b Q_{\mathrm{cap}}(b)$,
+  $\sum_i Q_{\mathrm{load},i}+\sum_i Q_{\mathrm{pv},i}^{\mathrm{actual}}-\sum_b Q_{\mathrm{cap}}(b)$,
   where load sums come from the snapshot and PV sums from the post-solve actual PV P/Q read above.
 \end{itemize}
 
@@ -365,14 +371,14 @@ All other feature ingredients are either from the applied snapshot (load P/Q, pe
 
 \subsection*{Effect of excluding upstream nodes on the injection dataset}
 
-Upstream nodes (\texttt{sourcebus}, 800) are excluded from all datasets, leaving 89 learning nodes. As a result, \emph{no stored row} in the injection dataset corresponds to the source bus. So no row has $P_{\mathrm{inj}}$ or $Q_{\mathrm{inj}}$ set from $P_{\mathrm{grid}}$ or $Q_{\mathrm{grid}}$. Every stored injection row uses $P_{\mathrm{inj},i}=P_{\mathrm{pv},i}-P_{\mathrm{load},i}$ and $Q_{\mathrm{inj},i}=Q_{\mathrm{pv},i}-Q_{\mathrm{load},i}+Q_{\mathrm{cap},i}$. Thus, by discarding the two buses connected to the grid, we effectively discard any direct use of total (grid) power in the injection dataset; grid power is not an explicit input to the trained model.
+Upstream nodes (\texttt{sourcebus}, 800) are excluded from all datasets, leaving 89 learning nodes. As a result, \emph{no stored row} in the injection dataset corresponds to the source bus. So no row has $P_{\mathrm{inj}}$ or $Q_{\mathrm{inj}}$ set from $P_{\mathrm{grid}}$ or $Q_{\mathrm{grid}}$. Every stored injection row uses $P_{\mathrm{inj},i}=P_{\mathrm{pv},i}-P_{\mathrm{load},i}$ and $Q_{\mathrm{inj},i}=-Q_{\mathrm{pv},i}-Q_{\mathrm{load},i}+Q_{\mathrm{cap},i}$. Thus, by discarding the two buses connected to the grid, we effectively discard any direct use of total (grid) power in the injection dataset; grid power is not an explicit input to the trained model.
 
 \subsection*{Pre-solve vs.\ post-solve summary by dataset}
 
 \begin{itemize}[noitemsep]
 \item \textbf{Original:} Load P/Q are from the snapshot (pre-solve). PV P (and stored Q) are \emph{post-solve} actual from DSS.
 \item \textbf{Injection:} $P_{\mathrm{inj}},Q_{\mathrm{inj}}$ use load from the snapshot (pre-solve) and actual PV P/Q from DSS (post-solve). At the source bus they would use $P_{\mathrm{grid}},Q_{\mathrm{grid}}$ from \texttt{TotalPower()}, but that node is excluded, so no stored row uses grid power.
-\item \textbf{Load-type:} Electrical distance, per-type load (m1/m2/m4/m5), and $Q_{\mathrm{cap}}$ are pre-solve (or static). $P_{\mathrm{pv},i}$ is post-solve actual. $P_{\mathrm{sys}},Q_{\mathrm{sys}}$ are calculated from snapshot load sums and post-solve PV sums (so post-solve in content but not read as a single quantity from DSS). Features are per-node except $P_{\mathrm{sys}},Q_{\mathrm{sys}}$, which are global (replicated to every node).
+\item \textbf{Load-type:} Electrical distance, per-type load (m1/m2/m4/m5), and $Q_{\mathrm{cap}}$ are pre-solve (or static). $P_{\mathrm{pv},i}$ and $Q_{\mathrm{pv},i}$ are post-solve actual. $P_{\mathrm{sys}},Q_{\mathrm{sys}}$ are calculated from snapshot load sums and post-solve PV sums (so post-solve in content but not read as a single quantity from DSS). Features are per-node except $P_{\mathrm{sys}},Q_{\mathrm{sys}}$, which are global (replicated to every node).
 \item \textbf{Delta-V:} Same as load-type, plus $|V_i^{(0)}|$ from the zero-PV solve (post-solve). Again, only $P_{\mathrm{sys}}$ and $Q_{\mathrm{sys}}$ are global; all others are per-node.
 \end{itemize}
 

@@ -1,0 +1,230 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\begin{document}
+
+\subsection{Best PF-identity GNN architectures per dataset}
+\label{sec:best-arch-per-dataset}
+
+Across all three full-voltage datasets---Original, Derived (injection), and Load-type---the final selected models use the same \emph{PF-identity GNN} backbone. The datasets differ only in the node input features and in a small set of architectural hyperparameters, namely the node and edge embedding dimensions $(n_{\text{emb}}, e_{\text{emb}})$, hidden width $h$, depth $L$, and whether explicit phase encoding is used.
+
+For a given dataset, let $x_i \in \mathbb{R}^{d_{\text{node}}}$ denote the feature vector at bus-phase node $i$. Each directed edge $(j \to i)$ carries physical line parameters
+\[
+e_{ji} = [R_{ji}, X_{ji}] \in \mathbb{R}^2
+\]
+together with an integer edge index. The model predicts the per-unit voltage magnitude $v_i$ at every node.
+
+\subsubsection*{Common PF-identity GNN backbone}
+
+The shared architecture is defined as follows.
+
+\paragraph{1. Node and edge embeddings.}
+Each node $i$ has a learned embedding $z_i \in \mathbb{R}^{n_{\text{emb}}}$ and each edge $(j,i)$ has a learned embedding $r_{ji} \in \mathbb{R}^{e_{\text{emb}}}$:
+\[
+z_i = \mathrm{Emb}_{\mathrm{node}}(i), 
+\qquad
+r_{ji} = \mathrm{Emb}_{\mathrm{edge}}(\mathrm{edge\_id}(j,i)).
+\]
+
+\paragraph{2. Input encoding.}
+The initial hidden state is obtained by concatenating the node features with the node embedding and passing the result through an MLP encoder:
+\[
+h_i^{(0)} = \phi_0([x_i, z_i]).
+\]
+Here,
+\[
+\phi_0 : \mathbb{R}^{d_{\text{node}} + n_{\text{emb}}} \to \mathbb{R}^{h}
+\]
+is a 2-hidden-layer MLP of the form
+\[
+\mathrm{Linear}(d_{\text{node}}+n_{\text{emb}},h)
+\to \mathrm{ReLU}
+\to \mathrm{Linear}(h,h)
+\to \mathrm{ReLU}
+\to \mathrm{Linear}(h,h).
+\]
+
+\paragraph{3. Message passing.}
+For each layer $\ell = 0,\dots,L-1$, a message is computed on every directed edge $(j \to i)$:
+\[
+m_{ji}^{(\ell)} =
+\psi^{(\ell)}\!\left([h_j^{(\ell)}, e_{ji}, r_{ji}]\right),
+\]
+where
+\[
+\psi^{(\ell)} : \mathbb{R}^{h+2+e_{\text{emb}}} \to \mathbb{R}^{h}
+\]
+is a 2-hidden-layer MLP with hidden width $h$. Incoming messages are summed,
+\[
+m_i^{(\ell)} = \sum_{j \in \mathcal{N}(i)} m_{ji}^{(\ell)},
+\]
+and the node state is updated as
+\[
+h_i^{(\ell+1)} =
+\mathrm{Upd}^{(\ell)}\!\left([h_i^{(\ell)}, m_i^{(\ell)}, z_i]\right),
+\]
+where
+\[
+\mathrm{Upd}^{(\ell)} : \mathbb{R}^{2h+n_{\text{emb}}} \to \mathbb{R}^{h}
+\]
+is again a 2-hidden-layer MLP with hidden width $h$.
+
+\paragraph{4. Readout.}
+After $L$ message-passing layers, the per-node voltage magnitude is predicted by
+\[
+\hat v_i = \rho(h_i^{(L)}),
+\qquad
+\rho : \mathbb{R}^{h} \to \mathbb{R},
+\]
+where $\rho$ is a final 2-hidden-layer MLP.
+
+\paragraph{5. Training objective.}
+All selected models are trained using mean-squared error on voltage magnitude:
+\[
+\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N}(\hat v_i - v_i)^2.
+\]
+Training uses Adam, early stopping based on validation RMSE, and a fixed split of snapshots into training and test sets.
+
+\subsubsection*{Architecture search summary}
+
+The same PF-identity backbone was used throughout the GNN2 and GNN3 studies, while varying depth, width, embedding size, normalization, and phase encoding.
+
+For the Original and Derived datasets, the search included shallow and deep variants ranging from 2 to 8 message-passing layers, with hidden widths spanning approximately $32$ to $192$, node/edge embedding sizes such as $(8,4)$ and $(16,8)$, and selected normalized or phase-aware variants. In both datasets, deeper models beyond 4 layers did not improve performance, and the best models were either moderately deep and wide or shallow and wide.
+
+For the Load-type dataset, the architecture search was broader. In addition to width/depth sweeps, it included normalization, phase one-hot encodings, and phase-subgraph variants. The final best model on this dataset emerged from the refine stage and showed that explicit phase encoding materially improves accuracy.
+
+\subsubsection*{Dataset-specific best models}
+
+\paragraph{Original dataset (baseline PF outputs).}
+For the Original dataset, the node features are
+\[
+x_i =
+\big[
+p_{\text{load},i}^{(\mathrm{kW})},
+\;
+q_{\text{load},i}^{(\mathrm{kvar})},
+\;
+p_{\text{pv},i}^{(\mathrm{kW})},
+\;
+q_{\text{pv},i}^{(\mathrm{kvar})}
+\big]
+\in \mathbb{R}^{4}.
+\]
+Using the current GNN2 architecture search (on one third of the snapshots with early stopping), the best-performing model is the \emph{light\_wide\_emb\_depth3} configuration, with
+\[
+n_{\text{emb}} = 12,\qquad
+e_{\text{emb}} = 6,\qquad
+h = 96,\qquad
+L = 3.
+\]
+This model uses no normalization and no explicit phase encoding. It achieves
+\[
+\mathrm{MAE} \approx 0.00583,
+\qquad
+\mathrm{RMSE} \approx 0.00781\;\text{pu}.
+\]
+Among the Original-dataset candidates in this search, this moderately wide 3-layer model outperformed both shallower and deeper alternatives on the held-out test set.
+
+\paragraph{Derived (injection) dataset.}
+For the Derived dataset, the node features encode net complex power injection:
+\[
+x_i =
+\big[
+p_{\text{inj},i}^{(\mathrm{kW})},
+\;
+q_{\text{inj},i}^{(\mathrm{kvar})}
+\big]
+\in \mathbb{R}^{2}.
+\]
+Under the same GNN2 search protocol, the best-performing model is the \emph{wide\_shallow\_h128\_depth3} configuration, with
+\[
+n_{\text{emb}} = 8,\qquad
+e_{\text{emb}} = 4,\qquad
+h = 128,\qquad
+L = 3.
+\]
+This model also uses no normalization and no explicit phase encoding. It achieves
+\[
+\mathrm{MAE} \approx 0.00567,
+\qquad
+\mathrm{RMSE} \approx 0.00771\;\text{pu}.
+\]
+Compared to deeper 4-layer alternatives and wider variants, this shallow but reasonably wide configuration gives the lowest error on the injection dataset.
+
+\paragraph{Load-type dataset.}
+For the Load-type dataset, the base node features now consist of 14 scalar descriptors:
+\[
+x_i =
+\big[
+\text{electrical distance},\;
+m1\_p,\; m1\_q,\;
+m2\_p,\; m2\_q,\;
+m4\_p,\; m4\_q,\;
+m5\_p,\; m5\_q,\;
+q_{\text{cap}},\;
+p_{\text{pv}},\;
+q_{\text{pv}},\;
+p_{\text{sys\_balance}},\;
+q_{\text{sys\_balance}}
+\big]
+\in \mathbb{R}^{14}.
+\]
+Some candidate models augment these features with a one-hot phase indicator
+$(\mathbf{1}\{\phi_i=A\},\mathbf{1}\{\phi_i=B\},\mathbf{1}\{\phi_i=C\})$, yielding a 17-dimensional input. In the current GNN2 search, however, the best-performing configuration is the simpler
+\emph{light\_emb\_h96\_depth2}, with
+\[
+n_{\text{emb}} = 16,\qquad
+e_{\text{emb}} = 8,\qquad
+h = 96,\qquad
+L = 2.
+\]
+This model uses no normalization and does \emph{not} include explicit phase one-hot encoding. It achieves
+\[
+\mathrm{MAE} \approx 0.00158,
+\qquad
+\mathrm{RMSE} \approx 0.00221\;\text{pu}.
+\]
+This is the best result among the full-voltage Load-type experiments in the current search, indicating that a relatively shallow architecture with accurate local features (including $q_{\text{pv}}$) is sufficient once the dataset and feature definitions are aligned with the present codebase.
+
+\subsubsection*{Final selected architectures}
+
+Table below summarize the final selected architecture for each non--$\Delta V$ full-voltage dataset.
+
+\begin{table}[htbp]
+  \centering
+  \footnotesize
+  \caption{Best-performing PF-identity GNN architectures for all full-voltage datasets.}
+  \label{tab:best-gnn-arch}
+  \begin{tabular}{llllllllll}
+    \toprule
+    Dataset & Config & Backbone & $n_{\text{emb}}$ & $e_{\text{emb}}$ & $h$ & $L$ & Phase enc. & Loss & MAE / RMSE (pu) \\
+    \midrule
+    Original 
+        & light\_wide\_emb\_depth3
+        & PFIdentityGNN
+        & 12 & 6 & 96 & 3 & none & MSE 
+        & $0.00583 / 0.00781$ \\
+    Derived  
+        & wide\_shallow\_h128\_depth3
+        & PFIdentityGNN
+        & 8 & 4 & 128 & 3 & none & MSE 
+        & $0.00567 / 0.00771$ \\
+    Load-type 
+        & light\_emb\_h96\_depth2
+        & PFIdentityGNN
+        & 16 & 8 & 96 & 2 & none & MSE 
+        & $0.00158 / 0.00221$ \\
+    Load-type (no global) 
+        & light\_emb\_h96\_phase\_onehot\_depth3\_h112\_no\_global
+        & PFIdentityGNN
+        & 16 & 8 & 112 & 3 & one-hot & MSE 
+        & $0.00537 / 0.00733$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\end{document}
