@@ -65,6 +65,7 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
       node_in_dim=2: INJECTION_FEAT  [p_inj_kw, q_inj_kvar]
       node_in_dim=3: ORIGINAL_FEAT (legacy 3) [p_load_kw, q_load_kvar, p_pv_kw]
       node_in_dim=4: ORIGINAL_FEAT (4)       [p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar]
+      node_in_dim=5: ORIGINAL+CAP [p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar, q_cap_kvar]
       node_in_dim=10: loadtype per-type (m1_p, m1_q, ..., q_cap, p_pv)
       node_in_dim=12: no-global LOADTYPE_FEAT [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, q_pv_kvar]
       node_in_dim=14: current LOADTYPE_FEAT [electrical_distance_ohm, m1_p_kw, m1_q_kvar, m2_p_kw, m2_q_kvar, m4_p_kw, m4_q_kvar, m5_p_kw, m5_q_kvar, q_cap_kvar, p_pv_kw, q_pv_kvar, p_sys_balance_kw, q_sys_balance_kvar]
@@ -77,6 +78,19 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
         return build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv, busphQ_pv=None)
     elif node_in_dim == 4:
         return build_gnn_x_original(node_names_master, busphP_load, busphQ_load, busphP_pv, busphQ_pv=busphQ_pv)
+    elif node_in_dim == 5:
+        if busphQ_pv is None:
+            raise ValueError("busphQ_pv required for node_in_dim=5 (original+cap)")
+        X = np.zeros((len(node_names_master), 5), dtype=np.float32)
+        for i, n in enumerate(node_names_master):
+            bus, phs = n.split(".")
+            ph = int(phs)
+            X[i, 0] = float(busphP_load.get((bus, ph), 0.0))
+            X[i, 1] = float(busphQ_load.get((bus, ph), 0.0))
+            X[i, 2] = float(busphP_pv.get((bus, ph), 0.0))
+            X[i, 3] = float(busphQ_pv.get((bus, ph), 0.0))
+            X[i, 4] = float(inj.cap_q_kvar_per_node(bus, ph))
+        return X
     elif node_in_dim == 10:
         return build_gnn_x_loadtype_per_type(node_names_master, busph_per_type, busphP_pv)
     elif node_in_dim == 12:
@@ -112,8 +126,7 @@ def build_x_for_model(node_in_dim, node_names_master, busphP_load, busphQ_load, 
     else:
         raise ValueError(
             f"Unsupported node_in_dim={node_in_dim}. "
-            "Only the strict load-type inference workflow is supported now: "
-            "use 12, 14, 15, or 17 for load-type checkpoints."
+            "Supported: 2 (injection), 3/4 (original), 5 (original+cap), 10/12/14/15/17 (load-type)."
         )
 
 
