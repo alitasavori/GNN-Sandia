@@ -317,7 +317,7 @@ def compare_daily_profiles(
     *,
     original_ckpt: str,
     plus_cap_ckpt: str,
-    nodes_to_plot: list[str],
+    nodes_to_plot: list[str] | None,
     device: str,
 ) -> None:
     """Run a 24h baseline day and save plots + print MAE/RMSE."""
@@ -327,9 +327,11 @@ def compare_daily_profiles(
     node_names_master, _ = _get_master_95_nodes_and_index()
     node_names_89 = _get_89_nodes_from_master(node_names_master)
     node_set_89 = set(node_names_89)
-    nodes_to_plot = [n for n in nodes_to_plot if n in node_set_89]
+    if nodes_to_plot:
+        nodes_to_plot = [n for n in nodes_to_plot if n in node_set_89]
+    # If no explicit list is provided (or all were invalid), default to all 89 nodes
     if not nodes_to_plot:
-        nodes_to_plot = ["850.1"]
+        nodes_to_plot = list(node_names_89)
 
     # Load models
     mdl_orig = _load_model(original_ckpt, device=device)
@@ -477,7 +479,12 @@ def main() -> None:
     p.add_argument("--k-per-scenario", type=int, default=320, help="Snapshots per scenario (default 320 = 1/3 of 960).")
     p.add_argument("--seed", type=int, default=20260130)
     p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
-    p.add_argument("--plot-nodes", nargs="*", default=["850.1", "848.1", "890.1"])
+    p.add_argument(
+        "--plot-nodes",
+        nargs="*",
+        default=None,
+        help="Optional list of nodes to plot; if omitted, plots are saved for all 89 nodes.",
+    )
     # Training hyperparams (single fixed candidate; you can edit/extend later)
     p.add_argument("--cfg-name", default="original_plus_cap_h128_depth4")
     p.add_argument("--h-dim", type=int, default=128)
