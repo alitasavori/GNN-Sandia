@@ -4,7 +4,7 @@ One-stop experiment:
 1) Generate a reduced-size "original + capacitor-Q" dataset:
    - Same as ORIGINAL (p_load, q_load, p_pv, q_pv) but adds:
        q_cap_kvar (pre-solve nominal capacitor kvar per node)
-   - Uses 1/3 as many snapshots per scenario (default: 320 vs 960)
+   - By default uses same 960 snapshots per scenario as run_original_dataset (use --k-per-scenario 320 for a quick 1/3-size run)
    - Writes to: datasets_gnn2/original_plus_cap/
 
 2) Train a PF-identity GNN on this dataset and save the best checkpoint.
@@ -80,7 +80,7 @@ def _get_89_nodes_from_master(node_names_master: list[str]) -> list[str]:
 def generate_dataset_original_plus_cap(
     *,
     n_scenarios: int = 200,
-    k_snapshots_per_scenario_total: int = 320,  # 1/3 of 960
+    k_snapshots_per_scenario_total: int = 960,  # match run_original_dataset for fair comparison
     bins_by_profile: dict | None = None,
     include_anchors: bool = True,
     master_seed: int = 20260130,
@@ -479,7 +479,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--original-ckpt", required=True, help="Checkpoint trained on datasets_gnn2/original (node_in_dim=4).")
     p.add_argument("--n-scenarios", type=int, default=200)
-    p.add_argument("--k-per-scenario", type=int, default=320, help="Snapshots per scenario (default 320 = 1/3 of 960).")
+    p.add_argument("--k-per-scenario", type=int, default=960, help="Snapshots per scenario (default 960, same as original dataset).")
     p.add_argument("--seed", type=int, default=20260130)
     p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
     p.add_argument(
@@ -488,12 +488,13 @@ def main() -> None:
         default=None,
         help="Optional list of nodes to plot; if omitted, plots are saved for all 89 nodes.",
     )
-    # Training hyperparams (single fixed candidate; you can edit/extend later)
+    # Training hyperparams: match best original (light_xwide_emb_depth4) for fair comparison
     p.add_argument("--cfg-name", default="original_plus_cap_h128_depth4")
     p.add_argument("--h-dim", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-emb", type=int, default=16)
     p.add_argument("--e-emb", type=int, default=8)
+    p.add_argument("--early-stop", action="store_true", help="Use early stopping; default is full 50 epochs (like best original).")
     args = p.parse_args()
 
     t0 = time.time()
@@ -530,7 +531,7 @@ def main() -> None:
         n_layers=int(args.n_layers),
         use_norm=False,
         use_phase_onehot=False,
-        early_stop=True,
+        early_stop=bool(args.early_stop),
     )
     if ckpt_path is None:
         raise RuntimeError("Training failed or was skipped; no checkpoint produced.")

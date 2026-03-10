@@ -349,6 +349,7 @@ def train_one(block_id, cfg_name, out_dir, feature_cols, target_col, n_emb, e_em
     mae_f, rmse_f = evaluate(model, test_loader)
 
     ckpt_path = os.path.join(OUTPUT_DIR, f"block{block_id}.pt")
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     ckpt = {
         "state_dict": model.state_dict(),
         "config": {

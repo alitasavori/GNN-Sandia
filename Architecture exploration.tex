@@ -201,28 +201,28 @@ Table below summarize the final selected architecture for each non--$\Delta V$ f
   \label{tab:best-gnn-arch}
   \begin{tabular}{llllllllll}
     \toprule
-    Dataset & Config & Backbone & $n_{\text{emb}}$ & $e_{\text{emb}}$ & $h$ & $L$ & Phase enc. & Loss & MAE / RMSE (pu) \\
+    Dataset & Config & $n_{\text{emb}}$ & $e_{\text{emb}}$ & $h$ & $L$ & Phase enc. & MAE / RMSE (pu) \\
     \midrule
     Original 
         & light\_wide\_emb\_depth3
-        & PFIdentityGNN
-        & 12 & 6 & 96 & 3 & none & MSE 
+        & 12 & 6 & 96 & 3 & none  
         & $0.00583 / 0.00781$ \\
     Derived  
         & wide\_shallow\_h128\_depth3
-        & PFIdentityGNN
-        & 8 & 4 & 128 & 3 & none & MSE 
+        & 8 & 4 & 128 & 3 & none 
         & $0.00567 / 0.00771$ \\
-    Load-type 
-        & light\_emb\_h96\_depth2
-        & PFIdentityGNN
-        & 16 & 8 & 96 & 2 & none & MSE 
-        & $0.00158 / 0.00221$ \\
     Load-type (no global) 
         & light\_emb\_h96\_phase\_onehot\_depth3\_h112\_no\_global
-        & PFIdentityGNN
-        & 16 & 8 & 112 & 3 & one-hot & MSE 
+        & 16 & 8 & 112 & 3 & one-hot 
         & $0.00537 / 0.00733$ \\
+    Load-type (no embeddings) 
+        & light\_h96\_depth2\_noemb
+        & 0 & 0 & 96 & 2 & none
+        & $0.00683 / 0.00810$ \\
+    Load-type 
+        & light\_emb\_h96\_depth2
+        & 16 & 8 & 96 & 2 & none
+        & $0.00158 / 0.00221$ \\
     \bottomrule
   \end{tabular}
 \end{table}
