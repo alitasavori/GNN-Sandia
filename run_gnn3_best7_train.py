@@ -93,13 +93,21 @@ class MLP(nn.Module):
 
 class EdgeIdentityMP(MessagePassing):
     def __init__(self, h_dim, edge_feat_dim, edge_emb_dim):
+        """
+        edge_emb_dim can be zero to disable edge ID embeddings. In that case,
+        the message MLP only sees [h_j, edge_attr].
+        """
         super().__init__(aggr="add")
-        self.psi = MLP(in_dim=h_dim + edge_feat_dim + edge_emb_dim, out_dim=h_dim, hidden=h_dim)
+        in_dim = h_dim + edge_feat_dim + max(0, edge_emb_dim)
+        self.psi = MLP(in_dim=in_dim, out_dim=h_dim, hidden=h_dim)
 
     def forward(self, h, edge_index, edge_attr, edge_emb):
         return self.propagate(edge_index=edge_index, h=h, edge_attr=edge_attr, edge_emb=edge_emb)
 
     def message(self, h_j, edge_attr, edge_emb):
+        # edge_emb may be None or zero-width; handle both cases.
+        if edge_emb is None or edge_emb.numel() == 0:
+            return self.psi(torch.cat([h_j, edge_attr], dim=-1))
         return self.psi(torch.cat([h_j, edge_attr, edge_emb], dim=-1))
 
 
@@ -108,27 +116,49 @@ class PFIdentityGNN(nn.Module):
                  node_emb_dim=8, edge_emb_dim=4, h_dim=64, num_layers=4, use_norm=False):
         super().__init__()
         self.num_nodes = int(num_nodes)
-        self.node_emb = nn.Embedding(num_nodes, node_emb_dim)
-        self.edge_emb = nn.Embedding(num_edges, edge_emb_dim)
-        self.phi0 = MLP(in_dim=node_in_dim + node_emb_dim, out_dim=h_dim, hidden=h_dim)
+        # Optional node/edge embeddings: allow dim=0 to disable them.
+        self.node_emb_dim = max(0, int(node_emb_dim))
+        self.edge_emb_dim = max(0, int(edge_emb_dim))
+
+        self.node_emb = None
+        if self.node_emb_dim > 0:
+            self.node_emb = nn.Embedding(num_nodes, self.node_emb_dim)
+
+        self.edge_emb = None
+        if self.edge_emb_dim > 0:
+            self.edge_emb = nn.Embedding(num_edges, self.edge_emb_dim)
+
+        self.phi0 = MLP(in_dim=node_in_dim + self.node_emb_dim, out_dim=h_dim, hidden=h_dim)
         self.use_norm = use_norm
         if use_norm:
-            self.node_norm = nn.LayerNorm(node_in_dim + node_emb_dim)
+            self.node_norm = nn.LayerNorm(node_in_dim + self.node_emb_dim)
             self.edge_norm = nn.LayerNorm(edge_in_dim)
-        self.mps = nn.ModuleList([EdgeIdentityMP(h_dim, edge_in_dim, edge_emb_dim) for _ in range(num_layers)])
-        self.updates = nn.ModuleList([MLP(in_dim=h_dim + h_dim + node_emb_dim, out_dim=h_dim, hidden=h_dim) for _ in range(num_layers)])
+        self.mps = nn.ModuleList(
+            [EdgeIdentityMP(h_dim, edge_in_dim, self.edge_emb_dim) for _ in range(num_layers)]
+        )
+        self.updates = nn.ModuleList(
+            [MLP(in_dim=h_dim + h_dim + self.node_emb_dim, out_dim=h_dim, hidden=h_dim) for _ in range(num_layers)]
+        )
         self.readout = MLP(in_dim=h_dim, out_dim=out_dim, hidden=h_dim)
 
     def forward(self, data):
         x, edge_index, edge_attr, edge_id = data.x, data.edge_index, data.edge_attr, data.edge_id
         node_ids = self._local_node_ids_from_ptr(data.ptr.to(x.device)) if hasattr(data, "ptr") and data.ptr is not None else torch.arange(data.num_nodes, device=x.device)
-        z = self.node_emb(node_ids)
+        if self.node_emb is not None:
+            z = self.node_emb(node_ids)
+        else:
+            # No node embeddings: use a zero-width or zero tensor and rely solely on x.
+            z = torch.zeros((x.size(0), 0), dtype=x.dtype, device=x.device)
         inp = torch.cat([x, z], dim=-1)
         if self.use_norm:
             inp = self.node_norm(inp)
             edge_attr = self.edge_norm(edge_attr)
         h = self.phi0(inp)
-        r = self.edge_emb(edge_id)
+        if self.edge_emb is not None:
+            r = self.edge_emb(edge_id)
+        else:
+            # No edge embeddings: pass None so EdgeIdentityMP only uses edge_attr.
+            r = None
         for mp, upd in zip(self.mps, self.updates):
             m = mp(h=h, edge_index=edge_index, edge_attr=edge_attr, edge_emb=r)
             h = upd(torch.cat([h, m, z], dim=-1))
