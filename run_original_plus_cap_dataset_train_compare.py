@@ -62,6 +62,9 @@ def _ensure_dirs() -> None:
     os.makedirs(OUT_DATASET_DIR, exist_ok=True)
     os.makedirs(OUT_MODELS_DIR, exist_ok=True)
     os.makedirs(OUT_PLOTS_DIR, exist_ok=True)
+    # Ensure shared training output dir from run_gnn3_best7_train also exists,
+    # so torch.save(...) in train_one does not fail on a fresh clone (e.g. Colab).
+    os.makedirs("gnn3_best7_output", exist_ok=True)
 
 
 def _get_master_95_nodes_and_index() -> tuple[list[str], dict[str, int]]:
