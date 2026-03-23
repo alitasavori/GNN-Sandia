@@ -134,6 +134,21 @@ def _instantiate_models(*, gnn_ckpt_path: str, mlp_ckpt_path: str, device: torch
     gnn_mean = torch.as_tensor(gnn_ckpt["mean"], dtype=torch.float32)
     gnn_std = torch.as_tensor(gnn_ckpt["std"], dtype=torch.float32).clamp_min(1e-8)
 
+    # Some checkpoints are mixed-format (e.g., model in_dim=18 but mean/std saved for 14 raw features).
+    # Normalize stats to match model input dim by appending identity stats for extra onehot channels.
+    gnn_stat_dim = int(gnn_mean.shape[-1])
+    if gnn_stat_dim != gnn_in_dim:
+        if gnn_stat_dim == 14 and gnn_in_dim == 18:
+            z = torch.zeros((1, 4), dtype=torch.float32)
+            o = torch.ones((1, 4), dtype=torch.float32)
+            gnn_mean = torch.cat([gnn_mean.reshape(1, 14), z], dim=1)
+            gnn_std = torch.cat([gnn_std.reshape(1, 14), o], dim=1)
+        else:
+            raise RuntimeError(
+                f"Incompatible GNN checkpoint stats: in_dim={gnn_in_dim}, "
+                f"mean/std dim={gnn_stat_dim}. Expected equal dims, or 14->18 expansion."
+            )
+
     gnn_mean = gnn_mean.to(device, non_blocking=False)
     gnn_std = gnn_std.to(device, non_blocking=False)
 
@@ -320,7 +335,8 @@ def main() -> None:
     # Reusable numpy work buffers (vectorized feature path).
     x_raw_np = np.zeros((N, F_raw), dtype=np.float32)
     x_onehot_np = np.zeros((N, 4), dtype=np.float32)
-    x_in_np = np.zeros((N, int(gnn_mean.shape[-1])), dtype=np.float32)
+    gnn_in_dim_effective = int(gnn_mean.shape[-1])
+    x_in_np = np.zeros((N, gnn_in_dim_effective), dtype=np.float32)
     m1_p_np = np.zeros((N,), dtype=np.float32)
     m1_q_np = np.zeros((N,), dtype=np.float32)
     m2_p_np = np.zeros((N,), dtype=np.float32)
@@ -522,8 +538,18 @@ def main() -> None:
             threshold=1e-8,
         )
 
-        x_in_np[:, :F_raw] = (x_raw_np - gnn_mean_np) / gnn_std_np
-        x_in_np[:, F_raw:] = x_onehot_np
+        if gnn_in_dim_effective == F_raw:
+            # Older checkpoint style: model trained on the base 14 features only.
+            x_in_np[:, :] = (x_raw_np - gnn_mean_np) / gnn_std_np
+        elif gnn_in_dim_effective == F_raw + 4:
+            # Newer checkpoint style: base 14 features + node-type onehot.
+            x_in_np[:, :F_raw] = (x_raw_np - gnn_mean_np[:, :F_raw]) / gnn_std_np[:, :F_raw]
+            x_in_np[:, F_raw:] = x_onehot_np
+        else:
+            raise RuntimeError(
+                f"Unsupported GNN input dim from checkpoint: {gnn_in_dim_effective}. "
+                f"Expected {F_raw} or {F_raw + 4} for this 8500 pipeline."
+            )
 
         if use_cuda_pipeline:
             slot = t & 1
