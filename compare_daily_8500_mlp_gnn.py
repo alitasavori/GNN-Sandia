@@ -33,6 +33,28 @@ from train_gnn_8500 import ResidualGCN8500
 from train_mlp_8500 import MLP8500
 
 
+def _compile_8500_from_master_dir() -> None:
+    """
+    Compile 8500 master from its own directory so relative Redirect paths
+    inside Master.dss (e.g., LineCodes2.dss) always resolve on Colab/local.
+    """
+    master_path = Path(loadtype8500.MASTER_8500).resolve()
+    if not master_path.is_file():
+        raise FileNotFoundError(f"Missing IEEE 8500 master: {master_path}")
+    master_dir = master_path.parent
+
+    prev_cwd = Path.cwd()
+    try:
+        os.chdir(master_dir)
+        dss.Basic.ClearAll()
+        # Use relative filename after cwd switch so nested Redirects are stable.
+        dss.Text.Command(f'redirect "{master_path.name}"')
+        dss.Solution.Mode(1)
+        inj._apply_voltage_bases()
+    finally:
+        os.chdir(prev_cwd)
+
+
 def _infer_dataset_dir_from_ckpt(ckpt_path: str | os.PathLike) -> Path:
     p = Path(ckpt_path).resolve()
     for anc in [p] + list(p.parents):
@@ -272,7 +294,7 @@ def main() -> None:
     F_raw = len(feature_cols_8500)  # expected 14
 
     # ---- OpenDSS setup for IEEE 8500 ----
-    loadtype8500.compile_8500()
+    _compile_8500_from_master_dir()
     base_loads, base_pvs = loadtype8500._collect_baselines()
 
     # Precompute load -> bucket -> bus-phase distribution.
