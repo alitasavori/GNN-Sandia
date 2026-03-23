@@ -19,4 +19,5 @@ new dss from dr mirzaei/gnn3_best7_output/
 # Local datasets that should stay off remote if ever added here
 *.pkl
 *.npz
+datasets_gnn2/
 
