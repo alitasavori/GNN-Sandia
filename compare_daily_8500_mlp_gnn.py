@@ -45,51 +45,60 @@ def _compile_8500_from_master_dir() -> None:
         raise FileNotFoundError(f"Missing IEEE 8500 master: {master_path}")
     master_dir = master_path.parent
 
-    # Linux/Colab is case-sensitive. Master.dss references some include files with
-    # different casing than the on-disk names (e.g., LineCodes2.dss vs LineCodes2.DSS).
-    # Create case-compatible aliases before redirect.
-    _ensure_case_compatible_redirect_files(master_path)
+    # Linux/Colab is case-sensitive. Resolve Redirect target filename casing up front.
+    master_to_run = _build_case_resolved_master_copy(master_path)
 
     prev_cwd = Path.cwd()
     try:
         os.chdir(master_dir)
         dss.Basic.ClearAll()
         # Use relative filename after cwd switch so nested Redirects are stable.
-        dss.Text.Command(f'redirect "{master_path.name}"')
+        dss.Text.Command(f'redirect "{master_to_run.name}"')
         dss.Solution.Mode(1)
         inj._apply_voltage_bases()
     finally:
         os.chdir(prev_cwd)
 
 
-def _ensure_case_compatible_redirect_files(master_path: Path) -> None:
+def _build_case_resolved_master_copy(master_path: Path) -> Path:
     """
-    Ensure every Redirect target in Master.dss exists with the exact referenced case.
-    If only a case-variant exists, create a local alias file with the requested name.
+    Build a temp master file with Redirect filenames rewritten to exact on-disk case.
+    Returns the path to the rewritten file.
     """
     text = master_path.read_text(encoding="utf-8", errors="ignore")
-    # Match lines like: Redirect  LineCodes2.dss
-    # Also supports quoted targets: Redirect "SomeFile.dss"
-    pat = re.compile(r"(?im)^\s*redirect\s+\"?([^\r\n\"!]+)\"?")
-    refs = [m.group(1).strip() for m in pat.finditer(text)]
-    if not refs:
-        return
-
     parent = master_path.parent
     name_lut = {p.name.lower(): p for p in parent.iterdir() if p.is_file()}
+    out_lines: list[str] = []
 
-    for ref in refs:
-        ref_path = (parent / ref).resolve()
+    # Match full redirect line while preserving whitespace/comments around it.
+    line_pat = re.compile(r"(?im)^(\s*redirect\s+)(\"?)([^\r\n\"!]+)(\"?)(.*)$")
+    for line in text.splitlines(keepends=True):
+        m = line_pat.match(line)
+        if not m:
+            out_lines.append(line)
+            continue
+
+        prefix, q1, ref, q2, suffix = m.groups()
+        ref_clean = ref.strip()
+        ref_path = (parent / ref_clean).resolve()
         if ref_path.is_file():
+            out_lines.append(line)
             continue
-        cand = name_lut.get(Path(ref).name.lower())
+
+        cand = name_lut.get(Path(ref_clean).name.lower())
         if cand is None:
+            out_lines.append(line)
             continue
-        # Create expected-case alias in same folder.
-        # Copy is used instead of symlink for broad notebook/runtime compatibility.
-        alias_path = parent / Path(ref).name
-        if not alias_path.exists():
-            shutil.copyfile(cand, alias_path)
+
+        rewritten = f"{prefix}{q1}{cand.name}{q2}{suffix}"
+        # Preserve original newline style if line ended with newline.
+        if line.endswith("\n") and not rewritten.endswith("\n"):
+            rewritten += "\n"
+        out_lines.append(rewritten)
+
+    tmp_master = parent / "_Master_case_resolved_tmp.dss"
+    tmp_master.write_text("".join(out_lines), encoding="utf-8")
+    return tmp_master
 
 
 def _infer_dataset_dir_from_ckpt(ckpt_path: str | os.PathLike) -> Path:
