@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import time
 from pathlib import Path
 
@@ -43,6 +45,11 @@ def _compile_8500_from_master_dir() -> None:
         raise FileNotFoundError(f"Missing IEEE 8500 master: {master_path}")
     master_dir = master_path.parent
 
+    # Linux/Colab is case-sensitive. Master.dss references some include files with
+    # different casing than the on-disk names (e.g., LineCodes2.dss vs LineCodes2.DSS).
+    # Create case-compatible aliases before redirect.
+    _ensure_case_compatible_redirect_files(master_path)
+
     prev_cwd = Path.cwd()
     try:
         os.chdir(master_dir)
@@ -53,6 +60,36 @@ def _compile_8500_from_master_dir() -> None:
         inj._apply_voltage_bases()
     finally:
         os.chdir(prev_cwd)
+
+
+def _ensure_case_compatible_redirect_files(master_path: Path) -> None:
+    """
+    Ensure every Redirect target in Master.dss exists with the exact referenced case.
+    If only a case-variant exists, create a local alias file with the requested name.
+    """
+    text = master_path.read_text(encoding="utf-8", errors="ignore")
+    # Match lines like: Redirect  LineCodes2.dss
+    # Also supports quoted targets: Redirect "SomeFile.dss"
+    pat = re.compile(r"(?im)^\s*redirect\s+\"?([^\r\n\"!]+)\"?")
+    refs = [m.group(1).strip() for m in pat.finditer(text)]
+    if not refs:
+        return
+
+    parent = master_path.parent
+    name_lut = {p.name.lower(): p for p in parent.iterdir() if p.is_file()}
+
+    for ref in refs:
+        ref_path = (parent / ref).resolve()
+        if ref_path.is_file():
+            continue
+        cand = name_lut.get(Path(ref).name.lower())
+        if cand is None:
+            continue
+        # Create expected-case alias in same folder.
+        # Copy is used instead of symlink for broad notebook/runtime compatibility.
+        alias_path = parent / Path(ref).name
+        if not alias_path.exists():
+            shutil.copyfile(cand, alias_path)
 
 
 def _infer_dataset_dir_from_ckpt(ckpt_path: str | os.PathLike) -> Path:
