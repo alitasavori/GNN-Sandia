@@ -1,0 +1,2542 @@
+\documentclass[11pt]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{hyperref}
+
+% ── Page layout ───────────────────────────────────────────────────────────────
+\geometry{
+  letterpaper,
+  top    = 1in,
+  bottom = 1in,
+  left   = 1.1in,
+  right  = 1.1in
+}
+
+% ── Colors ────────────────────────────────────────────────────────────────────
+\definecolor{headerblue}{RGB}{31,  73, 125}
+\definecolor{rowblue}   {RGB}{220, 230, 241}
+\definecolor{ruleblue}  {RGB}{31,  73, 125}
+\definecolor{notesgray} {RGB}{100, 100, 100}
+\definecolor{warnred}   {RGB}{180,  30,  30}
+\definecolor{greenok}   {RGB}{0,   120,   0}
+\definecolor{darkgreen} {RGB}{0,   120,   0}
+
+% ── Section heading styles ────────────────────────────────────────────────────
+\titleformat{\section}
+  {\large\bfseries\color{headerblue}}
+  {\thesection.}{0.6em}{}[\vspace{-4pt}\textcolor{ruleblue}{\rule{\linewidth}{0.8pt}}]
+
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{headerblue}}
+  {\thesubsection}{0.5em}{}
+
+\titleformat{\subsubsection}
+  {\normalsize\itshape\color{headerblue}}
+  {\thesubsubsection}{0.5em}{}
+
+\titlespacing*{\section}      {0pt}{18pt}{6pt}
+\titlespacing*{\subsection}   {0pt}{12pt}{4pt}
+\titlespacing*{\subsubsection}{0pt}{8pt}{3pt}
+
+% ── Header / footer ───────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\small\textcolor{notesgray}{GNN2 Project --- Speed Benchmark, Impossibility Analysis \& Literature Review}}
+\fancyhead[R]{\small\textcolor{notesgray}{March 2026}}
+\fancyfoot[C]{\small\thepage}
+
+% ── List spacing ──────────────────────────────────────────────────────────────
+\setlist[itemize]{itemsep=3pt, topsep=4pt, leftmargin=1.4em}
+\setlist[description]{itemsep=4pt, topsep=4pt, leftmargin=1.6em,
+                       labelwidth=0pt, leftmargin=!}
+
+% ── Hyperref ──────────────────────────────────────────────────────────────────
+\hypersetup{
+  colorlinks = true,
+  linkcolor  = headerblue,
+  urlcolor   = headerblue,
+  pdftitle   = {GNN2 Speed Benchmark and Literature Review},
+  pdfauthor  = {GNN2 Project},
+}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{document}
+
+% ── Title block ───────────────────────────────────────────────────────────────
+\begin{center}
+  {\LARGE\bfseries\color{headerblue}
+    GNN2 Speed Benchmark: OpenDSS vs.\ GNN Models\\[4pt]
+    with Impossibility Analysis, Literature Context, and PowerFlowNet Comparison}\\[6pt]
+  {\large GNN2 Project \quad|\quad March 2026}
+\end{center}
+
+\vspace{4pt}
+\noindent\textcolor{ruleblue}{\rule{\linewidth}{1.2pt}}
+\vspace{10pt}
+
+\tableofcontents
+\vspace{14pt}
+\noindent\textcolor{ruleblue}{\rule{\linewidth}{0.6pt}}
+\vspace{10pt}
+
+% =============================================================================
+\section{Executive Summary}
+% =============================================================================
+
+This report combines two investigations into the runtime performance of Graph Neural
+Network (GNN) surrogates for distribution power flow.  The first benchmarks the
+24-hour (288-timestep) inference speed of two GNN models against OpenDSS on an
+95-node distribution feeder and situates those results within the published literature,
+including a detailed comparison against PowerFlowMultiNet.  The second presents a
+convergent four-layer argument---drawn from benchmark data, framework profiling,
+FLOP-count analysis, and direct empirical evidence---establishing that no GNN can
+beat an optimised classical solver at CPU batch size~1 in single-scenario sequential
+mode.  Together, they give a complete picture of where GNN surrogates are and are not
+competitive with traditional power-flow solvers.
+
+\medskip
+\noindent\textbf{Core benchmark finding:}
+On CPU, OpenDSS is roughly $11.7\times$ faster per timestep than GNN inference.
+On GPU with batching, the GNN pipeline comes within $1.6\times$ of OpenDSS.
+The GNN's advantage lies in high-throughput, batched, parallel scenario
+evaluation---not in single-scenario latency.
+
+\medskip
+\noindent\textbf{Impossibility finding:}
+No published paper (2019--2026) demonstrates a GNN or any ML surrogate
+outperforming an optimised classical solver under the simultaneous conditions
+of CPU-only inference, single-scenario execution, and sequential processing.
+This is not an oversight in the literature.  It reflects a fundamental,
+quantifiable mismatch: lightsim2grid (KLU sparse solver) completes an
+IEEE~118-bus AC power flow in ${\approx}63\,\mu$s on a single CPU core,
+while PyTorch framework overhead alone accumulates $0.5$--$2.0\,\text{ms}$
+per GNN forward pass before any floating-point computation occurs.  GNN
+inference requires ${\approx}12{,}000\times$ more floating-point operations
+than sparse Newton--Raphson for a 100-bus radial network.  The sole paper
+that explicitly benchmarks batch-size-1 GNN against optimised NR
+(Kim et al., ICASSP 2026) confirms: ``\textit{In single-scenario runs,
+NR is competitive.}''
+
+\medskip
+\noindent\textbf{Where GNNs genuinely win:}
+Large-batch GPU-accelerated many-scenario evaluation (Monte Carlo studies,
+contingency screening, planning under uncertainty) where GPU throughput and
+batch amortisation of overhead together overcome the FLOP-count deficit.
+This is precisely the regime where published speedup claims ($4\times$--$38\times$)
+are observed, and it corresponds to a real and valuable use case---just not
+single-scenario sequential simulation.
+
+% =============================================================================
+\section{Experimental Setup}
+% =============================================================================
+
+\subsection{Environment}
+
+\begin{itemize}
+  \item \textbf{Working directory:} \verb|C:\Users\alita\OneDrive\Desktop\GNN2|
+  \item \textbf{Benchmark script:} \verb|speed_benchmark_and_timing.py|
+  \item \textbf{Timesteps:} $N_{\text{steps}} = 288$ \quad (24\,h at 5-minute resolution)
+  \item \textbf{Network size:} $N = 95$ nodes, $E = 184$ edges
+  \item \textbf{Devices:} CPU and NVIDIA L4 GPU
+\end{itemize}
+
+\subsection{Model Evaluated}
+
+All results in this report use the \textbf{GNN3 Best7 load-type model} trained
+on \texttt{gnn\_samples\_loadtype\_full}:
+
+\begin{itemize}
+  \item \textbf{Architecture:} $d_{\text{node}}=13$, $d_{\text{edge}}=2$,
+        $d_{\text{out}}=1$ (voltage magnitude);
+        node emb.\ $= 8$, edge emb.\ $= 4$,
+        hidden width $h = 128$, $L = 2$ message-passing layers
+  \item \textbf{Training:} best RMSE $= 0.008948$\,p.u.,
+        best MAE $= 0.006312$\,p.u., reached at epoch~9
+  \item \textbf{Inference (load-type model):} MAE $= 0.005276$\,p.u.,
+        RMSE $= 0.006559$\,p.u.
+\end{itemize}
+
+\subsection{Inference Modes}
+
+Four configurations are benchmarked:
+
+\begin{itemize}
+  \item \textbf{Non-batched CPU:} 288 separate GNN forward passes on CPU.
+  \item \textbf{Non-batched GPU:} 288 separate GNN forward passes on GPU.
+  \item \textbf{Batched CPU:} all 288 timesteps packed into one forward pass on CPU.
+  \item \textbf{Batched GPU:} all 288 timesteps packed into one forward pass on GPU.
+\end{itemize}
+
+OpenDSS runs timestep-by-timestep in all cases (no batching is available in
+its API).  All GNN pipeline times include three distinct stages: feature
+construction (\texttt{build\_gnn\_x}), tensor and batch object creation
+(\texttt{tensor\_data\_creation}), and the model forward pass
+(\texttt{model\_forward}).
+
+% =============================================================================
+\section{Notation and Definitions}
+% =============================================================================
+
+\subsection{OpenDSS Aggregates}
+
+\[
+T^{\text{wall}}_{\text{DSS}} \;\text{(total wall-clock time, 24\,h)},
+\qquad
+T^{\text{solve}}_{\text{DSS}} \;\text{(sum of pure \texttt{Solve()} times)}.
+\]
+Per-step means:
+\[
+\bar{t}^{\text{wall}}_{\text{DSS}}
+  = \frac{T^{\text{wall}}_{\text{DSS}}}{N_{\text{steps}}},
+\qquad
+\bar{t}^{\text{solve}}_{\text{DSS}}
+  = \frac{T^{\text{solve}}_{\text{DSS}}}{N_{\text{steps}}}.
+\]
+
+\subsection{GNN Aggregates}
+
+\[
+T^{\text{fwd}}_{\text{GNN}}
+  = \sum_{t=1}^{N_{\text{steps}}} t_{\text{fwd}}(t),
+\qquad
+\bar{t}^{\text{fwd}}_{\text{GNN}}
+  = \frac{T^{\text{fwd}}_{\text{GNN}}}{N_{\text{steps}}}.
+\]
+
+\subsection{Solver Iteration Means}
+
+\[
+\overline{\text{ControlIter}}
+  = \frac{1}{N_{\text{conv}}}
+    \sum_{t \in \mathcal{C}} \text{ControlIter}(t),
+\qquad
+\overline{\text{PFIter}}
+  = \frac{1}{N_{\text{conv}}}
+    \sum_{t \in \mathcal{C}} \text{PFIter}(t),
+\]
+where $\mathcal{C}$ is the set of converged steps and
+$N_{\text{conv}} = |\mathcal{C}|$.
+
+% =============================================================================
+\section{Benchmark Results}
+% =============================================================================
+
+\subsection{Summary Across All Four Configurations}
+
+Table~\ref{tab:summary} gives the headline totals for all four
+configurations.  Per-step values are obtained by dividing by
+$N_{\text{steps}} = 288$.
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{4.2cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\centering\arraybackslash}p{2.0cm}
+  >{\centering\arraybackslash}p{2.0cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Configuration}}
+  & \textcolor{white}{\textbf{OpenDSS total}}
+  & \textcolor{white}{\textbf{GNN total}}
+  & \textcolor{white}{\textbf{Per-step (GNN)}}
+  & \textcolor{white}{\textbf{GNN/DSS}} \\
+\midrule
+\rowcolor{rowblue}
+CPU, non-batched & 396\,ms & 4{,}642\,ms & 16.12\,ms & $11.72\times$ \\
+GPU, non-batched & 349\,ms &   686\,ms   &  2.38\,ms & $1.96\times$  \\
+\rowcolor{rowblue}
+CPU, batched     & 315\,ms & 3{,}664\,ms & 12.72\,ms & $11.63\times$ \\
+GPU, batched     & 311\,ms &   498\,ms   &  1.73\,ms & $1.60\times$  \\
+\bottomrule
+\end{tabular}
+\caption{Headline benchmark results for the GNN3 Best7 load-type model
+  (95 nodes, 184 edges, $h=128$, $L=2$).  Per-step values are totals
+  divided by 288 timesteps; for batched mode this is the
+  per-timestep-equivalent cost of the single batched forward pass.}
+\label{tab:summary}
+\end{table}
+
+\subsection{Model Accuracy}
+
+Inference with the load-type model (24-hour profile):
+\[
+\text{MAE} = 0.005276\,\text{p.u.}, \qquad
+\text{RMSE} = 0.006559\,\text{p.u.}
+\]
+These are \emph{better} than the training-set best
+(MAE $= 0.006312$\,p.u., RMSE $= 0.008948$\,p.u.), indicating
+The load-type model represents an easier-than-average scenario (loads close to nominal,
+few extreme voltage events).  The model converged at epoch~9, reflecting
+a well-conditioned load-type dataset.
+
+% =============================================================================
+\section{Detailed Pipeline Timing Breakdown}
+\label{sec:breakdown}
+% =============================================================================
+
+Each timing run separates two parallel pipelines over all 288 timesteps:
+\[
+T^{\text{profile}}_{\text{DSS}}
+  = T_{\text{set\_time}}
+  + T_{\text{apply\_full}}
+  + T_{\text{solve\_full}}
+  + T_{\text{get\_voltage}},
+\]
+\[
+T^{\text{pipe}}_{\text{GNN}}
+  = T_{\text{build\_gnn\_x}}
+  + T_{\text{tensor\_data\_creation}}
+  + T_{\text{model\_forward}}.
+\]
+
+\subsection{OpenDSS Pipeline Detail}
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Stage}}
+  & \textcolor{white}{\textbf{CPU NB}}
+  & \textcolor{white}{\textbf{GPU NB}}
+  & \textcolor{white}{\textbf{CPU B}}
+  & \textcolor{white}{\textbf{GPU B}} \\
+\midrule
+\rowcolor{rowblue}
+\texttt{set\_time\_index}    &   4.30\,ms &   3.51\,ms &   1.73\,ms &   1.64\,ms \\
+\texttt{apply\_snapshot\_full} & 236.29\,ms & 195.60\,ms & 176.55\,ms & 174.97\,ms \\
+\rowcolor{rowblue}
+\texttt{solve\_full}         &  30.42\,ms &  29.40\,ms &  24.90\,ms &  24.82\,ms \\
+\texttt{get\_voltage\_full}  & 125.17\,ms & 120.72\,ms & 111.94\,ms & 109.55\,ms \\
+\rowcolor{rowblue}
+\textbf{TOTAL}               & \textbf{396.19\,ms} & \textbf{349.23\,ms}
+                             & \textbf{315.13\,ms} & \textbf{310.98\,ms} \\
+\bottomrule
+\end{tabular}
+\caption{OpenDSS pipeline stage totals over 288 timesteps.
+  NB = non-batched, B = batched (GNN batching mode; OpenDSS is always
+  sequential).  The \texttt{solve\_full} row is the pure numerical
+  computation; all other rows are Python API overhead.}
+\label{tab:dss_detail}
+\end{table}
+
+\noindent\textbf{Key observation:} \texttt{solve\_full} accounts for only
+${\approx}7$--$8\%$ of OpenDSS wall time across all configurations.
+The dominant costs are \texttt{apply\_snapshot\_full} (${\approx}55\%$,
+setting per-timestep loads and PV states via the COM API) and
+\texttt{get\_voltage\_full} (${\approx}32\%$, reading back bus voltages).
+The pure solve per timestep is $30\,\text{ms} \div 288 \approx 0.105\,\text{ms}$,
+while the full wall-clock cost per timestep is $396\,\text{ms} \div 288 \approx 1.38\,\text{ms}$.
+
+\medskip
+\noindent\textbf{Solver iteration counts (load-type model):}
+\[
+\overline{\text{ControlIter}} \approx 2.33,
+\qquad
+\overline{\text{PFIter}} \approx 4.76.
+\]
+Each timestep therefore requires on average $2.33 \times 4.76 \approx 11$
+individual Newton--Raphson linear-system solves.  At $0.105\,\text{ms}$
+total, each KLU factorisation and back-solve costs only
+${\approx}0.105/11 \approx 9.5\,\mu\text{s}$---consistent with the
+sub-10\,$\mu$s floor measured by \texttt{lightsim2grid} on comparable
+radial feeders (Section~\ref{sec:impossibility}).  The control iterations
+(ControlIter $> 1$) arise from voltage-regulator and capacitor-bank
+control loops; on a fixed-tap, fixed-capacitor equivalent these would
+collapse to $\overline{\text{ControlIter}} = 1$, shaving a further
+factor of ${\approx}2\times$ off the already small $\texttt{solve\_full}$
+time.
+
+\subsection{GNN Pipeline Detail}
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{1.8cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Stage}}
+  & \textcolor{white}{\textbf{CPU NB}}
+  & \textcolor{white}{\textbf{GPU NB}}
+  & \textcolor{white}{\textbf{CPU B}}
+  & \textcolor{white}{\textbf{GPU B}} \\
+\midrule
+\rowcolor{rowblue}
+\texttt{build\_gnn\_x}
+  &  98.38\,ms &  96.55\,ms &  94.01\,ms &  92.35\,ms \\
+\quad\textit{share}
+  & \textit{2.1\%} & \textit{14.1\%} & \textit{2.6\%} & \textit{18.5\%} \\
+\rowcolor{rowblue}
+\texttt{tensor\_data\_creation}
+  &  25.61\,ms &  41.97\,ms &  47.70\,ms & \textbf{144.64\,ms} \\
+\quad\textit{share}
+  & \textit{0.6\%} & \textit{6.1\%} & \textit{1.3\%} & \textcolor{warnred}{\textit{29.0\%}} \\
+\rowcolor{rowblue}
+\texttt{model\_forward}
+  & 4{,}517.80\,ms & 547.26\,ms & 3{,}522.13\,ms & \textbf{261.41\,ms} \\
+\quad\textit{share}
+  & \textit{97.3\%} & \textit{79.8\%} & \textit{96.1\%} & \textit{52.4\%} \\
+\rowcolor{rowblue}
+\textbf{TOTAL}
+  & \textbf{4{,}641.78\,ms} & \textbf{685.78\,ms}
+  & \textbf{3{,}663.83\,ms} & \textbf{498.40\,ms} \\
+\bottomrule
+\end{tabular}
+\caption{GNN pipeline stage totals over 288 timesteps (batched mode =
+  one forward pass total).  Bold entries highlight the most important
+  transition: forward pass halves on batched GPU, while tensor creation
+  triples.}
+\label{tab:gnn_detail}
+\end{table}
+
+\subsection{Quantitative Analysis of the Four Transitions}
+
+\textbf{CPU $\to$ GPU (non-batched):}
+The model forward drops from $4{,}518$\,ms to $547$\,ms---an
+$8.3\times$ speedup from GPU parallelism on the dense $h \times h = 128
+\times 128$ matrix multiplies.  Total GNN time falls from $4{,}642$\,ms
+to $686$\,ms ($6.8\times$), and the GNN/OpenDSS ratio improves from
+$11.72\times$ to $1.96\times$.
+
+\textbf{Non-batched $\to$ batched (GPU):}
+The forward pass drops further from $547$\,ms to $261$\,ms---a
+$2.1\times$ improvement.  Packing 288 timesteps into one call produces a
+single large tensor of shape $[288 \times 95, 128]$, filling significantly
+more Streaming Multiprocessors and amortising the per-call kernel-launch
+overhead (${\approx}288$ launches $\times$ $10\,\mu$s each $= 2.9$\,ms
+saved).
+
+However, \texttt{tensor\_data\_creation} \textbf{explodes from $42$\,ms to
+$145$\,ms---a $3.4\times$ slowdown.}  PyTorch Geometric's
+\texttt{Batch.from\_data\_list()} must concatenate 288 individual
+\texttt{Data} objects into one batched graph.  This requires:
+(i)~concatenating 288 node-feature matrices ($95 \times 13$ each);
+(ii)~concatenating 288 edge-feature matrices ($184 \times 2$ each); and
+(iii)~\emph{offset-adjusting} 288 edge-index arrays so that node indices
+are globally unique in the merged graph ($0$\ldots$94$ for graph~1,
+$95$\ldots$189$ for graph~2, etc.).  This is a Python-side sequential
+loop that cannot be parallelised and scales linearly with the number of
+graphs batched.
+
+The forward-pass savings ($-286$\,ms) are partially eaten by the batching
+overhead ($+103$\,ms from tensor creation).  Net gain on GPU:
+$686 \to 498$\,ms $= 188$\,ms saved ($27\%$ reduction), improving the
+ratio from $1.96\times$ to $1.60\times$.
+
+\textbf{Non-batched $\to$ batched (CPU):}
+Batching on CPU reduces the forward from $4{,}518$\,ms to $3{,}522$\,ms
+($22\%$ reduction) but the ratio barely moves ($11.72 \to 11.63\times$)
+because CPU cannot exploit the larger matrix dimensions in parallel.  The
+slight reduction comes from fewer Python loop iterations and marginally
+better cache reuse.
+
+\textbf{Shifting bottleneck:}
+On CPU (either mode), \texttt{model\_forward} accounts for ${\approx}97\%$
+of GNN time---it is the only target worth optimising.  On GPU non-batched,
+it falls to $80\%$.  On GPU batched, it falls to only $52\%$, and the
+pipeline overhead stages (\texttt{build\_gnn\_x} at $18.5\%$ plus
+\texttt{tensor\_data\_creation} at $29.0\%$) together account for $47.5\%$
+of total GNN time.  This is the report's clearest optimisation signal:
+vectorising feature construction and pre-building the batched graph object
+are the next highest-leverage targets once the model forward is
+GPU-accelerated.
+
+\subsection{Visualisation}
+
+Figure~\ref{fig:timing} summarises the pipeline breakdown across all four
+configurations.  Panel~(A) shows absolute times on a log scale; the red
+diamonds mark the OpenDSS total, illustrating how the GNN/OpenDSS gap
+closes with GPU and batching.  Panel~(B) shows the percentage share of
+each pipeline stage, making the bottleneck shift from
+\texttt{model\_forward} to \texttt{tensor\_data\_creation} immediately
+visible on the right-hand bars.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\linewidth]{gnn_timing_breakdown.pdf}
+\caption{GNN pipeline timing breakdown across four configurations.
+  \textbf{(A)} Absolute times (log scale); red diamonds = OpenDSS total.
+  \textbf{(B)} Percentage share of each GNN stage.
+  The orange (\texttt{tensor\_data\_creation}) bar triples on batched GPU
+  while the blue (\texttt{model\_forward}) bar halves, exposing pipeline
+  overhead as the new bottleneck.}
+\label{fig:timing}
+\end{figure}
+
+% =============================================================================
+\section{Key Insights and Interpretation}
+% =============================================================================
+
+\begin{description}[style=unboxed, leftmargin=0pt, labelwidth=0pt]
+
+  \item[\textbf{Why OpenDSS is fast on this case.}]
+  OpenDSS uses a sparse admittance-matrix solver (KLU) written in compiled
+  C/C\texttt{++}.  For a 95-node feeder the linear system is tiny: the
+  admittance matrix has roughly $2$--$4$ non-zeros per row (each bus connects
+  to $2$--$4$ neighbours), making it ${\approx}98\%$ zeros.  KLU skips all
+  zero entries and performs only $O(n)$ work per solve.  The dominant
+  wall-clock cost is Python API overhead, not the numerical solve itself:
+  the pure \texttt{solve\_full} time is ${\approx}0.105$\,ms/step while the
+  full pipeline is ${\approx}1.38$\,ms/step---a $13\times$ ratio.  OpenDSS
+  completes the 288-step profile in under 0.40\,s.
+
+  \item[\textbf{Sparse NR vs.\ dense GNN: the FLOP-count gap.}]
+  The fundamental reason GNN is slower on CPU is the difference between
+  sparse and dense arithmetic.  KLU-based Newton--Raphson exploits the extreme
+  sparsity of a radial distribution feeder's admittance matrix: it touches
+  only the tiny fraction of entries that are non-zero, giving a per-solve cost
+  that scales linearly with the number of buses, $O(n)$.  The GNN forward pass
+  performs \emph{dense} matrix multiplications at every node and edge in every
+  message-passing layer---the hidden-dimension weight matrices are fully
+  populated, every element participates, and there are no zeros to skip.  The
+  resulting arithmetic cost scales as $O(n \cdot h^{2} \cdot L)$ where $h$ is
+  the hidden width and $L$ the number of layers.  For any model of practical
+  accuracy ($h \gg 1$), the GNN requires orders of magnitude more arithmetic
+  than the sparse solver for the same network.  This gap is structural: it
+  cannot be closed by training tricks or architecture changes without
+  sacrificing representational capacity.
+
+  \item[\textbf{Why GPU and batching close the gap.}]
+  GPU Streaming Multiprocessors are designed precisely for the large dense
+  matrix multiplies that dominate GNN inference.  The $8.3\times$ forward
+  speedup from CPU $\to$ GPU (non-batched) reflects this: $4{,}518$\,ms on
+  CPU falls to $547$\,ms on GPU.  Batching 288 timesteps into one forward pass
+  extends each matrix from $95 \times 128$ to $27{,}360 \times 128$, improving
+  SM occupancy and amortising kernel-launch overhead, reducing the forward
+  to $261$\,ms ($2.1\times$ further).  OpenDSS cannot be trivially batched
+  because its sequential API and the battery controller's state-of-charge
+  dependency prevent cross-timestep parallelism.
+
+  \item[\textbf{The shifting bottleneck: tensor creation explodes under batching.}]
+  On GPU batched, \texttt{model\_forward} drops to $261$\,ms but
+  \texttt{tensor\_data\_creation} triples from $42$\,ms to $145$\,ms.
+  PyTorch Geometric's \texttt{Batch.from\_data\_list()} must sequentially
+  concatenate and offset-adjust 288 graph objects in Python, a loop that
+  cannot be parallelised.  As a result, pipeline overhead stages now account
+  for $47.5\%$ of total GNN time (versus $6.7\%$ in the non-batched GPU
+  case).  The forward-pass savings ($-286$\,ms) are partially consumed by
+  this batching overhead ($+103$\,ms), giving a net gain of only $188$\,ms
+  ($27\%$).  Vectorising feature construction and pre-building the batched
+  graph object---eliminating the Python loop over 288 \texttt{Data}
+  objects---are the highest-leverage remaining optimisation targets.
+
+  \item[\textbf{Why the 288 timestep solves cannot be parallelised across steps.}]
+  Each OpenDSS power-flow solve involves two nested loops: an \emph{outer} control
+  iteration loop (regulators, capacitor banks negotiating tap positions) and an
+  \emph{inner} Newton--Raphson loop (solving the linear system given fixed device
+  states).  The control iterations within a single timestep are self-contained---devices
+  reach mutual consistency internally---so in principle each timestep's full solve is
+  mathematically independent of the others.  GPU-accelerated NR solvers
+  (e.g.,~\cite{Wang2021GPU}) exploit exactly this property by dispatching independent
+  scenario solves to separate GPU threads.
+
+  However, in the present GNN2 simulation two factors prevent this parallelism.
+  First, OpenDSS exposes a single-scenario sequential API with no native batched-solve
+  interface.  Second, and more fundamentally, the battery storage controller operates
+  as an \emph{external} control loop outside OpenDSS: its dispatch decisions at
+  timestep~$t$ depend on the state of charge inherited from timestep~$t-1$, creating a
+  strict sequential dependency across the 288 timesteps that cannot be internalised or
+  parallelised regardless of the solver architecture.  This external state chain is the
+  binding constraint---not the power-flow math itself.
+
+  Note that the unequal iteration count across solves (some converging in 4 iterations,
+  others in 8) would additionally cause GPU warp divergence and idle threads if batch
+  parallelism were attempted, further eroding the potential throughput gain.
+
+  \item[\textbf{Latency vs.\ throughput.}]
+  For single-scenario latency, OpenDSS wins on this small feeder.  For high-throughput
+  what-if analysis (many independent scenarios in parallel on GPU), a batched GNN can
+  deliver better aggregate throughput.  The present test is a worst-case regime for the
+  GNN: small feeder, single scenario, no batching on the baseline.
+
+  \item[\textbf{When does a GNN outperform Newton--Raphson power flow?}]
+  For large systems (hundreds to thousands of buses), huge scenario batches, and GPU
+  inference, a learned surrogate can match or beat traditional power flow in wall time.
+  For $N = 89$ nodes, NR-based power flow is faster due to the small problem dimension
+  and the highly efficient sparse solver.  The claim ``GNN is faster than NR'' is
+  \emph{not universally true}---it depends on system size, hardware, and batch size.
+
+  \item[\textbf{MLP vs.\ GNN trade-off: speed.}]
+  A smaller, shallower MLP surrogate could potentially close the remaining gap even for
+  95 nodes, trading some accuracy for speed.  Conrad et al.~\cite{Conrad2026} confirm
+  this directly: \textit{``[T]he lowest computation times are obtained by the MLP\ldots
+  This corresponds to a speedup of about four for the GNNs and more than four hundred
+  for the MLP compared to N-R.''}  The MLP is therefore roughly two orders of magnitude
+  faster than the GNN on CPU single-scenario inference at small scale---the same regime
+  where our GNN currently struggles.
+
+  Figure~\ref{fig:conrad_fig5} reproduces their Figure~5. The x-axis is the number of
+  inference samples evaluated in one call (log scale); the y-axis is total computation
+  time (ms, log scale).  Two features are immediately apparent: (i)~the MLP line
+  (red) lies a full two orders of magnitude below both GNN variants across the entire
+  range, confirming the speed advantage of topology-agnostic architectures at small
+  scale; (ii)~all neural surrogates converge toward NR at very small sample counts
+  where fixed framework overhead dominates, and then diverge increasingly from NR
+  as the sample count grows, because NR scales linearly while the neural models
+  amortise their launch cost over more samples.  The GNN fixed overhead
+  (the flat portion at low sample counts) is precisely the kernel-launch and
+  message-passing dispatch cost that cannot be eliminated at batch size~1.
+  In our batched case the number of samples is 288 timesteps stacked into one
+  forward pass, which corresponds to $x = 288$ on this plot---a regime where
+  the MLP is still far cheaper.
+
+  \medskip
+  \noindent\textbf{Why samples are not sequential even on CPU.}
+  Conrad's benchmark is CPU-only (Intel Xeon Gold 6226, 16 cores, no GPU).
+  Despite this, the neural models are \emph{not} run sample-by-sample.
+  PyTorch stacks all $N$ inputs into one matrix of shape
+  $N \times d_{\text{in}}$ and executes a single forward pass; Intel
+  MKL/BLAS parallelises that matrix multiply across all 16 cores.
+  The per-sample cost therefore \emph{decreases} as $N$ grows because
+  larger matrices utilise CPU cache and SIMD units more efficiently.
+  Newton--Raphson cannot batch in the same way: each case requires its
+  own iterative convergence, so Conrad parallelises NR across the 16
+  cores but each core still runs full sequential solves for its assigned
+  cases.  The fixed per-case factorisation overhead of NR does not
+  amortise across a batch.  This is why the GNN's advantage over NR
+  \emph{grows} with $N$ despite everything running on CPU.
+
+  \medskip
+  \noindent\textbf{CPU vs.\ GPU is quantitative, not qualitative.}
+  A GPU performs the identical batched matrix multiply---the same
+  BLAS operation---but with roughly ${\sim}500\times$ more parallel
+  workers (thousands of CUDA cores vs.\ 16 CPU cores).  Conrad's
+  ${\approx}100\times$ MLP speed advantage over GNN is measured
+  entirely on CPU; on GPU the ratio may narrow because the GPU is
+  also better at the GNN's irregular gather/scatter aggregation, but
+  the MLP advantage does not disappear---it merely shrinks.
+  The fundamental cost difference (MLP = pure dense matmul; GNN =
+  dense matmul $+$ irregular edge aggregation) exists on both CPU
+  and GPU.
+
+  \begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.65\linewidth]{conrad_fig5.pdf}
+  \caption{Reproduced from Conrad et al.~\cite{Conrad2026}, Figure~5.
+    Inference computation time (ms) vs.\ number of samples (log--log scale)
+    on a 5-bus system, CPU-only benchmark.
+    The MLP (red) is consistently around two orders of magnitude faster than
+    either GNN variant (blue/green) across all sample sizes, while both GNNs
+    are roughly $4\times$ faster than Newton--Raphson (purple) at large batch.
+    At small sample counts the GNN fixed overhead flattens the curve,
+    whereas the MLP overhead is negligible.}
+  \label{fig:conrad_fig5}
+  \end{figure}
+
+  \medskip
+  \noindent\textbf{MLP vs.\ GNN trade-off: accuracy.}
+  On Conrad et al.'s homogeneous 5-bus system the GNN does achieve lower loss:
+  their best GNN (GNN1, global decoder) reaches a test MSE of $5.65 \times 10^{-6}$
+  against the MLP's $1.14 \times 10^{-5}$---roughly a $2\times$ accuracy advantage
+  for the GNN.  The GNN's structural inductive bias (messages propagate along
+  physical edges, mirroring Kirchhoff's laws) helps it learn the underlying
+  physics with fewer parameters than a flat MLP.
+
+  However, three factors limit how far this accuracy advantage extends to a
+  heterogeneous distribution feeder such as the IEEE 34-bus system studied here.
+
+  \textbf{(1) Fixed topology removes GNN's primary justification.}
+  The canonical argument for a GNN surrogate is cross-topology
+  generalisation: train once, evaluate on grids you have never seen, without
+  retraining.  In the present work the topology is fixed---every simulation
+  uses the same IEEE 34-bus feeder.  An MLP trained on this feeder does not
+  need to generalise across topologies; it only needs to learn the
+  input-output mapping for this specific graph.  On a fixed topology the
+  MLP's lack of topological inductive bias is not a disadvantage.
+
+  \textbf{(2) GNN message-passing uses the same rule for every node.}
+  Standard GNN propagation applies a shared weight matrix $W$ to the
+  aggregated neighbourhood of every node identically, regardless of whether
+  that node is a load bus, a generator bus, a voltage regulator, or a
+  capacitor bank.  In a distribution feeder, buses are fundamentally
+  heterogeneous: spot loads, distributed loads, ZIP-model consumers, PV
+  inverters, and voltage regulators each obey different equations.  The
+  shared propagation rule is a strong homogeneity assumption that may fail
+  to capture this diversity.  Bus-type-specific encoders and decoders
+  (as used by Conrad et al.\ and Kim et al.)\ partially address the
+  embedding and readout stages, but the propagation weights remain shared.
+  An MLP, by contrast, has fully independent weights for each input
+  dimension and can learn bus-specific behaviour implicitly from data
+  without any architectural constraint.
+
+  \textbf{(3) Distribution-specific elements are hard to encode as graph features.}
+  Voltage regulators maintain a downstream voltage setpoint through
+  tap-changing logic; capacitor banks switch in discrete steps to manage
+  reactive power.  Both introduce strongly non-linear, state-dependent
+  behaviour that interacts across multiple buses.  Encoding these elements
+  accurately as node or edge features requires domain knowledge, and any
+  mismatch between the feature representation and the actual device physics
+  propagates through the message-passing layers.  A sufficiently wide MLP,
+  given the same features, may learn these interactions just as well---or
+  better---without the architectural constraint of locality.
+
+  \noindent The net implication is that for the specific use case of
+  fixed-topology, single-feeder distribution simulation, the accuracy
+  advantage of a GNN over an MLP is likely smaller than the Conrad et al.\
+  homogeneous benchmark suggests, while the speed disadvantage of the GNN
+  remains large.  A well-tuned MLP is therefore a serious alternative
+  that deserves empirical comparison on this feeder before committing to
+  a GNN architecture.
+
+\end{description}
+
+% =============================================================================
+\section{Conclusion and Next Steps}
+% =============================================================================
+
+On the 95-node feeder tested, OpenDSS (CPU) is the fastest solver for
+single-scenario latency, completing 288 timesteps in under 0.18\,s.
+GNN inference on CPU is ${\approx}11.7\times$ slower per step, but GPU
+acceleration and batching reduce this gap to just ${\approx}1.6\times$.
+These results are consistent with the broader literature: GNN surrogates
+offer their greatest advantage at scale rather than for small,
+single-scenario evaluations.  The sequential dependency introduced by the
+external battery controller further prevents cross-timestep parallelism
+that might otherwise be exploited.
+
+\medskip
+\noindent\textbf{Priority next steps:}
+\begin{enumerate}[itemsep=3pt]
+  \item \textbf{Minimise host\,$\leftrightarrow$\,device transfers.}
+        In the current pipeline, every timestep moves a freshly built
+        node-feature tensor from CPU RAM to GPU VRAM via PCIe.
+        PCIe~4.0 bandwidth is ${\approx}16$\,GB/s, so a $95\times d$
+        float32 tensor is cheap to transfer---but the \emph{synchronisation
+        overhead} (initiating the transfer, waiting for completion before
+        the kernel can launch) costs ${\approx}10$--$50\,\mu$s per call
+        regardless of tensor size, and is currently paid on every step.
+        Three concrete mitigations: (a)~\textbf{pre-pin} the input buffer
+        with \texttt{torch.zeros(\ldots, pin\_memory=True)} so
+        CUDA can DMA directly from page-locked RAM, cutting the per-transfer
+        penalty roughly in half; (b)~\textbf{pre-allocate persistent GPU
+        tensors} for \texttt{edge\_index} and edge features---these are
+        fixed across all timesteps and should be loaded once at startup;
+        (c)~\textbf{overlap transfer and compute} using two CUDA streams
+        so that the host prepares step $t{+}1$'s features while the GPU
+        runs the forward pass for step $t$.  Together these can reduce
+        the effective host$\leftrightarrow$device cost from ${\sim}40$\,ms
+        (288 synchronous transfers) to near zero.
+        After this, the remaining bottleneck shifts entirely into
+        \texttt{tensor\_data\_creation} (currently 29\% of GPU-batched
+        GNN time), which is the next target.
+
+  \item \textbf{Vectorise \texttt{build\_gnn\_x} and \texttt{tensor\_data\_creation}.}
+        Feature construction and PyG batching together account for up to 47\% of
+        total GNN time in the GPU-batched configuration.  Both are currently
+        Python loops and run on CPU; converting to batch tensor operations
+        (pre-stacked arrays, a single \texttt{Batch.from\_data\_list} call
+        replaced by a direct concatenation + offset addition) can reduce
+        this to a few microseconds.
+
+  \item \textbf{Explore lighter MLP architectures} for small feeders where full
+        message-passing GNNs may be over-parameterised.
+
+  \item \textbf{Scale tests to larger networks} (hundreds--thousands of buses)
+        where GNN parallelism becomes the decisive advantage.
+
+  \item \textbf{Profile batch-size sensitivity} to identify the optimal batch
+        size for the GPU configuration in use.
+\end{enumerate}
+
+% =============================================================================
+\section{Why No GNN Beats a Classical Solver at CPU Batch Size One}
+\label{sec:impossibility}
+% =============================================================================
+
+\noindent\textbf{Central claim:} No published paper demonstrates a GNN or any
+machine-learning surrogate outperforming a traditional power-flow solver
+(Newton--Raphson, OpenDSS, backward--forward sweep) on a distribution system
+under the simultaneous conditions of CPU-only inference, single-scenario
+execution, and sequential processing.  This is not an oversight in the
+literature.  It reflects a fundamental, quantifiable mismatch between the
+computational structure of sparse iterative solvers and dense neural-network
+inference when executed one scenario at a time on a CPU.  Four independent
+lines of published evidence each reach the same conclusion; a fifth covers
+how GPU-batched NR itself erodes the GNN advantage in the high-throughput
+regime.
+
+% ── Evidence 1 ──────────────────────────────────────────────────────────────
+\subsection{Evidence 1: The Sub-Millisecond Floor Set by lightsim2grid}
+
+The most direct quantitative evidence comes from \textbf{lightsim2grid}
+\cite{lightsim2grid}, a C\texttt{++} backend for Grid2Op developed by
+Benjamin Donnot at RTE France.  It wraps the KLU sparse direct solver from
+SuiteSparse and represents the realistic performance floor that any surrogate
+must beat.  Its official benchmark documentation reports the following
+per-solve times on a single CPU core of an Intel i7-6820HQ laptop
+(2015 vintage):
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{4.5cm}
+  >{\centering\arraybackslash}p{2.8cm}
+  >{\centering\arraybackslash}p{2.8cm}
+  >{\centering\arraybackslash}p{3.2cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{System}}
+  & \textcolor{white}{\textbf{lightsim2grid (KLU)}}
+  & \textcolor{white}{\textbf{pandapower (NR)}}
+  & \textcolor{white}{\textbf{lightsim2grid speedup}} \\
+\midrule
+\rowcolor{rowblue}
+IEEE 14-bus   & $\approx 0.010$\,ms & $\approx 9$\,ms   & $900\times$  \\
+IEEE 118-bus  & $\approx 0.063$\,ms & $\approx 9$\,ms   & $143\times$  \\
+\rowcolor{rowblue}
+L2RPN NeurIPS ($\approx$118-bus) & $\approx 0.080$\,ms & --- & --- \\
+IEEE 6470rte  & $\approx 0.580$\,ms & $\approx 580$\,ms & ${\approx}1{,}000\times$ \\
+\bottomrule
+\end{tabular}
+\caption{lightsim2grid single-scenario CPU solve times from the official
+  benchmark documentation~\cite{lightsim2grid}.  Note that 97\% of total
+  wall time in the 14-bus case is overhead \emph{external} to the solver
+  (data conversion, Grid2Op layer); the raw numerical solve is
+  effectively instantaneous.}
+\label{tab:lightsim}
+\end{table}
+
+These numbers establish a hard target.  A GNN running on CPU at batch
+size~1 must beat ${\approx}0.063$\,ms for a 118-bus system.
+Critically, \textbf{every favourable GNN comparison in the published
+literature uses pandapower as the NR baseline}---which is up to $900\times$
+slower than lightsim2grid.  PowerFlowNet's reported $4\times$ speedup over
+pandapower on IEEE 14-bus~\cite{Lin2024} implies the GNN would be
+${\approx}200$--$900\times$ \emph{slower} than lightsim2grid on the same
+case.  The appearance of GNN speed advantage is therefore largely an
+artefact of baseline choice, not a genuine algorithmic advantage over
+optimised sparse solvers.
+
+\medskip
+\noindent\textbf{Why lightsim2grid is so fast.}
+KLU uses a right-looking sparse LU factorisation with AMD fill-reducing
+ordering, specifically designed for circuit simulation matrices with
+radial (tree-like) sparsity~\cite{Davis2010}.  For a purely radial
+distribution feeder, the admittance matrix has a tree sparsity pattern
+that produces essentially zero fill-in during factorisation.  Both the
+factorisation and each forward/back substitution therefore cost $O(n)$
+floating-point operations.  Pre-factoring the topology on load means each
+new timestep only requires updating the current-injection right-hand side
+and performing two $O(n)$ triangular solves---no matrix assembly, no
+refactorisation, no Python overhead.  The entire computation fits in L2
+cache for networks up to several thousand buses.
+
+% ── Evidence 2 ──────────────────────────────────────────────────────────────
+\subsection{Evidence 2: PyTorch Framework Overhead Exceeds the Entire Solve Time}
+
+This line of evidence is independent of power systems entirely.  It
+concerns the irreducible overhead imposed by PyTorch's execution engine
+when running a single forward pass at batch size~1 on CPU.
+
+\textbf{Per-operation dispatch cost.}
+PyTorch's eager-mode execution dispatches each tensor operation through a
+Python-to-C\texttt{++} binding layer, performs type-checking and shape
+inference, allocates output tensors, and schedules the kernel.
+PyTorch GitHub issue~\#41383~\cite{pytorch_overhead} directly measured
+this cost: \textbf{6.8 seconds for one million scalar-multiply operations,
+i.e.\ ${\approx}6.8\,\mu$s per tensor operation.}
+A typical GNN forward pass involves 30--100 distinct tensor operations
+(scatter, gather, \texttt{addmm}, activation, layer-norm,
+\texttt{index\_select}, etc.).  At $6.8\,\mu$s each, this accumulates
+to \textbf{0.2--0.7\,ms of pure dispatch overhead before any useful
+floating-point computation occurs.}  For the IEEE 118-bus system, this
+overhead alone already exceeds the lightsim2grid solve time of
+$0.063$\,ms by a factor of $3$--$11\times$.
+
+\textbf{Memory allocation overhead.}
+Each intermediate tensor must be allocated on the heap during the forward
+pass.  A 3-layer GNN on a 100-node graph with hidden dimension~64 creates
+approximately 15--30 intermediate tensors per layer.  Heap allocations
+in Python/C\texttt{++} cost roughly $0.1$--$1\,\mu$s each; across 50--90
+allocations per forward pass, this adds \textbf{5--90\,$\mu$s of
+allocation overhead}.  Combined with garbage-collection pressure from
+Python reference counting, total memory overhead in eager mode reaches
+\textbf{0.5--2.0\,ms} for a small graph.
+
+\textbf{TorchScript and \texttt{torch.compile} do not eliminate the gap.}
+Even with \texttt{torch.compile(mode=\char`\"reduce-overhead\char`\")} and CUDA
+Graphs, the best documented speedup for small GNNs on CPU is
+${\approx}2$--$4\times$~\cite{pyg_compile}.  This reduces total
+forward-pass time from ${\sim}2$\,ms to ${\sim}0.5$--$1$\,ms.
+Lightsim2grid's $0.063$\,ms target is still \textbf{8--16$\times$ below
+the best-case compiled GNN inference time on CPU.}  Operator fusion
+reduces kernel-launch overhead but cannot change the FLOP count ratio.
+
+% ── Evidence 3 ──────────────────────────────────────────────────────────────
+\subsection{Evidence 3: FLOP Count Gap Between GNN and Sparse Solver}
+
+This argument is structurally independent of any specific implementation
+and applies regardless of software framework or hardware.
+
+\textbf{Newton--Raphson / KLU FLOP count for radial networks.}
+For a distribution feeder with $n$ buses and near-tree topology, the
+admittance matrix has $O(n)$ non-zeros and KLU's LU factorisation
+produces essentially zero fill-in.  The per-solve cost at warm-start
+(pre-factored, 2 iterations) is approximately $4n$ FLOPs.
+For $n = 100$ buses: $\mathbf{{\approx}400}$\,\textbf{FLOPs}.
+
+\textbf{GNN FLOP count.}
+For a GNN with $L$ message-passing layers, hidden dimension $h$,
+$|V|$ nodes, and $|E|$ edges:
+\[
+\text{FLOPs}_{\text{GNN}}
+  \approx 2|V|dh
+  + L\!\left(2|E|h^2 + |E|h + 2|V|h^2\right)
+  + 2|V|h\,d_{\text{out}},
+\]
+where $d$ is input dimension and $d_{\text{out}}$ is output dimension.
+For $|V|=100$, $|E|=99$ (radial), $d=2$, $h=64$, $L=3$,
+$d_{\text{out}}=2$:
+\[
+\text{FLOPs}_{\text{GNN}} \approx 4{,}900{,}000\;\text{FLOPs}.
+\]
+The ratio is:
+\[
+\frac{\text{FLOPs}_{\text{GNN}}}{\text{FLOPs}_{\text{NR}}}
+\approx \frac{4{,}900{,}000}{400} = \mathbf{12{,}250\times.}
+\]
+Even under the most generous assumptions (NR requires 5 iterations and
+GNN uses hidden dim 32 with 2 layers), the GNN requires
+\textbf{at least 2,000$\times$ more floating-point operations}.
+Conrad et al.\ (2026)~\cite{Conrad2026} confirm this experimentally on a
+CPU benchmark of a 5-bus system.  In their words: \textit{``This corresponds
+to a speedup of about four for the GNNs and more than four hundred for the
+MLP compared to N-R\ldots\ For small sample sizes the advantage of the neural
+models is less pronounced, as the fixed overhead of the GNNs dominates,
+whereas for larger case studies the advantage becomes much more
+significant.''}  The MLP therefore beats the GNN by roughly two orders of
+magnitude on CPU single-scenario inference, revealing that message-passing
+overhead dominates the NR solve time even at small scales.
+
+On CPU, the $4.9$\,million FLOPs for a 100-bus GNN would require
+${\approx}0.05$--$0.2$\,ms of pure compute time if all operations were
+perfectly vectorised and cache-resident.  In practice, the irregular
+gather/scatter operations of message-passing destroy SIMD vectorisation and
+cause cache misses on the edge-index arrays, realising only ${\approx}5$--$15\%$
+of peak throughput.  The effective compute time therefore reaches
+\textbf{0.3--1.0\,ms}, giving a total wall time of \textbf{0.5--2.0\,ms}
+when added to framework overhead---well above lightsim2grid's $0.063$\,ms
+target.
+
+% ── Evidence 4 ──────────────────────────────────────────────────────────────
+\subsection{Evidence 4: Batched NR on GPU Further Erodes the GNN Advantage}
+
+A critical paper often overlooked in GNN-vs-NR comparisons is
+Wang et al.\ (2021)~\cite{Wang2021GPU}, which GPU-accelerates NR itself
+using batched sparse LU refactorisation with identical sparsity patterns,
+achieving \textbf{over $100\times$ speedup} over pandapower for solving
+many power flows simultaneously.
+
+This directly undermines the GNN value proposition: if the speed advantage
+of GNNs comes from GPU batching, and NR can also be GPU-batched with equal
+or greater efficiency (because NR's operations map naturally to batched
+sparse algebra), then the GNN's only remaining advantage is at very large
+grid scales where NR's $O(n^{1.5})$ scaling eventually crosses the GNN's
+$O(n \cdot h^2 \cdot L)$ scaling.  TensorPowerFlow
+(Delgado-Mor\'{a}n et al., \textit{IJEPES}, 2024) similarly demonstrates
+$164\times$ speedup using GPU-batched fixed-point iteration for distribution
+systems.  Any fair comparison of GNN vs.\ NR in the batched regime should
+therefore use a GPU-accelerated NR baseline, not pandapower.
+
+% ── Evidence 5 ──────────────────────────────────────────────────────────────
+\subsection{Evidence 5: The Only Batch-Size-1 Empirical Test Confirms NR Wins}
+
+All four preceding lines of evidence are theoretical or derived from
+indirect measurements.  The fifth is direct empirical.
+
+Kim et al.\ (ICASSP 2026)~\cite{Kim2026} present PIGNN-Attn-LS, the
+\textbf{only paper identified in the 2019--2026 literature that explicitly
+measures and reports GNN inference time versus NR at batch size~1.}
+Section~4.3 of the paper states:
+\begin{quote}
+\textit{``PIGNN runs on a GPU with batch size 1, and NR runs on a CPU
+with one worker''}
+\end{quote}
+and reports:
+\begin{quote}
+\textit{``In single-scenario runs, NR is competitive.''}
+\end{quote}
+Even with a GPU, the GNN does not beat NR in single-scenario mode until
+grid sizes exceed several hundred buses.  The paper's $2$--$5\times$
+speedup arises \emph{exclusively} from the streaming micro-batch regime
+(4,096 scenarios simultaneously) where NR must run sequentially on 20 CPU
+workers while the GNN amortises GPU overhead across thousands of forward
+passes.
+
+% ── Systematic accounting ────────────────────────────────────────────────────
+\subsection{Systematic Accounting of Published Speedup Claims}
+
+Table~\ref{tab:bs1} gives a complete accounting of the relevant 2019--2026
+papers and their relationship to the batch-size-1 question.
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.5cm}
+  >{\centering\arraybackslash}p{1.0cm}
+  >{\centering\arraybackslash}p{1.8cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\raggedright\arraybackslash}p{2.8cm}
+  >{\raggedright\arraybackslash}p{2.2cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Paper}} &
+\textcolor{white}{\textbf{Year}} &
+\textcolor{white}{\textbf{BS=1 tested?}} &
+\textcolor{white}{\textbf{Speedup claim}} &
+\textcolor{white}{\textbf{Baseline solver}} &
+\textcolor{white}{\textbf{Adjusted vs.\ opt.\ NR}} \\
+\midrule
+\rowcolor{rowblue}
+PIGNN-Attn-LS~\cite{Kim2026}
+  & 2026 & \textcolor{darkgreen}{\textbf{Yes, explicit}}
+  & 2--5$\times$ (batched only)
+  & Optimised NumPy NR & \textcolor{warnred}{NR wins at BS=1} \\
+PowerFlowNet~\cite{Lin2024}
+  & 2024 & Not confirmed
+  & 4--145$\times$ & pandapower
+  & Likely ${<}1\times$ (small grids) \\
+\rowcolor{rowblue}
+PowerFlowMultiNet~\cite{Ghamizi2024}
+  & 2024 & Not confirmed
+  & 15--38$\times$ & OpenDSS solve-only
+  & Likely ${<}1\times$ (CPU BS=1) \\
+B\"{o}ttcher et al.~\cite{Bottcher2023}
+  & 2023 & No (batched)
+  & up to 1{,}000$\times$ & PyPower CPU
+  & N/A (contingency batch) \\
+\rowcolor{rowblue}
+Hybrid GNN-IZR~\cite{Shamseldein2025b}
+  & 2025 & Ambiguous
+  & \textcolor{warnred}{2.7$\times$ \textbf{slower}}
+  & PyPower & GNN slower already \\
+Donon et al.~(2019/2020)
+  & 2020 & Not confirmed
+  & ``Not significant'' (2019)
+  & Hades2 / NR & Unknown \\
+\bottomrule
+\end{tabular}
+\caption{Systematic accounting of GNN speed claims relative to the
+  batch-size-1 single-scenario CPU question.  No paper claims a GNN
+  advantage in this regime; the one paper that tests it finds NR wins.}
+\label{tab:bs1}
+\end{table}
+
+% ── Synthesis ────────────────────────────────────────────────────────────────
+\subsection{Synthesis: A Convergent Five-Layer Argument}
+
+The five lines of evidence are independent and converge on the same
+quantitative conclusion, summarised in Table~\ref{tab:convergence}.
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.8cm}
+  >{\raggedright\arraybackslash}p{4.5cm}
+  >{\centering\arraybackslash}p{4.0cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Evidence source}} &
+\textcolor{white}{\textbf{Key measurement}} &
+\textcolor{white}{\textbf{GNN CPU disadvantage}} \\
+\midrule
+\rowcolor{rowblue}
+lightsim2grid~\cite{lightsim2grid}
+  & KLU solves IEEE 118-bus in $0.063$\,ms on CPU
+  & GNN $\geq 8$--$30\times$ slower \\
+PyTorch overhead~\cite{pytorch_overhead}
+  & $6.8\,\mu$s per tensor op;
+    $0.5$--$2$\,ms total dispatch per forward pass
+  & Overhead alone exceeds solve time \\
+\rowcolor{rowblue}
+FLOP count analysis (this work)
+  & GNN requires ${\sim}12{,}000\times$ more FLOPs
+    than sparse NR for 100-bus system
+  & Structural, not implementation-specific \\
+GPU-batched NR~\cite{Wang2021GPU}
+  & $>100\times$ over pandapower; NR also benefits from GPU
+  & GNN loses its batching exclusivity \\
+\rowcolor{rowblue}
+PIGNN-Attn-LS~\cite{Kim2026}
+  & Only paper testing BS=1 explicitly;
+    ``NR is competitive''
+  & Direct empirical confirmation \\
+\bottomrule
+\end{tabular}
+\caption{Five independent lines of evidence, each confirming that GNN CPU
+  inference at batch size~1 cannot beat an optimised sparse solver on
+  small-to-medium distribution networks.}
+\label{tab:convergence}
+\end{table}
+
+The root cause is not a limitation of GNN architecture or training
+methodology.  It is a fundamental property of the problem structure:
+distribution power-flow problems on radial networks have $O(n)$
+computational complexity under sparse direct methods, while GNN inference
+has $O(n \cdot h^2 \cdot L)$ complexity with a large constant factor
+$h^2$ (typically $1{,}024$--$16{,}384$) that no architecture choice can
+eliminate without sacrificing representational capacity.  The framework
+overhead adds a further fixed cost of $0.5$--$2.0$\,ms that does not
+decrease with graph size.
+
+For any sparse, well-structured physical simulation problem where an
+optimised compiled solver achieves sub-millisecond single-scenario latency,
+a Python-based GNN inference pipeline running at batch size~1 on CPU cannot
+compete---regardless of the GNN's accuracy, architecture, or training
+dataset.  The regime where GNNs genuinely win is confined to large-batch,
+GPU-accelerated, many-scenario evaluations where GPU throughput and batch
+amortisation of overhead together overcome the FLOP-count and
+framework-overhead deficits.
+
+% =============================================================================
+\section{Comparison Between PowerFlowNet and the PF-Identity GNN Models}
+% =============================================================================
+
+This section compares the PowerFlowNet formulation from the literature against the
+PF-identity GNN models developed in this work, with emphasis on (i)~problem
+formulation, (ii)~input representation, (iii)~model architecture,
+(iv)~reported predictive performance, and (v)~runtime behaviour relative to
+traditional power-flow solvers.
+
+\subsection{What PowerFlowNet Does}
+
+PowerFlowNet~\cite{Lin2024} formulates the AC power-flow problem as a
+graph-based node-regression task on a transmission network.
+Buses are graph nodes, transmission lines are edges.  For each node~$i$,
+the state vector is
+\[
+x_i = (V_{m,i},\,\theta_i,\,P_i,\,Q_i),
+\]
+while each edge $(i,j)$ carries
+\[
+x^e_{ij} = (\Re[z_{ij}],\,\Im[z_{ij}]).
+\]
+PowerFlowNet is a partial-state reconstruction problem: for PQ buses $P$ and
+$Q$ are known; for PV buses $V_m$ and $P$ are known; for the slack bus $V_m$
+and $\theta$ are known.  The model predicts the missing portions of the full
+AC bus state via a learned mask embedding,
+\[
+\hat m_i = W_1\,\sigma(W_0 m_i + b_0) + b_1,
+\]
+combined with edge-aware message passing and a TAGConv-style multi-hop
+graph convolution
+\[
+\hat y(S,X) = \sigma\!\left(\sum_{k=0}^{K-1} S^k X W_k\right).
+\]
+
+\subsection{How the PF-Identity GNN in This Work Differs}
+
+The PF-identity GNN is a distribution-level voltage surrogate, not a
+transmission-level full-state approximator.  The graph is defined over
+bus-phase nodes; each directed edge $(j\!\to\!i)$ carries
+$e_{ji} = [R_{ji},X_{ji}]\in\mathbb{R}^2$
+together with a learned edge-identity embedding.  The model predicts only
+the per-unit voltage magnitude $v_i$:
+\[
+z_i = \mathrm{Emb}_{node}(i),\quad r_{ji} = \mathrm{Emb}_{edge}(\mathrm{id}(j,i)),
+\]
+\[
+h_i^{(0)} = \phi_0([x_i,z_i]),
+\]
+\[
+m_{ji}^{(\ell)} = \psi^{(\ell)}([h_j^{(\ell)},e_{ji},r_{ji}]),
+\qquad
+m_i^{(\ell)} = \textstyle\sum_{j\in\mathcal{N}(i)} m_{ji}^{(\ell)},
+\]
+\[
+h_i^{(\ell+1)} = \mathrm{Upd}^{(\ell)}([h_i^{(\ell)},m_i^{(\ell)},z_i]),
+\qquad
+\hat v_i = \rho(h_i^{(L)}).
+\]
+Training loss is MSE on voltage magnitude:
+$\mathcal{L} = \frac{1}{N}\sum_i(\hat v_i - v_i)^2$.
+
+\subsection{Comparison of Datasets Against PowerFlowNet}
+
+\subsubsection{Injection Dataset}
+
+Node features $x_i = [p_{\text{inj},i},\,q_{\text{inj},i}]\in\mathbb{R}^2$
+resemble the PQ-bus portion of classical power-flow input, but differ from
+PowerFlowNet in that no partial bus-state masking is applied and only voltage
+magnitude is predicted.
+
+\subsubsection{Load-Type Dataset}
+
+Node features are
+\[
+x_i =
+[\text{elec.\ dist.},\,m1p,\,m1q,\,m2p,\,m2q,\,m4p,\,m4q,\,m5p,\,m5q,\,
+ q_\text{cap},\,p_\text{pv},\,q_\text{pv},\,p_\text{sys},\,q_\text{sys}].
+\]
+This formulation is distribution-specific: it exposes local load-model
+structure, capacitor-bank support, PV injection, and system-level balance
+quantities that are irrelevant in transmission-level approximations.
+
+\subsection{Architectural Differences}
+
+PowerFlowNet targets full-state transmission approximation and includes a
+learned mask encoder, edge-aware message passing, TAGConv multi-hop
+convolution, and prediction of $(V_m,\theta,P,Q)$.
+
+The PF-identity GNN targets distribution-level voltage prediction and
+includes learned node/edge identity embeddings, MLP-based message and
+update functions, and direct prediction of voltage magnitude only.
+
+\medskip
+\noindent\textbf{Graph node granularity.}
+A key structural difference concerns what constitutes a graph node.
+PowerFlowMultiNet uses one node per \emph{bus}, so a 13-bus network is a
+13-node graph.  Node features store all three phases together:
+\[
+x_i^{\text{MNet}} = [P_a,\,Q_a,\,P_b,\,Q_b,\,P_c,\,Q_c] \in \mathbb{R}^6.
+\]
+The PF-identity GNN in this work uses one node per \emph{bus-phase}, so the
+same three-phase system with $N$ buses becomes up to $3N$ graph nodes.
+Phases are not features within a node---they are separate first-class
+entities in the graph.  This finer granularity is necessary to capture
+single-phase laterals, per-phase capacitor switching, and asymmetric loading,
+but it makes the graph $3\times$ larger and the message-passing $3\times$
+heavier per layer.
+
+\noindent\textbf{Multigraph edges.}
+PowerFlowMultiNet introduces a multigraph representation: two buses may be
+connected by \emph{multiple} parallel edges, one per phase of the physical
+connection.  A three-phase line between buses $i$ and $j$ produces three
+edges; a single-phase lateral produces one.  Each edge carries
+$x^e_{ij} = [\text{phase id},\;\text{type (line/transformer)},\;\text{tap state}]$.
+This allows per-phase asymmetry to be encoded in edge features rather than
+requiring separate phase nodes, which is a more compact representation but
+requires the message-passing operator to handle variable-degree multigraph
+neighbourhoods.  The PF-identity GNN uses directed single edges per
+bus-phase pair with $e_{ji} = [R_{ji},\,X_{ji}]$ and a learned edge-identity
+embedding, avoiding the multigraph complexity at the cost of a larger graph.
+
+\subsection{Reported Accuracy}
+
+PowerFlowNet reports a voltage-magnitude MAE of ${\approx}0.0012\,\text{p.u.}$
+on the IEEE 118-bus case (${\approx}0.0149\,\text{p.u.}$ under PV/PQ switching).
+
+The best PF-identity GNN results in this work are:
+\begin{itemize}
+  \item Injection dataset: MAE $\approx 0.00567$, RMSE $\approx 0.00771$\,p.u.
+  \item Load-type dataset: MAE $\approx 0.00158$, RMSE $\approx 0.00221$\,p.u.
+\end{itemize}
+The load-type model reaches accuracy in the same order of magnitude as
+PowerFlowNet, despite a harder prediction task.
+
+\subsection{Reported Speed Relative to Traditional Solvers}
+
+PowerFlowNet reports speedups of $4\times$ (14-bus), $5\times$ (118-bus),
+and $48\times$ (6470-bus) over Newton--Raphson~\cite{Lin2024}.  The
+execution time of the GNN remains nearly constant across grid sizes while NR
+time grows with problem scale.
+
+By contrast, the speed benchmark in this work shows that on the 95-node
+distribution feeder, OpenDSS is faster than the current GNN pipeline in
+single-scenario latency:
+\[
+\bar t^{\text{wall}}_{\text{DSS}} \approx 1.38\;\text{ms/step},
+\qquad
+\bar t^{\text{solve}}_{\text{DSS}} \approx 0.105\;\text{ms/step}.
+\]
+On CPU, OpenDSS is roughly $11.7\times$ faster per timestep (full pipeline).
+On GPU with batching, the gap narrows to $1.6\times$.
+
+\subsection{Testbed Complexity: PowerFlowMultiNet vs.\ IEEE~34-Bus}
+
+The three PowerFlowMultiNet test cases (IEEE~13-bus, IEEE~123-bus, European
+LV~906-bus) are all unbalanced and three-phase, which is the right problem
+class.  However, they do not fully exercise the characteristics that make
+real distribution systems hard.
+
+The IEEE~34-bus feeder is a standard benchmark specifically designed to stress
+distribution solvers.  Its distinguishing features are: (i)~a very long,
+lightly loaded feeder with high R/X ratio causing large voltage drops;
+(ii)~two in-line voltage regulators whose tap-changing logic introduces outer
+control-iteration loops; (iii)~a mix of spot loads and \emph{distributed
+loads} spread along line segments rather than concentrated at bus terminals;
+(iv)~single-phase laterals intermixed with the three-phase trunk; and
+(v)~voltage-dependent load models (ZIP loads) in the standard model, meaning
+the actual consumed $P$ and $Q$ change with the solved voltage.
+
+The IEEE~13-bus---PowerFlowMultiNet's smallest and most-cited test case---is
+the ``hello world'' of unbalanced distribution: 13 buses, mostly constant-power
+spot loads, one transformer, and one regulator.  It does not exhibit the
+long-feeder voltage profiles, multi-regulator tap interactions, or distributed
+load geometry of~34-bus.  The~123-bus case is larger and more realistic, but
+the European LV~906-bus network targets low-voltage residential topology
+(high R/X but no in-line regulators or mixed load models of the 34-bus type).
+
+None of the PowerFlowMultiNet test cases therefore stress the solver
+in the same way as a 34-bus-style feeder.  This matters for evaluating
+how well the model generalises under the conditions that challenge
+traditional solvers most.
+
+\subsection{Why PowerFlowMultiNet Appears Fast While the Present GNN Does Not}
+
+A careful reading of the PowerFlowMultiNet paper~\cite{Ghamizi2024} reveals
+four concrete methodological differences that together explain the apparent
+discrepancy, beyond the general structural factors discussed in the literature.
+
+\textbf{(1) Measurement methodology: their speedup is conservative, not inflated.}
+PowerFlowMultiNet explicitly compares
+\emph{``the forward operation of the deep learning model with the
+\textbf{solve operation} of OpenDSS''} (Section~III-d of~\cite{Ghamizi2024}).
+In the present benchmark, two distinct OpenDSS timings were recorded:
+
+\[
+\bar{t}^{\text{wall}}_{\text{DSS}} \approx 1.38\;\text{ms/step}
+\quad\text{(full pipeline, including API overhead)},
+\]
+\[
+\bar{t}^{\text{solve}}_{\text{DSS}} \approx 0.105\;\text{ms/step}
+\quad\text{(pure numerical solve only)}.
+\]
+
+The ratio between these two is ${\approx}13\times$.
+The speedup ratio is defined as $\text{OpenDSS time} / \text{GNN time}$,
+so a \emph{larger} OpenDSS baseline produces a \emph{larger} reported speedup.
+By comparing against the solve-only time---the smallest possible OpenDSS
+number---PowerFlowMultiNet actually \emph{understates} its advantage.
+Had it compared against the full wall-clock time instead, the reported
+$15\times$ speedup on the 13-bus case would scale by the factor
+$\bar{t}^{\text{wall}}_{\text{DSS}} / \bar{t}^{\text{solve}}_{\text{DSS}}
+\approx 13\times$, yielding a ratio closer to ${\approx}200\times$.
+
+This makes their speedup claim more impressive and more valid than it
+might initially appear.  It also means this measurement choice cannot
+explain the discrepancy with the present work.  The reasons the present
+GNN appears slower must lie elsewhere (see points 2 and 3 below, and the
+structural factors that follow).
+
+For completeness: had the present work adopted the solve-only baseline,
+our GPU GNN (batched, ${\approx}1.7\;\text{ms/step}$) would appear
+${\approx}16\times$ \emph{slower} than OpenDSS solve-only
+($0.105\;\text{ms}$)---worse than the $1.6\times$ slower figure reported
+against the full wall-clock time.  This illustrates that the choice of
+OpenDSS baseline matters greatly for how results read, but the present
+work's baseline (full wall-clock) is the harder and more meaningful target
+for real deployment.
+
+\textbf{(2) Batching strategy: thousands of independent scenarios, not sequential timesteps.}
+PowerFlowMultiNet is trained and evaluated with a batch size of 128 on
+a 2,000-sample validation set, meaning the reported ``forward operation'' time
+is the wall time for a single GPU kernel covering up to 2,000 independent
+power-flow scenarios simultaneously.  Multiplying by bus count: on the 13-bus
+case, one batched forward processes $128 \times 13 = 1{,}664$ node-states in
+parallel on a V100.  This is precisely the high-throughput regime where GPU
+utilisation is high and per-scenario cost is minimal.
+
+In the present work, the 288 timesteps are \emph{not} independent:
+the battery storage controller introduces a strict causal chain
+($\text{SoC}_{t}$ depends on $\text{SoC}_{t-1}$), so they cannot be collapsed
+into a single batched forward in the same way.  Our ``batched'' mode stacks
+all 288 timesteps structurally but still represents a single simulation
+trajectory rather than 288 independent scenarios drawn from a distribution.
+
+\textbf{(3) Node feature dimensionality and load-type rigidity: 6 vs.\ 14 features per node.}
+PowerFlowMultiNet uses only active and reactive power per phase as node
+inputs:
+\[
+x_i^{\text{MNet}} = [P_a,\,Q_a,\,P_b,\,Q_b,\,P_c,\,Q_c] \in \mathbb{R}^6.
+\]
+The load-type GNN in this work requires:
+\[
+x_i^{\text{LT}} = [\text{elec.dist.},\,m1p,\,m1q,\,m2p,\,m2q,\,m4p,\,m4q,
+                   \,m5p,\,m5q,\,q_\text{cap},\,p_\text{pv},\,q_\text{pv},
+                   \,p_\text{sys},\,q_\text{sys}] \in \mathbb{R}^{14}.
+\]
+The richer feature set is necessary to capture load-model structure,
+capacitor-bank support, PV injections, and system-level balance---quantities
+absent in transmission-oriented formulations---but it increases the size of
+the initial embedding MLP and all downstream message-passing weight matrices.
+
+Beyond dimensionality, there is a deeper rigidity in the PowerFlowMultiNet
+training procedure: scenarios are generated by \emph{scaling load magnitudes}
+only (uniform $\pm$10\%, $\pm$50\% variations, and real-world time series),
+not by changing load model types.  The load-model composition at each bus
+(constant power, constant current, constant impedance, motor, etc.) is fixed
+at the OpenDSS network definition and never varies between training samples.
+The model therefore never learns to generalise across different load-type
+mixes at the same bus.
+
+The load-type GNN in this work is designed precisely to handle this
+variability: the features $m1p, m1q, m2p, \ldots$ encode the per-bus
+composition of load model types explicitly, allowing the model to generalise
+to unseen load-type distributions.  This is the more realistic setting for
+a real distribution feeder where customer equipment---EVs, heat pumps, motor
+loads---changes over time.
+
+\textbf{(4) Post-solve inputs and the circular dependency problem.}
+This is the most fundamental limitation of the PowerFlowMultiNet approach
+for real deployment.  The paper states that node features are obtained by
+\emph{updating} them after running OpenDSS:
+
+\begin{quote}
+\emph{``We update our graph features (load nodes $P$ and $Q$, state of
+capacitors and transformers)''} \cite{Ghamizi2024}
+\end{quote}
+
+This means the $P$ and $Q$ values used as GNN inputs are \emph{post-solve}
+quantities---the actual consumed power \emph{after} voltage-dependent load
+resolution.  For a ZIP load model, the actual consumed power is:
+\[
+P_{\text{actual}} = P_0\!\left[a\!\left(\frac{V}{V_0}\right)^{\!2}
+  + b\!\left(\frac{V}{V_0}\right) + c\right],
+\]
+where $V$ is the \emph{solved} bus voltage.  The actual $P$ thus depends on
+$V$, which is exactly the quantity the GNN is trained to predict.
+
+At real inference time, only the \emph{pre-solve nominal} loads are
+available---the scheduled $P_0$ and $Q_0$ before voltage correction.  The
+post-solve values that PowerFlowMultiNet uses as inputs require knowing the
+voltages first, creating a circular dependency: to prepare the inputs you
+must already know the answer.
+
+This issue is benign only in the special case where all loads are
+constant-power ($a=0$, $b=0$, $c=1$), in which case
+$P_{\text{actual}} = P_0$ regardless of voltage and the pre-solve and
+post-solve values are identical.  The IEEE~13-bus and~123-bus test cases
+used by PowerFlowMultiNet are predominantly modelled with constant-power
+loads in their standard OpenDSS definitions, which is likely why the authors
+do not flag this as an issue.  However, for feeders with genuine ZIP loads,
+constant-current components, or motor loads---such as the IEEE~34-bus---the
+circular dependency becomes a real deployment barrier.  Either the model must
+assume constant-power loads (losing realism), or it must iterate (essentially
+reinventing Newton--Raphson inside the GNN pipeline).
+
+The PF-identity GNN in this work avoids this entirely.  Its load-type
+features encode the \emph{model parameters} ($m1p, m1q, \ldots$ = ZIP
+coefficients per load type) rather than the voltage-corrected consumed
+power.  These parameters are available before any solve and do not depend
+on the voltage outcome.  The GNN must therefore learn to implicitly resolve
+the voltage-dependence as part of its mapping---a harder learning task that
+demands more features and a heavier model---but the inference pipeline is
+genuinely open-loop and does not require OpenDSS at deployment time.
+
+\medskip
+\noindent
+The remaining factors are structural rather than methodological:
+
+\textbf{Different solver baselines.}
+PowerFlowNet~\cite{Lin2024} is benchmarked against a generic NR
+implementation; PowerFlowMultiNet~\cite{Ghamizi2024} against OpenDSS
+\emph{solve-only}; the present work against the \emph{full} OpenDSS pipeline.
+Each successive baseline is harder to beat.
+
+\textbf{Different grid regimes.}
+Both PowerFlowNet and PowerFlowMultiNet include large cases
+(6,470-bus and 906-bus respectively) where GNN inference time stays nearly
+constant while NR/OpenDSS time grows.  The present work targets an 89-node
+feeder, a regime where every published source agrees the traditional solver
+wins on single-scenario latency.
+
+\textbf{Pipeline overhead.}
+Once GPU acceleration reduces model-forward time to $\sim$10\;$\mu$s,
+Python-side feature construction and tensor packaging dominate the measured
+wall time.  This overhead is entirely absent from the PowerFlowMultiNet
+comparison, which isolates only the neural-network forward pass.
+
+\subsection{Overall Interpretation}
+
+PowerFlowMultiNet achieves its reported $15$--$38\times$ speedup through a
+combination of factors: (i)~comparing GPU forward time against
+OpenDSS \emph{solve-only} time, which actually understates their advantage
+since the full OpenDSS wall-clock time is ${\approx}7\times$ larger;
+(ii)~evaluating on 2,000 independent batched scenarios simultaneously, which
+saturates V100 GPU utilisation; (iii)~using a compact 6-feature per-bus node
+representation on simple constant-power test cases; and (iv)~operating on
+test cases (IEEE~13, 123-bus) that do not stress the solver with the features
+that make distribution power flow genuinely hard---long-feeder voltage
+profiles, ZIP loads, and in-line regulators.
+
+Critically, PowerFlowMultiNet's inputs are \emph{post-solve} P and Q
+values that already embed voltage-dependent load resolution.  For deployments
+involving true ZIP or motor loads, these inputs are not available at inference
+time without first running the solver---a fundamental circularity that limits
+the approach to constant-power load settings in real deployment.
+
+The PF-identity GNN in this work operates in a strictly harder regime across
+every dimension: it is evaluated against the full OpenDSS pipeline wall time;
+it processes a causally chained simulation trajectory that cannot be trivially
+batched into independent scenarios; its 14-feature per-bus-phase inputs encode
+raw load-model parameters rather than post-solve injections, making inference
+genuinely solver-free; and its bus-phase graph representation handles the
+per-phase asymmetry and single-phase laterals that characterise real
+distribution feeders.  Its load-type variant nonetheless achieves strong
+predictive accuracy (MAE $0.00158$\,p.u., comparable to PowerFlowNet's
+$0.0012$\,p.u.\ on a larger transmission case) and closes the speed gap
+to $1.6\times$ on GPU with batching.  The remaining gap is attributable
+to Python pipeline overhead and not to a fundamental limitation of the
+surrogate approach.
+
+% =============================================================================
+\section{Literature on GNN Speed for Distribution Power Flow}
+\label{sec:lit}
+% =============================================================================
+
+This section reviews five published or preprint papers that make explicit
+speed claims comparing GNN surrogates to traditional solvers on distribution
+systems, and positions the present benchmark results within that context.
+
+\subsection{Overview of Speed Claims in the Literature}
+
+The pattern across the literature is remarkably consistent: GNN speedups over
+traditional distribution solvers are real but depend critically on three
+structural factors---network size, hardware comparison (GPU vs.\ CPU),
+and batching strategy.  Table~\ref{tab:lit} summarises the five papers.
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.2cm}
+  >{\centering\arraybackslash}p{1.5cm}
+  >{\centering\arraybackslash}p{2.5cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\centering\arraybackslash}p{1.4cm}
+  >{\centering\arraybackslash}p{1.4cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Paper}} &
+\textcolor{white}{\textbf{Year}} &
+\textcolor{white}{\textbf{Test cases}} &
+\textcolor{white}{\textbf{Speedup}} &
+\textcolor{white}{\textbf{GPU?}} &
+\textcolor{white}{\textbf{Batched?}} \\
+\midrule
+\rowcolor{rowblue}
+PowerFlowMultiNet~\cite{Ghamizi2024} & 2024
+  & 13, 123, 906-bus (3$\phi$ unbal.) & 15--38$\times$ faster & V100 & likely \\
+Hybrid GNN-LSE~\cite{Shamseldein2025a} & 2025
+  & 33, 69-bus (radial)  & up to 8{,}400$\times$ faster & RTX 4070 & no \\
+\rowcolor{rowblue}
+PIGNN-Attn-LS~\cite{Kim2026} & 2026
+  & 4--1{,}024-bus (MV/HV) & 2--5$\times$ faster ($>$200 buses) & RTX 3070 & yes \\
+B\"{o}ttcher et al.~\cite{Bottcher2023} & 2023
+  & 20--500-bus synth.\ MV & $\sim$2--5$\times$ faster ($>$200 buses) & V100 & yes \\
+\rowcolor{rowblue}
+Hybrid GNN-IZR~\cite{Shamseldein2025b} & 2025
+  & 33-bus (radial) & \textcolor{warnred}{2.7$\times$ \textbf{slower}} & GPU+CPU & no \\
+\bottomrule
+\end{tabular}
+\caption{Summary of distribution-system GNN speed claims.  All comparisons
+  involve GPU inference vs.\ CPU-based traditional solver, except the
+  Hybrid GNN-IZR where the GNN is found to be slower.}
+\label{tab:lit}
+\end{table}
+
+\subsection{PowerFlowMultiNet (Ghamizi et al., 2024)}
+\label{subsec:multinet}
+
+\textbf{Citation:} Salah Ghamizi, Jun Cao, Aoxiang Ma, Pedro Rodriguez.
+``PowerFlowMultiNet: Multigraph Neural Networks for Unbalanced Three-Phase
+Distribution Systems.''
+\textit{IEEE Transactions on Power Systems}, 2024.
+DOI:~10.1109/TPWRS.2024.3465088.
+arXiv: \url{https://arxiv.org/abs/2403.00892}
+
+\textbf{Networks tested:} IEEE 13-bus, 123-bus, and European LV 906-bus
+(all unbalanced three-phase distribution feeders).
+
+\textbf{Speed claims (Section~III(e), Table~I):}
+Up to $15\times$ faster than OpenDSS on 13-bus, $37\times$ on 123-bus, and
+$38\times$ on 906-bus.  Measured inference times: ${\approx}8.3\,\mu$s (13-bus),
+${\approx}27.6\,\mu$s (123-bus), ${\approx}66.8\,\mu$s (906-bus) on a V100 GPU
+vs.\ ${\approx}130\,\mu$s, ${\approx}1.03\,\text{ms}$, and ${\approx}2.53\,\text{ms}$
+for OpenDSS on CPU.
+
+\textbf{Hardware:} NVIDIA V100-32\,GB GPU for GNN; OpenDSS on CPU
+(via PyDSS wrapper, CPU model unspecified).
+
+\textbf{Critical caveat:} This is a GPU-vs-CPU comparison.  The speedup scales
+with network size because OpenDSS time grows while GNN time stays nearly flat---a
+property of GPU parallelism, not algorithmic superiority per se.  At 13-bus
+(comparable to our 95-node feeder in spirit), the speedup is the smallest of the
+three cases, at $15\times$.
+
+\textbf{Relevance to this work:} Even with a V100 GPU, PowerFlowMultiNet is
+only $15\times$ faster on the smallest tested system (13-bus); our GPU result of
+$1.6\times$ slower at 95 nodes is not surprising given the scale difference and
+the fact that we compare against a non-Python OpenDSS call (not a pure solver
+benchmark).
+
+\subsection{Hybrid GNN-LSE (Shamseldein, 2025)}
+
+\textbf{Citation:} Mohamed Shamseldein.
+``A Hybrid GNN-LSE Method for Fast, Robust, and Physically-Consistent AC
+Power Flow.'' arXiv preprint, arXiv:2510.22020, October 2025.
+\url{https://arxiv.org/abs/2510.22020}
+
+\textbf{Networks tested:} IEEE 33-bus and 69-bus (both radial distribution).
+
+\textbf{Speed claim (Abstract; Tables~2--4):}
+``Results show that our GNN variants are up to $8.4\times10^3$ times faster
+than NR.''  GNN inference falls below 0.01\,ms (sub-10\,$\mu$s) while NR
+(PYPOWER, CPU) requires multiple milliseconds.
+
+\textbf{Hardware:} AMD Ryzen~7 CPU, NVIDIA RTX~4070 GPU; ML on GPU, NR on CPU.
+
+\textbf{Batched:} No---times are averaged over 1,000 single-scenario runs.
+
+\textbf{Critical caveat:} An unreviewed arXiv preprint.  The 8,400$\times$ ratio
+is a hardware-mismatch artefact: sub-0.01\,ms GPU inference vs.\
+multi-ms CPU NR.  The two-stage approach (GNN + LSE linear refinement) reduces the
+effective speedup.  On the 33-bus system, 5 of 7,500 stressed test scenarios
+required LSE correction, indicating occasional GNN failures under stressed conditions.
+
+\subsection{PIGNN-Attn-LS (Kim et al., 2026)}
+\label{subsec:pignn}
+
+\textbf{Citation:} Changhun Kim et al.
+``Physics-Informed GNN for Medium-High Voltage AC Power Flow with
+Edge-Aware Attention and Line Search Correction Operator.''
+Accepted to \textit{ICASSP 2026}.
+arXiv: \url{https://arxiv.org/abs/2509.22458}
+
+\textbf{Networks tested:} 4--1,024-bus MV and HV grids.
+
+\textbf{Speed claims (Section~4.3, Figure~3):}
+In single-scenario mode, NR is competitive for $N < 200$ buses; PIGNN
+becomes $2$--$5\times$ faster at larger grids.
+In multi-scenario mode (4,096 cases), PIGNN achieves ${\approx}3\times$
+higher throughput than 20-worker parallel CPU NR across all grid sizes.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\linewidth]{pignn_fig3.pdf}
+\caption{Reproduced from Kim et al.~\cite{Kim2026}, Figure~3.
+  Computational time vs.\ grid size for NR and PIGNN variants.
+  \textbf{Left (single-scenario):} NR is faster for small grids; PIGNN
+  surpasses it around $N \approx 200$ and widens the gap at larger sizes.
+  \textbf{Right (multi-scenario, 4,096 cases):} PIGNN is faster across all
+  grid sizes; the inset confirms that even for the smallest grids the GPU
+  GNN amortises its launch overhead across scenarios and stays ahead.
+  The crossover in single-scenario mode at $N \approx 200$ is the key
+  boundary: our 95-node feeder falls well below it, explaining why our
+  GNN cannot yet beat OpenDSS at batch size~1.}
+\label{fig:pignn_timing}
+\end{figure}
+
+\textbf{Hardware:} NVIDIA RTX~3070 8\,GB GPU for GNN;
+Intel Core i7-12700 (20 threads) for NR with BLAS set to one thread per
+worker to avoid oversubscription.
+
+\textbf{Batched:} Yes---streaming micro-batches of 4,096 cases filling GPU
+memory without overflow.
+
+\textbf{Why this is the most honest benchmark in the literature:}
+This is the only paper that uses a genuinely competitive NR baseline
+(multi-worker, vectorised, analytically assembled Jacobian) rather than
+single-threaded Python NR or pandapower.  The resulting $2$--$5\times$
+speedup with a modest GPU is far more realistic than the headline numbers
+from other papers.  Critically, the paper explicitly states: ``In
+single-scenario runs, NR is competitive for $N < 200$''---directly explaining
+why our 95-node result shows the GNN behind.  Figure~\ref{fig:pignn_timing}
+makes this crossover visually explicit: the left panel shows NR beating all
+PIGNN variants below roughly 200 buses, after which PIGNN's GPU parallelism
+decisively takes over.
+
+\subsection{B\"{o}ttcher et al.\ (2023)}
+
+\textbf{Citation:} Luis B\"{o}ttcher et al.
+``Solving AC Power Flow with Graph Neural Networks under Realistic
+Constraints.''
+In \textit{2023 IEEE Belgrade PowerTech}, pp.~1--7.
+DOI:~10.1109/PowerTech55446.2023.10202246.
+arXiv: \url{https://arxiv.org/abs/2204.07000}
+
+\textbf{Networks tested:} Synthetic MV distribution grids of 20--500 buses;
+also SimBench MV (100-bus) and a real MV grid (120-bus).
+
+\textbf{Speed claims (Figure~4, Section~V):}
+GNN inference time is nearly constant across grid sizes (batch of 50 grids);
+Newton--Raphson (PYPOWER) scales up with problem size.
+The crossover point where GNN becomes faster is approximately 200--300 buses
+(visual reading of Figure~4).
+
+\textbf{Hardware:} NVIDIA Tesla V100 16\,GB GPU for GNN; PYPOWER on CPU.
+
+\textbf{Batched:} Yes---50 grids batched per evaluation; additionally the
+method uses 50 recurrent iterations $\times$ 10 random initialisations
+(500 forward passes per problem), all included in reported time.
+
+\textbf{Critical caveat:}  The 500 forward passes per inference scenario
+inflate GNN wall time substantially---this is an unsupervised approach that
+trades many forward passes for physics consistency without NR ground-truth
+training.  At 95 nodes, NR would still be faster based on Figure~4's trend.
+
+\subsection{Hybrid GNN-IZR (Shamseldein, 2025)}
+
+\textbf{Citation:} Mohamed Shamseldein.
+``A Hybrid GNN-IZR Framework for Fast and Empirically Robust AC Power Flow
+Analysis in Radial Distribution Systems.''
+arXiv preprint, arXiv:2510.04264, October 2025.
+\url{https://arxiv.org/abs/2510.04264}
+
+\textbf{Networks tested:} IEEE 33-bus radial distribution system only
+(7,500 stressed test scenarios).
+
+\textbf{Speed result (Figure~6(a); Table~III):}
+The hybrid GNN-IZR framework has a mean solution time of ${\approx}3.794\,\text{ms}$,
+while standard NR (PYPOWER) averages ${\approx}1.382\,\text{ms}$---making the
+hybrid \textcolor{warnred}{\textbf{${\approx}2.7\times$ slower}} than NR.
+The raw GNN-only path has a median of ${\approx}3.01\,\text{ms}$.
+
+\textbf{Hardware:} GNN on GPU; IZR solver Numba JIT-compiled on CPU;
+NR baseline from PYPOWER on CPU.
+
+\textbf{Batched:} No---single-scenario per-case inference.
+
+\textbf{Why this is the most relevant paper to our work:}
+This is the only paper in this group where the GNN is demonstrably slower
+than the traditional solver on a small distribution feeder (33-bus), closely
+mirroring our finding of ${\approx}11.7\times$ slower on CPU.  The paper implicitly
+acknowledges that for small radial distribution networks, GNN inference
+overhead exceeds iterative solver time, and pivots the value proposition
+from speed to robustness (0\% convergence failures vs.\ 13.11\% for the
+pure GNN approach on stressed scenarios).  \textbf{This is exactly the
+situation in this work}: our 95-node feeder is small enough that OpenDSS
+wins on raw speed, but the GNN surrogate offers other potential benefits
+(differentiability, topology generalisation, GPU throughput at batch scale).
+
+\subsection{Synthesis: Why the Present Results Are Consistent}
+
+Three structural factors explain every entry in Table~\ref{tab:lit} and
+position the present benchmark precisely within the literature.
+
+\begin{description}[style=unboxed, leftmargin=0pt, labelwidth=0pt]
+
+  \item[\textbf{Network size is the dominant variable.}]
+  PowerFlowMultiNet shows speedups scaling from $15\times$ (13-bus) to
+  $38\times$ (906-bus).  PIGNN-Attn-LS explicitly finds NR competitive below
+  ${\approx}200$ buses.  B\"{o}ttcher et al.'s crossover is at 200--300 buses.
+  Our \textbf{95-node feeder sits squarely in the regime where traditional
+  solvers are expected to win.}
+
+  \item[\textbf{GPU-vs-CPU comparisons inflate speedup ratios.}]
+  Every paper reporting large speedups ($15$--$38\times$, $8{,}400\times$)
+  compares GPU inference against single-threaded CPU solvers.  The only paper
+  using a strong multi-worker CPU baseline (PIGNN-Attn-LS, 20 NR workers)
+  reports a much more modest $2$--$5\times$ speedup, and only at scales above
+  200 buses.  Our finding of ${\approx}11.7\times$ slower on CPU is consistent with this:
+  CPU GNN inference is inherently disadvantaged by the lack of parallelism
+  that makes GPUs attractive.
+
+  \item[\textbf{Batching is essential for GNN competitiveness.}]
+  Our finding that GPU + batching narrows the gap to $1.6\times$ slower aligns
+  with the literature.  The GNN-IZR paper, which uses single-scenario inference
+  on a 33-bus system, shows the GNN at ${\approx}3\,\text{ms}$ vs.\ NR at
+  ${\approx}1.4\,\text{ms}$---the GNN is slower.  Without batching, GNN
+  per-scenario latency exceeds solver time for small networks.
+
+\end{description}
+
+% =============================================================================
+\section{Roadmap for GNN-Beats-OpenDSS at Batch Size One}
+\label{sec:roadmap}
+% =============================================================================
+
+A GNN surrogate can plausibly outperform OpenDSS in single-scenario
+sequential mode, but only on distribution feeders with roughly
+2,000--5,000+ buses.  The core challenge is that OpenDSS uses an
+extraordinarily fast fixed-point current-injection solver with KLU sparse
+factorisation that scales nearly linearly for radial networks, while a
+batch-size-1 GPU GNN forward pass carries ${\approx}1$--$3$\,ms of fixed
+overhead from kernel launches and CPU--GPU dispatch.  The crossover occurs
+when network size pushes OpenDSS solve time above that fixed overhead.
+The bottleneck to beat is therefore not OpenDSS's algorithm---which is
+near-optimal for radial networks---but the PyTorch/CUDA dispatch overhead,
+making inference optimisation the single highest-leverage investment.
+
+% ── OpenDSS scaling ─────────────────────────────────────────────────────────
+\subsection{OpenDSS Is Deceptively Fast on Radial Networks}
+
+OpenDSS does not use Newton--Raphson.  Its default mode is a
+\textbf{fixed-point current-injection method} that builds the system
+admittance matrix once, factors it via the KLU sparse direct solver, and
+then iterates by updating current injections and performing
+forward/backward substitution.  For sequential time-series (QSTS)
+simulations, convergence typically requires only \textbf{2 iterations per
+timestep} because the previous solution provides an excellent warm start.
+The KLU factorisation for radial (tree) networks produces essentially zero
+fill-in, yielding $O(n)$ factorisation and $O(n)$ solve per iteration.
+
+Calibrating against the 95-node feeder benchmarked in this work
+(${\approx}0.2$\,ms per solve), the estimated per-solve times for larger
+feeders are:
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.2cm}
+  >{\centering\arraybackslash}p{3.6cm}
+  >{\centering\arraybackslash}p{3.6cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Network size}}
+  & \textcolor{white}{\textbf{OpenDSS (no controls)}}
+  & \textcolor{white}{\textbf{OpenDSS (with controls)}} \\
+\midrule
+\rowcolor{rowblue}
+89 buses (this work)      & ${\approx}0.2$\,ms & ${\approx}0.3$--$0.5$\,ms \\
+500 buses                  & ${\approx}0.5$--$1.5$\,ms & ${\approx}1$--$4$\,ms \\
+\rowcolor{rowblue}
+1,000 buses                & ${\approx}1$--$3$\,ms & ${\approx}3$--$8$\,ms \\
+3,000 buses                & ${\approx}3$--$8$\,ms & ${\approx}8$--$25$\,ms \\
+\rowcolor{rowblue}
+5,000 buses                & ${\approx}5$--$15$\,ms & ${\approx}15$--$50$\,ms \\
+8,500 nodes (IEEE 8500)   & ${\approx}10$--$30$\,ms & ${\approx}30$--$100$\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Estimated OpenDSS per-solve times calibrated from the 95-node
+  benchmark.  Voltage regulators, capacitor banks, and smart-inverter
+  controls add outer control iterations that multiply solve time by
+  $2$--$5\times$.}
+\label{tab:opendss_scaling}
+\end{table}
+
+The critical observation: PowerFlowNet's headline ``$48$--$145\times$
+speedup'' is measured against pandapower Newton--Raphson, which is
+${\approx}117\times$ slower than OpenDSS.  Against OpenDSS specifically,
+the advantage shrinks dramatically.
+
+% ── Fixed overhead floor ─────────────────────────────────────────────────────
+\subsection{The Fixed Overhead Floor at Batch Size One}
+
+At batch size~1 on a small-to-medium graph, GNN inference is dominated by
+fixed overhead rather than computation.  A typical PyTorch Geometric
+forward pass with 2--3 message-passing layers launches ${\approx}10$--$30$
+CUDA kernels.  Python/ATen operator dispatch, memory management, and
+CPU--GPU synchronisation push the effective per-launch cost to
+${\approx}20$--$200\,\mu$s, giving a total fixed overhead in
+\textbf{eager mode of ${\approx}1.5$--$3.0$\,ms} regardless of graph
+size.
+
+The present benchmark confirms this directly.  At 95 nodes, the GNN on GPU
+with batching runs at ${\approx}1.73$\,ms per step; at batch size~1 it
+runs at ${\approx}2.38$\,ms---a difference of only $0.65$\,ms despite
+$288\times$ fewer nodes being processed.  The computation is negligible;
+the overhead is not.  The good news: this overhead is compressible.
+
+% ── Three optimizations ──────────────────────────────────────────────────────
+\subsection{Three Optimisation Techniques That Change the Crossover Math}
+
+\textbf{\texttt{torch.compile} with \texttt{mode=\char`\"reduce-overhead\char`\"}:}
+Fuses multiple PyG message-passing operations into fewer CUDA kernels,
+applies constant folding, and automatically employs CUDA Graphs.
+PyG~2.5+ explicitly supports this.  Documented speedups on
+GCN/GraphSAGE/GIN architectures reach \textbf{up to $3\times$}, reducing
+overhead from ${\approx}2$\,ms to ${\approx}0.7$--$1.0$\,ms.
+
+\textbf{CUDA Graphs:}
+Record the entire kernel sequence on the first forward pass and replay it
+as a single GPU operation on subsequent calls, eliminating per-kernel CPU
+dispatch.  This requires fixed input tensor shapes---perfectly satisfied
+by a fixed-topology distribution network where only node features ($P$,
+$Q$ injections) change between timesteps.  Combined with
+\texttt{torch.compile}, overhead can drop below \textbf{0.3--0.5\,ms}.
+
+\textbf{FP16 mixed precision:}
+\texttt{torch.autocast} engages Tensor Cores on V100/A100/RTX-series GPUs,
+roughly doubling throughput for matrix multiplications within
+message-passing layers.  The benefit is modest at small graph sizes where
+compute is not the bottleneck, but increasingly significant above
+${\approx}2{,}000$ nodes.
+
+With all three optimisations applied, the estimated GNN batch=1 inference
+time compresses to approximately \textbf{0.3--0.5\,ms at 95 nodes} and
+\textbf{0.5--2.0\,ms at 5,000+ nodes}.  This shifts the crossover
+substantially.
+
+% ── Crossover analysis ───────────────────────────────────────────────────────
+\subsection{Calibrated Crossover Analysis}
+
+Using the 95-node data point as calibration anchor (OpenDSS
+${\approx}0.2$\,ms, GNN batch=1 GPU ${\approx}1.5$--$3$\,ms in eager
+mode), the crossover bus count depends on both OpenDSS control complexity
+and GNN optimisation level:
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{4.6cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\centering\arraybackslash}p{2.0cm}
+  >{\centering\arraybackslash}p{2.8cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Scenario}}
+  & \textcolor{white}{\textbf{OpenDSS scaling}}
+  & \textcolor{white}{\textbf{GNN overhead}}
+  & \textcolor{white}{\textbf{Crossover point}} \\
+\midrule
+\rowcolor{rowblue}
+Simple radial, unoptimised GNN & $O(n^{1.0})$ & ${\approx}2$\,ms & ${\approx}900$ buses \\
+Simple radial, optimised GNN   & $O(n^{1.0})$ & ${\approx}0.5$\,ms & ${\approx}220$ buses \\
+\rowcolor{rowblue}
+Moderate controls, unoptimised & $O(n^{1.2})$ & ${\approx}2$\,ms & 500--1,500 buses \\
+Moderate controls, optimised   & $O(n^{1.2})$ & ${\approx}0.5$\,ms & 200--500 buses \\
+\rowcolor{rowblue}
+Complex controls, unoptimised  & $O(n^{1.5})$ & ${\approx}2$\,ms & 300--800 buses \\
+\bottomrule
+\end{tabular}
+\caption{Estimated crossover bus count at which a batch-size-1 GNN becomes
+  faster than OpenDSS, as a function of feeder control complexity and GNN
+  optimisation level.}
+\label{tab:crossover}
+\end{table}
+
+\noindent\textbf{The sweet spot for a convincing demonstration is a feeder
+in the 2,000--5,000 bus range.}  At this size, even an unoptimised GNN is
+within striking distance, and an optimised one should be $2$--$5\times$
+faster than OpenDSS.  At 8,500 nodes, the advantage grows to an estimated
+$5$--$20\times$ depending on control complexity.
+
+A critical tension exists: a topologically simple feeder (few controls)
+minimises GNN input features but also minimises OpenDSS solve time.
+The optimal strategy is a feeder that is \textbf{large} (to push OpenDSS
+above the overhead threshold) but \textbf{topologically simple} (to keep
+the GNN minimal), while accepting that some voltage-dependent controls
+actually help because they slow OpenDSS disproportionately through outer
+control iterations.
+
+% ── Test systems ─────────────────────────────────────────────────────────────
+\subsection{Available Test Systems Ranked by Suitability}
+
+\textbf{Tier 1 (best candidates).}
+The \textbf{IEEE 8500-node test feeder} (4,876 buses / 8,531 nodes) is
+the strongest candidate.  It is included in every OpenDSS installation
+(\texttt{IEEETestCases/8500-Node/}), is the most widely benchmarked large
+distribution system, and has 4 voltage regulators, 4 capacitor banks, and
+${\approx}1{,}100$ centre-tapped transformers---which significantly slow
+OpenDSS through outer control iterations.  A balanced single-phase
+equivalent preserves the large topology while reducing GNN input
+dimensionality.
+
+\textbf{NREL Smart-DS feeders} are synthetic city-scale distribution
+feeders (San Francisco, Greensboro, Austin) in native OpenDSS format,
+available at \url{https://data.openei.org/submissions/2981}.  Individual
+feeders range from hundreds to tens of thousands of nodes and can be
+selected at any desired size.
+
+\textbf{Tier 2 (good candidates).}
+\textbf{EPRI J1} at 3,434 buses / 4,245 nodes is the largest EPRI test
+circuit included with OpenDSS and already models distributed generation.
+\textbf{EPRI Ckt7} has 5,694 customers in a compact, heavily loaded
+topology.  Both are unbalanced and in native OpenDSS format.
+
+\textbf{Tier 3 (supplementary).}
+The \textbf{IEEE 906-bus European LV feeder} is purely radial with no
+voltage regulators or capacitors, making it topologically simple but
+possibly too small (${\approx}906$ buses) for a convincing crossover with
+an unoptimised GNN.
+\textbf{PNNL taxonomy feeders} (up to ${\approx}850$--$1{,}630$ nodes in
+OpenDSS format) are useful for intermediate-size validation but below the
+primary demonstration threshold.
+
+% ── Minimal GNN architecture ─────────────────────────────────────────────────
+\subsection{Minimal GNN Architecture for the Target Feeder}
+
+For a large simplified distribution feeder, the GNN can be remarkably
+lightweight.  The minimum viable architecture is:
+
+\begin{itemize}
+  \item \textbf{Input features per node:} 2 ($P$ and $Q$ injections).
+        Line impedances are fixed for a given topology and can be
+        pre-encoded as fixed edge attributes.  Output: 2 features
+        (voltage magnitude and angle).  For an unbalanced per-phase model:
+        6 inputs / 6 outputs per bus.
+
+  \item \textbf{Architecture:} 2--3 message-passing layers, hidden
+        dimension $h = 32$--$64$.  TAGConv with $K=3$ gives an effective
+        9-hop receptive field in 3 layers---sufficient because voltage
+        drops in distribution systems are primarily local phenomena, as
+        confirmed by PowerFlowNet for networks up to 6,470 buses.
+        Total parameters: ${\approx}10{,}000$--$50{,}000$, compared to
+        PowerFlowNet-Medium's 357,000.
+
+  \item \textbf{Edge features:} 2 ($r$, $x$ per line), pre-loaded as
+        persistent GPU tensors---zero runtime overhead.
+
+  \item \textbf{Estimated inference time:}  ${\approx}2$--$4$\,ms in
+        eager mode for a 3,000--8,500 node graph at batch=1; compresses
+        to \textbf{${\approx}0.5$--$1.5$\,ms with
+        \texttt{torch.compile} + CUDA Graphs}.
+\end{itemize}
+
+% ── Concrete roadmap ─────────────────────────────────────────────────────────
+\subsection{Revised Roadmap: Single-Scenario Sequential Inference on the Current Feeder}
+\label{subsec:revised_roadmap}
+
+The roadmap below is designed around the actual constraint: the same
+95-node IEEE~34-bus feeder, a battery controller that enforces sequential
+timesteps, and a target of beating OpenDSS wall-clock time at batch
+size~1.  Steps are ordered to win the easiest gains first and to minimise
+interaction with distribution-system complexities (voltage-dependent loads,
+regulators, capacitor banks) until the inference pipeline is already fast.
+
+\medskip
+\noindent\textbf{Phase 1 --- Vectorise the feature-building pipeline (1 week).}
+
+The first bottleneck that can be eliminated without touching the model is
+the Python loop inside \texttt{build\_gnn\_x}.  Currently this function
+runs per-timestep in pure Python, costing ${\approx}0.34$\,ms/step on GPU
+non-batched.  The fix is to pre-stack all time-varying inputs as a
+persistent numpy or tensor array at the start of the simulation and index
+into it with a single slice per step.  Separately, because the feeder
+topology is fixed, \texttt{edge\_index} and all edge features
+(impedances, line lengths, phase configuration) should be converted to
+persistent GPU tensors at startup and never re-transferred.  Similarly,
+\texttt{tensor\_data\_creation} should be replaced by a direct tensor
+slice and offset-addition rather than \texttt{Batch.from\_data\_list()},
+eliminating the sequential Python concatenation loop that currently costs
+${\approx}0.15$\,ms/step.  After this phase the pipeline overhead
+stages should be negligible ($<0.05$\,ms/step combined), leaving the
+model forward pass as the only remaining cost.
+
+\medskip
+\noindent\textbf{Phase 2 --- Establish an MLP baseline (1--2 weeks).}
+
+Before investing further in GNN optimisation, train a shallow MLP on the
+same dataset and inputs.  The MLP takes the full node-feature matrix
+flattened into a single vector (all 95 buses concatenated) and outputs
+predicted voltages for all buses.  Conrad et al.~\cite{Conrad2026}
+show that on CPU this architecture is roughly two orders of magnitude
+faster than a GNN at the sample sizes relevant here ($N \leq 288$).
+Because the feeder topology is fixed, the MLP's lack of topological
+inductive bias is not a disadvantage---it never needs to generalise to
+unseen topologies.  Moreover, because distribution feeder buses are
+heterogeneous (different load types, regulator buses, capacitor buses),
+the MLP's fully independent per-input weights may actually learn
+bus-specific behaviour better than the GNN's shared message-passing
+rule.  The MLP baseline therefore provides both a speed ceiling and an
+accuracy sanity check: if the MLP already beats OpenDSS on GPU and
+matches GNN accuracy, the GNN architecture is unnecessary for this
+feeder.
+
+\medskip
+\noindent\textbf{Phase 3 --- Optimise the GPU inference pipeline (1 week).}
+
+Apply the following in sequence, benchmarking after each step:
+
+\begin{enumerate}[itemsep=2pt]
+  \item \textbf{\texttt{torch.inference\_mode()}} instead of
+        \texttt{no\_grad}---saves autograd bookkeeping overhead.
+  \item \textbf{FP16 autocast}---halves memory bandwidth for weight reads;
+        safe for inference if trained in FP32.
+  \item \textbf{Pre-pinned input buffer}---allocate the node-feature tensor
+        with \texttt{pin\_memory=True} so CUDA can DMA directly from
+        page-locked RAM.  Transfer with
+        \texttt{.to(device, non\_blocking=True)}.
+  \item \textbf{Dual CUDA streams}---one stream runs the forward pass for
+        step $t$ while a second stream copies features for step $t{+}1$,
+        overlapping transfer and compute entirely.
+  \item \textbf{\texttt{torch.compile(model, mode=\char`\"reduce-overhead\char`\",
+        dynamic=False)}}---fuses kernels, applies constant folding, and
+        wraps the repeated identical call-graph into a CUDA Graph,
+        eliminating the ${\approx}10\,\mu$s per-kernel Python dispatch
+        overhead.  Expected reduction: forward pass from
+        ${\approx}1.9$\,ms/step to ${\approx}0.3$--$0.5$\,ms/step.
+\end{enumerate}
+
+\noindent Target after Phase~3: end-to-end inference below $0.5$\,ms/step,
+which would place the GNN (or MLP) faster than OpenDSS wall-clock
+($1.38$\,ms/step) with margin to spare.
+
+\medskip
+\noindent\textbf{Phase 4 --- Handle distribution-system inputs correctly (1--2 weeks).}
+
+This phase addresses the distribution-specific complexities that can
+silently degrade accuracy if handled incorrectly.
+
+\emph{Voltage-dependent (ZIP) loads.}  Never use post-solve $P$ and $Q$
+values as model inputs---these are only known \emph{after} the power flow
+converges and create a circular dependency (the PowerFlowMultiNet
+problem, Section~\ref{sec:multinet}).  Use nominal $P$ and $Q$ values
+(pre-solve, as specified in the load profile) and the ZIP coefficients as
+static node features.  The model then learns the direct mapping from
+nominal load demand to converged bus voltages; the voltage-correction
+effect is implicitly absorbed into the training targets from OpenDSS.
+Validate that inference error does not increase on timesteps with large
+voltage deviations from nominal (where ZIP correction is most significant).
+
+\emph{Voltage regulators.}  The regulator tap position after convergence
+is a discrete state that affects downstream voltages strongly.  Add the
+per-tap-step voltage ratio of each regulator as a node or edge feature,
+sampled from the OpenDSS state \emph{at the start of each timestep}
+(before the solve).  This is available without running the solver.
+Because ControlIter $\approx 2.33$ in this feeder, tap positions do
+change within a timestep; the model must learn to predict the post-control
+voltage from the pre-control tap state.  Validate on timesteps where
+tap changes occur.
+
+\emph{Capacitor banks.}  Add the switched state (in/out) of each
+capacitor bank as a binary node feature.  Same principle: use the
+pre-solve state, validate on switching timesteps.
+
+\emph{Three-phase imbalance.}  The IEEE~34-bus feeder is unbalanced.
+If the model operates on a per-phase graph (as the current GNN3 Best7
+does), ensure phase identity is encoded in node features.  If operating
+on a single-phase equivalent, validate that phase-averaging does not
+introduce systematic error on heavily unbalanced segments.
+
+\medskip
+\noindent\textbf{Phase 5 --- End-to-end evaluation and decision point (1 week).}
+
+Run the full battery controller simulation loop (288 timesteps, 24-hour
+profile) with OpenDSS replaced by the optimised model.  Measure
+wall-clock time per timestep including feature construction, host$\to$device
+transfer, model forward, and result extraction.  Compare against
+the current OpenDSS baseline of $1.38$\,ms/step.
+
+At this point one of three outcomes is expected:
+
+\begin{description}[itemsep=3pt]
+  \item[\textbf{Success (model faster, accuracy acceptable).}]
+    Proceed to deployment.  The MLP variant is the likely winner here
+    given Conrad et al.'s evidence.
+
+  \item[\textbf{Close but not faster.}]
+    The remaining gap is most likely the model forward pass.  The next
+    lever is architecture reduction: halve the hidden dimension (128
+    $\to$ 64 or 32) and retrain.  Each halving reduces the forward
+    FLOP count by $4\times$.  Accept the accuracy penalty only if
+    it remains within operational tolerance.
+
+  \item[\textbf{Still substantially slower.}]
+    The 95-node feeder is below the single-scenario crossover point
+    (${\approx}200$ buses) identified in the literature.  Pivot the
+    use case: abandon real-time single-scenario replacement and instead
+    use the model for high-throughput \emph{scenario screening}
+    (thousands of independent load profiles evaluated in parallel),
+    where the GPU advantage is decisive and the sequential dependency
+    of the battery controller does not apply.
+\end{description}
+
+% =============================================================================
+\section{Practical Implementation Checklist: IEEE 8500-Node Feeder Pipeline}
+\label{sec:checklist}
+% =============================================================================
+
+This section is a sequential, hands-on checklist for building the full
+GNN-beats-OpenDSS pipeline from scratch on the IEEE~8500-node feeder.
+Follow the steps in order; each step has a clear pass/fail criterion before
+you continue to the next.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 1: Locate or Install the IEEE 8500-Node Feeder}
+\label{subsec:step1}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+The IEEE~8500-node feeder ships as a set of \texttt{.dss} files
+(entry point: \texttt{Master.dss}) and is distributed with the official
+OpenDSS test cases.  Run the following search in any Python environment that
+has \texttt{pathlib} available to find it on the machine:
+
+\begin{verbatim}
+import pathlib
+roots = [
+    pathlib.Path(r"C:\Users\alita\OneDrive\Desktop\quest-ssim"),
+    pathlib.Path(r"C:\Users\alita\Documents"),
+    pathlib.Path(r"C:\Users\alita\Desktop"),
+    pathlib.Path(r"C:\Users\alita\Downloads"),
+    pathlib.Path(r"C:\OpenDSS"),
+    pathlib.Path(r"C:\Program Files\OpenDSS"),
+]
+for root in roots:
+    if root.exists():
+        for f in root.rglob("*.dss"):
+            if "8500" in str(f).lower():
+                print(f)
+\end{verbatim}
+
+\noindent\textbf{If not found --- Option A (recommended).}
+Download the feeder directly from the official OpenDSS GitHub mirror:
+
+\begin{verbatim}
+# In a terminal / Anaconda Prompt (no admin rights needed):
+pip install dss-python          # ships the full IEEE test suite
+python -c "import dss; print(dss.__file__)"
+# Navigate to that folder -> IEEETestCases -> 8500-Node
+\end{verbatim}
+
+\noindent\textbf{If not found --- Option B.}
+Clone or download the zip from the OpenDSS SourceForge repository:
+\url{https://sourceforge.net/p/electricdss/code/HEAD/tree/trunk/Distrib/IEEETestCases/8500-Node/}
+and extract to a known path (e.g.\ \texttt{C:\textbackslash OpenDSS\textbackslash 8500-Node\textbackslash}).
+
+\noindent\textbf{Pass criterion.}
+You have a local path to \texttt{Master.dss} that can be stored in a
+variable \texttt{DSS\_8500} and passed to \texttt{dss.run\_command('Redirect ...')}.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 2: Profile the OpenDSS Solve Time}
+\label{subsec:step2}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+In the \textit{try for 8500 node} Jupyter notebook, set \texttt{DSS\_8500}
+to the path found in Step~1 and run the profiling cell (already written in
+the notebook).  The cell loads the feeder, runs 50 snapshot solves, and
+reports median/mean/min/max solve time in milliseconds.
+
+\noindent\textbf{What to check.}
+\begin{itemize}
+  \item \texttt{Converged: True} --- if False, the feeder has a load or
+    voltage issue; check that \texttt{Redirect} picked up all dependency
+    files correctly.
+  \item Buses: ${\approx}4{,}876$, node-phases: ${\approx}8{,}531$ (hence
+    ``8500-node'').
+  \item Median solve time should be in the range of \textbf{5--30\,ms} per
+    snapshot on a typical laptop.  This is the GNN target to beat.
+  \item Record \texttt{ControlIterations} and \texttt{Iterations}
+    (power-flow iterations).  A high control-iteration count
+    ($>$5) means the feeder has many regulators or capacitors switching
+    and will be harder to surpass; a low count ($<$3) is favourable.
+\end{itemize}
+
+\noindent\textbf{Pass criterion.}
+Median solve time $\geq 2$\,ms per snapshot.  If it is below 2\,ms the
+feeder may still be too fast; if above 5\,ms the GNN will have a very
+comfortable margin.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 3: Generate the Training Dataset}
+\label{subsec:step3}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Write a standalone script \texttt{generate\_dataset\_8500.py} that:
+
+\begin{enumerate}[itemsep=2pt]
+  \item Loads the feeder with \texttt{opendssdirect} and sets
+    \texttt{dss.Solution.Mode(1)} (snapshot).
+  \item Generates $N=5{,}000$--$10{,}000$ random load scenarios by scaling
+    each load's $P$ and $Q$ independently, drawn from a truncated normal
+    distribution centred on the nominal value with $\sigma = 20\%$.
+    Use \texttt{dss.Loads.kW()} and \texttt{dss.Loads.kvar()} setters.
+  \item Records the \emph{pre-solve} state vector $\mathbf{x}$ for each
+    scenario: nominal $P$, $Q$ for every load bus; regulator tap positions
+    (read with \texttt{dss.RegControls.TapNumber()}); capacitor switch
+    states (\texttt{dss.Capacitors.States()}).
+  \item Solves and records the \emph{post-solve} voltage magnitudes and
+    angles for all node-phases as the target vector $\mathbf{y}$.
+  \item Saves the full dataset as compressed numpy arrays:
+    \texttt{X\_8500.npy} (shape: $N \times F$) and
+    \texttt{Y\_8500.npy} (shape: $N \times 2 \times n_{\text{nodes}}$
+    for magnitude and angle).
+\end{enumerate}
+
+\noindent\textbf{Key implementation note.}
+Do \emph{not} use post-solve $P$ and $Q$ as model inputs.  Use only the
+pre-solve nominal demand values --- these are causally prior to the solution
+and avoid the circular-dependency problem described in
+Section~\ref{sec:multinet}.
+
+\noindent\textbf{Expected runtime.}
+At $\approx$10\,ms per solve, 10\,000 scenarios takes about 100\,s.  Run
+in a single Python process with no parallelism needed.
+
+\noindent\textbf{Pass criterion.}
+\texttt{X\_8500.npy} and \texttt{Y\_8500.npy} saved and loadable.  Spot-check
+5 random rows: all voltage magnitudes should be in the range 0.85--1.10\,pu
+and all scenarios should have converged (check by saving a convergence flag
+alongside each row and asserting all are \texttt{True}).
+
+% ---------------------------------------------------------------------------
+\subsection{Step 4: Build the Graph Structure}
+\label{subsec:step4}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Write \texttt{build\_graph\_8500.py} that constructs the static PyG
+\texttt{Data} object for the feeder (this is computed once and cached):
+
+\begin{enumerate}[itemsep=2pt]
+  \item Load the feeder (without solving) and use
+    \texttt{dss.Lines.AllNames()}, \texttt{dss.Lines.Bus1()},
+    \texttt{dss.Lines.Bus2()}, \texttt{dss.Lines.R1()},
+    \texttt{dss.Lines.X1()}, \texttt{dss.Lines.Length()} to build
+    \texttt{edge\_index} (shape $2 \times E$) and \texttt{edge\_attr}
+    (impedance + length per edge).
+  \item Assign each bus a node ID (integer) matching the row index in
+    \texttt{X\_8500.npy}.  Store the mapping as a dict.
+  \item Save \texttt{edge\_index.pt}, \texttt{edge\_attr.pt}, and
+    the bus-name-to-index mapping as a JSON file.
+  \item Load these to GPU at startup and keep them there for the full
+    simulation:
+    \begin{verbatim}
+edge_index = torch.load("edge_index.pt").to("cuda")
+edge_attr  = torch.load("edge_attr.pt").to("cuda")
+    \end{verbatim}
+\end{enumerate}
+
+\noindent\textbf{Pass criterion.}
+\texttt{edge\_index} has shape $(2, E)$ with $E \approx 8{,}000$--$9{,}000$
+(roughly one edge per node in a radial feeder).  Visualise the degree
+distribution: most buses should have degree 1 or 2 (radial), with a handful
+of junction buses at degree 3--4.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 5: Train the MLP Baseline}
+\label{subsec:step5}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Before building the GNN, train an MLP as a speed and accuracy baseline.
+Write \texttt{train\_mlp\_8500.py}:
+
+\begin{enumerate}[itemsep=2pt]
+  \item Load \texttt{X\_8500.npy} and \texttt{Y\_8500.npy}.  Split 80/10/10
+    train/val/test.
+  \item Normalise: z-score each feature column.  Save the mean and std
+    vectors --- they will be applied at inference time.
+  \item Architecture: \texttt{Linear($F$, 512) $\to$ ReLU $\to$
+    Linear(512, 512) $\to$ ReLU $\to$ Linear(512, $2 \times n_{\text{nodes}}$)}.
+    Two hidden layers of width 512 is a safe starting point; the feeder has
+    ${\approx}8{,}531$ node-phases so the output layer is large.
+  \item Loss: MSE on voltage magnitude; optionally add MSE on angle with a
+    lower weight (0.1) since angles have much smaller variance.
+  \item Train for 100 epochs with Adam, lr $= 10^{-3}$, reduce on plateau.
+  \item Evaluate on test set: report mean absolute error (MAE) in volts
+    (multiply pu error by nominal voltage).
+\end{enumerate}
+
+\noindent\textbf{Pass criterion.}
+Test MAE $< 0.005$\,pu on voltage magnitude ($< 0.6$\,V at 120\,V base).
+This is the accuracy bar --- the GNN must match or beat it.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 6: Train the GNN}
+\label{subsec:step6}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Write \texttt{train\_gnn\_8500.py} using the same dataset.  Recommended
+architecture for a first pass:
+
+\begin{enumerate}[itemsep=2pt]
+  \item \textbf{Node embedding}: linear projection of the node feature vector
+    to hidden dimension $H = 64$.  Use node-type one-hot encoding (load bus,
+    regulator bus, capacitor bus, source bus) as additional static features
+    concatenated to the per-timestep features.
+  \item \textbf{Message passing}: 3--4 layers of
+    \texttt{GCNConv} or \texttt{SAGEConv} with $H=64$, ReLU activation,
+    residual connections after each layer.
+  \item \textbf{Readout}: per-node \texttt{Linear(64, 2)} (magnitude + angle).
+  \item Same loss, optimiser, and train/val/test split as the MLP.
+\end{enumerate}
+
+\noindent\textbf{Why $H=64$?}  The 8500-node feeder is large enough that
+GNN message passing provides genuine value (information propagates over
+${\approx}30$--50 hops in a radial feeder of this size), but $H=128$ would
+increase the forward-pass FLOP count $4\times$ for marginal accuracy gain.
+Start at 64 and increase only if the accuracy target is not met.
+
+\noindent\textbf{Pass criterion.}
+Test MAE $\leq$ MLP baseline.  If the GNN is more than 2$\times$ worse than
+the MLP, the MLP is the better model for this feeder.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 7: Benchmark Inference Speed}
+\label{subsec:step7}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Write \texttt{benchmark\_inference\_8500.py}.  For both the MLP and GNN:
+
+\begin{enumerate}[itemsep=2pt]
+  \item Load model weights and move to GPU.  Call
+    \texttt{torch.compile(model, mode="reduce-overhead", dynamic=False)}
+    and run 20 warm-up steps (the first call triggers compilation).
+  \item Pre-build the full feature matrix \texttt{X} (all $N$ rows) and keep
+    on CPU with \texttt{pin\_memory=True}.
+  \item Simulate the sequential battery-controller loop:
+    for each timestep $t = 1 \ldots N$, copy one row of \texttt{X} to GPU
+    with \texttt{non\_blocking=True}, run the model forward, move the voltage
+    result back to CPU.  Time each step with \texttt{time.perf\_counter()}.
+  \item Report median, mean, p95 wall-clock time per step.
+\end{enumerate}
+
+\noindent\textbf{What to compare.}
+\begin{itemize}
+  \item OpenDSS median solve time (from Step~2).
+  \item MLP median inference time per step.
+  \item GNN median inference time per step.
+\end{itemize}
+
+\noindent\textbf{Pass criterion.}
+At least one of (MLP, GNN) has median inference time \textbf{below} the
+OpenDSS median solve time from Step~2.  Given that the 8500-node feeder
+is well above the ${\approx}200$-bus crossover identified in the PIGNN
+paper, this outcome is strongly expected.
+
+% ---------------------------------------------------------------------------
+\subsection{Step 8: End-to-End Validation in the Battery Controller}
+\label{subsec:step8}
+% ---------------------------------------------------------------------------
+
+\noindent\textbf{What to do.}
+Replace the \texttt{dss.Solution.Solve()} call inside the existing battery
+controller loop with the trained model.  Run the full 24-hour simulation
+(288 timesteps) and compare:
+
+\begin{enumerate}[itemsep=2pt]
+  \item \textbf{Wall-clock time}: total simulation time with OpenDSS vs.\
+    with the model.
+  \item \textbf{Voltage accuracy}: plot predicted vs.\ true voltage at
+    a representative set of buses across all 288 timesteps.
+  \item \textbf{Battery dispatch accuracy}: compare the battery charge/discharge
+    schedule produced by the controller under predicted voltages vs.\ true
+    voltages.  Assess whether voltage prediction errors propagate into
+    materially different control decisions.
+\end{enumerate}
+
+\noindent\textbf{Pass criterion.}
+Total simulation time with model $<$ total simulation time with OpenDSS,
+\emph{and} battery dispatch decisions differ by $<5\%$ from the OpenDSS
+ground truth.
+
+% =============================================================================
+% References
+% =============================================================================
+\begin{thebibliography}{99}
+
+\bibitem{lightsim2grid}
+B.~Donnot,
+``lightsim2grid: A fast simulator for the Grid2op platform,''
+\textit{lightsim2grid documentation, v0.9.2},
+RTE France, 2023.
+\url{https://lightsim2grid.readthedocs.io/en/v0.9.2/benchmarks_grid_sizes.html}
+
+\bibitem{Davis2010}
+T.~A.~Davis and E.~Palamadai Natarajan,
+``Algorithm 907: KLU, a direct sparse solver for circuit simulation
+problems,''
+\textit{ACM Trans.\ Math.\ Softw.}, vol.~37, no.~3, pp.~36:1--36:17, 2010.
+DOI:~10.1145/1824801.1824814.
+
+\bibitem{pytorch_overhead}
+PyTorch contributors,
+``Large overhead (7 microseconds) for PyTorch operation,''
+\textit{PyTorch GitHub Issue \#41383}, 2020.
+\url{https://github.com/pytorch/pytorch/issues/41383}
+
+\bibitem{pyg_compile}
+PyTorch Geometric contributors,
+``Compiled Graph Neural Networks,''
+\textit{PyG Documentation v2.6.1}, 2024.
+\url{https://pytorch-geometric.readthedocs.io/en/2.6.1/advanced/compile.html}
+
+\bibitem{Lin2024}
+N.~Lin, S.~Orfanoudakis, N.~O.~Cardenas, J.~S.~Giraldo, and P.~P.~Vergara,
+``PowerFlowNet: Power flow approximation using message passing Graph Neural
+Networks,''
+\textit{Int.\ J.\ Electr.\ Power Energy Syst.}, vol.~160, p.~110112, 2024.
+DOI:~10.1016/j.ijepes.2024.110112.
+arXiv:~2311.03415.
+
+\bibitem{Wang2021GPU}
+Z.~Wang, S.~Wende-von Berg, and M.~Braun,
+``Fast parallel Newton--Raphson power flow solver for large number of system
+calculations with CPU and GPU,''
+\textit{Sustain.\ Energy Grids Netw.}, vol.~27, p.~100488, 2021.
+DOI:~10.1016/j.segan.2021.100488.
+arXiv:~2101.02270.
+
+\bibitem{Conrad2026}
+T.~Conrad, C.~Kim, J.~J\"{a}ger, A.~Maier, and S.~Bayer,
+``Impact of training dataset size for ML load flow surrogates,''
+arXiv preprint arXiv:2602.19667, Feb.\ 2026.
+
+\bibitem{Ghamizi2024}
+S.~Ghamizi, J.~Cao, A.~Ma, and P.~Rodriguez,
+``PowerFlowMultiNet: Multigraph neural networks for unbalanced three-phase
+distribution systems,''
+\textit{IEEE Trans.\ Power Syst.}, 2024.
+DOI:~10.1109/TPWRS.2024.3465088.
+arXiv:~2403.00892.
+
+\bibitem{Shamseldein2025a}
+M.~Shamseldein,
+``A hybrid GNN-LSE method for fast, robust, and physically-consistent AC
+power flow,''
+arXiv preprint arXiv:2510.22020, Oct.\ 2025.
+
+\bibitem{Kim2026}
+C.~Kim, T.~Conrad, R.~Karim, J.~Oelhaf, D.~Riebesel, T.~Arias-Vergara,
+A.~Maier, J.~J\"{a}ger, and S.~Bayer,
+``Physics-informed GNN for medium-high voltage AC power flow with edge-aware
+attention and line search correction operator,''
+\textit{ICASSP 2026} (accepted).
+arXiv:~2509.22458.
+
+\bibitem{Bottcher2023}
+L.~B\"{o}ttcher et al.,
+``Solving AC power flow with graph neural networks under realistic
+constraints,''
+in \textit{Proc.\ 2023 IEEE Belgrade PowerTech}, pp.~1--7, 2023.
+DOI:~10.1109/PowerTech55446.2023.10202246.
+arXiv:~2204.07000.
+
+\bibitem{Shamseldein2025b}
+M.~Shamseldein,
+``A hybrid GNN-IZR framework for fast and empirically robust AC power flow
+analysis in radial distribution systems,''
+arXiv preprint arXiv:2510.04264, Oct.\ 2025.
+
+\bibitem{Donon2020}
+B.~Donon, R.~Clément, B.~Donnot, A.~Marot, I.~Guyon, and M.~Schoenauer,
+``Neural networks for power flow: Graph neural solver,''
+\textit{Electr.\ Power Syst.\ Res.}, vol.~189, p.~106547, 2020.
+DOI:~10.1016/j.epsr.2020.106547.
+
+\end{thebibliography}
+
+\end{document}

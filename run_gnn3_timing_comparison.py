@@ -15,7 +15,7 @@ import run_injection_dataset as inj
 import run_loadtype_dataset as lt
 from run_deltav_dataset import _apply_snapshot_zero_pv
 from run_gnn3_overlay_7 import (
-    BASE_DIR, CAP_Q_KVAR, DIR_LOADTYPE, OUTPUT_DIR, NPTS, P_BASE, Q_BASE, PV_BASE,
+    BASE_DIR, DIR_LOADTYPE, OUTPUT_DIR, NPTS, P_BASE, Q_BASE, PV_BASE,
     OBSERVED_NODE, STEP_MIN,
     build_bus_to_phases_from_master_nodes, build_gnn_x_original, build_gnn_x_injection,
     build_gnn_x_loadtype, get_all_node_voltage_pu_and_angle_dict,
@@ -30,6 +30,333 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 OBSERVED_NODE = "816.1"
 
 
+def task_opendss_steps_and_context(
+    *,
+    cfg,
+    static,
+    dataset_dir,
+    node_names_master,
+    node_to_idx,
+    obs_idx,
+    bus_to_phases,
+    loads_dss,
+    dev_to_dss_load,
+    dev_to_busph_load,
+    pv_dss,
+    pv_to_dss,
+    pv_to_busph,
+    rng_det,
+    mL,
+    mPV,
+    node_to_electrical_dist,
+    use_phase_onehot,
+    ph_oh,
+    pv_scale,
+):
+    """Task: OpenDSS timing + collect per-timestep context for GNN steps."""
+    node_in_dim = int(cfg.get("node_in_dim", 3))
+    target_col = cfg.get("target_col", "vmag_pu")
+    is_deltav = target_col == "vmag_delta_pu"
+
+    # Accumulators for each OpenDSS step (seconds)
+    dss_steps = {
+        "1_set_time_index": 0.0,
+        "2_apply_snapshot_zero_pv": 0.0,
+        "3_solve_zero_pv": 0.0,
+        "4_get_voltage_zero_pv": 0.0,
+        "5_apply_snapshot_full": 0.0,
+        "6_solve_full": 0.0,
+        "7_get_voltage_full": 0.0,
+    }
+
+    # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0)
+    vmag_zero_precomputed = None
+    if is_deltav:
+        inj.compile_once()
+        inj.setup_daily()
+        vmag_zero_precomputed = []
+        for t in range(NPTS):
+            inj.set_time_index(t)
+            t0 = time.perf_counter()
+            _apply_snapshot_zero_pv(
+                P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, mL_t=float(mL[t]),
+                loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
+                pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
+                sigma_load=0.0, rng=rng_det,
+            )
+            dss_steps["2_apply_snapshot_zero_pv"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            dss.Solution.Solve()
+            dss_steps["3_solve_zero_pv"] += time.perf_counter() - t0
+            if not dss.Solution.Converged():
+                vmag_zero_precomputed.append(np.full(len(node_names_master), np.nan, dtype=np.float32))
+                continue
+            t0 = time.perf_counter()
+            vdict_z = get_all_node_voltage_pu_and_angle_dict()
+            vmag_z = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
+            dss_steps["4_get_voltage_zero_pv"] += time.perf_counter() - t0
+            vmag_zero_precomputed.append(vmag_z)
+        # Re-compile so main pass starts fresh
+        inj.compile_once()
+        inj.setup_daily()
+
+    pv_nominal = PV_BASE * float(pv_scale)
+    t_hours, vmag_dss = [], []
+    contexts = [None] * NPTS
+
+    for t in range(NPTS):
+        # --- OpenDSS step 1 ---
+        t0 = time.perf_counter()
+        inj.set_time_index(t)
+        dss_steps["1_set_time_index"] += time.perf_counter() - t0
+
+        vmag_zero = vmag_zero_precomputed[t] if is_deltav else None
+        if is_deltav and not np.isfinite(vmag_zero).all():
+            t_hours.append(t * STEP_MIN / 60.0)
+            vmag_dss.append(np.nan)
+            contexts[t] = None
+            continue
+
+        # OpenDSS steps 5, 6, 7 (full)
+        t0 = time.perf_counter()
+        _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=pv_nominal,
+            mL_t=float(mL[t]), mPV_t=float(mPV[t]),
+            loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
+            pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
+            sigma_load=0.0, sigma_pv=0.0, rng=rng_det,
+        )
+        dss_steps["5_apply_snapshot_full"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        dss.Solution.Solve()
+        dss_steps["6_solve_full"] += time.perf_counter() - t0
+        if not dss.Solution.Converged():
+            t_hours.append(t * STEP_MIN / 60.0)
+            vmag_dss.append(np.nan)
+            contexts[t] = None
+            continue
+
+        t0 = time.perf_counter()
+        vdict = get_all_node_voltage_pu_and_angle_dict()
+        dss_steps["7_get_voltage_full"] += time.perf_counter() - t0
+        vm_dss, _ = vdict[OBSERVED_NODE]
+
+        # Collect per-timestep context needed for GNN step timing
+        ctx = {
+            "t": t,
+            "busphP_load": busphP_load,
+            "busphQ_load": busphQ_load,
+            "busphP_pv": busphP_pv,
+            "busphQ_pv": busphQ_pv,
+            "busph_per_type": busph_per_type,
+            "vm_dss": float(vm_dss),
+        }
+
+        # Dataset-specific extra values needed to build X
+        if dataset_dir == os.path.join("datasets_gnn2", "original"):
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
+            ctx["busphP_pv_actual"] = busphP_pv_actual
+            ctx["busphQ_pv_actual"] = busphQ_pv_actual
+        elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
+            pwr = dss.Circuit.TotalPower()
+            ctx["P_grid"] = -float(pwr[0])
+            ctx["Q_grid"] = -float(pwr[1])
+        else:
+            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
+            sum_p_load = float(sum(busphP_load.values()))
+            sum_q_load = float(sum(busphQ_load.values()))
+            sum_p_pv = float(sum(busphP_pv_actual.values()))
+            sum_q_pv = float(sum(busphQ_pv_actual.values()))
+            p_sys_balance = sum_p_load - sum_p_pv
+            q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
+            ctx["busphP_pv_actual"] = busphP_pv_actual
+            ctx["busphQ_pv_actual"] = busphQ_pv_actual
+            ctx["p_sys_balance"] = p_sys_balance
+            ctx["q_sys_balance"] = q_sys_balance
+
+        if is_deltav:
+            ctx["vmag_zero"] = vmag_zero
+        if use_phase_onehot:
+            ctx["ph_oh"] = ph_oh
+        ctx["node_in_dim"] = node_in_dim
+        ctx["dataset_dir"] = dataset_dir
+        ctx["node_to_electrical_dist"] = node_to_electrical_dist
+        contexts[t] = ctx
+
+        t_hours.append(t * STEP_MIN / 60.0)
+        vmag_dss.append(float(vm_dss))
+
+    return dss_steps, contexts, is_deltav, t_hours, vmag_dss, vmag_zero_precomputed
+
+
+def task_gnn_steps_from_context(
+    *,
+    model,
+    static,
+    cfg,
+    device,
+    contexts,
+    node_names_master,
+    obs_idx,
+    is_deltav,
+    use_phase_onehot,
+    use_batched_gnn,
+):
+    """Task: GNN step timing (build_x, tensor creation, forward), using OpenDSS-collected contexts."""
+    node_in_dim = int(cfg.get("node_in_dim", 3))
+    dataset_dir = cfg.get("dataset", DIR_LOADTYPE)
+    N_expected = int(static["N"])
+
+    edge_index = static["edge_index"].to(device)
+    edge_attr = static["edge_attr"].to(device)
+    edge_id = static["edge_id"].to(device)
+
+    gnn_steps = {
+        "1_build_gnn_x": 0.0,
+        "2_tensor_data_creation": 0.0,
+        "3_model_forward": 0.0,
+    }
+
+    use_cuda_timer = device.type == "cuda" and torch.cuda.is_available()
+    vmag_gnn = [np.nan] * NPTS
+
+    batched_X_list = []
+    batched_t_list = []
+
+    for t in range(NPTS):
+        ctx = contexts[t]
+        if ctx is None:
+            continue
+
+        busphP_load = ctx["busphP_load"]
+        busphQ_load = ctx["busphQ_load"]
+        busphP_pv = ctx["busphP_pv"]
+        busphQ_pv = ctx["busphQ_pv"]
+        busph_per_type = ctx["busph_per_type"]
+        vmag_zero = ctx.get("vmag_zero")
+
+        # --- GNN step 1: build_gnn_x ---
+        t0 = time.perf_counter()
+        if dataset_dir == os.path.join("datasets_gnn2", "original"):
+            busphP_pv_actual = ctx["busphP_pv_actual"]
+            busphQ_pv_actual = ctx["busphQ_pv_actual"]
+            X = build_gnn_x_original(
+                node_names_master,
+                busphP_load,
+                busphQ_load,
+                busphP_pv_actual,
+                busphQ_pv=busphQ_pv_actual if node_in_dim == 4 else None,
+            )
+        elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
+            X = build_gnn_x_injection(
+                node_names_master,
+                busphP_load,
+                busphQ_load,
+                busphP_pv,
+                ctx["P_grid"],
+                ctx["Q_grid"],
+            )
+        else:
+            busphP_pv_actual = ctx["busphP_pv_actual"]
+            busphQ_pv_actual = ctx["busphQ_pv_actual"]
+            p_sys_balance = ctx["p_sys_balance"]
+            q_sys_balance = ctx["q_sys_balance"]
+            if node_in_dim not in (14, 17):
+                raise ValueError(
+                    f"Strict load-type timing path only supports node_in_dim 14 or 17, got {node_in_dim}."
+                )
+            X = build_gnn_x_loadtype(
+                node_names_master,
+                busph_per_type,
+                busphP_pv_actual,
+                ctx["node_to_electrical_dist"],
+                p_sys_balance,
+                q_sys_balance,
+                busphQ_pv=busphQ_pv_actual,
+            )
+        if is_deltav:
+            X = np.concatenate([X, vmag_zero[:, None]], axis=-1)
+        if use_phase_onehot:
+            X = np.concatenate([X, ctx["ph_oh"]], axis=-1)
+        gnn_steps["1_build_gnn_x"] += time.perf_counter() - t0
+
+        if use_batched_gnn:
+            batched_X_list.append(X.copy())
+            batched_t_list.append(t)
+        else:
+            # --- GNN step 2: tensor + Data creation ---
+            t0 = time.perf_counter()
+            x_t = torch.tensor(X, dtype=torch.float32, device=device)
+            g = Data(x=x_t, edge_index=edge_index, edge_attr=edge_attr, edge_id=edge_id, num_nodes=N_expected)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
+
+            # --- GNN step 3: model forward ---
+            if use_cuda_timer:
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                yhat = model(g)
+                end.record()
+                torch.cuda.synchronize()
+                gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
+            else:
+                t0 = time.perf_counter()
+                yhat = model(g)
+                gnn_steps["3_model_forward"] += time.perf_counter() - t0
+
+            if is_deltav:
+                vmag_gnn[t] = float(vmag_zero[obs_idx] + float(yhat[obs_idx, 0].item()))
+            else:
+                vmag_gnn[t] = float(yhat[obs_idx, 0].item())
+
+    # Batched GNN forward (all 288 timesteps in one call)
+    if use_batched_gnn and batched_X_list:
+        t0 = time.perf_counter()
+        data_list = [
+            Data(
+                x=torch.tensor(X_t, dtype=torch.float32, device=device),
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                edge_id=edge_id,
+                num_nodes=N_expected,
+            )
+            for X_t in batched_X_list
+        ]
+        batch = Batch.from_data_list(data_list)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        if use_cuda_timer:
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+        yhat = model(batch)
+        if use_cuda_timer:
+            end.record()
+            torch.cuda.synchronize()
+            gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
+        else:
+            gnn_steps["3_model_forward"] += time.perf_counter() - t0
+
+        # Extract predictions for observed node: output[i*N + obs_idx] for batch i
+        yhat_np = yhat.detach().cpu().numpy()
+        for i, t in enumerate(batched_t_list):
+            pred = float(yhat_np[i * N_expected + obs_idx, 0])
+            if is_deltav:
+                vmag_zero_t = contexts[t]["vmag_zero"]
+                pred = float(vmag_zero_t[obs_idx] + pred)
+            vmag_gnn[t] = pred
+
+    return gnn_steps, vmag_gnn
+
+
 def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True, pv_scale=1.0):
     """Returns dict of step name -> total seconds. use_batched_gnn: batch all 288 GNN forwards."""
     model, static = load_model_for_inference(ckpt_path, device=device)
@@ -38,6 +365,16 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
     target_col = cfg.get("target_col", "vmag_pu")
     use_phase_onehot = bool(cfg.get("use_phase_onehot", False))
     dataset_dir = cfg.get("dataset", DIR_LOADTYPE)
+    # If dataset_dir is an absolute path but does not exist on this machine,
+    # and it contains 'datasets_gnn2', fall back to a repo-relative path.
+    if isinstance(dataset_dir, str) and os.path.isabs(dataset_dir) and not os.path.exists(dataset_dir):
+        lower = dataset_dir.replace("\\", "/")
+        if "datasets_gnn2" in lower:
+            _, tail = lower.split("datasets_gnn2", 1)
+            tail = tail.lstrip("/\\")
+            candidate = os.path.join("datasets_gnn2", tail)
+            if os.path.exists(candidate):
+                dataset_dir = candidate
     is_deltav = target_col == "vmag_delta_pu"
     N_expected = static["N"]
 
@@ -80,216 +417,43 @@ def timing_one_block_detailed(ckpt_path, device, block_id, use_batched_gnn=True,
     edge_attr = static["edge_attr"].to(device)
     edge_id = static["edge_id"].to(device)
 
-    # Accumulators for each step (seconds)
-    dss_steps = {
-        "1_set_time_index": 0.0,
-        "2_apply_snapshot_zero_pv": 0.0,
-        "3_solve_zero_pv": 0.0,
-        "4_get_voltage_zero_pv": 0.0,
-        "5_apply_snapshot_full": 0.0,
-        "6_solve_full": 0.0,
-        "7_get_voltage_full": 0.0,
-    }
-    gnn_steps = {
-        "1_build_gnn_x": 0.0,
-        "2_tensor_data_creation": 0.0,
-        "3_model_forward": 0.0,
-    }
-    use_cuda_timer = device.type == "cuda" and torch.cuda.is_available()
-    t_hours, vmag_dss, vmag_gnn = [], [], []
-    # For batched: collect (t, X_t) for converged steps, run one batch at end
-    batched_X_list = []
-    batched_t_list = []
+    # OpenDSS task (timing + contexts)
+    dss_steps, contexts, is_deltav, t_hours, vmag_dss, _vmag_zero = task_opendss_steps_and_context(
+        cfg=cfg,
+        static=static,
+        dataset_dir=dataset_dir,
+        node_names_master=node_names_master,
+        node_to_idx=node_to_idx,
+        obs_idx=obs_idx,
+        bus_to_phases=bus_to_phases,
+        loads_dss=loads_dss,
+        dev_to_dss_load=dev_to_dss_load,
+        dev_to_busph_load=dev_to_busph_load,
+        pv_dss=pv_dss,
+        pv_to_dss=pv_to_dss,
+        pv_to_busph=pv_to_busph,
+        rng_det=rng_det,
+        mL=mL,
+        mPV=mPV,
+        node_to_electrical_dist=node_to_electrical_dist,
+        use_phase_onehot=use_phase_onehot,
+        ph_oh=ph_oh if use_phase_onehot else None,
+        pv_scale=pv_scale,
+    )
 
-    # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0) so the main
-    # full-solve pass uses the same initial-guess behavior as Load-type blocks,
-    # ensuring identical OpenDSS voltage profiles across all blocks.
-    vmag_zero_precomputed = None
-    if is_deltav:
-        inj.compile_once()
-        inj.setup_daily()
-        vmag_zero_precomputed = []
-        for t in range(NPTS):
-            inj.set_time_index(t)
-            t0 = time.perf_counter()
-            _apply_snapshot_zero_pv(
-                P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, mL_t=float(mL[t]),
-                loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
-                pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
-                sigma_load=0.0, rng=rng_det,
-            )
-            dss_steps["2_apply_snapshot_zero_pv"] += time.perf_counter() - t0
-            t0 = time.perf_counter()
-            dss.Solution.Solve()
-            dss_steps["3_solve_zero_pv"] += time.perf_counter() - t0
-            if not dss.Solution.Converged():
-                vmag_zero_precomputed.append(np.full(len(node_names_master), np.nan, dtype=np.float32))
-                continue
-            t0 = time.perf_counter()
-            vdict_z = get_all_node_voltage_pu_and_angle_dict()
-            vmag_z = np.array([float(vdict_z.get(n, (np.nan, 0))[0]) for n in node_names_master], dtype=np.float32)
-            dss_steps["4_get_voltage_zero_pv"] += time.perf_counter() - t0
-            vmag_zero_precomputed.append(vmag_z)
-        # Re-compile so main pass starts fresh (full solve uses prev-timestep guess, like Load-type)
-        inj.compile_once()
-        inj.setup_daily()
-
-    for t in range(NPTS):
-        # --- OpenDSS step 1 ---
-        t0 = time.perf_counter()
-        inj.set_time_index(t)
-        dss_steps["1_set_time_index"] += time.perf_counter() - t0
-
-        vmag_zero = vmag_zero_precomputed[t] if is_deltav else None
-        if is_deltav and not np.isfinite(vmag_zero).all():
-            t_hours.append(t * STEP_MIN / 60.0)
-            vmag_dss.append(np.nan)
-            vmag_gnn.append(np.nan)
-            continue
-
-        # OpenDSS steps 5, 6, 7 (full) — no zero-PV solve here; same initial-guess behavior as Load-type
-        pv_nominal = PV_BASE * pv_scale
-        t0 = time.perf_counter()
-        _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=pv_nominal,
-            mL_t=float(mL[t]), mPV_t=float(mPV[t]),
-            loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
-            pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
-            sigma_load=0.0, sigma_pv=0.0, rng=rng_det,
-        )
-        dss_steps["5_apply_snapshot_full"] += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        dss.Solution.Solve()
-        dss_steps["6_solve_full"] += time.perf_counter() - t0
-        if not dss.Solution.Converged():
-            t_hours.append(t * STEP_MIN / 60.0)
-            vmag_dss.append(np.nan)
-            vmag_gnn.append(np.nan)
-            continue
-
-        t0 = time.perf_counter()
-        vdict = get_all_node_voltage_pu_and_angle_dict()
-        dss_steps["7_get_voltage_full"] += time.perf_counter() - t0
-        vm_dss, _ = vdict[OBSERVED_NODE]
-
-        # --- GNN step 1: build_gnn_x ---
-        t0 = time.perf_counter()
-        if dataset_dir == os.path.join("datasets_gnn2", "original"):
-            # Use post-solve actual PV P/Q for ORIGINAL models (matches training).
-            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
-            X = build_gnn_x_original(
-                node_names_master,
-                busphP_load,
-                busphQ_load,
-                busphP_pv_actual,
-                busphQ_pv=busphQ_pv_actual if node_in_dim == 4 else None,
-            )
-        elif dataset_dir == os.path.join("datasets_gnn2", "injection"):
-            pwr = dss.Circuit.TotalPower()
-            P_grid = -float(pwr[0])
-            Q_grid = -float(pwr[1])
-            X = build_gnn_x_injection(node_names_master, busphP_load, busphQ_load, busphP_pv, P_grid, Q_grid)
-        else:
-            busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
-            sum_p_load = float(sum(busphP_load.values()))
-            sum_q_load = float(sum(busphQ_load.values()))
-            sum_p_pv = float(sum(busphP_pv_actual.values()))
-            sum_q_pv = float(sum(busphQ_pv_actual.values()))
-            p_sys_balance = sum_p_load - sum_p_pv
-            q_sys_balance = sum_q_load + sum_q_pv - inj.total_cap_q_kvar(node_names_master)
-            if node_in_dim not in (14, 17):
-                raise ValueError(
-                    f"Strict load-type timing path only supports node_in_dim 14 or 17, got {node_in_dim}."
-                )
-            X = build_gnn_x_loadtype(
-                node_names_master, busph_per_type, busphP_pv_actual,
-                node_to_electrical_dist, p_sys_balance, q_sys_balance,
-                busphQ_pv=busphQ_pv_actual,
-            )
-        if is_deltav:
-            X = np.concatenate([X, vmag_zero[:, None]], axis=-1)
-        if use_phase_onehot:
-            X = np.concatenate([X, ph_oh], axis=-1)
-        gnn_steps["1_build_gnn_x"] += time.perf_counter() - t0
-
-        t_hours.append(t * STEP_MIN / 60.0)
-        vmag_dss.append(float(vm_dss))
-
-        if use_batched_gnn:
-            batched_X_list.append(X.copy())
-            batched_t_list.append(t)
-            vmag_gnn.append(np.nan)  # fill after batch
-        else:
-            # --- GNN step 2: tensor + Data creation ---
-            t0 = time.perf_counter()
-            x_t = torch.tensor(X, dtype=torch.float32, device=device)
-            g = Data(x=x_t, edge_index=edge_index, edge_attr=edge_attr, edge_id=edge_id, num_nodes=N_expected)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
-
-            # --- GNN step 3: model forward ---
-            if use_cuda_timer:
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                yhat = model(g)
-                end.record()
-                torch.cuda.synchronize()
-                gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
-            else:
-                t0 = time.perf_counter()
-                yhat = model(g)
-                gnn_steps["3_model_forward"] += time.perf_counter() - t0
-
-            if is_deltav:
-                vm_gnn = vmag_zero[obs_idx] + float(yhat[obs_idx, 0].item())
-            else:
-                vm_gnn = float(yhat[obs_idx, 0].item())
-            vmag_gnn.append(vm_gnn)
-
-    # Batched GNN forward (all 288 timesteps in one call)
-    if use_batched_gnn and batched_X_list:
-        t0 = time.perf_counter()
-        data_list = [
-            Data(
-                x=torch.tensor(X_t, dtype=torch.float32, device=device),
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                edge_id=edge_id,
-                num_nodes=N_expected,
-            )
-            for X_t in batched_X_list
-        ]
-        batch = Batch.from_data_list(data_list)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        gnn_steps["2_tensor_data_creation"] += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        if use_cuda_timer:
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-        yhat = model(batch)
-        if use_cuda_timer:
-            end.record()
-            torch.cuda.synchronize()
-            gnn_steps["3_model_forward"] += float(start.elapsed_time(end)) / 1000.0
-        else:
-            gnn_steps["3_model_forward"] += time.perf_counter() - t0
-
-        # Extract predictions for observed node: output[i*N + obs_idx] for batch i
-        yhat_np = yhat.detach().cpu().numpy()
-        for i, t in enumerate(batched_t_list):
-            pred = float(yhat_np[i * N_expected + obs_idx, 0])
-            if is_deltav:
-                vmag_zero_t = vmag_zero_precomputed[t]
-                pred = vmag_zero_t[obs_idx] + pred
-            vmag_gnn[t] = pred
+    # GNN task (timing)
+    gnn_steps, vmag_gnn = task_gnn_steps_from_context(
+        model=model,
+        static=static,
+        cfg=cfg,
+        device=device,
+        contexts=contexts,
+        node_names_master=node_names_master,
+        obs_idx=obs_idx,
+        is_deltav=is_deltav,
+        use_phase_onehot=use_phase_onehot,
+        use_batched_gnn=use_batched_gnn,
+    )
 
     return dss_steps, gnn_steps, is_deltav, t_hours, vmag_dss, vmag_gnn, cfg, static
 

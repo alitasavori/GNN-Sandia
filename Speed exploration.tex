@@ -1,0 +1,412 @@
+\documentclass[11pt]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+% ── Page layout ───────────────────────────────────────────────────────────────
+\geometry{
+  letterpaper,
+  top    = 1in,
+  bottom = 1in,
+  left   = 1.1in,
+  right  = 1.1in
+}
+
+% ── Colors ────────────────────────────────────────────────────────────────────
+\definecolor{headerblue}{RGB}{31,  73, 125}
+\definecolor{rowblue}   {RGB}{220, 230, 241}
+\definecolor{ruleblue}  {RGB}{31,  73, 125}
+\definecolor{notesgray} {RGB}{100, 100, 100}
+
+% ── Section heading styles ────────────────────────────────────────────────────
+\titleformat{\section}
+  {\large\bfseries\color{headerblue}}
+  {\thesection.}{0.6em}{}[\vspace{-4pt}\textcolor{ruleblue}{\rule{\linewidth}{0.8pt}}]
+
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{headerblue}}
+  {\thesubsection}{0.5em}{}
+
+\titlespacing*{\section}      {0pt}{18pt}{6pt}
+\titlespacing*{\subsection}   {0pt}{12pt}{4pt}
+
+% ── Header / footer ───────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\small\textcolor{notesgray}{GNN2 Project --- Speed Benchmark}}
+\fancyhead[R]{\small\textcolor{notesgray}{March 2026}}
+\fancyfoot[C]{\small\thepage}
+
+% ── List spacing ──────────────────────────────────────────────────────────────
+\setlist[itemize]{itemsep=3pt, topsep=4pt, leftmargin=1.4em}
+\setlist[description]{itemsep=4pt, topsep=4pt, leftmargin=1.6em, labelwidth=0pt, leftmargin=!}
+
+% ── Hyperref ──────────────────────────────────────────────────────────────────
+\hypersetup{
+  colorlinks = true,
+  linkcolor  = headerblue,
+  urlcolor   = headerblue,
+  pdftitle   = {24-Hour Speed Benchmark: OpenDSS vs.\ GNN Models},
+  pdfauthor  = {GNN2 Project},
+}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{document}
+
+% ── Title block ───────────────────────────────────────────────────────────────
+\begin{center}
+  {\LARGE\bfseries\color{headerblue}
+    24-Hour Speed Benchmark: OpenDSS vs.\ GNN Models}\\[6pt]
+  {\large GNN2 Project \quad|\quad March 2026}
+\end{center}
+
+\vspace{4pt}
+\noindent\textcolor{ruleblue}{\rule{\linewidth}{1.2pt}}
+\vspace{10pt}
+
+\tableofcontents
+\vspace{14pt}
+\noindent\textcolor{ruleblue}{\rule{\linewidth}{0.6pt}}
+\vspace{10pt}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Executive Summary}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This report benchmarks the 24-hour (288 timestep) inference speed of two Graph Neural
+Network (GNN) models against OpenDSS, a traditional power-flow solver, on an 89-node
+distribution feeder.
+
+\medskip
+\noindent\textbf{Core finding:} On CPU, OpenDSS is roughly $22\times$ faster per timestep
+than GNN inference.  On GPU with batching, the GNN pipeline comes within $1.6\times$ of
+OpenDSS, closing the gap substantially.  The GNN's advantage lies in high-throughput,
+batched, parallel scenario evaluation---not in single-scenario latency.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Environment}
+
+\begin{itemize}
+  \item \textbf{Working directory:} \verb|C:\Users\alita\OneDrive\Desktop\GNN2|
+  \item \textbf{Benchmark script:} \verb|speed_benchmark_and_timing.py|
+  \item \textbf{Timesteps:} $N_{\text{steps}} = 288$ \; (24\,h at 5-minute resolution)
+  \item \textbf{Network size:} $N = 89$ nodes (training subset)
+  \item \textbf{Devices:} CPU and NVIDIA L4 GPU
+\end{itemize}
+
+\subsection{Models Evaluated}
+
+\begin{itemize}
+  \item \textbf{Loadtype GNN:} \verb|gnn2_architecture_search/loadtype/best.pt|
+  \item \textbf{Original GNN:} \verb|gnn2_architecture_search/original/best.pt|
+\end{itemize}
+
+\subsection{Inference Modes}
+
+\begin{itemize}
+  \item \textbf{Non-batched:} one GNN forward pass per timestep ($288$ separate forwards).
+  \item \textbf{Batched:} all $288$ timesteps packed into a single batched forward.
+\end{itemize}
+
+OpenDSS runs timestep-by-timestep (no batching is available).  All GNN pipeline times
+include feature construction, tensor/batch creation, and the model forward.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Notation and Definitions}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{OpenDSS Aggregates}
+
+\[
+T^{\text{wall}}_{\text{DSS}} \;\text{(total wall-clock time, 24\,h)},
+\qquad
+T^{\text{solve}}_{\text{DSS}} \;\text{(sum of pure \texttt{Solve()} times)}.
+\]
+Per-step means:
+\[
+\bar{t}^{\text{wall}}_{\text{DSS}}
+  = \frac{T^{\text{wall}}_{\text{DSS}}}{N_{\text{steps}}},
+\qquad
+\bar{t}^{\text{solve}}_{\text{DSS}}
+  = \frac{T^{\text{solve}}_{\text{DSS}}}{N_{\text{steps}}}.
+\]
+
+\subsection{GNN Aggregates}
+
+\[
+T^{\text{fwd}}_{\text{GNN}}
+  = \sum_{t=1}^{N_{\text{steps}}} t_{\text{fwd}}(t),
+\qquad
+\bar{t}^{\text{fwd}}_{\text{GNN}}
+  = \frac{T^{\text{fwd}}_{\text{GNN}}}{N_{\text{steps}}}.
+\]
+
+\subsection{Solver Iteration Means}
+
+\[
+\overline{\text{ControlIter}}
+  = \frac{1}{N_{\text{conv}}}
+    \sum_{t \in \mathcal{C}} \text{ControlIter}(t),
+\qquad
+\overline{\text{PFIter}}
+  = \frac{1}{N_{\text{conv}}}
+    \sum_{t \in \mathcal{C}} \text{PFIter}(t),
+\]
+where $\mathcal{C}$ is the set of converged steps and $N_{\text{conv}} = |\mathcal{C}|$.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Benchmark Results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{OpenDSS Baseline (CPU)}
+
+\[
+T^{\text{wall}}_{\text{DSS}} \approx 0.1763\,\text{s},
+\qquad
+\bar{t}^{\text{wall}}_{\text{DSS}} \approx 0.612\,\text{ms/step},
+\]
+\[
+T^{\text{solve}}_{\text{DSS}} \approx 0.0253\,\text{s},
+\qquad
+\bar{t}^{\text{solve}}_{\text{DSS}} \approx 0.088\,\text{ms/step},
+\]
+\[
+\overline{\text{ControlIter}} \approx 2.33,
+\qquad
+\overline{\text{PFIter}} \approx 4.76.
+\]
+
+OpenDSS solves the full 24-hour profile in well under a quarter of a second, with
+sub-millisecond solves and only a few nonlinear iterations per step.
+
+\subsection{GNN Forward Times (CPU)}
+
+\paragraph{Loadtype model.}
+\[
+T^{\text{fwd}}_{\text{GNN,LT}} \approx 3.8749\,\text{s},
+\qquad
+\bar{t}^{\text{fwd}}_{\text{GNN,LT}} \approx 13.455\,\text{ms/step}.
+\]
+
+\paragraph{Original model.}
+\[
+T^{\text{fwd}}_{\text{GNN,Orig}} \approx 3.8597\,\text{s},
+\qquad
+\bar{t}^{\text{fwd}}_{\text{GNN,Orig}} \approx 13.402\,\text{ms/step}.
+\]
+
+The per-step slowdown relative to OpenDSS wall time is:
+\[
+\frac{\bar{t}^{\text{fwd}}_{\text{GNN}}}{\bar{t}^{\text{wall}}_{\text{DSS}}}
+\approx \frac{13.4\,\text{ms}}{0.612\,\text{ms}} \approx 21.9\times.
+\]
+
+\subsection{Summary Table}
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{5.4cm}
+  >{\centering\arraybackslash}p{2.2cm}
+  >{\centering\arraybackslash}p{2.4cm}
+  >{\centering\arraybackslash}p{2.4cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Configuration}}
+  & \textcolor{white}{\textbf{Total (24\,h)}}
+  & \textcolor{white}{\textbf{Per-step mean}}
+  & \textcolor{white}{\textbf{vs.\ OpenDSS}} \\
+\midrule
+\rowcolor{rowblue}
+OpenDSS (CPU, wall)                  & 0.176\,s   & 0.612\,ms & 1.0$\times$ (baseline) \\
+OpenDSS (CPU, solve only)            & 0.025\,s   & 0.088\,ms & --- \\
+\rowcolor{rowblue}
+GNN Loadtype (CPU, non-batched)      & 3.875\,s   & 13.455\,ms & ${\approx}21.9\times$ slower \\
+GNN Original (CPU, non-batched)      & 3.860\,s   & 13.402\,ms & ${\approx}21.9\times$ slower \\
+\rowcolor{rowblue}
+GNN Original (GPU, non-batched)$^*$  & 0.686\,s   & 2.382\,ms  & ${\approx}1.96\times$ slower \\
+GNN Original (GPU, batched)$^*$      & 0.498\,s   & 1.729\,ms  & ${\approx}1.60\times$ slower \\
+\bottomrule
+\end{tabular}
+\caption{Headline benchmark numbers across all configurations.
+  $^*$GPU times are from the pipeline breakdown totals (Section~\ref{sec:breakdown}).}
+\label{tab:summary}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Detailed Pipeline Timing Breakdown}
+\label{sec:breakdown}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The script separates two pipelines over all 288 steps:
+\[
+T^{\text{profile}}_{\text{DSS}}
+  \approx T_{\text{set\_time}}
+         + T_{\text{apply}}
+         + T_{\text{solve}}
+         + T_{\text{get\_voltage}},
+\]
+\[
+T^{\text{pipe}}_{\text{GNN}}
+  = T_{\text{build\_x}}
+  + T_{\text{tensor\_creation}}
+  + T_{\text{forward}}.
+\]
+
+\begin{table}[ht]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{3.6cm}
+  >{\centering\arraybackslash}p{1.2cm}
+  >{\centering\arraybackslash}p{2.4cm}
+  >{\centering\arraybackslash}p{2.4cm}
+  >{\centering\arraybackslash}p{1.8cm}
+}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Dataset / Mode}}
+  & \textcolor{white}{\textbf{Device}}
+  & \textcolor{white}{\textbf{DSS Profile}}
+  & \textcolor{white}{\textbf{GNN Pipeline}}
+  & \textcolor{white}{\textbf{Ratio}} \\
+\midrule
+\rowcolor{rowblue}
+Original, non-batched & CPU & 0.396\,s & 4.642\,s & $11.72\times$ \\
+Original, non-batched & GPU & 0.349\,s & 0.686\,s & $1.96\times$  \\
+\rowcolor{rowblue}
+Original, batched     & CPU & 0.315\,s & 3.664\,s & $11.63\times$ \\
+Original, batched     & GPU & 0.311\,s & 0.498\,s & $1.60\times$  \\
+\bottomrule
+\end{tabular}
+\caption{Component-level pipeline totals over 288 timesteps.
+  Divide by 288 for per-step values.}
+\label{tab:breakdown}
+\end{table}
+
+\medskip
+The main qualitative transitions are:
+\begin{itemize}
+  \item \textbf{CPU $\to$ GPU:} model forward time drops dramatically, exposing
+        feature-construction and tensor-creation overheads as the new bottleneck.
+  \item \textbf{Non-batched $\to$ batched:} packing all 288 timesteps into one call
+        improves GPU occupancy and amortises kernel-launch overhead, yielding a further
+        $\approx 27\%$ speedup on GPU.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Key Insights and Interpretation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{description}[style=unboxed, leftmargin=0pt, labelwidth=0pt]
+
+  \item[\textbf{Why OpenDSS is fast on this case.}]
+  OpenDSS uses a sparse admittance-matrix solver written in optimised C/C\texttt{++}.
+  For an 89-node feeder the linear system is tiny and very few nonlinear iterations
+  are required per step.  The dominant wall-clock cost is Python API overhead
+  (snapshot apply and voltage reads), not the numerical solve itself:
+  $\bar{t}^{\text{solve}}_{\text{DSS}} \approx 0.088\,\text{ms}$, while
+  $\bar{t}^{\text{wall}}_{\text{DSS}} \approx 0.612\,\text{ms}$.
+
+  \item[\textbf{Why GNN is slower on CPU.}]
+  GNN inference involves repeated dense matrix multiplications of size $h \times h$
+  across $L$ message-passing layers.  The four primary speed levers are:
+  input dimension $d_{\text{node}}$, embedding sizes $(n_{\text{emb}},\,e_{\text{emb}})$,
+  hidden width $h$, and depth $L$.  For a small 89-node feeder, this dense computation
+  is unnecessarily heavy compared to OpenDSS's sparse approach.
+
+  \item[\textbf{Why GPU and batching close the gap.}]
+  GPU Streaming Multiprocessors, warp-level SIMT execution, and Tensor Cores accelerate
+  the dense matrix multiplies that dominate GNN inference.  Batching stacks multiple
+  timesteps into larger tensor dimensions, improving SM occupancy and amortising
+  kernel-launch overhead.  OpenDSS cannot be trivially batched because its iterative
+  solver has internal branching and a single-scenario API.
+
+  \item[\textbf{Feature-building overhead.}]
+  Once the model forward is accelerated on GPU, the remaining bottleneck shifts to
+  Python-side feature construction and tensor/batch creation.  Vectorising feature
+  building, eliminating Python loops, and minimising host\,$\leftrightarrow$\,device
+  transfers are the next optimisation levers.
+
+  \item[\textbf{Latency vs.\ throughput.}]
+  For single-scenario latency, OpenDSS wins on this small feeder.  For high-throughput
+  what-if analysis (many scenarios in parallel on GPU), a batched GNN can deliver
+  better aggregate throughput.  The present test is a worst-case regime for the GNN:
+  small feeder, single scenario, no batching on the baseline.
+
+  \item[\textbf{When does a GNN outperform Newton--Raphson power flow?}]
+  For large systems (hundreds to thousands of buses), huge scenario batches, and GPU
+  inference, a learned surrogate can match or beat traditional power flow in wall time.
+  For $N = 89$ nodes, NR-based power flow is faster due to the small problem dimension
+  and the highly efficient sparse solver.  The claim ``GNN is faster than NR'' is
+  \emph{not universally true}---it depends on system size, hardware, and batch size.
+
+  \item[\textbf{Two levels of GPU parallelism.}]
+  \begin{itemize}
+    \item \emph{Within one forward pass (matrix-multiply parallelism):}
+          GPU SIMT execution and Tensor Cores (FP16/BF16/TF32) accelerate dense
+          operations, reducing $T_{\text{forward}}$ dramatically.
+    \item \emph{Across scenarios/timesteps (batch parallelism):}
+          batching creates larger tensor dimensions, giving the GPU more work per
+          kernel launch and improving occupancy across SMs.
+  \end{itemize}
+
+  \item[\textbf{MLP vs.\ GNN trade-off.}]
+  A smaller, shallower MLP surrogate could potentially close the remaining gap even for
+  89 nodes, trading some accuracy for speed.  The current GNN architecture
+  (message passing + dense MLP blocks) may be heavier than necessary for a small feeder.
+
+  \item[\textbf{Consistency with the literature.}]
+  Claims that learned surrogates are faster than traditional power flow typically assume
+  larger networks (hundreds--thousands of buses), GPU inference, and/or many scenarios
+  evaluated in parallel.  In the present setting
+  ($N = 89$, Python overhead, single-scenario evaluation), it is expected that OpenDSS
+  wins on CPU, while GPU and batching reduce the gap substantially.
+
+\end{description}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion and Next Steps}
+% ─────────────────────────────────────────────────────────────────────────────
+
+On the 89-node feeder tested, OpenDSS (CPU) is the fastest solver for single-scenario
+latency, completing 288 timesteps in under 0.18\,s.  GNN inference on CPU is
+${\approx}22\times$ slower per step, but GPU acceleration and batching reduce this gap
+to just ${\approx}1.6\times$.  These results are consistent with the broader literature:
+GNN surrogates offer their greatest advantage at scale rather than for small,
+single-scenario evaluations.
+
+\medskip
+\noindent\textbf{Priority next steps:}
+\begin{enumerate}[itemsep=3pt]
+  \item \textbf{Reduce Python feature-building overhead} --- vectorise construction loops
+        and minimise host\,$\leftrightarrow$\,device transfers.
+  \item \textbf{Explore lighter MLP architectures} for small feeders where full
+        message-passing GNNs may be over-parameterised.
+  \item \textbf{Scale tests to larger networks} (hundreds--thousands of buses) where GNN
+        parallelism becomes the decisive advantage.
+  \item \textbf{Profile batch-size sensitivity} to identify the optimal batch size for
+        the GPU configuration in use.
+\end{enumerate}
+
+\end{document}

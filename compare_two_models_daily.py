@@ -15,11 +15,22 @@ present in the checkpoint; it does not store full training history.
 Scaled baseline (from run_injection_dataset.BASELINE, used in dataset generation):
   P_load_total_kw=849.12, Q_load_total_kvar=501.12, P_pv_total_kw=975.0
 
+Supported model types:
+  - Single checkpoint: any .pt (injection, original, original+cap, loadtype 14-feat, loadtype
+    with phase one-hot 17-feat). Pass path to the .pt; node_in_dim is read from config.
+  - Phase one-hot: use models_gnn2/loadtype/light_emb_h96_depth2_phase_onehot_best.pt (17 features).
+  - Three per-phase GNNs: use --model1-per-phase or --model2-per-phase with three .pt paths
+    (phase1, phase2, phase3). Each .pt is trained on that phase's subgraph; inference builds
+    14-dim loadtype features and runs each model on its phase nodes, then merges.
+
 Usage (from repo root):
   python compare_two_models_daily.py <ckpt1.pt> <ckpt2.pt> [--nodes 840.1 848.2 ...] [--top-k 5] [--output-dir DIR]
+  python compare_two_models_daily.py ckpt1.pt --model2-per-phase p1.pt p2.pt p3.pt [options]
   Use --top-k 0 to plot all nodes (89).
 Example:
   python compare_two_models_daily.py models_gnn2/injection/best.pt models_gnn2/loadtype/best.pt --nodes 840.1 890.1 --top-k 5
+  python compare_two_models_daily.py models_gnn2/loadtype/light_emb_h96_depth2_best.pt models_gnn2/loadtype/light_emb_h96_depth2_phase_onehot_best.pt
+  python compare_two_models_daily.py models_gnn2/loadtype/light_emb_h96_depth2_best.pt --model2-per-phase models_gnn2/loadtype/light_emb_h96_depth2_phase1_best.pt models_gnn2/loadtype/light_emb_h96_depth2_phase2_best.pt models_gnn2/loadtype/light_emb_h96_depth2_phase3_best.pt
 """
 import argparse
 import importlib
@@ -45,6 +56,25 @@ from run_gnn3_overlay_7 import (
     load_model_for_inference,
 )
 from run_gnn3_best7_train import PFIdentityGNN
+
+
+def load_per_phase_ensemble(path_phase1, path_phase2, path_phase3, device=None):
+    """Load three per-phase checkpoints (from train_loadtype_variants). Returns (models, statics).
+    Each static has keys config, edge_index, edge_attr, edge_id, N, node_indices_phase (array of global node indices)."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    models = []
+    statics = []
+    for path in (path_phase1, path_phase2, path_phase3):
+        model, static = load_model_for_inference(path, device=device)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        static["node_indices_phase"] = ckpt.get("node_indices_phase")
+        if static["node_indices_phase"] is not None and hasattr(static["node_indices_phase"], "numpy"):
+            static["node_indices_phase"] = static["node_indices_phase"].numpy()
+        static["node_indices_phase"] = np.asarray(static["node_indices_phase"], dtype=np.int64)
+        models.append(model)
+        statics.append(static)
+    return models, statics
 
 os.chdir(BASE_DIR)
 
@@ -171,20 +201,40 @@ def _get_full_master_node_list(dataset_dir):
     return master_df["node"].astype(str).tolist()
 
 
-def run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv_dist, dataset_dir=None):
-    """Run 24h profile for all nodes using P_BASE, Q_BASE, PV_BASE (scaled baseline). Returns (t_hours, V_dss, V_1, V_2)."""
-    model_1, static_1 = load_model_for_inference(ckpt_1_path, device=DEVICE)
-    model_2, static_2 = load_model_for_inference(ckpt_2_path, device=DEVICE)
-    N = static_1["N"]
-    dim_1 = int(static_1["config"]["node_in_dim"])
-    dim_2 = int(static_2["config"]["node_in_dim"])
+def run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv_dist, dataset_dir=None,
+                       per_phase_paths_1=None, per_phase_paths_2=None):
+    """Run 24h profile for all nodes using P_BASE, Q_BASE, PV_BASE (scaled baseline). Returns (t_hours, V_dss, V_1, V_2).
+    If per_phase_paths_1 is not None, it must be (path_p1, path_p2, path_p3) and model 1 is the per-phase ensemble.
+    Same for per_phase_paths_2 and model 2. N is always the full 89-node count (from first single checkpoint or from node_names_master)."""
+    if per_phase_paths_1 is not None:
+        models_1, statics_1 = load_per_phase_ensemble(*per_phase_paths_1, device=DEVICE)
+        model_1 = None
+        static_1 = {"N": len(node_names_master), "config": {"node_in_dim": 14}}
+        ei_1 = ea_1 = eid_1 = None
+        dim_1 = 14
+    else:
+        model_1, static_1 = load_model_for_inference(ckpt_1_path, device=DEVICE)
+        models_1 = statics_1 = None
+        dim_1 = int(static_1["config"]["node_in_dim"])
+        ei_1 = static_1["edge_index"].to(DEVICE)
+        ea_1 = static_1["edge_attr"].to(DEVICE)
+        eid_1 = static_1["edge_id"].to(DEVICE)
 
-    ei_1 = static_1["edge_index"].to(DEVICE)
-    ea_1 = static_1["edge_attr"].to(DEVICE)
-    eid_1 = static_1["edge_id"].to(DEVICE)
-    ei_2 = static_2["edge_index"].to(DEVICE)
-    ea_2 = static_2["edge_attr"].to(DEVICE)
-    eid_2 = static_2["edge_id"].to(DEVICE)
+    if per_phase_paths_2 is not None:
+        models_2, statics_2 = load_per_phase_ensemble(*per_phase_paths_2, device=DEVICE)
+        model_2 = None
+        static_2 = {"N": len(node_names_master), "config": {"node_in_dim": 14}}
+        ei_2 = ea_2 = eid_2 = None
+        dim_2 = 14
+    else:
+        model_2, static_2 = load_model_for_inference(ckpt_2_path, device=DEVICE)
+        models_2 = statics_2 = None
+        dim_2 = int(static_2["config"]["node_in_dim"])
+        ei_2 = static_2["edge_index"].to(DEVICE)
+        ea_2 = static_2["edge_attr"].to(DEVICE)
+        eid_2 = static_2["edge_id"].to(DEVICE)
+
+    N = len(node_names_master)
 
     # Use full 95-node master list for electrical distance (includes sourcebus, 800) so source_nodes is correct.
     # Matches dataset generation: run_loadtype_dataset uses get_all_bus_phase_nodes() (95 nodes) for this.
@@ -249,13 +299,30 @@ def run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv_dis
         X_1 = build_x_for_model(dim_1, **kw)
         X_2 = build_x_for_model(dim_2, **kw)
 
-        x_1 = torch.tensor(X_1, dtype=torch.float32, device=DEVICE)
-        x_2 = torch.tensor(X_2, dtype=torch.float32, device=DEVICE)
-        g_1 = Data(x=x_1, edge_index=ei_1, edge_attr=ea_1, edge_id=eid_1, num_nodes=N)
-        g_2 = Data(x=x_2, edge_index=ei_2, edge_attr=ea_2, edge_id=eid_2, num_nodes=N)
         with torch.no_grad():
-            V_1[t, :] = model_1(g_1)[:, 0].cpu().numpy()
-            V_2[t, :] = model_2(g_2)[:, 0].cpu().numpy()
+            if per_phase_paths_1 is not None:
+                for m, st in zip(models_1, statics_1):
+                    idx = st["node_indices_phase"]
+                    x_p = torch.tensor(X_1[idx], dtype=torch.float32, device=DEVICE)
+                    g_p = Data(x=x_p, edge_index=st["edge_index"].to(DEVICE), edge_attr=st["edge_attr"].to(DEVICE),
+                               edge_id=st["edge_id"].to(DEVICE), num_nodes=len(idx))
+                    V_1[t, idx] = m(g_p)[:, 0].cpu().numpy()
+            else:
+                x_1 = torch.tensor(X_1, dtype=torch.float32, device=DEVICE)
+                g_1 = Data(x=x_1, edge_index=ei_1, edge_attr=ea_1, edge_id=eid_1, num_nodes=N)
+                V_1[t, :] = model_1(g_1)[:, 0].cpu().numpy()
+
+            if per_phase_paths_2 is not None:
+                for m, st in zip(models_2, statics_2):
+                    idx = st["node_indices_phase"]
+                    x_p = torch.tensor(X_2[idx], dtype=torch.float32, device=DEVICE)
+                    g_p = Data(x=x_p, edge_index=st["edge_index"].to(DEVICE), edge_attr=st["edge_attr"].to(DEVICE),
+                               edge_id=st["edge_id"].to(DEVICE), num_nodes=len(idx))
+                    V_2[t, idx] = m(g_p)[:, 0].cpu().numpy()
+            else:
+                x_2 = torch.tensor(X_2, dtype=torch.float32, device=DEVICE)
+                g_2 = Data(x=x_2, edge_index=ei_2, edge_attr=ea_2, edge_id=eid_2, num_nodes=N)
+                V_2[t, :] = model_2(g_2)[:, 0].cpu().numpy()
 
     t_hours = np.arange(NPTS) * STEP_MIN / 60.0
     return t_hours, V_dss, V_1, V_2
@@ -311,21 +378,37 @@ def run_one_step_and_return_features(ckpt_1_path, ckpt_2_path, node_names_master
     return X_1, X_2, np.array([float(x) for x in vmag_m]), dim_1, dim_2
 
 
-def run_comparison_for_notebook(ckpt_1_path, ckpt_2_path, nodes_to_plot=None, top_k=5):
+def run_comparison_for_notebook(ckpt_1_path, ckpt_2_path, nodes_to_plot=None, top_k=5,
+                                per_phase_paths_1=None, per_phase_paths_2=None):
     """
     Run 24h comparison and return data for notebook use (no PNG/CSV saved).
     Returns: t_hours, node_names, V_dss, V_1, V_2, df_mae, label_1, label_2, worst_indices, summary
     where summary is a dict with mae_1, rmse_1, mae_2, rmse_2, n_points (this run), and train_mae_1, train_rmse_1, train_epoch_1, train_mae_2, train_rmse_2, train_epoch_2 (from checkpoint when present).
+
+    For phase-onehot model: pass path to light_emb_h96_depth2_phase_onehot_best.pt as ckpt_1_path or ckpt_2_path (node_in_dim=17).
+    For three per-phase GNNs: pass per_phase_paths_1=(p1.pt, p2.pt, p3.pt) and/or per_phase_paths_2=(p1.pt, p2.pt, p3.pt).
     """
     nodes_to_plot = nodes_to_plot or []
+    if per_phase_paths_1 and (ckpt_1_path is None or ckpt_1_path == ""):
+        ckpt_1_path = per_phase_paths_1[0]
+    if per_phase_paths_2 and (ckpt_2_path is None or ckpt_2_path == ""):
+        ckpt_2_path = per_phase_paths_2[0]
     ckpt_1_path = os.path.abspath(ckpt_1_path)
     ckpt_2_path = os.path.abspath(ckpt_2_path)
     for p in (ckpt_1_path, ckpt_2_path):
         if not os.path.isfile(p):
             raise FileNotFoundError(f"Checkpoint not found: {p}")
+    if per_phase_paths_1:
+        for p in per_phase_paths_1:
+            if not os.path.isfile(os.path.abspath(p)):
+                raise FileNotFoundError(f"Checkpoint not found: {p}")
+    if per_phase_paths_2:
+        for p in per_phase_paths_2:
+            if not os.path.isfile(os.path.abspath(p)):
+                raise FileNotFoundError(f"Checkpoint not found: {p}")
 
-    label_1 = os.path.splitext(os.path.basename(ckpt_1_path))[0]
-    label_2 = os.path.splitext(os.path.basename(ckpt_2_path))[0]
+    label_1 = "per_phase_ensemble_1" if per_phase_paths_1 else os.path.splitext(os.path.basename(ckpt_1_path))[0]
+    label_2 = "per_phase_ensemble_2" if per_phase_paths_2 else os.path.splitext(os.path.basename(ckpt_2_path))[0]
 
     edge_csv = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
     if not os.path.exists(edge_csv):
@@ -336,9 +419,14 @@ def run_comparison_for_notebook(ckpt_1_path, ckpt_2_path, nodes_to_plot=None, to
         raise FileNotFoundError("Could not find gnn_edges_phase_static.csv (e.g. in datasets_gnn2/loadtype).")
 
     node_names_master = _resolve_node_list(ckpt_1_path)
+    pp1 = tuple(os.path.abspath(p) for p in per_phase_paths_1) if per_phase_paths_1 else None
+    pp2 = tuple(os.path.abspath(p) for p in per_phase_paths_2) if per_phase_paths_2 else None
     print(f"Scaled baseline: P_load={P_BASE} kW, Q_load={Q_BASE} kVAR, P_pv={PV_BASE} kW (dataset-generation values)")
     print(f"Running 24h profile: {label_1} vs {label_2}...")
-    t_hours, V_dss, V_1, V_2 = run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv)
+    t_hours, V_dss, V_1, V_2 = run_24h_two_models(
+        ckpt_1_path, ckpt_2_path, node_names_master, edge_csv,
+        per_phase_paths_1=pp1, per_phase_paths_2=pp2,
+    )
     N = len(node_names_master)
 
     mae_1 = np.full(N, np.nan)
@@ -379,8 +467,10 @@ def run_comparison_for_notebook(ckpt_1_path, ckpt_2_path, nodes_to_plot=None, to
 
 def main():
     parser = argparse.ArgumentParser(description="Compare two GNN models on 24h profile with scaled baseline (849.12/501.12/975).")
-    parser.add_argument("ckpt1", help="Path to first .pt checkpoint")
-    parser.add_argument("ckpt2", help="Path to second .pt checkpoint")
+    parser.add_argument("ckpt1", nargs="?", default=None, help="Path to first .pt checkpoint (omit if using --model1-per-phase)")
+    parser.add_argument("ckpt2", nargs="?", default=None, help="Path to second .pt checkpoint (omit if using --model2-per-phase)")
+    parser.add_argument("--model1-per-phase", nargs=3, metavar=("P1", "P2", "P3"), help="Three .pt paths (phase1, phase2, phase3) for model 1")
+    parser.add_argument("--model2-per-phase", nargs=3, metavar=("P1", "P2", "P3"), help="Three .pt paths (phase1, phase2, phase3) for model 2")
     parser.add_argument("--nodes", nargs="*", default=[], help="Node names (e.g. 840.1 848.2) to plot daily profile")
     parser.add_argument("--top-k", type=int, default=5, help="Number of worst-difference nodes to plot (default 5). Use 0 for all nodes.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for CSV and plots")
@@ -391,14 +481,28 @@ def main():
     parser.add_argument("--debug-features", action="store_true", help="Dump built features at t=0 to CSV in output-dir for inspection")
     args = parser.parse_args()
 
-    ckpt_1_path = os.path.abspath(args.ckpt1)
-    ckpt_2_path = os.path.abspath(args.ckpt2)
-    for p in (ckpt_1_path, ckpt_2_path):
-        if not os.path.isfile(p):
-            raise FileNotFoundError(f"Checkpoint not found: {p}")
+    per_phase_1 = getattr(args, "model1_per_phase", None)
+    per_phase_2 = getattr(args, "model2_per_phase", None)
+    if per_phase_1 and args.ckpt1:
+        raise ValueError("Use either ckpt1 or --model1-per-phase, not both.")
+    if per_phase_2 and args.ckpt2:
+        raise ValueError("Use either ckpt2 or --model2-per-phase, not both.")
+    if not (args.ckpt1 or per_phase_1):
+        raise ValueError("Provide either ckpt1 or --model1-per-phase.")
+    if not (args.ckpt2 or per_phase_2):
+        raise ValueError("Provide either ckpt2 or --model2-per-phase.")
 
-    label_1 = args.label1 or os.path.splitext(os.path.basename(ckpt_1_path))[0]
-    label_2 = args.label2 or os.path.splitext(os.path.basename(ckpt_2_path))[0]
+    ckpt_1_path = os.path.abspath(args.ckpt1) if args.ckpt1 else os.path.abspath(per_phase_1[0])
+    ckpt_2_path = os.path.abspath(args.ckpt2) if args.ckpt2 else os.path.abspath(per_phase_2[0])
+    paths_to_check = ([ckpt_1_path] + (list(per_phase_1) if per_phase_1 else []) +
+                      [ckpt_2_path] + (list(per_phase_2) if per_phase_2 else []))
+    for p in paths_to_check:
+        p_abs = os.path.abspath(p)
+        if not os.path.isfile(p_abs):
+            raise FileNotFoundError(f"Checkpoint not found: {p_abs}")
+
+    label_1 = args.label1 or (os.path.splitext(os.path.basename(ckpt_1_path))[0] if args.ckpt1 else "per_phase_ensemble_1")
+    label_2 = args.label2 or (os.path.splitext(os.path.basename(ckpt_2_path))[0] if args.ckpt2 else "per_phase_ensemble_2")
 
     node_names_master = _resolve_node_list(ckpt_1_path)
     edge_csv = os.path.join(DIR_LOADTYPE, "gnn_edges_phase_static.csv")
@@ -439,9 +543,15 @@ def main():
         print(f"Saved -> {debug_path}")
         return
 
+    per_phase_1_abs = tuple(os.path.abspath(p) for p in per_phase_1) if per_phase_1 else None
+    per_phase_2_abs = tuple(os.path.abspath(p) for p in per_phase_2) if per_phase_2 else None
+
     print(f"Scaled baseline: P_load={P_BASE} kW, Q_load={Q_BASE} kVAR, P_pv={PV_BASE} kW (dataset-generation values)")
     print(f"Running 24h profile: {label_1} vs {label_2}...")
-    t_hours, V_dss, V_1, V_2 = run_24h_two_models(ckpt_1_path, ckpt_2_path, node_names_master, edge_csv)
+    t_hours, V_dss, V_1, V_2 = run_24h_two_models(
+        ckpt_1_path, ckpt_2_path, node_names_master, edge_csv,
+        per_phase_paths_1=per_phase_1_abs, per_phase_paths_2=per_phase_2_abs,
+    )
     N = len(node_names_master)
 
     mae_1 = np.full(N, np.nan)

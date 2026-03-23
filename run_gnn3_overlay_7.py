@@ -36,6 +36,7 @@ STEP_MIN = 5
 P_BASE = float(inj.BASELINE["P_load_total_kw"])
 Q_BASE = float(inj.BASELINE["Q_load_total_kvar"])
 PV_BASE = float(inj.BASELINE["P_pv_total_kw"])
+CAP_Q_KVAR = float(inj.BASELINE.get("Q_cap_total_kvar", 0.0)) if hasattr(inj, "BASELINE") else 0.0
 OBSERVED_NODE = "840.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -276,15 +277,24 @@ def _parse_phase_from_node_name(name):
 
 
 @torch.no_grad()
-def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=True, observed_node=None):
-    """Run 24h overlay for one model. Returns (df, dss_total_s, gnn_total_s, mae, rmse).
-    observed_node: bus.phase to plot (default OBSERVED_NODE='840.1')."""
-    if device is None:
-        device = DEVICE
-    obs_node = observed_node if observed_node is not None else OBSERVED_NODE
+def task_opendss_profile_and_features(
+    *,
+    cfg,
+    static,
+    obs_node,
+    pv_scale=1.0,
+    verbose=True,
+):
+    """Task 1: Run OpenDSS for 24h and build per-timestep GNN features.
 
-    model, static = load_model_for_inference(ckpt_path, device=device)
-    cfg = static["config"]
+    Returns:
+      - X_list: list length NPTS of np.ndarray (N x F) or None if non-converged
+      - t_hours: list length NPTS
+      - vmag_dss: list length NPTS (observed node)
+      - vmag_zero_precomputed: list length NPTS of np.ndarray (N,) or None (only for Delta-V)
+      - dss_solve_times: list length NPTS (seconds; solve-only time, matches prior behavior)
+      - node_names_master, obs_idx, is_deltav, nonconv
+    """
     node_in_dim = int(cfg["node_in_dim"])
     target_col = cfg.get("target_col", "vmag_pu")
     use_phase_onehot = bool(cfg.get("use_phase_onehot", False))
@@ -298,10 +308,9 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
     master_df["node_idx"] = pd.to_numeric(master_df["node_idx"], errors="raise").astype(int)
     master_df = master_df.sort_values("node_idx").reset_index(drop=True)
     node_names_master = master_df["node"].astype(str).tolist()
-    N_expected = static["N"]
+    N_expected = int(static["N"])
     if len(node_names_master) != N_expected:
         raise RuntimeError(f"MASTER node count {len(node_names_master)} != model expects {N_expected}.")
-
     if obs_node not in set(node_names_master):
         raise RuntimeError(f"observed_node='{obs_node}' not in MASTER.")
     node_to_idx = {n: i for i, n in enumerate(node_names_master)}
@@ -329,15 +338,10 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         phase_map = np.array([_parse_phase_from_node_name(n) for n in node_names_master], dtype=np.int64)
         ph_oh = np.eye(3, dtype=np.float32)[phase_map]
 
-    edge_index = static["edge_index"].to(device)
-    edge_attr = static["edge_attr"].to(device)
-    edge_id = static["edge_id"].to(device)
-
     dss_solve_times = []
-    gnn_times = []
-    t_hours, vmag_dss, vmag_gnn = [], [], []
+    X_list = []
+    t_hours, vmag_dss = [], []
     nonconv = 0
-    use_cuda_timer = device.startswith("cuda") and torch.cuda.is_available()
 
     # For Delta-V: precompute vmag_zero in a separate 24h pass (PV=0) so the main
     # full-solve pass uses the same initial-guess behavior as Load-type blocks.
@@ -362,6 +366,7 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         inj.compile_once()
         inj.setup_daily()
 
+    pv_nominal = PV_BASE * float(pv_scale)
     for t in range(NPTS):
         inj.set_time_index(t)
         dss_time_step = 0.0
@@ -371,13 +376,12 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             nonconv += 1
             t_hours.append(t * STEP_MIN / 60.0)
             vmag_dss.append(np.nan)
-            vmag_gnn.append(np.nan)
-            gnn_times.append(np.nan)
             dss_solve_times.append(0.0)
+            X_list.append(None)
             continue
 
         _, busphP_load, busphQ_load, busphP_pv, busphQ_pv, busph_per_type = lt._apply_snapshot_with_per_type(
-            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=PV_BASE,
+            P_load_total_kw=P_BASE, Q_load_total_kvar=Q_BASE, P_pv_total_kw=pv_nominal,
             mL_t=float(mL[t]), mPV_t=float(mPV[t]),
             loads_dss=loads_dss, dev_to_dss_load=dev_to_dss_load, dev_to_busph_load=dev_to_busph_load,
             pv_dss=pv_dss, pv_to_dss=pv_to_dss, pv_to_busph=pv_to_busph,
@@ -393,15 +397,14 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             nonconv += 1
             t_hours.append(t * STEP_MIN / 60.0)
             vmag_dss.append(np.nan)
-            vmag_gnn.append(np.nan)
-            gnn_times.append(np.nan)
+            X_list.append(None)
             continue
 
         vdict = get_all_node_voltage_pu_and_angle_dict()
         vm_dss, _ = vdict[obs_node]
 
+        # Build features (kept in OpenDSS task so GNN task can be pure inference+timing)
         if dataset_dir == os.path.join("datasets_gnn2", "original"):
-            # Use post-solve actual PV P/Q for ORIGINAL models (matches training).
             busphP_pv_actual, busphQ_pv_actual = inj.get_pv_actual_pq_by_busph(pv_to_dss, pv_to_busph)
             X = build_gnn_x_original(
                 node_names_master,
@@ -439,6 +442,56 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
         if use_phase_onehot:
             X = np.concatenate([X, ph_oh], axis=-1)
 
+        t_hours.append(t * STEP_MIN / 60.0)
+        vmag_dss.append(float(vm_dss))
+        X_list.append(X)
+
+    if verbose:
+        print(f"  OpenDSS task: nonconv={nonconv} / {NPTS}")
+
+    return {
+        "X_list": X_list,
+        "t_hours": t_hours,
+        "vmag_dss": vmag_dss,
+        "vmag_zero_precomputed": vmag_zero_precomputed,
+        "dss_solve_times": dss_solve_times,
+        "node_names_master": node_names_master,
+        "obs_idx": obs_idx,
+        "is_deltav": is_deltav,
+        "nonconv": nonconv,
+    }
+
+
+@torch.no_grad()
+def task_gnn_forward_and_timing(
+    *,
+    model,
+    static,
+    X_list,
+    obs_idx,
+    is_deltav,
+    vmag_zero_precomputed=None,
+    device=None,
+):
+    """Task 2: Run GNN forward passes and measure inference time (per timestep)."""
+    if device is None:
+        device = DEVICE
+    edge_index = static["edge_index"].to(device)
+    edge_attr = static["edge_attr"].to(device)
+    edge_id = static["edge_id"].to(device)
+    N_expected = int(static["N"])
+
+    vmag_gnn = []
+    gnn_times = []
+    use_cuda_timer = str(device).startswith("cuda") and torch.cuda.is_available()
+
+    for t in range(len(X_list)):
+        X = X_list[t]
+        if X is None:
+            vmag_gnn.append(np.nan)
+            gnn_times.append(np.nan)
+            continue
+
         x_t = torch.tensor(X, dtype=torch.float32, device=device)
         g = Data(x=x_t, edge_index=edge_index, edge_attr=edge_attr, edge_id=edge_id, num_nodes=N_expected)
 
@@ -458,17 +511,48 @@ def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=T
             gnn_times.append(time.perf_counter() - t0_gnn)
 
         if is_deltav:
+            vmag_zero = vmag_zero_precomputed[t]
             delta_pred = float(yhat[obs_idx, 0].item())
-            vm_gnn = vmag_zero[obs_idx] + delta_pred
+            vm_gnn = float(vmag_zero[obs_idx] + delta_pred)
         else:
             vm_gnn = float(yhat[obs_idx, 0].item())
-
-        t_hours.append(t * STEP_MIN / 60.0)
-        vmag_dss.append(float(vm_dss))
         vmag_gnn.append(vm_gnn)
 
+    return {"vmag_gnn": vmag_gnn, "gnn_times": gnn_times}
+
+
+@torch.no_grad()
+def voltage_profile_overlay_24h(ckpt_path, scenario_name, device=None, verbose=True, observed_node=None):
+    """Run 24h overlay for one model. Returns (df, dss_total_s, gnn_total_s, mae, rmse).
+    observed_node: bus.phase to plot (default OBSERVED_NODE='840.1')."""
+    if device is None:
+        device = DEVICE
+    obs_node = observed_node if observed_node is not None else OBSERVED_NODE
+
+    model, static = load_model_for_inference(ckpt_path, device=device)
+    cfg = static["config"]
+
+    op = task_opendss_profile_and_features(cfg=cfg, static=static, obs_node=obs_node, verbose=verbose)
+    gp = task_gnn_forward_and_timing(
+        model=model,
+        static=static,
+        X_list=op["X_list"],
+        obs_idx=op["obs_idx"],
+        is_deltav=op["is_deltav"],
+        vmag_zero_precomputed=op["vmag_zero_precomputed"],
+        device=device,
+    )
+
+    dss_solve_times = op["dss_solve_times"]
+    gnn_times = gp["gnn_times"]
+    t_hours = op["t_hours"]
+    vmag_dss = op["vmag_dss"]
+    vmag_gnn = gp["vmag_gnn"]
+    nonconv = op["nonconv"]
     dss_total = float(np.nansum(dss_solve_times))
     gnn_total = float(np.nansum(gnn_times))
+    target_col = cfg.get("target_col", "vmag_pu")
+    is_deltav = op["is_deltav"]
 
     # RMSE and MAE vs OpenDSS at observed bus (this 24h run)
     vd = np.array(vmag_dss, dtype=np.float64)
