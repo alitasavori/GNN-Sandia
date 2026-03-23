@@ -184,11 +184,17 @@ def _train_one_mlp(
     if verbose:
         print(
             f"[{arch_label}] Naive baseline (val) MAE |V| = {naive_val_mae:.6f} pu  "
-            f"(test naive MAE = {naive_test_mae:.6f} pu)"
+            f"(test naive MAE = {naive_test_mae:.6f} pu)",
+            flush=True,
         )
         print(
             f"  arch: hidden_dim={hidden_dim}  num_hidden_layers={num_hidden_layers}  "
-            f"loss=MSE(|V|) only"
+            f"loss=MSE(|V|) only",
+            flush=True,
+        )
+        print(
+            "  Training (CPU: first epoch can take several minutes — output may look idle).",
+            flush=True,
         )
 
     for ep in range(1, epochs + 1):
@@ -218,7 +224,8 @@ def _train_one_mlp(
             print(
                 f"  epoch {ep:3d}/{epochs}  val_mse_|V|={val_loss:.6f}  "
                 f"val_mae_|V|_pu={vm['val_mae_vmag_pu']:.6f}  "
-                f"val_rmse_|V|_pu={vm['val_rmse_vmag_pu']:.6f}  lr={opt.param_groups[0]['lr']:.2e}"
+                f"val_rmse_|V|_pu={vm['val_rmse_vmag_pu']:.6f}  lr={opt.param_groups[0]['lr']:.2e}",
+                flush=True,
             )
 
     if best_state is not None:
@@ -269,9 +276,10 @@ def _train_one_mlp(
     if verbose:
         print(
             f"[{arch_label}] device={device!s}  test MAE |V| (pu): {mae_pu:.6f}  "
-            f"vs naive {naive_test_mae:.6f}  ({'better' if mae_pu < naive_test_mae else 'worse'} than naive)"
+            f"vs naive {naive_test_mae:.6f}  ({'better' if mae_pu < naive_test_mae else 'worse'} than naive)",
+            flush=True,
         )
-        print(f"  saved {ckpt}")
+        print(f"  saved {ckpt}", flush=True)
     return meta
 
 
@@ -338,6 +346,10 @@ def train_mlp_architecture_sweep_8500(
     path_x, path_y = tdir / "X.pt", tdir / "Y.pt"
     if not path_x.is_file() or not path_y.is_file():
         raise FileNotFoundError(f"Need {path_x} and {path_y}. Run assemble_dataset_tensors_8500 first.")
+    print(
+        f"[sweep] Loading tensors from {tdir} (large files — can take 1–2 min on Colab)...",
+        flush=True,
+    )
     try:
         X = torch.load(path_x, map_location="cpu", weights_only=True).float()
     except TypeError:
@@ -347,6 +359,7 @@ def train_mlp_architecture_sweep_8500(
     except TypeError:
         Y = torch.load(path_y, map_location="cpu").float()
     S = int(X.shape[0])
+    print(f"[sweep] Loaded X,Y shape X={tuple(X.shape)} Y={tuple(Y.shape)}  samples={S}", flush=True)
     g = torch.Generator().manual_seed(base_seed)
     perm = torch.randperm(S, generator=g)
 
@@ -382,7 +395,7 @@ def train_mlp_architecture_sweep_8500(
         )
         meta["sweep_name"] = name
         results.append(meta)
-        print()
+        print(flush=True)
 
     best = min(results, key=lambda m: m["test_mae_vmag_pu"])
     best_name = str(best["sweep_name"])
@@ -415,17 +428,21 @@ def train_mlp_architecture_sweep_8500(
     summary_path = sweep_root / "sweep_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print("=" * 60)
-    print(f"SWEEP DONE. Best architecture: {best_name}")
-    print(f"  test MAE |V| (pu) = {best['test_mae_vmag_pu']:.6f}")
-    print(f"  copied to {best_dst}")
-    print(f"  summary: {summary_path}")
+    print("=" * 60, flush=True)
+    print(f"SWEEP DONE. Best architecture: {best_name}", flush=True)
+    print(f"  test MAE |V| (pu) = {best['test_mae_vmag_pu']:.6f}", flush=True)
+    print(f"  copied to {best_dst}", flush=True)
+    print(f"  summary: {summary_path}", flush=True)
     return summary
 
 
 def main() -> None:
     import argparse
 
+    print(
+        "[train_mlp_8500] Starting sweep (use: python -u for unbuffered logs in notebooks).",
+        flush=True,
+    )
     p = argparse.ArgumentParser(description="IEEE 8500 MLP sweep (MSE on |V| only).")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=16)
