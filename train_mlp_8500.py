@@ -424,7 +424,13 @@ def train_mlp_architecture_sweep_8500(
 
 
 def main() -> None:
-    train_mlp_architecture_sweep_8500()
+    import argparse
+
+    p = argparse.ArgumentParser(description="IEEE 8500 MLP sweep (MSE on |V| only).")
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=16)
+    args = p.parse_args()
+    train_mlp_architecture_sweep_8500(epochs=args.epochs, batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
