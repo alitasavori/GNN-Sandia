@@ -14,14 +14,14 @@ Usage (local):
   python train_8500_device_state_arch_search.py
   python train_8500_device_state_arch_search.py --epochs 80 --dataset-dir datasets_gnn2/loadtype_8500_dailyagg
 
-Colab (typical):
-  !git clone <your-repo-url> /content/GNN2
-  %cd /content/GNN2
-  # Upload or mount Drive so datasets_gnn2/loadtype_8500_dailyagg exists, then:
+Colab (typical; same as setup cell using REPO_DIR=/content/GNN-Sandia):
+  !git clone https://github.com/alitasavori/GNN-Sandia.git /content/GNN-Sandia
+  %cd /content/GNN-Sandia
+  # Add datasets_gnn2/loadtype_8500_dailyagg, then:
   !python train_8500_device_state_arch_search.py --epochs 100
 
 Or set env before running (any platform):
-  export GNN2_REPO=/content/GNN2
+  export GNN_REPO=/content/GNN-Sandia
   python train_8500_device_state_arch_search.py
 """
 from __future__ import annotations
@@ -38,8 +38,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def resolve_repo_root() -> Path:
-    """Project root: GNN2_REPO env, else directory containing this file, else cwd."""
-    env = os.environ.get("GNN2_REPO", "").strip()
+    """Project root: GNN2_REPO or GNN_REPO env, else directory containing this file, else cwd."""
+    env = (os.environ.get("GNN2_REPO") or os.environ.get("GNN_REPO") or "").strip()
     if env:
         return Path(env).expanduser().resolve()
     try:
@@ -373,7 +373,7 @@ def main() -> None:
         "--repo-root",
         type=str,
         default=None,
-        help="Project root (default: GNN2_REPO env, else script directory, else cwd). "
+        help="Project root (default: GNN2_REPO or GNN_REPO env, else script directory, else cwd). "
         "Used to build default --dataset-dir / --out-dir when those are omitted.",
     )
     ap.add_argument(
