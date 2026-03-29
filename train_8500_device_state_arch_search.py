@@ -286,6 +286,7 @@ def train_one_arch(
     lr: float,
     weight_decay: float,
     device: torch.device,
+    log_every: int,
 ) -> dict:
     flat_dim = int(X.shape[1] * X.shape[2])
     model = _build_model(name, flat_dim=flat_dim, dropout=0.1).to(device)
@@ -343,6 +344,16 @@ def train_one_arch(
 
         sched.step(loss_va)
 
+        if log_every > 0 and (
+            (ep + 1) % log_every == 0 or ep == 0 or ep == epochs - 1
+        ):
+            cur_lr = opt.param_groups[0]["lr"]
+            print(
+                f"    epoch {ep + 1:4d}/{epochs}  train_mse={loss_tr:.6f}  "
+                f"val_mse={loss_va:.6f}  lr={cur_lr:.2e}",
+                flush=True,
+            )
+
         if loss_va < best_val:
             best_val = loss_va
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -399,6 +410,12 @@ def main() -> None:
         default="",
         help="Optional path to a .pt file: load/save stacked node tensor X [S,N,2] to skip re-streaming the large CSV.",
     )
+    ap.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="Print train/val MSE every N epochs (also epoch 1 and the last epoch). Use 0 to disable.",
+    )
     args = ap.parse_args()
 
     repo = Path(args.repo_root).expanduser().resolve() if args.repo_root else resolve_repo_root()
@@ -443,6 +460,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  device={device}")
+    print(f"  log_every={args.log_every}", flush=True)
 
     results = []
     for name in ARCHITECTURES:
@@ -458,6 +476,7 @@ def main() -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             device=device,
+            log_every=args.log_every,
         )
         results.append(r)
         print(f"  best_val_mse_norm={r['best_val_mse_normalized']:.6f}")
