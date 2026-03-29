@@ -41,19 +41,27 @@ def _compile_8500_from_master_dir() -> None:
     inside Master.dss (e.g., LineCodes2.dss) always resolve on Colab/local.
     """
     master_path = Path(loadtype8500.MASTER_8500).resolve()
+    run_daily_path = master_path.parent / "Run_8500Node_Daily_5min.dss"
     if not master_path.is_file():
         raise FileNotFoundError(f"Missing IEEE 8500 master: {master_path}")
+    if not run_daily_path.is_file():
+        raise FileNotFoundError(f"Missing daily setup DSS entrypoint: {run_daily_path}")
     master_dir = master_path.parent
 
-    # Linux/Colab is case-sensitive. Resolve Redirect target filename casing up front.
+    # Linux/Colab is case-sensitive. Build case-resolved copies:
+    # - master copy for internal Redirects
+    # - daily setup copy that compiles the case-resolved master
     master_to_run = _build_case_resolved_master_copy(master_path)
+    run_daily_to_run = _build_case_resolved_daily_setup_copy(run_daily_path, master_to_run.name)
 
     prev_cwd = Path.cwd()
     try:
         os.chdir(master_dir)
         dss.Basic.ClearAll()
         # Use relative filename after cwd switch so nested Redirects are stable.
-        dss.Text.Command(f'redirect "{master_to_run.name}"')
+        dss.Text.Command(f'redirect "{run_daily_to_run.name}"')
+        # Daily setup entrypoint sets mode=daily; this comparison script performs
+        # explicit per-step snapshot solves for fair timing, so force snapshot mode.
         dss.Solution.Mode(1)
         inj._apply_voltage_bases()
     finally:
@@ -99,6 +107,55 @@ def _build_case_resolved_master_copy(master_path: Path) -> Path:
     tmp_master = parent / "_Master_case_resolved_tmp.dss"
     tmp_master.write_text("".join(out_lines), encoding="utf-8")
     return tmp_master
+
+
+def _build_case_resolved_daily_setup_copy(run_daily_path: Path, master_name_to_compile: str) -> Path:
+    """
+    Build a temp copy of Run_8500Node_Daily_5min.dss where:
+      - Compile(...) points to the provided case-resolved master filename
+      - Redirect targets (if any) are rewritten to exact on-disk case
+    """
+    text = run_daily_path.read_text(encoding="utf-8", errors="ignore")
+    parent = run_daily_path.parent
+    name_lut = {p.name.lower(): p for p in parent.iterdir() if p.is_file()}
+    out_lines: list[str] = []
+
+    re_compile = re.compile(r"(?im)^(\s*compile\s*\(\s*)([^)\r\n]+)(\s*\)\s*.*)$")
+    re_redirect = re.compile(r"(?im)^(\s*redirect\s+)(\"?)([^\r\n\"!]+)(\"?)(.*)$")
+
+    for line in text.splitlines(keepends=True):
+        m_compile = re_compile.match(line)
+        if m_compile:
+            pfx, _old_target, sfx = m_compile.groups()
+            rewritten = f"{pfx}{master_name_to_compile}{sfx}"
+            if line.endswith("\n") and not rewritten.endswith("\n"):
+                rewritten += "\n"
+            out_lines.append(rewritten)
+            continue
+
+        m_redirect = re_redirect.match(line)
+        if not m_redirect:
+            out_lines.append(line)
+            continue
+
+        pfx, q1, ref, q2, sfx = m_redirect.groups()
+        ref_clean = ref.strip()
+        ref_path = (parent / ref_clean).resolve()
+        if ref_path.is_file():
+            out_lines.append(line)
+            continue
+        cand = name_lut.get(Path(ref_clean).name.lower())
+        if cand is None:
+            out_lines.append(line)
+            continue
+        rewritten = f"{pfx}{q1}{cand.name}{q2}{sfx}"
+        if line.endswith("\n") and not rewritten.endswith("\n"):
+            rewritten += "\n"
+        out_lines.append(rewritten)
+
+    tmp_run = parent / "_Run_8500Node_Daily_5min_case_resolved_tmp.dss"
+    tmp_run.write_text("".join(out_lines), encoding="utf-8")
+    return tmp_run
 
 
 def _infer_dataset_dir_from_ckpt(ckpt_path: str | os.PathLike) -> Path:

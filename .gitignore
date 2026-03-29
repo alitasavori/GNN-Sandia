@@ -21,3 +21,6 @@ new dss from dr mirzaei/gnn3_best7_output/
 *.npz
 datasets_gnn2/
 
+# Generated comparison / run outputs
+gnn2_daily_compare_8500_output/
+

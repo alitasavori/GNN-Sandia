@@ -503,14 +503,21 @@ def pad_square(mat, n=3):
     out[:k, :k] = mat
     return out
 
-def extract_static_phase_edges_to_csv(node_names_master, edge_csv_path, make_bidirectional=True):
+def extract_static_phase_edges_to_csv(
+    node_names_master,
+    edge_csv_path,
+    make_bidirectional=True,
+    excluded_buses=EXCLUDED_UPSTREAM_BUSES,
+):
     node_to_idx = {n: i for i, n in enumerate(node_names_master)}
     rows = []
     seen = set()
 
+    excluded_buses_norm = {str(b).strip().lower() for b in (excluded_buses or [])}
+
     def _add_edge(from_node, to_node, b_from, b_to, ph, elem_name, linecode, nph_line, length, r_per, x_per, c_per):
         # Skip edges incident to excluded upstream buses to keep them out of static graph
-        if b_from in EXCLUDED_UPSTREAM_BUSES or b_to in EXCLUDED_UPSTREAM_BUSES:
+        if str(b_from).strip().lower() in excluded_buses_norm or str(b_to).strip().lower() in excluded_buses_norm:
             return
         if from_node not in node_to_idx or to_node not in node_to_idx:
             return

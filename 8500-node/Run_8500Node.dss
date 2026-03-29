@@ -1,48 +1,36 @@
-! REV 2
+! REV 3
 !----------------------------------------------------------------------------------------------------------------------------
-! OpenDSS script to control the running of the IEEE 8500-Node Distrubution Test Feeder
+! OpenDSS script to run IEEE 8500-node feeder in DAILY mode (5-minute resolution)
 ! Balanced Load Case
 !----------------------------------------------------------------------------------------------------------------------------
 
-! To execute, select one or more line and right-click, select Do Selected
-!  1. Select from Compile through Solve and execute
-!  2. Select one or more of the statements to display results and execute
+! Compile balanced 8500 master
+Compile (Master.dss)
 
-!----------------------------------------------------------------------------------------------------------------------------
+! Daily load multiplier from local CSV (time,value with 288 points at 5-minute spacing)
+! CSV path is relative to this script location (8500-node folder).
+New Loadshape.Day5min npts=288 interval=0.0833333333333333 mult=(file=5minDayShape.csv, col=2, header=no)
 
-! Edit the path name to indicate the correct location of the Master file.
+! Apply this daily profile to all loads.
+BatchEdit Load..* Daily=Day5min
 
-Compile (master.dss)
+! Solver settings for daily run
+Set maxiterations=20
+Set mode=daily
+Set stepsize=5m
+Set number=288
 
+! Optional monitor/energymeter
 New Energymeter.m1 Line.ln5815900-1 1
 
-Set Maxiterations=20     ! Sometimes the solution takes more than the default 15 iterations
-
+! Run full day
 Solve
 
-Show Voltage LN Nodes
-Show Currents Elem Resid
-Show Powers kVA elem
-
+! Optional output/plots
 Set ShowExport=yes
+Export Voltages
 Export Currents
 Export Powers
-Export voltages
-
-// *********************** Plotting *****************************
-
-Set markCapacitors=yes  CapMarkersize=3
-Set markRegulators=yes  RegMarkersize=5
-Interpolate
-Plot Circuit Power Max=5000 dots=n labels=n  C1=Blue  1ph=3   ! $00FF0000
-
-Plot Circuit voltage Max=0 dots=n n  C1=Blue C2=$FF00FF  1ph=3
-
-plot circuit Losses Max=50 dots=n labels=n subs=y C1=Blue
-
-plot profile ph=all
-plot profile ph=1
 
 summary
-
 show taps
