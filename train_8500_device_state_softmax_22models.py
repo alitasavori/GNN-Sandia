@@ -153,6 +153,13 @@ class MLPClassifier(nn.Module):
         return self.net(x)
 
 
+ARCH_LIBRARY = {
+    "a1_wide_shallow": {"hidden_dim": 256, "num_layers": 2, "dropout": 0.10},
+    "a2_mid_deep": {"hidden_dim": 192, "num_layers": 4, "dropout": 0.10},
+    "a3_narrow_deeper": {"hidden_dim": 128, "num_layers": 6, "dropout": 0.15},
+}
+
+
 def _build_target_classes(y: torch.Tensor) -> tuple[np.ndarray, torch.Tensor]:
     # Round regulator tap pu values for stable discrete bins.
     y_q = np.round(y.cpu().numpy().astype(np.float64), 6)
@@ -161,14 +168,22 @@ def _build_target_classes(y: torch.Tensor) -> tuple[np.ndarray, torch.Tensor]:
     return classes.astype(np.float32), torch.from_numpy(idx.astype(np.int64))
 
 
+def _make_class_weights(y_idx_train: torch.Tensor, n_classes: int) -> torch.Tensor:
+    counts = torch.bincount(y_idx_train, minlength=n_classes).float()
+    counts = counts.clamp_min(1.0)
+    weights = counts.sum() / counts
+    weights = weights / weights.mean().clamp_min(1e-12)
+    return weights
+
+
 def train_one_target(
     target_name: str,
+    arch_name: str,
     X_flat_n: torch.Tensor,
     y_idx: torch.Tensor,
     class_values: np.ndarray,
     idx_train: np.ndarray,
     idx_val: np.ndarray,
-    out_dir: Path,
     epochs: int,
     lr: float,
     weight_decay: float,
@@ -178,16 +193,18 @@ def train_one_target(
     log_every: int,
     device: torch.device,
 ) -> dict:
+    n_classes = int(len(class_values))
     model = MLPClassifier(
         in_dim=int(X_flat_n.shape[1]),
         hidden=hidden_dim,
         num_layers=num_layers,
         dropout=dropout,
-        n_classes=int(len(class_values)),
+        n_classes=n_classes,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=8)
+    class_weights = _make_class_weights(y_idx[idx_train], n_classes).to(device)
 
     best_val_ce = float("inf")
     best_val_acc = 0.0
@@ -208,9 +225,10 @@ def train_one_target(
             xb = X_flat_n[bi].to(device)
             yb = y_idx[bi].to(device)
             logits = model(xb)
-            loss = F.cross_entropy(logits, yb)
+            loss = F.cross_entropy(logits, yb, weight=class_weights)
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
             tr_ce += float(loss.item()) * len(bi)
             tr_correct += int((logits.argmax(dim=1) == yb).sum().item())
@@ -227,7 +245,7 @@ def train_one_target(
                 xb = X_flat_n[bi].to(device)
                 yb = y_idx[bi].to(device)
                 logits = model(xb)
-                loss = F.cross_entropy(logits, yb)
+                loss = F.cross_entropy(logits, yb, weight=class_weights)
                 va_ce += float(loss.item()) * len(bi)
                 va_correct += int((logits.argmax(dim=1) == yb).sum().item())
                 va_n += len(bi)
@@ -239,7 +257,7 @@ def train_one_target(
         if log_every > 0 and ((ep + 1) % log_every == 0 or ep == 0 or ep == epochs - 1):
             cur_lr = opt.param_groups[0]["lr"]
             print(
-                f"    epoch {ep + 1:4d}/{epochs}  train_ce={tr_ce:.6f}  train_acc={tr_acc:.4f}  "
+                f"    [{arch_name}] epoch {ep + 1:4d}/{epochs}  train_ce={tr_ce:.6f}  train_acc={tr_acc:.4f}  "
                 f"val_ce={va_ce:.6f}  val_acc={va_acc:.4f}  lr={cur_lr:.2e}",
                 flush=True,
             )
@@ -249,27 +267,16 @@ def train_one_target(
             best_val_acc = va_acc
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
-    target_dir = out_dir / target_name
-    target_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = target_dir / "best.pt"
-    torch.save(
-        {
-            "target_name": target_name,
-            "model_type": "mlp_softmax_single_target",
-            "n_classes": int(len(class_values)),
-            "class_values": class_values.tolist(),
-            "model_state_dict": best_state,
-            "best_val_ce": float(best_val_ce),
-            "best_val_acc": float(best_val_acc),
-        },
-        ckpt_path,
-    )
     return {
         "target": target_name,
-        "n_classes": int(len(class_values)),
+        "arch": arch_name,
+        "n_classes": n_classes,
         "best_val_ce": float(best_val_ce),
         "best_val_acc": float(best_val_acc),
-        "ckpt": str(ckpt_path),
+        "hidden_dim": int(hidden_dim),
+        "num_layers": int(num_layers),
+        "dropout": float(dropout),
+        "model_state_dict": best_state,
     }
 
 
@@ -282,10 +289,11 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=20260329)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--hidden-dim", type=int, default=128)
-    ap.add_argument("--num-layers", type=int, default=3)
-    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--hidden-dim", type=int, default=128, help="Ignored when architecture search is enabled.")
+    ap.add_argument("--num-layers", type=int, default=3, help="Ignored when architecture search is enabled.")
+    ap.add_argument("--dropout", type=float, default=0.1, help="Ignored when architecture search is enabled.")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--disable-arch-search", action="store_true", help="Train one architecture per target using hidden-dim/num-layers/dropout.")
     ap.add_argument(
         "--node-cache",
         type=str,
@@ -338,37 +346,91 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  device={device} log_every={args.log_every}", flush=True)
+    if args.disable_arch_search:
+        print("  architecture_search=disabled (1 architecture/target)", flush=True)
+    else:
+        print(f"  architecture_search=enabled ({len(ARCH_LIBRARY)} architectures/target)", flush=True)
 
     results = []
+    best_per_target = []
     for j, target_name in enumerate(TARGET_COLS):
         print(f"\n--- Training target {j + 1}/{len(TARGET_COLS)}: {target_name} ---", flush=True)
         class_values, y_idx = _build_target_classes(Y[:, j])
-        r = train_one_target(
-            target_name=target_name,
-            X_flat_n=X_flat_n,
-            y_idx=y_idx,
-            class_values=class_values,
-            idx_train=idx_train,
-            idx_val=idx_val,
-            out_dir=out_dir,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            hidden_dim=args.hidden_dim,
-            num_layers=args.num_layers,
-            dropout=args.dropout,
-            log_every=args.log_every,
-            device=device,
+        if args.disable_arch_search:
+            arch_runs = [{
+                "arch": "single_manual",
+                "hidden_dim": int(args.hidden_dim),
+                "num_layers": int(args.num_layers),
+                "dropout": float(args.dropout),
+            }]
+        else:
+            arch_runs = [{"arch": k, **v} for k, v in ARCH_LIBRARY.items()]
+
+        target_runs = []
+        for cfg in arch_runs:
+            print(
+                f"  -> arch={cfg['arch']} hidden={cfg['hidden_dim']} layers={cfg['num_layers']} dropout={cfg['dropout']}",
+                flush=True,
+            )
+            r = train_one_target(
+                target_name=target_name,
+                arch_name=cfg["arch"],
+                X_flat_n=X_flat_n,
+                y_idx=y_idx,
+                class_values=class_values,
+                idx_train=idx_train,
+                idx_val=idx_val,
+                epochs=args.epochs,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                hidden_dim=cfg["hidden_dim"],
+                num_layers=cfg["num_layers"],
+                dropout=cfg["dropout"],
+                log_every=args.log_every,
+                device=device,
+            )
+            target_runs.append(r)
+            results.append(r)
+
+        best_r = min(target_runs, key=lambda x: (x["best_val_ce"], -x["best_val_acc"]))
+        target_dir = out_dir / target_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = target_dir / "best.pt"
+        torch.save(
+            {
+                "target_name": target_name,
+                "model_type": "mlp_softmax_single_target",
+                "arch": best_r["arch"],
+                "hidden_dim": int(best_r["hidden_dim"]),
+                "num_layers": int(best_r["num_layers"]),
+                "dropout": float(best_r["dropout"]),
+                "n_classes": int(best_r["n_classes"]),
+                "class_values": class_values.tolist(),
+                "model_state_dict": best_r["model_state_dict"],
+                "best_val_ce": float(best_r["best_val_ce"]),
+                "best_val_acc": float(best_r["best_val_acc"]),
+                "x_mean": x_mean.cpu(),
+                "x_std": x_std.cpu(),
+            },
+            ckpt_path,
         )
-        results.append(r)
+        best_entry = {
+            "target": target_name,
+            "arch": best_r["arch"],
+            "n_classes": int(best_r["n_classes"]),
+            "best_val_ce": float(best_r["best_val_ce"]),
+            "best_val_acc": float(best_r["best_val_acc"]),
+            "ckpt": str(ckpt_path),
+        }
+        best_per_target.append(best_entry)
         print(
-            f"  done {target_name}: val_ce={r['best_val_ce']:.6f}  val_acc={r['best_val_acc']:.4f}  "
-            f"n_classes={r['n_classes']}",
+            f"  done {target_name}: best_arch={best_r['arch']} val_ce={best_r['best_val_ce']:.6f}  "
+            f"val_acc={best_r['best_val_acc']:.4f} n_classes={best_r['n_classes']}",
             flush=True,
         )
 
-    mean_acc = float(np.mean([r["best_val_acc"] for r in results]))
-    mean_ce = float(np.mean([r["best_val_ce"] for r in results]))
+    mean_acc = float(np.mean([r["best_val_acc"] for r in best_per_target]))
+    mean_ce = float(np.mean([r["best_val_ce"] for r in best_per_target]))
     summary = {
         "dataset_dir": str(dset),
         "out_dir": str(out_dir),
@@ -376,11 +438,22 @@ def main() -> None:
         "n_samples": int(S),
         "n_nodes": int(n_nodes),
         "flat_dim": int(X_flat_n.shape[1]),
-        "n_models": len(TARGET_COLS),
+        "n_models_trained": int(len(results)),
+        "n_models_saved": int(len(best_per_target)),
+        "architectures_per_target": int(1 if args.disable_arch_search else len(ARCH_LIBRARY)),
+        "architecture_library": (
+            [{"arch": "single_manual", "hidden_dim": int(args.hidden_dim), "num_layers": int(args.num_layers), "dropout": float(args.dropout)}]
+            if args.disable_arch_search
+            else [{"arch": k, **v} for k, v in ARCH_LIBRARY.items()]
+        ),
         "targets": list(TARGET_COLS),
         "mean_best_val_acc": mean_acc,
         "mean_best_val_ce": mean_ce,
-        "runs": results,
+        "best_per_target": best_per_target,
+        "all_runs": [
+            {k: v for k, v in r.items() if k != "model_state_dict"}
+            for r in results
+        ],
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
