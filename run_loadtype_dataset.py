@@ -114,6 +114,12 @@ NODE_INDEX_CSV = os.path.join(OUT_DIR, "gnn_node_index_master.csv")
 SOURCE_BUSES = ("sourcebus", "800")
 
 
+def _is_grid_source_bus(bus: str) -> bool:
+    """True if `bus` is the slack / substation side used as the electrical-distance root."""
+    b = str(bus).strip().lower()
+    return b in ("sourcebus", "800") or b.startswith("_hvmv_sub")
+
+
 def _ensure_active_circuit():
     try:
         _ = list(inj.dss.Circuit.AllNodeNames())
@@ -150,12 +156,12 @@ def _infer_reduced_graph_roots(node_names_master):
 
     def _register_boundary_edge(bus_a, phs_a, bus_b, phs_b, nph, r_full, x_full):
         z_mag = float(np.sqrt(float(r_full) * float(r_full) + float(x_full) * float(x_full)))
-        if bus_a in SOURCE_BUSES and bus_b not in SOURCE_BUSES:
+        if _is_grid_source_bus(bus_a) and not _is_grid_source_bus(bus_b):
             for ph in _select_shared_phases(phs_a, phs_b, nph):
                 node = f"{bus_b}.{ph}"
                 if node in node_set:
                     roots[node] = min(float(roots.get(node, float("inf"))), z_mag)
-        if bus_b in SOURCE_BUSES and bus_a not in SOURCE_BUSES:
+        if _is_grid_source_bus(bus_b) and not _is_grid_source_bus(bus_a):
             for ph in _select_shared_phases(phs_a, phs_b, nph):
                 node = f"{bus_a}.{ph}"
                 if node in node_set:
@@ -244,7 +250,7 @@ def _compute_electrical_distance_from_source(node_names_master, edge_csv_path):
         z_mag = np.sqrt(r * r + x * x)
         adj.setdefault(a, []).append((b, z_mag))
 
-    source_nodes = [n for n in node_names_master if n.split(".")[0] in SOURCE_BUSES and n in adj]
+    source_nodes = [n for n in node_names_master if _is_grid_source_bus(n.split(".")[0]) and n in adj]
     root_nodes = {}
     if source_nodes:
         root_nodes = {src: 0.0 for src in source_nodes}

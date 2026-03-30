@@ -12,8 +12,8 @@ Outputs (new folder):
   datasets_gnn2/loadtype_8500_dailyagg/
     - gnn_node_index_master.csv
     - gnn_edges_phase_static.csv
-    - gnn_sample_meta.csv
-    - gnn_node_features_and_targets.csv
+    - gnn_sample_meta.csv (per sample: P/Q load totals, post-solve realized loads, losses, upstream grid)
+    - gnn_node_features_and_targets.csv (per node: electrical_distance_ohm from substation, M1 P/Q, voltages)
 """
 from __future__ import annotations
 
@@ -27,9 +27,11 @@ import pandas as pd
 import opendssdirect as dss
 
 import run_injection_dataset as inj
+import run_loadtype_dataset as lt_dist
 import run_loadtype_dataset_8500 as lt8500
 
 inj = importlib.reload(inj)
+lt_dist = importlib.reload(lt_dist)
 lt8500 = importlib.reload(lt8500)
 
 try:
@@ -50,6 +52,57 @@ RUN_DSS_DAILY = REPO_ROOT / "8500-node" / "Run_8500Node_Daily_5min.dss"
 def _is_source_like_bus(bus_name: str) -> bool:
     b = str(bus_name).strip().lower()
     return b.startswith("sourcebus") or b.startswith("_hvmv_sub")
+
+
+def _sum_loads_post_solve_kw_kvar() -> tuple[float, float]:
+    """Sum realized P/Q over all Load elements (post power-flow)."""
+    p_sum, q_sum = 0.0, 0.0
+    dss.Loads.First()
+    while True:
+        name = dss.Loads.Name()
+        dss.Circuit.SetActiveElement(f"Load.{name}")
+        pwr = dss.CktElement.TotalPowers()
+        if pwr is not None and len(pwr) >= 2:
+            p_sum += float(pwr[0])
+            q_sum += float(pwr[1])
+        if not dss.Loads.Next():
+            break
+    return p_sum, q_sum
+
+
+def _circuit_losses_kw_kvar() -> tuple[float, float]:
+    """Total circuit losses (post solve); kW / kvar (handles W/VAR if magnitudes are large)."""
+    loss = dss.Circuit.Losses()
+    p_l, q_l = float(loss[0]), float(loss[1])
+    if abs(p_l) > 1000.0 or abs(q_l) > 1000.0:
+        p_l /= 1000.0
+        q_l /= 1000.0
+    return p_l, q_l
+
+
+def _grid_upstream_post_kw_kvar() -> tuple[float, float]:
+    """Power from upstream / slack (post solve); positive = injection into the feeder (same as injection dataset)."""
+    pwr = dss.Circuit.TotalPower()
+    return -float(pwr[0]), -float(pwr[1])
+
+
+def _detach_daily_loadshape_from_loads() -> None:
+    """Clear Daily on every Load so kW/kvar are not multiplied again at solve.
+
+    Run_8500Node_Daily_5min.dss runs ``BatchEdit Load..* Daily=Day5min``. This script already
+    applies profile[m_t] when setting kW/kvar; leaving Daily attached would scale by m_t twice,
+    so post-solve TotalPowers sums would read ~m_t × the intended totals.
+
+    Note: ``BatchEdit Load..* Daily=`` does not clear the property in OpenDSS (verified: Daily
+    stays ``day5min``); clearing must use the Loads API per element.
+    """
+    dss.Loads.First()
+    while True:
+        nm = dss.Loads.Name()
+        dss.Loads.Name(nm)
+        dss.Loads.Daily("")
+        if not dss.Loads.Next():
+            break
 
 
 def _compile_8500_daily_setup() -> None:
@@ -117,8 +170,13 @@ def _discover_capacitors() -> list[str]:
     return sorted(cap_names)
 
 
-def _read_capacitor_state(cap_names: list[str]) -> dict[str, float | int]:
-    """Per capacitor bank: n_steps_on only (no is_on, no n_steps_total)."""
+def _read_capacitor_sample_fields(cap_names: list[str]) -> dict[str, float | int]:
+    """Per capacitor: n_steps_on, nameplate kvar, post-solve Q (in column order).
+
+    q_nominal_kvar is the OpenDSS ``kvar`` rating (DSS nameplate). q_post_kvar uses
+    ``-TotalPowers()[1]`` so **positive** means VArs **injected** by the bank (same cap
+    convention as ``compare_nominal_vs_realized.py``).
+    """
     out: dict[str, float | int] = {}
     for nm in cap_names:
         steps: list[int] = []
@@ -140,8 +198,30 @@ def _read_capacitor_state(cap_names: list[str]) -> dict[str, float | int]:
                 steps = []
 
         n_on = int(sum(1 for x in steps if int(x) > 0))
+        q_nom = np.nan
+        try:
+            dss.Capacitors.Name(nm)
+            q_nom = float(dss.Capacitors.kvar())
+        except Exception:
+            pass
+
+        q_post = np.nan
+        try:
+            dss.Circuit.SetActiveElement(f"Capacitor.{nm}")
+            pwr = dss.CktElement.TotalPowers()
+            if pwr is not None and len(pwr) >= 2:
+                q_post = float(-float(pwr[1]))
+        except Exception:
+            pass
+
         out[f"cap_{nm}_n_steps_on"] = n_on
+        out[f"cap_{nm}_q_nominal_kvar"] = float(q_nom) if np.isfinite(q_nom) else np.nan
+        out[f"cap_{nm}_q_post_kvar"] = float(q_post) if np.isfinite(q_post) else np.nan
     return out
+
+
+# Notebooks / older snippets may call this name; same payload (includes Q columns).
+_read_capacitor_state = _read_capacitor_sample_fields
 
 
 def _read_reg_control_state(reg_names: list[str]) -> dict[str, float | int]:
@@ -165,7 +245,7 @@ def _read_reg_control_state(reg_names: list[str]) -> dict[str, float | int]:
 
 def generate_dataset_8500_daily_aggregate(
     *,
-    n_scenarios: int = 5,
+    n_scenarios: int = 500,
     k_snapshots_per_scenario: int = 20,
     total_load_scale_range: tuple[float, float] = (0.7, 1.3),
     sigma_device: float = 0.03,
@@ -190,6 +270,7 @@ def generate_dataset_8500_daily_aggregate(
 
     # Initial compile and static artifacts (aligned with notebook Step 9 daily setup)
     _compile_8500_daily_setup()
+    _detach_daily_loadshape_from_loads()
     node_names_master, _, _, _ = inj.get_all_bus_phase_nodes()
     node_to_idx_master = {n: i for i, n in enumerate(node_names_master)}
     # Safe-band evaluation aligned with Step-9 style node population:
@@ -220,6 +301,12 @@ def generate_dataset_8500_daily_aggregate(
         node_names_master=node_names_master,
         edge_csv_path=str(EDGE_CSV),
         excluded_buses=(),
+    )
+    node_to_dist = lt_dist._compute_electrical_distance_from_source(node_names_master, str(EDGE_CSV))
+    dist_vals = list(node_to_dist.values())
+    print(
+        f"[diag] electrical_distance_ohm: min={min(dist_vals):.6g} max={max(dist_vals):.6g} "
+        f"(|Z| sum along min-|Z| path from substation)"
     )
 
     # Baseline loads and bus-phase maps
@@ -256,6 +343,7 @@ def generate_dataset_8500_daily_aggregate(
         "node_idx",
         "bus",
         "phase",
+        "electrical_distance_ohm",
         "p_load_kw",
         "q_load_kvar",
         "vmag_pu",
@@ -268,6 +356,7 @@ def generate_dataset_8500_daily_aggregate(
         for s in range(n_scenarios):
             # fresh circuit each scenario
             _compile_8500_daily_setup()
+            _detach_daily_loadshape_from_loads()
             # keep all loads as model 1 (M1), as requested
             dss.Loads.First()
             while True:
@@ -353,6 +442,10 @@ def generate_dataset_8500_daily_aggregate(
                 finite_v_count_this_scenario += n_finite
                 total_v_outside_band += n_outside
 
+                p_load_post_kw, q_load_post_kvar = _sum_loads_post_solve_kw_kvar()
+                p_loss_post_kw, q_loss_post_kvar = _circuit_losses_kw_kvar()
+                p_grid_post_kw, q_grid_post_kvar = _grid_upstream_post_kw_kvar()
+
                 # Count offending nodes for quick diagnostics.
                 if n_outside > 0:
                     eval_idx = np.asarray(safe_band_eval_indices, dtype=int)
@@ -372,10 +465,12 @@ def generate_dataset_8500_daily_aggregate(
                         "scenario_total_load_scale": scenario_scale,
                         "m_loadshape": m_t,
                         "effective_total_scale": total_scale_t,
-                        "P_load_total_kw": float(sum(busphP_load.values())),
-                        "Q_load_total_kvar": float(sum(busphQ_load.values())),
-                        "P_load_total_kw_nominal": float(p_total_base * total_scale_t),
-                        "Q_load_total_kvar_nominal": float(q_total_base * total_scale_t),
+                        "P_load_sum_post_kw": float(p_load_post_kw),
+                        "Q_load_sum_post_kvar": float(q_load_post_kvar),
+                        "P_loss_total_post_kw": float(p_loss_post_kw),
+                        "Q_loss_total_post_kvar": float(q_loss_post_kvar),
+                        "P_grid_upstream_post_kw": float(p_grid_post_kw),
+                        "Q_grid_upstream_post_kvar": float(q_grid_post_kvar),
                         "sigma_device": float(sigma_device),
                         "safe_vmin_pu": float(vmin_safe_pu),
                         "safe_vmax_pu": float(vmax_safe_pu),
@@ -383,7 +478,7 @@ def generate_dataset_8500_daily_aggregate(
                         "n_v_below_safe_band": int(n_below),
                         "n_v_above_safe_band": int(n_above),
                         **_read_reg_control_state(reg_names),
-                        **_read_capacitor_state(cap_names),
+                        **_read_capacitor_sample_fields(cap_names),
                     }
                 )
 
@@ -399,6 +494,7 @@ def generate_dataset_8500_daily_aggregate(
                             "node_idx": int(node_to_idx_master[n]),
                             "bus": bus,
                             "phase": int(ph),
+                            "electrical_distance_ohm": float(node_to_dist.get(n, 0.0)),
                             # M1-only dataset: expose load P/Q with simplified names.
                             "p_load_kw": float(busphP_load.get((bus, ph), 0.0)),
                             "q_load_kvar": float(busphQ_load.get((bus, ph), 0.0)),
@@ -447,7 +543,7 @@ def generate_dataset_8500_daily_aggregate(
 
 if __name__ == "__main__":
     generate_dataset_8500_daily_aggregate(
-        n_scenarios=5,
+        n_scenarios=500,
         k_snapshots_per_scenario=20,
         total_load_scale_range=(0.7, 1.3),
         sigma_device=0.03,
