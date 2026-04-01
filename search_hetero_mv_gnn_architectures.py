@@ -54,11 +54,12 @@ DEFAULT_DATASET = (
     REPO / "datasets_gnn2" / "loadtype_8500_dailyagg" / "Heterogenous GNN dataset"
 )
 
+# Filenames only: joined with dataset_dir / "nodes" in run_search (not nodes/nodes/...).
 NODE_FILES = {
-    "upstream": "nodes/hetero_mv_nodes_regulator_upstream.csv",
-    "downstream": "nodes/hetero_mv_nodes_regulator_downstream.csv",
-    "capacitor": "nodes/hetero_mv_nodes_capacitor_related.csv",
-    "load": "nodes/hetero_mv_nodes_load_transformer.csv",
+    "upstream": "hetero_mv_nodes_regulator_upstream.csv",
+    "downstream": "hetero_mv_nodes_regulator_downstream.csv",
+    "capacitor": "hetero_mv_nodes_capacitor_related.csv",
+    "load": "hetero_mv_nodes_load_transformer.csv",
 }
 
 # Canonical order for ModuleDict / iteration
