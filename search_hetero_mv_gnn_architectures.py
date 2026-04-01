@@ -632,12 +632,14 @@ def run_search(
     edges_dir = dataset_dir / "edges"
     nodes_dir = dataset_dir / "nodes"
 
+    print("[hetero_mv_search] reading edge catalog + line attrs...", flush=True)
     catalog = pd.read_csv(edges_dir / "hetero_mv_edge_catalog.csv")
     line_attr = pd.read_csv(edges_dir / "hetero_mv_line_edge_attr.csv")
     reg_csv = edges_dir / "hetero_mv_regulator_edge_features.csv"
 
     name_to_gidx = _read_node_idx_master(node_index_master)
     extra_names: set[str] = set()
+    print("[hetero_mv_search] scanning node CSVs for bus names (load file can take several minutes)...", flush=True)
     for fn in NODE_FILES.values():
         df = pd.read_csv(nodes_dir / fn, usecols=["node"])
         for n in df["node"].astype(str):
@@ -645,7 +647,9 @@ def run_search(
 
     g_list = _collect_global_node_indices(catalog, name_to_gidx, extra_names)
     gset = set(g_list)
+    print("[hetero_mv_search] membership scan (full pass over load CSV in chunks)...", flush=True)
     membership = _membership_by_csv(nodes_dir)
+    print("[hetero_mv_search] building typed topology + tensors...", flush=True)
     g2l, global_type, counts, edge_index_dict_cpu, line_edge_attr_dict_cpu = _build_typed_topology(
         catalog, line_attr, g_list, membership
     )
@@ -656,6 +660,7 @@ def run_search(
     edge_index_dict = {k: v.to(device) for k, v in edge_index_dict_cpu.items()}
     base_line_attr = {k: v.to(device) for k, v in line_edge_attr_dict_cpu.items()}
 
+    print("[hetero_mv_search] loading regulator tap table...", flush=True)
     reg_tap_map = _load_reg_taps(reg_csv)
 
     exclude_typed: tuple[str, int] | None = None
@@ -712,9 +717,12 @@ def run_search(
         )
 
     per_sample: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
+    print("[hetero_mv_search] accumulating per-sample node features (another full load-CSV pass)...", flush=True)
     for kind, rel in NODE_FILES.items():
+        print(f"  ... reading {kind} CSV", flush=True)
         _accumulate_node_csv(nodes_dir / rel, kind, per_sample, name_to_gidx)
 
+    print("[hetero_mv_search] building GPU cache for train/val samples...", flush=True)
     cache: dict[int, dict[str, Any]] = {}
     for sid in pool:
         x_d: dict[str, np.ndarray] = {}
