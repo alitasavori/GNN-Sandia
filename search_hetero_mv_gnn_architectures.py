@@ -624,6 +624,7 @@ def run_search(
     max_samples: int | None,
     target_nodes: frozenset[str] | None,
     target_node_types: frozenset[str] | None,
+    log_every: int,
 ) -> Path:
     _set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -834,6 +835,11 @@ def run_search(
                 bad = 0
             else:
                 bad += 1
+            if log_every > 0 and ((ep + 1) % log_every == 0 or ep == 0):
+                print(
+                    f"    epoch {ep + 1:4d}/{epochs}  val_rmse={val_rmse:.6f}  "
+                    f"best_val_rmse={best_val:.6f}  no_improve_streak={bad}/{patience}"
+                )
             if bad >= patience:
                 break
         if best_state:
@@ -934,6 +940,12 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=120)
     p.add_argument("--patience", type=int, default=18)
     p.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="Print val_rmse every N epochs during each architecture run (0 to disable). Also prints after epoch 1.",
+    )
+    p.add_argument(
         "--exclude-train-nodes",
         type=str,
         default="l2823592.1",
@@ -988,6 +1000,8 @@ def main() -> None:
         if bad:
             raise SystemExit(f"Invalid --target-node-types {bad!r}. Allowed: {list(NODE_TYPES)}")
 
+    log_every = max(0, int(args.log_every))
+
     run_search(
         args.dataset_dir.resolve(),
         args.node_index.resolve(),
@@ -999,6 +1013,7 @@ def main() -> None:
         args.max_samples,
         target_frozen,
         tnt,
+        log_every,
     )
 
 
