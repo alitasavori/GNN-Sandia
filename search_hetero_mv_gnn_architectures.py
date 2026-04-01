@@ -627,6 +627,7 @@ def run_search(
     target_nodes: frozenset[str] | None,
     target_node_types: frozenset[str] | None,
     log_every: int,
+    train_progress_every: int,
 ) -> Path:
     _set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -812,8 +813,13 @@ def run_search(
         t0 = time.time()
         ep = 0
         for ep in range(epochs):
+            print(
+                f"    epoch {ep + 1}/{epochs}  |  {len(train_ids)} train graphs (1 step each), "
+                f"{len(val_ids)} val — running train pass...",
+                flush=True,
+            )
             wrapped.train()
-            for sid in train_ids:
+            for ni, sid in enumerate(train_ids):
                 b = cache[sid]
                 opt.zero_grad()
                 pred = wrapped(b) if use_gine else wrapped(b["x_dict"], edge_index_dict)
@@ -824,6 +830,12 @@ def run_search(
                     continue
                 loss.backward()
                 opt.step()
+                if train_progress_every > 0 and (ni + 1) % train_progress_every == 0:
+                    print(
+                        f"    epoch {ep + 1}  train progress {ni + 1}/{len(train_ids)}",
+                        flush=True,
+                    )
+            print(f"    epoch {ep + 1}/{epochs}  |  validation pass ({len(val_ids)} graphs)...", flush=True)
             wrapped.eval()
             val_se = 0.0
             val_n = 0
@@ -956,6 +968,12 @@ def main() -> None:
         help="Print val_rmse every N epochs during each architecture run (0 to disable). Also prints after epoch 1.",
     )
     p.add_argument(
+        "--train-progress-every",
+        type=int,
+        default=400,
+        help="During each epoch, print train progress every K sample graphs (0 to disable). Default 400 for Colab visibility.",
+    )
+    p.add_argument(
         "--exclude-train-nodes",
         type=str,
         default="l2823592.1",
@@ -1017,6 +1035,7 @@ def main() -> None:
             raise SystemExit(f"Invalid --target-node-types {bad!r}. Allowed: {list(NODE_TYPES)}")
 
     log_every = max(0, int(args.log_every))
+    train_progress_every = max(0, int(args.train_progress_every))
 
     run_search(
         args.dataset_dir.resolve(),
@@ -1030,6 +1049,7 @@ def main() -> None:
         target_frozen,
         tnt,
         log_every,
+        train_progress_every,
     )
 
 
