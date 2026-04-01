@@ -444,7 +444,10 @@ def _make_hetero_conv_gat(
 ) -> HeteroConv:
     mods = {}
     for key in edge_index_dict:
-        mods[key] = GATConv(d, h_per, heads=heads, concat=True, dropout=dropout)
+        # Required for hetero bipartite relations (src_type != dst_type); PyG raises otherwise.
+        mods[key] = GATConv(
+            d, h_per, heads=heads, concat=True, dropout=dropout, add_self_loops=False
+        )
     return HeteroConv(mods, aggr="sum")
 
 
