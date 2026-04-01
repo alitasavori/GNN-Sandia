@@ -126,18 +126,16 @@ def _collect_global_node_indices(
 
 
 def _membership_by_csv(nodes_dir: Path) -> dict[str, set[int]]:
-    """Global node_idx sets appearing in each CSV (all samples)."""
+    """Global node_idx sets appearing in each CSV (all samples). Full load-CSV scan (slow on huge files)."""
     use = ["node_idx", "node"]
     out: dict[str, set[int]] = {t: set() for t in NODE_TYPES}
     for kind, rel in NODE_FILES.items():
         path = nodes_dir / rel
         if kind == "load":
             for chunk in pd.read_csv(path, usecols=lambda c: c in use, chunksize=400_000):
-                for _, r in chunk.iterrows():
-                    g = int(float(r["node_idx"])) if pd.notna(r["node_idx"]) else None
-                    if g is None:
-                        continue
-                    out[kind].add(int(g))
+                s = chunk["node_idx"]
+                s = pd.to_numeric(s, errors="coerce").dropna().astype(np.int64)
+                out[kind].update(s.unique().tolist())
         else:
             df = pd.read_csv(path, usecols=lambda c: c in use)
             for _, r in df.iterrows():
@@ -960,7 +958,13 @@ def main() -> None:
         default="l2823592.1",
         help="Comma-separated node names to drop from train mask only (empty to disable)",
     )
-    p.add_argument("--max-samples", type=int, default=None, help="Cap number of samples (debug)")
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Cap sample IDs after discovery (debug). Does NOT skip full load-CSV scans for membership/features; "
+        "copy dataset to local disk (e.g. /content/data) for faster Colab I/O.",
+    )
     p.add_argument(
         "--target-nodes",
         type=str,
