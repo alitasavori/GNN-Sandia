@@ -628,6 +628,7 @@ def run_search(
     target_node_types: frozenset[str] | None,
     log_every: int,
     train_progress_every: int,
+    only_cfg: str | None = None,
 ) -> Path:
     _set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -798,6 +799,13 @@ def run_search(
         ("hetero_sage_3x112_wide", HeteroTypedSAGE(NODE_TYPES, IN_DIMS, 112, 3, 0.05, False, edge_index_dict).to(device), False),
         ("hetero_gine_3x80", HeteroTypedGINE(NODE_TYPES, IN_DIMS, 80, 3, 0.1, edge_index_dict).to(device), True),
     ]
+    if only_cfg is not None:
+        only_cfg = only_cfg.strip()
+        all_names = [c[0] for c in candidates]
+        candidates = [c for c in candidates if c[0] == only_cfg]
+        if not candidates:
+            raise ValueError(f"only_cfg={only_cfg!r} not in {all_names}")
+        print(f"[hetero_mv_search] single architecture: {only_cfg}", flush=True)
 
     for name, model, use_gine in candidates:
         print(f"\n>>> Training {name} (gine_edge_attr={use_gine})", flush=True)
@@ -1007,6 +1015,12 @@ def main() -> None:
         "Supervise vmag only on those node types (all buses in that storage). "
         "Empty = all types. Example: --target-node-types load for all ~load transformer MV buses.",
     )
+    p.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="Train only this cfg_name (e.g. hetero_gine_3x80) and skip other architectures. Saves that checkpoint.",
+    )
     args = p.parse_args()
     ex: set[str] = set()
     if args.exclude_train_nodes.strip():
@@ -1037,6 +1051,7 @@ def main() -> None:
 
     log_every = max(0, int(args.log_every))
     train_progress_every = max(0, int(args.train_progress_every))
+    only_cfg = args.only.strip() if str(args.only).strip() else None
 
     run_search(
         args.dataset_dir.resolve(),
@@ -1051,6 +1066,7 @@ def main() -> None:
         tnt,
         log_every,
         train_progress_every,
+        only_cfg=only_cfg,
     )
 
 
