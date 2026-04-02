@@ -800,7 +800,7 @@ def run_search(
     ]
 
     for name, model, use_gine in candidates:
-        print(f"\n>>> Training {name} (gine_edge_attr={use_gine})")
+        print(f"\n>>> Training {name} (gine_edge_attr={use_gine})", flush=True)
         if use_gine:
             wrapped = GINEWrapper(model, base_line_attr).to(device)
         else:
@@ -860,7 +860,8 @@ def run_search(
             if log_every > 0 and ((ep + 1) % log_every == 0 or ep == 0):
                 print(
                     f"    epoch {ep + 1:4d}/{epochs}  val_rmse={val_rmse:.6f}  "
-                    f"best_val_rmse={best_val:.6f}  no_improve_streak={bad}/{patience}"
+                    f"best_val_rmse={best_val:.6f}  no_improve_streak={bad}/{patience}",
+                    flush=True,
                 )
             if bad >= patience:
                 break
@@ -965,7 +966,7 @@ def main() -> None:
         "--log-every",
         type=int,
         default=10,
-        help="Print val_rmse every N epochs during each architecture run (0 to disable). Also prints after epoch 1.",
+        help="Print val_rmse every N epochs (0 to disable). With N=10, epochs 61–69 print no RMSE line—use 1 for every epoch or rely on --train-progress-every.",
     )
     p.add_argument(
         "--train-progress-every",
