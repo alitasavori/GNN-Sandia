@@ -270,7 +270,10 @@ def run_compare_homo(
     Args:
         checkpoint: Path to ``homo_gine_h*_L*_best.pt`` (or homo_gcn_...) state dict.
         dataset_dir: ``.../Heterogenous GNN dataset`` (contains edges/, nodes/).
-        nodes_csv: Defaults to ``.../nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv``.
+        nodes_csv: Defaults to ``.../nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv`` under
+            ``dataset_dir``, or the same filename under ``<repo>/8500-node/`` if the dataset tree is absent
+            (e.g. Colab clone without ``datasets_gnn2/``). The repo copy is **first-sample-only** rows (~KB),
+            matching what ``_load_homo_node_order`` uses from the full training CSV.
         train_metrics_path: Defaults to ``checkpoint.parent / train_metrics.json``.
         feature_norm_path: Defaults to ``checkpoint.parent / feature_norm.pt``; if missing, inference uses raw features (warns).
         device: ``None`` uses env ``GNN_COMPARE_DEVICE`` or ``auto`` (CUDA if available else CPU). Pass ``cpu`` or ``cuda`` to force.
@@ -325,11 +328,31 @@ def run_compare_homo(
     ds = Path(dataset_dir).resolve()
     edges_dir = ds / "edges"
     nodes_dir = ds / "nodes"
+    repo_root = Path(__file__).resolve().parent
     if nodes_csv is None:
-        nodes_csv = nodes_dir / "hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+        p_dataset = nodes_dir / "hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+        p_repo = repo_root / "8500-node" / "hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+        if p_dataset.is_file():
+            nodes_csv = p_dataset
+        elif p_repo.is_file():
+            nodes_csv = p_repo
+            print(
+                f"[compare_homo_mv_daily] nodes_csv: using repo copy (dataset path missing): {p_repo.resolve()}",
+                flush=True,
+            )
+        else:
+            nodes_csv = p_dataset
     nodes_csv = Path(nodes_csv).resolve()
     if not nodes_csv.is_file():
-        raise FileNotFoundError(nodes_csv)
+        raise FileNotFoundError(
+            f"{nodes_csv}\n"
+            "Expected homo node list at:\n"
+            f"  {nodes_dir / 'hetero_mv_nodes_load_transformer_reg_tap_only.csv'}\n"
+            "or (Colab / no datasets_gnn2 checkout):\n"
+            f"  {repo_root / '8500-node' / 'hetero_mv_nodes_load_transformer_reg_tap_only.csv'}\n"
+            "Generate the full file with: python merge_load_transformer_reg_tap_only.py "
+            "(training CSV is huge; compare only needs the first-sample rows — see repo 8500-node copy)."
+        )
 
     node_names, old_to_new = _load_homo_node_order(nodes_csv)
     N = len(node_names)
@@ -401,7 +424,6 @@ def run_compare_homo(
     all_nodes = list(dict.fromkeys(all_nodes))
     node_to_idx = {n: i for i, n in enumerate(all_nodes)}
 
-    repo_root = Path(__file__).resolve().parent
     mpath = mv_sx_mapping if mv_sx_mapping is not None else (repo_root / "8500-node" / "mv_x_sx_node_mapping_8500.csv")
     mv_sx_rules: list[dict[str, str]] = _load_mv_sx_mapping(mpath) if mpath.is_file() else []
     if mv_sx_rules:
