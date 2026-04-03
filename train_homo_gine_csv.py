@@ -13,6 +13,8 @@ Defaults: --sample_frac 0.1 (10%% of timesteps), --log_every 1 (print every epoc
 Speed: CSV read uses only needed columns; first run writes ``<out_dir>/preloaded_nodes.pt``; next runs reload tensors (skip parse). Copy data to Colab local disk (not Drive) for faster I/O; use ``--num_workers 2`` on Linux/Colab. GPU DataLoader uses ``pin_memory=True``.
 
 Colab: pass --data_root /content/drive/MyDrive/.../loadtype_8500_dailyagg (or clone the repo and upload the two CSV folders).
+
+Subprocess/Colab: run ``python -u train_homo_gine_csv.py`` or set ``PYTHONUNBUFFERED=1`` so logs stream live. If you use ``subprocess.run(..., capture_output=True)``, stdout only appears in ``result.stdout`` (not the notebook).
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import argparse
 import json
 import os
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +54,14 @@ TAP_FEAT_COLS: tuple[str, ...] = (
     "VREG4_C",
 )
 NODE_FEAT_COLS: tuple[str, ...] = BASE_FEAT_COLS + TAP_FEAT_COLS
+
+
+def _configure_stdout() -> None:
+    """Line-buffer stdout so subprocess/Colab shows logs as they run (not only at exit)."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _set_seeds(seed: int) -> None:
@@ -283,11 +294,12 @@ def train_loop(
         if epoch == 1 or epoch % le == 0:
             print(
                 f"Epoch {epoch:4d} | train_mae={train_mae:.6f} | val_mae={val_mae:.6f} | "
-                f"best_val_mae={best:.6f} | patience {bad}/{patience}"
+                f"best_val_mae={best:.6f} | patience {bad}/{patience}",
+                flush=True,
             )
 
         if bad >= patience:
-            print(f"Early stopping at epoch {epoch}")
+            print(f"Early stopping at epoch {epoch}", flush=True)
             break
 
     return best
@@ -360,6 +372,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _configure_stdout()
     _set_seeds(args.seed)
 
     repo = Path(__file__).resolve().parent
@@ -403,10 +416,10 @@ def main() -> None:
             node_order = pack["node_order"]
             sample_ids = pack["sample_ids"]
             old_to_new = pack["old_to_new"]
-            print("Loaded tensor cache (skip CSV parse):", cache_file)
+            print("Loaded tensor cache (skip CSV parse):", cache_file, flush=True)
 
     if x is None:
-        print("Loading nodes:", nodes_path)
+        print("Loading nodes:", nodes_path, flush=True)
         x, y, node_order, sample_ids, old_to_new = _load_and_stack_nodes(nodes_path, NODE_FEAT_COLS)
         if not args.no_tensor_cache:
             torch.save(
@@ -421,7 +434,7 @@ def main() -> None:
                 },
                 cache_file,
             )
-            print("Wrote tensor cache:", cache_file)
+            print("Wrote tensor cache:", cache_file, flush=True)
 
     assert x is not None and y is not None and node_order is not None and sample_ids is not None and old_to_new is not None
     n_all = x.shape[0]
@@ -429,21 +442,21 @@ def main() -> None:
         k = min(int(args.max_samples), n_all)
         x, y = x[:k], y[:k]
         sample_ids = sample_ids[:k]
-        print(f"Using --max_samples={k} (of {n_all} loaded).")
+        print(f"Using --max_samples={k} (of {n_all} loaded).", flush=True)
     elif args.sample_frac < 1.0:
         if not (0.0 < args.sample_frac <= 1.0):
             raise ValueError("--sample_frac must be in (0, 1].")
         k = max(1, int(round(n_all * args.sample_frac)))
         x, y = x[:k], y[:k]
         sample_ids = sample_ids[:k]
-        print(f"Using --sample_frac={args.sample_frac} -> {k} samples (of {n_all}).")
+        print(f"Using --sample_frac={args.sample_frac} -> {k} samples (of {n_all}).", flush=True)
     else:
-        print(f"Using all {n_all} samples (--sample_frac=1.0).")
+        print(f"Using all {n_all} samples (--sample_frac=1.0).", flush=True)
 
-    print("Stacked:", x.shape, y.shape, "samples:", len(sample_ids))
+    print("Stacked:", x.shape, y.shape, "samples:", len(sample_ids), flush=True)
 
     edge_index, edge_attr = _load_line_edges_supervised(edge_path, old_to_new)
-    print("Line edges (bidir):", edge_index.shape[1], "edge_attr:", edge_attr.shape)
+    print("Line edges (bidir):", edge_index.shape[1], "edge_attr:", edge_attr.shape, flush=True)
 
     n = x.shape[0]
     rng = np.random.RandomState(args.seed)
@@ -465,7 +478,13 @@ def main() -> None:
     val_ds = Subset(dataset, val_idx)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    print("Device:", device, flush=True)
+    print(
+        f"Train/val split: n_train={len(train_idx)} n_val={len(val_idx)} | epochs={args.epochs}",
+        flush=True,
+    )
+    if len(train_idx) == 0:
+        raise RuntimeError("Empty training set (train_idx). Increase samples or adjust --train_frac.")
 
     pin = device.type == "cuda"
     nw = args.num_workers
@@ -501,6 +520,8 @@ def main() -> None:
     model = model.to(device)
     ckpt = out_dir / f"homo_{args.model}_h{args.hidden}_L{args.layers}_best.pt"
 
+    print("Starting training loop…", flush=True)
+
     best_mae = train_loop(
         model,
         train_loader,
@@ -535,9 +556,9 @@ def main() -> None:
     with open(out_dir / "train_metrics.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    print("Best val MAE (p.u.):", best_mae)
-    print("Saved:", ckpt)
-    print("Wrote:", out_dir / "train_metrics.json")
+    print("Best val MAE (p.u.):", best_mae, flush=True)
+    print("Saved:", ckpt, flush=True)
+    print("Wrote:", out_dir / "train_metrics.json", flush=True)
 
 
 if __name__ == "__main__":
