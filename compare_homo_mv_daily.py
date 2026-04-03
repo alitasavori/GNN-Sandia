@@ -13,6 +13,7 @@ Requires:
   - Checkpoint: ``homo_*_h{H}_L{L}_best.pt`` (state dict only) from train_homo_gine_csv.py
   - ``train_metrics.json`` in the same folder (hidden, layers, model, n_features)
   - ``feature_norm.pt`` from training (unless trained with --no_normalize; then pass feature_norm_path=None and raw features are used — not recommended)
+  - ``dataset_dir/edges/hetero_mv_edge_catalog.csv``; ``load_electrical_distance_to_each_regulator.csv`` under ``edges/`` or dataset root, or repo copies under ``8500-node/`` when ``datasets_gnn2`` is missing (Colab).
 
 Node features at inference match training: P/Q, q_cap, 12× (tap_pu × downstream mask from electrical distance CSV).
 """
@@ -51,7 +52,7 @@ from train_homo_gine_csv import (
 REG_ORDER: tuple[str, ...] = tuple(TAP_FEAT_COLS)
 
 
-def _resolve_dist_csv(dataset_dir: Path) -> Path:
+def _resolve_dist_csv(dataset_dir: Path, repo_root: Path | None = None) -> Path:
     bundle = dataset_dir
     p_edges = bundle / "edges" / "load_electrical_distance_to_each_regulator.csv"
     p_root = bundle / "load_electrical_distance_to_each_regulator.csv"
@@ -59,8 +60,22 @@ def _resolve_dist_csv(dataset_dir: Path) -> Path:
         return p_edges
     if p_root.is_file():
         return p_root
+    if repo_root is not None:
+        p_repo = repo_root / "8500-node" / "load_electrical_distance_to_each_regulator.csv"
+        if p_repo.is_file():
+            print(
+                f"[compare_homo_mv_daily] distance CSV: using repo copy (dataset path missing): {p_repo.resolve()}",
+                flush=True,
+            )
+            return p_repo
     raise FileNotFoundError(
-        f"Missing load_electrical_distance_to_each_regulator.csv under {bundle} (edges/ or root)."
+        f"Missing load_electrical_distance_to_each_regulator.csv under {bundle} (edges/ or root)"
+        + (
+            f" and not at {repo_root / '8500-node' / 'load_electrical_distance_to_each_regulator.csv'}"
+            if repo_root is not None
+            else ""
+        )
+        + "."
     )
 
 
@@ -358,7 +373,7 @@ def run_compare_homo(
     N = len(node_names)
     name_to_homo = {str(n).strip().lower(): i for i, n in enumerate(node_names)}
 
-    dist_csv = _resolve_dist_csv(ds)
+    dist_csv = _resolve_dist_csv(ds, repo_root)
     dist_mat = _load_dist_matrix(node_names, dist_csv)
 
     catalog_path = edges_dir / "hetero_mv_edge_catalog.csv"
