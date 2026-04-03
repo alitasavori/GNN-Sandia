@@ -10,6 +10,8 @@ No other CSVs are read by this script (see train_metrics.json field extra_csvs_u
 
 Defaults: --sample_frac 0.1 (10%% of timesteps), --log_every 1 (print every epoch). Use --sample_frac 1.0 for full data.
 
+Speed: CSV read uses only needed columns; first run writes ``<out_dir>/preloaded_nodes.pt``; next runs reload tensors (skip parse). Copy data to Colab local disk (not Drive) for faster I/O; use ``--num_workers 2`` on Linux/Colab. GPU DataLoader uses ``pin_memory=True``.
+
 Colab: pass --data_root /content/drive/MyDrive/.../loadtype_8500_dailyagg (or clone the repo and upload the two CSV folders).
 """
 
@@ -174,7 +176,8 @@ def _load_and_stack_nodes(
     feat_cols: tuple[str, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, list[int], dict[int, int]]:
     """Returns x [S,N,F], y [S,N], node_order, sample_ids, old_to_new (global idx -> 0..N-1)."""
-    df = pd.read_csv(nodes_csv)
+    usecols = ["sample_id", "node_idx", "vmag_pu"] + list(feat_cols)
+    df = pd.read_csv(nodes_csv, usecols=usecols)
     for c in ("sample_id", "node_idx", "vmag_pu", *feat_cols):
         if c not in df.columns:
             raise ValueError(f"Missing column {c!r} in {nodes_csv}")
@@ -347,6 +350,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Print train/val MAE every N epochs (1 = every epoch).",
     )
+    p.add_argument(
+        "--no_tensor_cache",
+        action="store_true",
+        help="Do not load/save preloaded_nodes.pt under --out_dir (disables fast restarts).",
+    )
     return p.parse_args()
 
 
@@ -373,8 +381,49 @@ def main() -> None:
         out_dir = repo / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading nodes:", nodes_path)
-    x, y, node_order, sample_ids, old_to_new = _load_and_stack_nodes(nodes_path, NODE_FEAT_COLS)
+    cache_file = out_dir / "preloaded_nodes.pt"
+    x: torch.Tensor | None = None
+    y: torch.Tensor | None = None
+    node_order: np.ndarray | None = None
+    sample_ids: list[int] | None = None
+    old_to_new: dict[int, int] | None = None
+
+    if not args.no_tensor_cache and cache_file.is_file():
+        try:
+            pack = torch.load(cache_file, map_location="cpu", weights_only=False)
+        except TypeError:
+            pack = torch.load(cache_file, map_location="cpu")
+        m_csv = nodes_path.stat().st_mtime
+        if (
+            pack.get("nodes_path") == str(nodes_path.resolve())
+            and abs(float(pack.get("nodes_mtime", 0.0)) - m_csv) < 1e-3
+        ):
+            x = pack["x"]
+            y = pack["y"]
+            node_order = pack["node_order"]
+            sample_ids = pack["sample_ids"]
+            old_to_new = pack["old_to_new"]
+            print("Loaded tensor cache (skip CSV parse):", cache_file)
+
+    if x is None:
+        print("Loading nodes:", nodes_path)
+        x, y, node_order, sample_ids, old_to_new = _load_and_stack_nodes(nodes_path, NODE_FEAT_COLS)
+        if not args.no_tensor_cache:
+            torch.save(
+                {
+                    "x": x,
+                    "y": y,
+                    "node_order": node_order,
+                    "sample_ids": sample_ids,
+                    "old_to_new": old_to_new,
+                    "nodes_path": str(nodes_path.resolve()),
+                    "nodes_mtime": nodes_path.stat().st_mtime,
+                },
+                cache_file,
+            )
+            print("Wrote tensor cache:", cache_file)
+
+    assert x is not None and y is not None and node_order is not None and sample_ids is not None and old_to_new is not None
     n_all = x.shape[0]
     if args.max_samples is not None:
         k = min(int(args.max_samples), n_all)
@@ -418,17 +467,23 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
+    pin = device.type == "cuda"
+    nw = args.num_workers
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
     )
 
     in_dim = x.shape[-1]
