@@ -149,7 +149,17 @@ def _resolve_checkpoint_path(checkpoint: Path) -> Path:
         return p
     parent = p.parent
     name = p.name
-    for sub in ("GCN", "GINE", "GINE-128-4", "GINE-64-2", "GINE-64-3", "GCN-128-4", "GCN-64-3"):
+    for sub in (
+        "GCN",
+        "GINE",
+        "GINE-128-4",
+        "GINE-64-2",
+        "GINE-64-2-EMB-16-8",
+        "GINE-64-3",
+        "GINE-64-3-EMB-16-8",
+        "GCN-128-4",
+        "GCN-64-3",
+    ):
         alt = parent / sub / name
         if alt.is_file():
             return alt
@@ -163,7 +173,14 @@ def _resolve_checkpoint_path(checkpoint: Path) -> Path:
                 if cands:
                     return max(cands, key=lambda x: x.stat().st_mtime)
     if "homo_gine" in stem_l:
-        for sub in ("GINE", "GINE-128-4", "GINE-64-2", "GINE-64-3"):
+        for sub in (
+            "GINE",
+            "GINE-128-4",
+            "GINE-64-2",
+            "GINE-64-2-EMB-16-8",
+            "GINE-64-3",
+            "GINE-64-3-EMB-16-8",
+        ):
             d = parent / sub
             if d.is_dir():
                 cands = list(d.glob("homo_gine*_best.pt"))
@@ -211,7 +228,14 @@ def _resolve_meta_and_feature_norm(
                 f = grand / sub / "feature_norm.pt"
                 return m, f
     if "gine" in name:
-        for sub in ("GINE-128-4", "GINE-64-2", "GINE-64-3", "GINE"):
+        for sub in (
+            "GINE-128-4",
+            "GINE-64-2",
+            "GINE-64-2-EMB-16-8",
+            "GINE-64-3",
+            "GINE-64-3-EMB-16-8",
+            "GINE",
+        ):
             if (grand / sub / "train_metrics.json").is_file():
                 m = grand / sub / "train_metrics.json"
                 f = grand / sub / "feature_norm.pt"

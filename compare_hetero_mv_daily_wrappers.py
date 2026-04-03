@@ -10,8 +10,8 @@ If you **do not** see ``=== Daily Timing Summary (hetero MV vs OpenDSS) ===`` af
 ``compare_hetero_mv_daily``. Wrappers now ``reload`` it each call; if needed **Restart kernel**.
 
 After ``git pull``, **restart the Jupyter kernel** so ``CKPT_HOMO_*`` paths update.
-Homo checkpoints under ``homo_mv_8500/``: ``GINE-128-4``, ``GINE-64-2``, ``GINE-64-3``, ``GCN-128-4``, ``GCN-64-3``
-(see ``run_homo_gine_mv``, ``run_homo_gine_64_2_mv``, ``run_homo_gine_64_3_mv``, ``run_homo_gcn_mv``, ``run_homo_gcn_64_3_mv``).
+Homo checkpoints under ``homo_mv_8500/``: ``GINE-128-4``, ``GINE-64-2``, ``GINE-64-2-EMB-16-8``, ``GINE-64-3``, ``GINE-64-3-EMB-16-8``, ``GCN-128-4``, ``GCN-64-3``
+(see ``run_homo_gine_mv``, ``run_homo_gine_64_2_mv``, ``run_homo_gine_64_2_emb_16_8_mv``, ``run_homo_gine_64_3_mv``, ``run_homo_gine_64_3_emb_16_8_mv``, ``run_homo_gcn_mv``, ``run_homo_gcn_64_3_mv``).
 
 Timing: OpenDSS **solve** in the daily compare uses **snapshot** solves per timestep; GNN timing
 may use ``torch.compile`` when ``GNN_TORCH_COMPILE=1`` (default off on Windows).
@@ -19,14 +19,14 @@ may use ``torch.compile`` when ``GNN_TORCH_COMPILE=1`` (default off on Windows).
 GNN **device**: set env ``GNN_COMPARE_DEVICE`` to ``auto`` (default), ``cpu``, or ``cuda``, or pass
 ``device="cpu"`` / ``device="cuda"`` into any runner (overrides env). See ``compare_mv_daily_timing.resolve_inference_device``.
 
-If Jupyter says ``cannot import name 'run_juxtapose_sage_vs_gine'``, the kernel
-cached an **old** copy of this module. Fix: **Restart kernel**, or run::
+If Jupyter says ``cannot import name …`` (e.g. ``run_homo_gine_64_2_mv``), the kernel
+cached an **old** copy of this module. Fix: **Restart kernel**, or::
 
     import importlib, sys
     sys.modules.pop("compare_hetero_mv_daily_wrappers", None)
     import compare_hetero_mv_daily_wrappers as w
     importlib.reload(w)
-    from compare_hetero_mv_daily_wrappers import run_juxtapose_sage_vs_gine
+    from compare_hetero_mv_daily_wrappers import run_homo_gine_64_2_mv  # etc.
 
 Or use ``%run juxtapose_sage_gine_daily.py``, ``juxtapose_both_fail_vs_dss_daily.py``,
 ``juxtapose_lowest_min_v_top5_daily.py`` from the repo root.
@@ -43,6 +43,7 @@ CLI:
     python compare_hetero_mv_daily_wrappers.py homo-gcn-64-3
     python compare_hetero_mv_daily_wrappers.py homo-gine-64-2
     python compare_hetero_mv_daily_wrappers.py homo-gine-64-3
+    python compare_hetero_mv_daily_wrappers.py homo-gine-64-3-emb-16-8
     python compare_hetero_mv_daily_wrappers.py juxtapose
     python compare_hetero_mv_daily_wrappers.py both-fail
     python compare_hetero_mv_daily_wrappers.py lowest-min-v
@@ -75,12 +76,21 @@ OUT_GINE = Path("gnn2_daily_compare_8500_output_gine_edgeaware")
 # Homogeneous GINE / GCN from train_homo_gine_csv.py (each run folder: *_best.pt + train_metrics.json + feature_norm.pt)
 CKPT_HOMO_GINE = Path("gnn2_architecture_search/homo_mv_8500/GINE-128-4/homo_gine_h128_L4_best.pt")
 CKPT_HOMO_GINE_64_2 = Path("gnn2_architecture_search/homo_mv_8500/GINE-64-2/homo_gine_h64_L2_best.pt")
+# Same h64 L2 + learned ID embeddings (train_homo_gine_csv: --node_emb_dim 16 --edge_emb_dim 8)
+CKPT_HOMO_GINE_64_2_EMB_16_8 = Path(
+    "gnn2_architecture_search/homo_mv_8500/GINE-64-2-EMB-16-8/homo_gine_h64_L2_ne16_ee8_best.pt"
+)
 CKPT_HOMO_GINE_64_3 = Path("gnn2_architecture_search/homo_mv_8500/GINE-64-3/homo_gine_h64_L3_best.pt")
+CKPT_HOMO_GINE_64_3_EMB_16_8 = Path(
+    "gnn2_architecture_search/homo_mv_8500/GINE-64-3-EMB-16-8/homo_gine_h64_L3_ne16_ee8_best.pt"
+)
 CKPT_HOMO_GCN = Path("gnn2_architecture_search/homo_mv_8500/GCN-128-4/homo_gcn_h128_L4_best.pt")
 CKPT_HOMO_GCN_64_3 = Path("gnn2_architecture_search/homo_mv_8500/GCN-64-3/homo_gcn_h64_L3_best.pt")
 OUT_HOMO_GINE = Path("gnn2_daily_compare_8500_output_homo_gine")
 OUT_HOMO_GINE_64_2 = Path("gnn2_daily_compare_8500_output_homo_gine_64_2")
+OUT_HOMO_GINE_64_2_EMB_16_8 = Path("gnn2_daily_compare_8500_output_homo_gine_64_2_emb_16_8")
 OUT_HOMO_GINE_64_3 = Path("gnn2_daily_compare_8500_output_homo_gine_64_3")
+OUT_HOMO_GINE_64_3_EMB_16_8 = Path("gnn2_daily_compare_8500_output_homo_gine_64_3_emb_16_8")
 OUT_HOMO_GCN = Path("gnn2_daily_compare_8500_output_homo_gcn")
 OUT_HOMO_GCN_64_3 = Path("gnn2_daily_compare_8500_output_homo_gcn_64_3")
 
@@ -88,14 +98,20 @@ OUT_JUXTAPOSE = Path("gnn2_daily_compare_8500_output_sage_vs_gine")
 OUT_JUXTAPOSE_BOTH_FAIL = Path("gnn2_daily_compare_8500_output_both_fail_vs_dss")
 OUT_JUXTAPOSE_LOWEST_MIN_V = Path("gnn2_daily_compare_8500_output_lowest_min_v_top5")
 
-__version__ = "12"  # bump when exports change (helps debug stale notebook imports)
+# If ``ImportError: cannot import name 'run_homo_gine_64_2_emb_16_8_mv'`` (or similar),
+# the kernel cached an *old* copy of this file. Before importing, run:
+#   import sys; sys.modules.pop("compare_hetero_mv_daily_wrappers", None)
+# then import again, or use Kernel → Restart. Fresh load should show __version__ >= "16".
+__version__ = "16"  # bump when exports change (helps debug stale notebook imports)
 
 __all__ = (
     "run_sage_not_edge_aware",
     "run_gine_edge_aware",
     "run_homo_gine_mv",
     "run_homo_gine_64_2_mv",
+    "run_homo_gine_64_2_emb_16_8_mv",
     "run_homo_gine_64_3_mv",
+    "run_homo_gine_64_3_emb_16_8_mv",
     "run_homo_gcn_mv",
     "run_homo_gcn_64_3_mv",
     "run_juxtapose_sage_vs_gine",
@@ -344,6 +360,41 @@ def run_homo_gine_64_2_mv(
     )
 
 
+def run_homo_gine_64_2_emb_16_8_mv(
+    *,
+    repo_root: Path | None = None,
+    checkpoint: Path | None = None,
+    dataset_dir: Path | None = None,
+    out_dir: Path | None = None,
+    plot_nodes: list[str] | None = None,
+    mv_sx_mapping: Path | None = None,
+    npts: int = 288,
+    step_min: int = 5,
+    ymin: float = 0.85,
+    ymax: float = 1.10,
+    device: str | None = None,
+    show_plots: bool = False,
+    monitoring_plots_subfolders: bool = True,
+) -> None:
+    """HomoGINE h64 L2 with node/edge embeddings (16/8) under ``homo_mv_8500/GINE-64-2-EMB-16-8/``."""
+    ch = _reload_compare_homo_mv_daily()
+    root = repo_root or _repo()
+    ch.run_compare_homo(
+        checkpoint=(root / (checkpoint or CKPT_HOMO_GINE_64_2_EMB_16_8)).resolve(),
+        dataset_dir=(root / (dataset_dir or DATASET_DIR)).resolve(),
+        out_dir=(root / (out_dir or OUT_HOMO_GINE_64_2_EMB_16_8)).resolve(),
+        plot_nodes=list(plot_nodes or DEFAULT_NODES),
+        npts=npts,
+        step_min=step_min,
+        ymin=ymin,
+        ymax=ymax,
+        mv_sx_mapping=_resolve_mv_sx_mapping(root, mv_sx_mapping),
+        device=device,
+        show_plots=show_plots,
+        monitoring_plots_subfolders=monitoring_plots_subfolders,
+    )
+
+
 def run_homo_gine_64_3_mv(
     *,
     repo_root: Path | None = None,
@@ -367,6 +418,41 @@ def run_homo_gine_64_3_mv(
         checkpoint=(root / (checkpoint or CKPT_HOMO_GINE_64_3)).resolve(),
         dataset_dir=(root / (dataset_dir or DATASET_DIR)).resolve(),
         out_dir=(root / (out_dir or OUT_HOMO_GINE_64_3)).resolve(),
+        plot_nodes=list(plot_nodes or DEFAULT_NODES),
+        npts=npts,
+        step_min=step_min,
+        ymin=ymin,
+        ymax=ymax,
+        mv_sx_mapping=_resolve_mv_sx_mapping(root, mv_sx_mapping),
+        device=device,
+        show_plots=show_plots,
+        monitoring_plots_subfolders=monitoring_plots_subfolders,
+    )
+
+
+def run_homo_gine_64_3_emb_16_8_mv(
+    *,
+    repo_root: Path | None = None,
+    checkpoint: Path | None = None,
+    dataset_dir: Path | None = None,
+    out_dir: Path | None = None,
+    plot_nodes: list[str] | None = None,
+    mv_sx_mapping: Path | None = None,
+    npts: int = 288,
+    step_min: int = 5,
+    ymin: float = 0.85,
+    ymax: float = 1.10,
+    device: str | None = None,
+    show_plots: bool = False,
+    monitoring_plots_subfolders: bool = True,
+) -> None:
+    """HomoGINE h64 L3 with node/edge embeddings (16/8) under ``homo_mv_8500/GINE-64-3-EMB-16-8/``."""
+    ch = _reload_compare_homo_mv_daily()
+    root = repo_root or _repo()
+    ch.run_compare_homo(
+        checkpoint=(root / (checkpoint or CKPT_HOMO_GINE_64_3_EMB_16_8)).resolve(),
+        dataset_dir=(root / (dataset_dir or DATASET_DIR)).resolve(),
+        out_dir=(root / (out_dir or OUT_HOMO_GINE_64_3_EMB_16_8)).resolve(),
         plot_nodes=list(plot_nodes or DEFAULT_NODES),
         npts=npts,
         step_min=step_min,
@@ -544,7 +630,9 @@ def main(argv: list[str] | None = None) -> None:
             "gine",
             "homo-gine",
             "homo-gine-64-2",
+            "homo-gine-64-2-emb-16-8",
             "homo-gine-64-3",
+            "homo-gine-64-3-emb-16-8",
             "homo-gcn",
             "homo-gcn-64-3",
             "juxtapose",
@@ -562,8 +650,12 @@ def main(argv: list[str] | None = None) -> None:
         run_homo_gine_mv()
     elif args.which == "homo-gine-64-2":
         run_homo_gine_64_2_mv()
+    elif args.which == "homo-gine-64-2-emb-16-8":
+        run_homo_gine_64_2_emb_16_8_mv()
     elif args.which == "homo-gine-64-3":
         run_homo_gine_64_3_mv()
+    elif args.which == "homo-gine-64-3-emb-16-8":
+        run_homo_gine_64_3_emb_16_8_mv()
     elif args.which == "homo-gcn":
         run_homo_gcn_mv()
     elif args.which == "homo-gcn-64-3":
