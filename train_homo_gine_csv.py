@@ -8,6 +8,8 @@ Edges: hetero_mv_edge_catalog.csv — only rows with edge_type == 'line' (regula
 
 No other CSVs are read by this script (see train_metrics.json field extra_csvs_used).
 
+Defaults: --sample_frac 0.1 (10%% of timesteps), --log_every 1 (print every epoch). Use --sample_frac 1.0 for full data.
+
 Colab: pass --data_root /content/drive/MyDrive/.../loadtype_8500_dailyagg (or clone the repo and upload the two CSV folders).
 """
 
@@ -221,6 +223,7 @@ def train_loop(
     weight_decay: float,
     checkpoint_path: Path,
     use_compile: bool,
+    log_every: int = 1,
 ) -> float:
     if use_compile and hasattr(torch, "compile"):
         model = torch.compile(model)  # type: ignore[assignment]
@@ -273,7 +276,8 @@ def train_loop(
         else:
             bad += 1
 
-        if epoch % 10 == 0 or epoch == 1:
+        le = max(1, log_every)
+        if epoch == 1 or epoch % le == 0:
             print(
                 f"Epoch {epoch:4d} | train_mae={train_mae:.6f} | val_mae={val_mae:.6f} | "
                 f"best_val_mae={best:.6f} | patience {bad}/{patience}"
@@ -325,7 +329,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wrap model with torch.compile for training (PyTorch 2+). Checkpoint stores underlying weights.",
     )
-    p.add_argument("--max_samples", type=int, default=None, help="Debug: only use first K samples after sort.")
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="If set, only use first K samples after sort (overrides --sample_frac).",
+    )
+    p.add_argument(
+        "--sample_frac",
+        type=float,
+        default=0.1,
+        help="Fraction of timesteps to load (0,1]. Default 0.1 = 10%% for quick runs; use 1.0 for full data.",
+    )
+    p.add_argument(
+        "--log_every",
+        type=int,
+        default=1,
+        help="Print train/val MAE every N epochs (1 = every epoch).",
+    )
     return p.parse_args()
 
 
@@ -354,10 +375,21 @@ def main() -> None:
 
     print("Loading nodes:", nodes_path)
     x, y, node_order, sample_ids, old_to_new = _load_and_stack_nodes(nodes_path, NODE_FEAT_COLS)
+    n_all = x.shape[0]
     if args.max_samples is not None:
-        x = x[: args.max_samples]
-        y = y[: args.max_samples]
-        sample_ids = sample_ids[: args.max_samples]
+        k = min(int(args.max_samples), n_all)
+        x, y = x[:k], y[:k]
+        sample_ids = sample_ids[:k]
+        print(f"Using --max_samples={k} (of {n_all} loaded).")
+    elif args.sample_frac < 1.0:
+        if not (0.0 < args.sample_frac <= 1.0):
+            raise ValueError("--sample_frac must be in (0, 1].")
+        k = max(1, int(round(n_all * args.sample_frac)))
+        x, y = x[:k], y[:k]
+        sample_ids = sample_ids[:k]
+        print(f"Using --sample_frac={args.sample_frac} -> {k} samples (of {n_all}).")
+    else:
+        print(f"Using all {n_all} samples (--sample_frac=1.0).")
 
     print("Stacked:", x.shape, y.shape, "samples:", len(sample_ids))
 
@@ -425,6 +457,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         checkpoint_path=ckpt,
         use_compile=args.compile,
+        log_every=args.log_every,
     )
 
     meta = {
@@ -432,6 +465,9 @@ def main() -> None:
         "nodes_csv": str(nodes_path),
         "edge_catalog_csv": str(edge_path),
         "n_samples": len(sample_ids),
+        "sample_frac": args.sample_frac,
+        "max_samples": args.max_samples,
+        "log_every": args.log_every,
         "n_nodes": int(x.shape[1]),
         "n_features": int(in_dim),
         "model": args.model,
