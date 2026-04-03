@@ -7,7 +7,7 @@ Edge types:
     gnn_sample_meta.csv using regulator_involved_nodes.csv (Regulator name →
     one tap column per phase device).
 
-Outputs (default under datasets_gnn2/loadtype_8500_dailyagg/):
+Outputs (default: same directory as --mv-edges, i.e. datasets_gnn2/loadtype_8500_dailyagg/ unless --out-dir is set):
   - hetero_mv_edge_catalog.csv
       edge_id, from_node, to_node, edge_type, Regulator, tap_column, R_full, X_full, u_idx, v_idx
   - hetero_mv_line_edge_attr.csv
@@ -15,6 +15,17 @@ Outputs (default under datasets_gnn2/loadtype_8500_dailyagg/):
   - hetero_mv_regulator_edge_features.csv
       sample_id, from_node, to_node, edge_id, Regulator, reg_tap_pu
       (one row per regulator edge × sample; tap matches that edge's regulator only)
+
+Inference consistency (`compare_hetero_mv_daily.py`):
+  - Loads the same three files from ``<dataset_dir>/edges/`` (default dataset_dir ends with
+    ``Heterogenous GNN dataset``). REGULATOR_TO_TAP_COL below is imported by that script for
+    tap lookup; topology uses ``search_hetero_mv_gnn_architectures._build_typed_topology`` with
+    this catalog + line_attr — same as training.
+  - At daily inference, regulator taps come from OpenDSS ``_read_reg_control_state`` (keys
+    ``reg_<RegControlName>_tap_pu``) matched to each catalog row via REGULATOR_TO_TAP_COL +
+    ``Regulator`` label — same meta column names as ``tap_column`` here.
+  - If you use the bundled hetero dataset path for compare, rebuild into that ``edges`` folder, e.g.:
+    ``--out-dir datasets_gnn2/loadtype_8500_dailyagg/Heterogenous GNN dataset/edges``
 """
 from __future__ import annotations
 
@@ -201,6 +212,12 @@ def build(
     print(f"  {path_catalog.name}")
     print(f"  {path_line.name}")
     print(f"  {path_reg.name}")
+    if "heterogenous gnn dataset" not in str(out_dir.resolve()).lower():
+        print(
+            "[build_hetero_mv_edge_dataset] hint: compare_hetero_mv_daily uses "
+            "<dataset_dir>/edges/ (often .../Heterogenous GNN dataset/edges). "
+            "Copy these three files there or rerun with --out-dir pointing to that edges folder."
+        )
 
     return {
         "catalog": path_catalog,

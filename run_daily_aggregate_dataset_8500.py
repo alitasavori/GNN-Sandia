@@ -29,6 +29,10 @@ import opendssdirect as dss
 import run_injection_dataset as inj
 import run_loadtype_dataset as lt_dist
 import run_loadtype_dataset_8500 as lt8500
+from compare_opendss_snapshot_helpers import (
+    force_snapshot_mode_for_compare_timing as _force_snapshot_mode_for_compare_timing,
+    reassert_snapshot_before_each_solve as _reassert_snapshot_before_each_solve,
+)
 
 inj = importlib.reload(inj)
 lt_dist = importlib.reload(lt_dist)

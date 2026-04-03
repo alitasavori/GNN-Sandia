@@ -10,6 +10,9 @@ No other CSVs are read by this script (see train_metrics.json field extra_csvs_u
 
 Defaults: --sample_frac 0.1 (10%% of timesteps), --log_every 1 (print every epoch). Use --sample_frac 1.0 for full data.
 
+Optional **learned ID embeddings** (same spirit as ``search_loadtype_gnn_architectures`` / ``run_gnn3_best7_train``):
+``--node_emb_dim D`` / ``--edge_emb_dim D`` (0 = disabled). GINE uses both; GCN uses node embeddings only and ignores ``--edge_emb_dim``.
+
 Speed: CSV read uses only needed columns; first run writes ``<out_dir>/preloaded_nodes.pt``; next runs reload tensors (skip parse). Copy data to Colab local disk (not Drive) for faster I/O; use ``--num_workers 2`` on Linux/Colab. GPU DataLoader uses ``pin_memory=True``.
 
 Colab: pass --data_root /content/drive/MyDrive/.../loadtype_8500_dailyagg (or clone the repo and upload the two CSV folders).
@@ -133,9 +136,51 @@ class HomoGINEDataset(Dataset):
 
 
 class HomoGINE(nn.Module):
-    def __init__(self, in_dim: int, edge_dim: int, hidden: int, n_layers: int, dropout: float):
+    """
+    Optional learned **node** and **edge** ID embeddings (same idea as ``run_gnn3_best7_train`` /
+    architecture search): concatenated to CSV features and to R,X before GINE layers.
+
+    Use ``node_emb_dim=0`` and ``edge_emb_dim=0`` to disable (default).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        edge_dim: int,
+        hidden: int,
+        n_layers: int,
+        dropout: float,
+        *,
+        num_nodes: int = 0,
+        num_edges: int = 0,
+        node_emb_dim: int = 0,
+        edge_emb_dim: int = 0,
+    ):
         super().__init__()
-        self.input_proj = nn.Linear(in_dim, hidden)
+        self.num_nodes = int(num_nodes)
+        self.num_edges = int(num_edges)
+        self.node_emb_dim = max(0, int(node_emb_dim))
+        self.edge_emb_dim = max(0, int(edge_emb_dim))
+
+        self.node_emb: nn.Embedding | None
+        if self.node_emb_dim > 0:
+            if self.num_nodes <= 0:
+                raise ValueError("num_nodes must be > 0 when node_emb_dim > 0")
+            self.node_emb = nn.Embedding(self.num_nodes, self.node_emb_dim)
+        else:
+            self.node_emb = None
+
+        self.edge_emb: nn.Embedding | None
+        if self.edge_emb_dim > 0:
+            if self.num_edges <= 0:
+                raise ValueError("num_edges must be > 0 when edge_emb_dim > 0")
+            self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim)
+        else:
+            self.edge_emb = None
+
+        eff_in = in_dim + self.node_emb_dim
+        eff_edge_dim = edge_dim + self.edge_emb_dim
+        self.input_proj = nn.Linear(eff_in, hidden)
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(n_layers):
@@ -144,25 +189,68 @@ class HomoGINE(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden * 2, hidden),
             )
-            self.convs.append(GINEConv(mlp, edge_dim=edge_dim))
+            self.convs.append(GINEConv(mlp, edge_dim=eff_edge_dim))
             self.norms.append(nn.LayerNorm(hidden))
         self.dropout = nn.Dropout(dropout)
         self.output_head = nn.Linear(hidden, 1)
 
+    def _node_ids(self, n_nodes_total: int, device: torch.device) -> torch.Tensor:
+        if n_nodes_total == self.num_nodes:
+            return torch.arange(self.num_nodes, device=device, dtype=torch.long)
+        if n_nodes_total % self.num_nodes != 0:
+            raise RuntimeError(f"Expected num_nodes multiple of {self.num_nodes}, got {n_nodes_total}")
+        b = n_nodes_total // self.num_nodes
+        return torch.arange(self.num_nodes, device=device, dtype=torch.long).repeat(b)
+
+    def _edge_ids(self, n_edges_total: int, device: torch.device) -> torch.Tensor:
+        if n_edges_total == self.num_edges:
+            return torch.arange(self.num_edges, device=device, dtype=torch.long)
+        if n_edges_total % self.num_edges != 0:
+            raise RuntimeError(f"Expected num_edges multiple of {self.num_edges}, got {n_edges_total}")
+        b = n_edges_total // self.num_edges
+        return torch.arange(self.num_edges, device=device, dtype=torch.long).repeat(b)
+
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        if self.node_emb is not None:
+            z = self.node_emb(self._node_ids(x.size(0), x.device))
+            x = torch.cat([x, z], dim=-1)
+        ea = edge_attr
+        if self.edge_emb is not None:
+            ze = self.edge_emb(self._edge_ids(ea.size(0), ea.device))
+            ea = torch.cat([ea, ze], dim=-1)
         h = self.input_proj(x)
         for conv, norm in zip(self.convs, self.norms):
-            h_msg = F.relu(conv(h, edge_index, edge_attr))
+            h_msg = F.relu(conv(h, edge_index, ea))
             h = h + self.dropout(norm(h_msg))
         return self.output_head(h)
 
 
 class HomoGCNRes(nn.Module):
-    """Fast baseline: scalar edge weight from R,X."""
+    """Fast baseline: scalar edge weight from R,X. Optional **node** ID embeddings only (edge emb N/A for GCN)."""
 
-    def __init__(self, in_dim: int, hidden: int, n_layers: int, dropout: float):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int,
+        n_layers: int,
+        dropout: float,
+        *,
+        num_nodes: int = 0,
+        node_emb_dim: int = 0,
+    ):
         super().__init__()
-        self.input_proj = nn.Linear(in_dim, hidden)
+        self.num_nodes = int(num_nodes)
+        self.node_emb_dim = max(0, int(node_emb_dim))
+        self.node_emb: nn.Embedding | None
+        if self.node_emb_dim > 0:
+            if self.num_nodes <= 0:
+                raise ValueError("num_nodes must be > 0 when node_emb_dim > 0")
+            self.node_emb = nn.Embedding(self.num_nodes, self.node_emb_dim)
+        else:
+            self.node_emb = None
+
+        eff_in = in_dim + self.node_emb_dim
+        self.input_proj = nn.Linear(eff_in, hidden)
         self.convs = nn.ModuleList([GCNConv(hidden, hidden) for _ in range(n_layers)])
         self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
@@ -170,11 +258,24 @@ class HomoGCNRes(nn.Module):
 
     @staticmethod
     def edge_attr_to_weight(edge_attr: torch.Tensor) -> torch.Tensor:
-        z = torch.sqrt(edge_attr[:, 0] ** 2 + edge_attr[:, 1] ** 2).clamp(min=1e-6)
+        # Only physical R,X (first 2 columns); ignore any padded cols if present
+        ea = edge_attr[:, :2]
+        z = torch.sqrt(ea[:, 0] ** 2 + ea[:, 1] ** 2).clamp(min=1e-6)
         return 1.0 / z
+
+    def _node_ids(self, n_nodes_total: int, device: torch.device) -> torch.Tensor:
+        if n_nodes_total == self.num_nodes:
+            return torch.arange(self.num_nodes, device=device, dtype=torch.long)
+        if n_nodes_total % self.num_nodes != 0:
+            raise RuntimeError(f"Expected num_nodes multiple of {self.num_nodes}, got {n_nodes_total}")
+        b = n_nodes_total // self.num_nodes
+        return torch.arange(self.num_nodes, device=device, dtype=torch.long).repeat(b)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         edge_weight = self.edge_attr_to_weight(edge_attr)
+        if self.node_emb is not None:
+            z = self.node_emb(self._node_ids(x.size(0), x.device))
+            x = torch.cat([x, z], dim=-1)
         h = self.input_proj(x)
         for conv, norm in zip(self.convs, self.norms):
             h_msg = F.relu(conv(h, edge_index, edge_weight=edge_weight))
@@ -367,6 +468,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not load/save preloaded_nodes.pt under --out_dir (disables fast restarts).",
     )
+    p.add_argument(
+        "--node_emb_dim",
+        type=int,
+        default=0,
+        metavar="D",
+        help="Optional learned node ID embedding dim (0=off). Same role as n_emb in architecture search.",
+    )
+    p.add_argument(
+        "--edge_emb_dim",
+        type=int,
+        default=0,
+        metavar="D",
+        help="Optional learned directed-edge ID embedding dim for GINE (0=off). Ignored for model=gcn. Same role as e_emb in architecture search.",
+    )
     return p.parse_args()
 
 
@@ -506,6 +621,17 @@ def main() -> None:
     )
 
     in_dim = x.shape[-1]
+    n_nodes = int(x.shape[1])
+    n_edges = int(edge_index.shape[1])
+    ned = max(0, int(args.node_emb_dim))
+    eed = max(0, int(args.edge_emb_dim))
+    if args.model == "gcn" and eed > 0:
+        print(
+            "[train_homo_gine_csv] model=gcn does not use --edge_emb_dim; ignoring edge embeddings.",
+            flush=True,
+        )
+        eed = 0
+
     if args.model == "gine":
         model = HomoGINE(
             in_dim=in_dim,
@@ -513,13 +639,33 @@ def main() -> None:
             hidden=args.hidden,
             n_layers=args.layers,
             dropout=args.dropout,
+            num_nodes=n_nodes,
+            num_edges=n_edges,
+            node_emb_dim=ned,
+            edge_emb_dim=eed,
         )
     else:
-        model = HomoGCNRes(in_dim=in_dim, hidden=args.hidden, n_layers=args.layers, dropout=args.dropout)
+        model = HomoGCNRes(
+            in_dim=in_dim,
+            hidden=args.hidden,
+            n_layers=args.layers,
+            dropout=args.dropout,
+            num_nodes=n_nodes,
+            node_emb_dim=ned,
+        )
 
     model = model.to(device)
-    ckpt = out_dir / f"homo_{args.model}_h{args.hidden}_L{args.layers}_best.pt"
+    emb_tag = ""
+    if ned > 0 or eed > 0:
+        emb_tag = f"_ne{ned}_ee{eed}"
+    ckpt = out_dir / f"homo_{args.model}_h{args.hidden}_L{args.layers}{emb_tag}_best.pt"
 
+    if ned > 0 or eed > 0:
+        print(
+            f"Learned embeddings: node_emb_dim={ned} edge_emb_dim={eed} | "
+            f"N={n_nodes} E={n_edges}",
+            flush=True,
+        )
     print("Starting training loop…", flush=True)
 
     best_mae = train_loop(
@@ -545,7 +691,10 @@ def main() -> None:
         "max_samples": args.max_samples,
         "log_every": args.log_every,
         "n_nodes": int(x.shape[1]),
+        "n_edges": int(edge_index.shape[1]),
         "n_features": int(in_dim),
+        "node_emb_dim": ned,
+        "edge_emb_dim": eed,
         "model": args.model,
         "hidden": args.hidden,
         "layers": args.layers,
