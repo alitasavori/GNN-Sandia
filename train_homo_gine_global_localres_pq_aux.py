@@ -337,6 +337,28 @@ def _aux_loss(
     return lreg, lcap
 
 
+def _aux_lambda_scale(epoch_1based: int, warmup_epochs: int, ramp_epochs: int) -> float:
+    """
+    Multiplier in [0, 1] for auxiliary loss weights (voltage-only when 0).
+
+    - Epochs 1..warmup: 0 (no aux gradient).
+    - Next ramp_epochs epochs: linear ramp 1/ramp, 2/ramp, ..., 1.
+    - After that: 1.
+
+    If warmup_epochs and ramp_epochs are both 0, returns 1 (full aux from epoch 1).
+    """
+    if warmup_epochs <= 0 and ramp_epochs <= 0:
+        return 1.0
+    if epoch_1based <= warmup_epochs:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    t = epoch_1based - warmup_epochs
+    if t > ramp_epochs:
+        return 1.0
+    return float(t) / float(ramp_epochs)
+
+
 def train_loop(
     model: nn.Module,
     train_loader: DataLoader,
@@ -349,6 +371,8 @@ def train_loop(
     weight_decay: float,
     lambda_reg: float,
     lambda_cap: float,
+    aux_warmup_epochs: int,
+    aux_ramp_epochs: int,
     checkpoint_path: Path,
     log_every: int,
 ) -> float:
@@ -359,6 +383,9 @@ def train_loop(
     bad = 0
 
     for ep in range(1, epochs + 1):
+        aux_scale = _aux_lambda_scale(ep, aux_warmup_epochs, aux_ramp_epochs)
+        lr_reg = float(lambda_reg) * aux_scale
+        lr_cap = float(lambda_cap) * aux_scale
         model.train()
         tr_mae = tr_mse = tr_auxr = tr_auxc = 0.0
         ntr = 0
@@ -370,7 +397,7 @@ def train_loop(
             yc = batch.y_cap.view(batch.num_graphs, -1).long()  # [B, 10]
             lv = mse(v_pred, yv)
             lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
-            loss = lv + float(lambda_reg) * lr_aux + float(lambda_cap) * lc_aux
+            loss = lv + lr_reg * lr_aux + lr_cap * lc_aux
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -417,7 +444,8 @@ def train_loop(
 
         if ep == 1 or ep % max(1, log_every) == 0:
             print(
-                f"Epoch {ep:4d} | train_mae={tr_mae:.6f} train_mse={tr_mse:.6f} "
+                f"Epoch {ep:4d} | aux_scale={aux_scale:.4f} eff_λ_reg={lr_reg:.6f} eff_λ_cap={lr_cap:.6f} | "
+                f"train_mae={tr_mae:.6f} train_mse={tr_mse:.6f} "
                 f"aux_reg={tr_auxr:.4f} aux_cap={tr_auxc:.4f} | "
                 f"val_mae={va_mae:.6f} val_mse={va_mse:.6f} aux_reg={va_auxr:.4f} aux_cap={va_auxc:.4f} | "
                 f"best_val_mse={best:.6f} | patience {bad}/{patience}",
@@ -457,6 +485,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--edge_emb_dim", type=int, default=0)
     p.add_argument("--lambda_reg", type=float, default=0.2)
     p.add_argument("--lambda_cap", type=float, default=0.1)
+    p.add_argument(
+        "--aux_warmup_epochs",
+        type=int,
+        default=0,
+        help="Train voltage only (aux loss weight 0) for this many epochs before applying aux.",
+    )
+    p.add_argument(
+        "--aux_ramp_epochs",
+        type=int,
+        default=0,
+        help="After warmup, linearly ramp aux weight multiplier from 0 to 1 over this many epochs. 0 = jump to full λ.",
+    )
     p.add_argument("--cache_tensor", type=str, default="")
     return p.parse_args()
 
@@ -586,8 +626,9 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"aux λ: reg={args.lambda_reg} cap={args.lambda_cap} | dropout={drop} "
-        f"| node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
+        f"aux λ (targets): reg={args.lambda_reg} cap={args.lambda_cap} | "
+        f"warmup_epochs={args.aux_warmup_epochs} ramp_epochs={args.aux_ramp_epochs} | "
+        f"dropout={drop} | node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
         flush=True,
     )
     print("Starting training...", flush=True)
@@ -603,6 +644,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
         lambda_reg=float(args.lambda_reg),
         lambda_cap=float(args.lambda_cap),
+        aux_warmup_epochs=int(args.aux_warmup_epochs),
+        aux_ramp_epochs=int(args.aux_ramp_epochs),
         checkpoint_path=ckpt,
         log_every=args.log_every,
     )
@@ -629,6 +672,8 @@ def main() -> None:
         "seed": int(args.seed),
         "lambda_reg": float(args.lambda_reg),
         "lambda_cap": float(args.lambda_cap),
+        "aux_warmup_epochs": int(args.aux_warmup_epochs),
+        "aux_ramp_epochs": int(args.aux_ramp_epochs),
         "aux_targets": {
             "reg": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["reg"]],
             "cap": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["cap"]],
