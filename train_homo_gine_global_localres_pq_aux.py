@@ -366,8 +366,8 @@ def train_loop(
             batch = batch.to(device)
             v_pred, reg_logits, cap_logits = model.forward_train(batch)
             yv = batch.y.view(batch.num_graphs, -1)
-            yr = batch.y_reg.long()
-            yc = batch.y_cap.long()
+            yr = batch.y_reg.view(batch.num_graphs, -1).long()  # [B, 12]
+            yc = batch.y_cap.view(batch.num_graphs, -1).long()  # [B, 10]
             lv = mse(v_pred, yv)
             lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
             loss = lv + float(lambda_reg) * lr_aux + float(lambda_cap) * lc_aux
@@ -393,8 +393,8 @@ def train_loop(
                 batch = batch.to(device)
                 v_pred, reg_logits, cap_logits = model.forward_train(batch)
                 yv = batch.y.view(batch.num_graphs, -1)
-                yr = batch.y_reg.long()
-                yc = batch.y_cap.long()
+                yr = batch.y_reg.view(batch.num_graphs, -1).long()
+                yc = batch.y_cap.view(batch.num_graphs, -1).long()
                 lv = mse(v_pred, yv)
                 lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
                 va_mse += float(lv.item()) * batch.num_graphs
