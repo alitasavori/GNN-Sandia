@@ -91,16 +91,19 @@ def _norm_sid(s: object) -> int:
         return int(str(s).strip())
 
 
-def _build_classes_from_train(y: np.ndarray, train_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _build_classes(y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build class ids from all available labels for stable CE indexing.
+    (Using train-only class sets can crash when val has unseen labels.)
+    """
     yq = np.round(y.astype(np.float64), 6)
-    classes = np.unique(yq[train_idx])
-    if classes.size == 0:
-        classes = np.unique(yq)
-    idx = np.searchsorted(classes, yq)
-    return classes.astype(np.float32), idx.astype(np.int64)
+    classes = np.unique(yq)
+    cls_to_i = {float(c): i for i, c in enumerate(classes.tolist())}
+    idx = np.array([cls_to_i[float(v)] for v in yq.tolist()], dtype=np.int64)
+    return classes.astype(np.float32), idx
 
 
-def _load_aux_targets(meta_csv: Path, sample_ids: list[int], train_idx: np.ndarray) -> dict:
+def _load_aux_targets(meta_csv: Path, sample_ids: list[int]) -> dict:
     usecols = ["sample_id", *TARGET_REG_COLS, *TARGET_CAP_COLS]
     df = pd.read_csv(meta_csv, usecols=usecols)
     lk = {_norm_sid(k): i for i, k in enumerate(df["sample_id"].tolist())}
@@ -116,11 +119,11 @@ def _load_aux_targets(meta_csv: Path, sample_ids: list[int], train_idx: np.ndarr
     }
     for c in TARGET_REG_COLS:
         y = df[c].to_numpy(dtype=np.float64)[order]
-        cls, yi = _build_classes_from_train(y, train_idx)
+        cls, yi = _build_classes(y)
         out["reg"].append({"name": c, "classes": cls, "y_idx": torch.from_numpy(yi)})
     for c in TARGET_CAP_COLS:
         y = df[c].to_numpy(dtype=np.float64)[order]
-        cls, yi = _build_classes_from_train(y, train_idx)
+        cls, yi = _build_classes(y)
         out["cap"].append({"name": c, "classes": cls, "y_idx": torch.from_numpy(yi)})
     return out
 
@@ -525,7 +528,7 @@ def main() -> None:
     x, mean, std = _zscore_features_train(x, train_idx)
     torch.save({"mean": mean, "std": std, "feat_cols": ["p_load_kw", "q_load_kvar"]}, out_dir / "feature_norm_pq.pt")
 
-    aux = _load_aux_targets(meta_path, sample_ids, train_idx)
+    aux = _load_aux_targets(meta_path, sample_ids)
     y_reg = [d["y_idx"] for d in aux["reg"]]
     y_cap = [d["y_idx"] for d in aux["cap"]]
     reg_nclasses = [len(d["classes"]) for d in aux["reg"]]
