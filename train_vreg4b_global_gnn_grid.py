@@ -19,11 +19,20 @@ Required files (under --data_root, default …/loadtype_8500_dailyagg):
 
 from __future__ import annotations
 
+import sys
+
+# First line users see when running the script (imports can take 1–2+ min on Colab).
+print(
+    "[train_vreg4b_global_gnn_grid] importing numpy/pandas/torch/torch_geometric "
+    "(wait; no logs until this finishes)…",
+    flush=True,
+)
+
 import argparse
 import json
 import os
 import random
-import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +45,8 @@ from torch.utils.data import Dataset, Subset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GINEConv
+
+print("[train_vreg4b_global_gnn_grid] imports finished.", flush=True)
 
 TARGET_META_COL = "reg_vreg4_b_tap_pu"
 FEAT_COLS: tuple[str, ...] = ("p_load_kw", "q_load_kvar")
@@ -100,7 +111,17 @@ def _load_line_edges_supervised(
 
 def _load_pq_and_ids(nodes_csv: Path) -> tuple[torch.Tensor, np.ndarray, list[int], dict[int, int]]:
     usecols = ["sample_id", "node_idx"] + list(FEAT_COLS)
+    try:
+        sz_mb = nodes_csv.stat().st_size / (1024 * 1024)
+        print(
+            f"  Node CSV ~{sz_mb:.1f} MiB — pandas read_csv (can take many minutes from Google Drive)...",
+            flush=True,
+        )
+    except OSError:
+        print("  Reading node CSV with pandas...", flush=True)
+    t0 = time.perf_counter()
     df = pd.read_csv(nodes_csv, usecols=usecols)
+    print(f"  read_csv done in {time.perf_counter() - t0:.1f}s", flush=True)
     for c in usecols:
         if c not in df.columns:
             raise ValueError(f"Missing column {c!r} in {nodes_csv}")
@@ -115,7 +136,10 @@ def _load_pq_and_ids(nodes_csv: Path) -> tuple[torch.Tensor, np.ndarray, list[in
     f_ct = len(FEAT_COLS)
     x_np = np.zeros((s_ct, n_nodes, f_ct), dtype=np.float32)
 
+    print(f"  Stacking {s_ct} samples × {n_nodes} nodes (progress every 1000 samples)...", flush=True)
     for si, sid in enumerate(sample_ids):
+        if si > 0 and si % 1000 == 0:
+            print(f"  ... stacked {si}/{s_ct} samples", flush=True)
         sub = df[df["sample_id"] == sid].sort_values("node_idx")
         if len(sub) != n_nodes:
             raise RuntimeError(f"sample_id={sid}: expected {n_nodes} rows, got {len(sub)}")
@@ -123,6 +147,7 @@ def _load_pq_and_ids(nodes_csv: Path) -> tuple[torch.Tensor, np.ndarray, list[in
             raise RuntimeError(f"sample_id={sid}: node_idx order differs from first sample")
         x_np[si] = sub[list(FEAT_COLS)].to_numpy(dtype=np.float32)
 
+    print(f"  stacking done.", flush=True)
     return torch.from_numpy(x_np), node_order, sample_ids, old_to_new
 
 
@@ -319,6 +344,12 @@ def train_one_run(
     bad = 0
     best_ep = 0
 
+    print(
+        f"  [{run_name}] training: up to {epochs} epochs, log_every={log_every} "
+        f"(1 = print every epoch)",
+        flush=True,
+    )
+
     for epoch in range(1, epochs + 1):
         model.train()
         tr_loss = 0.0
@@ -425,6 +456,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _configure_stdout()
+    print("[train_vreg4b_global_gnn_grid] starting…", flush=True)
     _set_seeds(args.seed)
 
     repo = Path(__file__).resolve().parent
@@ -446,7 +478,7 @@ def main() -> None:
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
 
     if cache_path and cache_path.is_file():
-        print(f"Loading cache {cache_path}", flush=True)
+        print(f"Loading preprocessed cache (fast): {cache_path}", flush=True)
         pack = torch.load(cache_path, map_location="cpu", weights_only=False)
         x = pack["x"]
         y_idx = pack["y_idx"]
