@@ -368,7 +368,8 @@ def train_loop(
         for batch in train_loader:
             batch = batch.to(device)
             pred = model(batch)      # [B, N]
-            tgt = batch.y            # [B, N]
+            # PyG may collate per-graph y [N] into a flat [B*N] tensor.
+            tgt = batch.y.view(batch.num_graphs, -1)  # [B, N]
             loss = criterion(pred, tgt)
             optimizer.zero_grad()
             loss.backward()
@@ -388,7 +389,7 @@ def train_loop(
             for batch in val_loader:
                 batch = batch.to(device)
                 pred = model(batch)
-                tgt = batch.y
+                tgt = batch.y.view(batch.num_graphs, -1)
                 loss = criterion(pred, tgt)
                 va_mse += float(loss.item()) * batch.num_graphs
                 va_mae += float((pred - tgt).abs().mean(dim=1).sum().item())
