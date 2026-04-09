@@ -86,6 +86,10 @@ CKPT_HOMO_GINE_64_3_EMB_16_8 = Path(
 )
 CKPT_HOMO_GCN = Path("gnn2_architecture_search/homo_mv_8500/GCN-128-4/homo_gcn_h128_L4_best.pt")
 CKPT_HOMO_GCN_64_3 = Path("gnn2_architecture_search/homo_mv_8500/GCN-64-3/homo_gcn_h64_L3_best.pt")
+CKPT_HOMO_GINE_GLOBAL_LOCALRES_PQ = Path(
+    "gnn2_architecture_search/homo_mv_8500/checkpoints_homo_gine_global_localres_pq/"
+    "homo_gine_global_localres_pq_h64_L3_nout2_ne16_ee8_do0.15_best.pt"
+)
 OUT_HOMO_GINE = Path("gnn2_daily_compare_8500_output_homo_gine")
 OUT_HOMO_GINE_64_2 = Path("gnn2_daily_compare_8500_output_homo_gine_64_2")
 OUT_HOMO_GINE_64_2_EMB_16_8 = Path("gnn2_daily_compare_8500_output_homo_gine_64_2_emb_16_8")
@@ -93,6 +97,7 @@ OUT_HOMO_GINE_64_3 = Path("gnn2_daily_compare_8500_output_homo_gine_64_3")
 OUT_HOMO_GINE_64_3_EMB_16_8 = Path("gnn2_daily_compare_8500_output_homo_gine_64_3_emb_16_8")
 OUT_HOMO_GCN = Path("gnn2_daily_compare_8500_output_homo_gcn")
 OUT_HOMO_GCN_64_3 = Path("gnn2_daily_compare_8500_output_homo_gcn_64_3")
+OUT_HOMO_GINE_GLOBAL_LOCALRES_PQ = Path("gnn2_daily_compare_8500_output_homo_gine_global_localres_pq")
 
 OUT_JUXTAPOSE = Path("gnn2_daily_compare_8500_output_sage_vs_gine")
 OUT_JUXTAPOSE_BOTH_FAIL = Path("gnn2_daily_compare_8500_output_both_fail_vs_dss")
@@ -114,6 +119,7 @@ __all__ = (
     "run_homo_gine_64_3_emb_16_8_mv",
     "run_homo_gcn_mv",
     "run_homo_gcn_64_3_mv",
+    "run_homo_gine_global_localres_pq_mv",
     "run_juxtapose_sage_vs_gine",
     "run_juxtapose_both_fail_vs_dss",
     "run_juxtapose_lowest_min_v_top5",
@@ -465,6 +471,43 @@ def run_homo_gine_64_3_emb_16_8_mv(
     )
 
 
+def run_homo_gine_global_localres_pq_mv(
+    *,
+    repo_root: Path | None = None,
+    checkpoint: Path | None = None,
+    dataset_dir: Path | None = None,
+    out_dir: Path | None = None,
+    plot_nodes: list[str] | None = None,
+    mv_sx_mapping: Path | None = None,
+    npts: int = 288,
+    step_min: int = 5,
+    ymin: float = 0.85,
+    ymax: float = 1.10,
+    device: str | None = None,
+    show_plots: bool = False,
+) -> None:
+    """
+    Daily OpenDSS vs load-only homo GINE local+global residual checkpoint.
+    Saves node plots with V_pred, V_local, and ΔV_global.
+    """
+    from compare_homo_mv_daily_global_localres import run_compare_homo_global_localres
+
+    root = repo_root or _repo()
+    run_compare_homo_global_localres(
+        checkpoint=(root / (checkpoint or CKPT_HOMO_GINE_GLOBAL_LOCALRES_PQ)).resolve(),
+        dataset_dir=(root / (dataset_dir or DATASET_DIR)).resolve(),
+        out_dir=(root / (out_dir or OUT_HOMO_GINE_GLOBAL_LOCALRES_PQ)).resolve(),
+        plot_nodes=list(plot_nodes or DEFAULT_NODES),
+        npts=npts,
+        step_min=step_min,
+        ymin=ymin,
+        ymax=ymax,
+        mv_sx_mapping=_resolve_mv_sx_mapping(root, mv_sx_mapping),
+        device=device,
+        show_plots=show_plots,
+    )
+
+
 def run_gine_edge_aware(
     *,
     repo_root: Path | None = None,
@@ -633,6 +676,7 @@ def main(argv: list[str] | None = None) -> None:
             "homo-gine-64-2-emb-16-8",
             "homo-gine-64-3",
             "homo-gine-64-3-emb-16-8",
+            "homo-gine-global-localres-pq",
             "homo-gcn",
             "homo-gcn-64-3",
             "juxtapose",
@@ -656,6 +700,8 @@ def main(argv: list[str] | None = None) -> None:
         run_homo_gine_64_3_mv()
     elif args.which == "homo-gine-64-3-emb-16-8":
         run_homo_gine_64_3_emb_16_8_mv()
+    elif args.which == "homo-gine-global-localres-pq":
+        run_homo_gine_global_localres_pq_mv()
     elif args.which == "homo-gcn":
         run_homo_gcn_mv()
     elif args.which == "homo-gcn-64-3":

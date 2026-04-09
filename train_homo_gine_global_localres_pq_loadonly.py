@@ -149,7 +149,7 @@ class _GlobalLocalBase(nn.Module):
             nn.Linear(gdim // 2, self.n_nodes),
         )
 
-    def _combine(self, h: torch.Tensor, bvec: torch.Tensor | None) -> torch.Tensor:
+    def _combine(self, h: torch.Tensor, bvec: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         local = self.local_head(h).squeeze(-1)
         z = self.node_proj(h)
         if bvec is None:
@@ -161,7 +161,7 @@ class _GlobalLocalBase(nn.Module):
             z = z.view(b, self.n_nodes, -1)
         g = z.reshape(z.size(0), -1)
         delta = self.global_head(g)
-        return local + delta
+        return local + delta, local, delta
 
 
 class HomoGINEGlobalLocalRes(_GlobalLocalBase):
@@ -214,7 +214,7 @@ class HomoGINEGlobalLocalRes(_GlobalLocalBase):
             e_total // self.num_edges_directed
         )
 
-    def forward(self, batch: Data) -> torch.Tensor:
+    def forward_components(self, batch: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = batch.x
         ea = batch.edge_attr
         if self.node_emb is not None:
@@ -226,6 +226,10 @@ class HomoGINEGlobalLocalRes(_GlobalLocalBase):
             h_msg = F.relu(conv(h, batch.edge_index, ea))
             h = h + self.dropout(norm(h_msg))
         return self._combine(h, batch.batch)
+
+    def forward(self, batch: Data) -> torch.Tensor:
+        pred, _, _ = self.forward_components(batch)
+        return pred
 
 
 class HomoGCNGlobalLocalRes(_GlobalLocalBase):
@@ -262,7 +266,7 @@ class HomoGCNGlobalLocalRes(_GlobalLocalBase):
             raise RuntimeError(f"Expected node count multiple of {self.n_nodes}, got {n_total}")
         return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
 
-    def forward(self, batch: Data) -> torch.Tensor:
+    def forward_components(self, batch: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = batch.x
         if self.node_emb is not None:
             x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
@@ -272,6 +276,10 @@ class HomoGCNGlobalLocalRes(_GlobalLocalBase):
             h_msg = F.relu(conv(h, batch.edge_index, edge_weight=ew))
             h = h + self.dropout(norm(h_msg))
         return self._combine(h, batch.batch)
+
+    def forward(self, batch: Data) -> torch.Tensor:
+        pred, _, _ = self.forward_components(batch)
+        return pred
 
 
 def train_loop(
