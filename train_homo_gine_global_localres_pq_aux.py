@@ -20,6 +20,7 @@ import json
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -530,6 +531,69 @@ def train_loop(
     return best
 
 
+def _angle_diff_deg(pred_deg: torch.Tensor, true_deg: torch.Tensor) -> torch.Tensor:
+    d = pred_deg - true_deg
+    return (d + 180.0) % 360.0 - 180.0
+
+
+@torch.no_grad()
+def eval_voltage_metrics(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    voltage_target_mode: str,
+) -> dict[str, float]:
+    model.eval()
+    sum_abs_v = 0.0
+    sum_sq_v = 0.0
+    n_v = 0
+    sum_abs_a = 0.0
+    sum_sq_a = 0.0
+    n_a = 0
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch)
+        y_true = batch.y
+        if voltage_target_mode == "complex_ri":
+            # pred, y_true: [B, N, 2] with [V_re, V_im]
+            pr = pred[..., 0]
+            pi = pred[..., 1]
+            tr = y_true[..., 0]
+            ti = y_true[..., 1]
+
+            pm = torch.sqrt(pr * pr + pi * pi + 1e-12)
+            tm = torch.sqrt(tr * tr + ti * ti + 1e-12)
+            dv = pm - tm
+            sum_abs_v += float(dv.abs().sum().item())
+            sum_sq_v += float((dv * dv).sum().item())
+            n_v += int(dv.numel())
+
+            pa = torch.rad2deg(torch.atan2(pi, pr))
+            ta = torch.rad2deg(torch.atan2(ti, tr))
+            da = _angle_diff_deg(pa, ta)
+            sum_abs_a += float(da.abs().sum().item())
+            sum_sq_a += float((da * da).sum().item())
+            n_a += int(da.numel())
+        else:
+            # vmag mode: pred, y_true are [B, N]
+            dv = pred.view(batch.num_graphs, -1) - y_true.view(batch.num_graphs, -1)
+            sum_abs_v += float(dv.abs().sum().item())
+            sum_sq_v += float((dv * dv).sum().item())
+            n_v += int(dv.numel())
+
+    out = {
+        "mae_vmag_pu": float(sum_abs_v / max(n_v, 1)),
+        "rmse_vmag_pu": float((sum_sq_v / max(n_v, 1)) ** 0.5),
+    }
+    if n_a > 0:
+        out["mae_angle_deg"] = float(sum_abs_a / n_a)
+        out["rmse_angle_deg"] = float((sum_sq_a / n_a) ** 0.5)
+    else:
+        out["mae_angle_deg"] = float("nan")
+        out["rmse_angle_deg"] = float("nan")
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Aux-head deep supervision training; drop aux heads at inference.")
     p.add_argument("--data_root", type=str, default=None)
@@ -570,6 +634,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--train_frac", type=float, default=0.8)
+    p.add_argument("--val_frac", type=float, default=0.1, help="Validation fraction; test gets remaining samples.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--sample_frac", type=float, default=1.0)
@@ -666,11 +731,15 @@ def main() -> None:
     n_edges = int(edge_index.shape[1])
     perm = np.random.RandomState(args.seed).permutation(n)
     n_train = max(1, int(args.train_frac * n))
+    n_val = max(1, int(args.val_frac * n))
+    if n_train + n_val >= n:
+        n_val = max(1, n - n_train - 1)
     train_idx = perm[:n_train]
-    val_idx = perm[n_train:]
-    if val_idx.size == 0:
-        val_idx = train_idx[-1:]
-        train_idx = train_idx[:-1]
+    val_idx = perm[n_train : n_train + n_val]
+    test_idx = perm[n_train + n_val :]
+    if test_idx.size == 0:
+        test_idx = val_idx[-1:]
+        val_idx = val_idx[:-1]
 
     x, mean, std = _zscore_features_train(x, train_idx)
     torch.save({"mean": mean, "std": std, "feat_cols": ["p_load_kw", "q_load_kvar"]}, out_dir / "feature_norm_pq.pt")
@@ -694,11 +763,13 @@ def main() -> None:
     ds = AuxDataset(x, yv, y_reg, y_cap, edge_index, edge_attr)
     train_ds = Subset(ds, train_idx.tolist())
     val_ds = Subset(ds, val_idx.tolist())
+    test_ds = Subset(ds, test_idx.tolist())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.type == "cuda"
     nw = int(args.num_workers)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=nw, pin_memory=pin, persistent_workers=nw > 0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=nw, pin_memory=pin, persistent_workers=nw > 0)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=nw, pin_memory=pin, persistent_workers=nw > 0)
 
     if args.model == "gine":
         model: nn.Module = HomoGINEGlobalLocalAux(
@@ -760,6 +831,7 @@ def main() -> None:
         flush=True,
     )
     print("Starting training...", flush=True)
+    t_train_start = time.perf_counter()
 
     best_val_mse = train_loop(
         model,
@@ -777,6 +849,13 @@ def main() -> None:
         checkpoint_path=ckpt,
         log_every=args.log_every,
     )
+    train_seconds = float(time.perf_counter() - t_train_start)
+
+    # Evaluate the best checkpoint on val/test with physical metrics.
+    best_state = torch.load(ckpt, map_location=device, weights_only=False)
+    model.load_state_dict(best_state, strict=False)
+    val_voltage_metrics = eval_voltage_metrics(model, val_loader, device, voltage_target_mode)
+    test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode)
 
     meta_out = {
         "best_val_mse_pu2": float(best_val_mse),
@@ -799,6 +878,7 @@ def main() -> None:
         "dropout_global": float(dropout_global),
         "dropout_aux": float(dropout_aux),
         "train_frac": float(args.train_frac),
+        "val_frac": float(args.val_frac),
         "seed": int(args.seed),
         "lambda_reg": float(args.lambda_reg),
         "lambda_cap": float(args.lambda_cap),
@@ -809,6 +889,14 @@ def main() -> None:
             "cap": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["cap"]],
         },
         "voltage_target_mode": voltage_target_mode,
+        "train_seconds": train_seconds,
+        "split_counts": {
+            "train": int(len(train_idx)),
+            "val": int(len(val_idx)),
+            "test": int(len(test_idx)),
+        },
+        "val_voltage_metrics": val_voltage_metrics,
+        "test_voltage_metrics": test_voltage_metrics,
     }
     with open(out_dir / "train_metrics_global_localres_aux.json", "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
