@@ -618,6 +618,7 @@ def main() -> None:
         dropout_aux = float(args.dropout_aux)
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
 
+    node_to_local = None
     if cache_path and cache_path.is_file():
         print(f"Loading tensor cache: {cache_path}", flush=True)
         pack = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -667,6 +668,9 @@ def main() -> None:
 
     voltage_target_mode = str(args.voltage_target).strip().lower()
     if voltage_target_mode == "complex_ri":
+        if node_to_local is None:
+            _x_tmp, _y_tmp, _sample_ids_tmp, _node_order_tmp, node_to_local = _load_nodes_pq_target(nodes_path)
+            del _x_tmp, _y_tmp, _sample_ids_tmp, _node_order_tmp
         yv = _load_voltage_target_complex_ri(nodes_path, sample_ids, node_to_local)
         print("Voltage target mode: complex_ri (training on V_re,V_im)", flush=True)
     else:
