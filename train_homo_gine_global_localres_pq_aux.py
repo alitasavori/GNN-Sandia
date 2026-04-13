@@ -446,6 +446,13 @@ def train_loop(
     best = float("inf")
     bad = 0
 
+    def _flatten_voltage_tensor(t: torch.Tensor, n_graphs: int) -> torch.Tensor:
+        # vmag mode: [B, N] -> [B, N]
+        # complex_ri mode: [B, N, 2] -> [B, 2N]
+        if t.dim() <= 2:
+            return t.view(n_graphs, -1)
+        return t.reshape(n_graphs, -1)
+
     for ep in range(1, epochs + 1):
         aux_scale = _aux_lambda_scale(ep, aux_warmup_epochs, aux_ramp_epochs)
         lr_reg = float(lambda_reg) * aux_scale
@@ -456,10 +463,11 @@ def train_loop(
         for batch in train_loader:
             batch = batch.to(device)
             v_pred, reg_logits, cap_logits = model.forward_train(batch)
-            yv = batch.y.view(batch.num_graphs, -1)
+            yv = _flatten_voltage_tensor(batch.y, batch.num_graphs)
+            v_pred_f = _flatten_voltage_tensor(v_pred, batch.num_graphs)
             yr = batch.y_reg.view(batch.num_graphs, -1).long()  # [B, 12]
             yc = batch.y_cap.view(batch.num_graphs, -1).long()  # [B, 10]
-            lv = mse(v_pred, yv)
+            lv = mse(v_pred_f, yv)
             lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
             loss = lv + lr_reg * lr_aux + lr_cap * lc_aux
             opt.zero_grad()
@@ -467,7 +475,7 @@ def train_loop(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             tr_mse += float(lv.item()) * batch.num_graphs
-            tr_mae += float((v_pred - yv).abs().mean(dim=1).sum().item())
+            tr_mae += float((v_pred_f - yv).abs().mean(dim=1).sum().item())
             tr_auxr += float(lr_aux.item()) * batch.num_graphs
             tr_auxc += float(lc_aux.item()) * batch.num_graphs
             ntr += int(batch.num_graphs)
@@ -483,13 +491,14 @@ def train_loop(
             for batch in val_loader:
                 batch = batch.to(device)
                 v_pred, reg_logits, cap_logits = model.forward_train(batch)
-                yv = batch.y.view(batch.num_graphs, -1)
+                yv = _flatten_voltage_tensor(batch.y, batch.num_graphs)
+                v_pred_f = _flatten_voltage_tensor(v_pred, batch.num_graphs)
                 yr = batch.y_reg.view(batch.num_graphs, -1).long()
                 yc = batch.y_cap.view(batch.num_graphs, -1).long()
-                lv = mse(v_pred, yv)
+                lv = mse(v_pred_f, yv)
                 lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
                 va_mse += float(lv.item()) * batch.num_graphs
-                va_mae += float((v_pred - yv).abs().mean(dim=1).sum().item())
+                va_mae += float((v_pred_f - yv).abs().mean(dim=1).sum().item())
                 va_auxr += float(lr_aux.item()) * batch.num_graphs
                 va_auxc += float(lc_aux.item()) * batch.num_graphs
                 nva += int(batch.num_graphs)
