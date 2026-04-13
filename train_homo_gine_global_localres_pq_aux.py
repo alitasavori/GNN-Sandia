@@ -128,6 +128,36 @@ def _load_aux_targets(meta_csv: Path, sample_ids: list[int]) -> dict:
     return out
 
 
+def _load_voltage_target_complex_ri(
+    nodes_csv: Path,
+    sample_ids: list[int],
+    node_to_local: dict[int, int],
+) -> torch.Tensor:
+    """
+    Build voltage targets as real/imag from vmag_pu + vang_deg.
+    Returns tensor [S, N, 2] where last dim is [V_re, V_im].
+    """
+    sid_to_i = {_norm_sid(s): i for i, s in enumerate(sample_ids)}
+    S = len(sample_ids)
+    N = len(node_to_local)
+    y_ri = np.zeros((S, N, 2), dtype=np.float32)
+    usecols = ["sample_id", "node_idx", "vmag_pu", "vang_deg"]
+    for chunk in pd.read_csv(nodes_csv, usecols=usecols, chunksize=500_000):
+        row_s = chunk["sample_id"].map(lambda v: sid_to_i.get(_norm_sid(v), -1)).to_numpy(dtype=np.int64)
+        row_n = chunk["node_idx"].map(lambda v: node_to_local.get(int(v), -1)).to_numpy(dtype=np.int64)
+        valid = (row_s >= 0) & (row_n >= 0)
+        if not np.any(valid):
+            continue
+        s = row_s[valid]
+        n = row_n[valid]
+        vmag = chunk.loc[valid, "vmag_pu"].to_numpy(dtype=np.float32)
+        vang_deg = chunk.loc[valid, "vang_deg"].to_numpy(dtype=np.float32)
+        vang_rad = np.deg2rad(vang_deg)
+        y_ri[s, n, 0] = vmag * np.cos(vang_rad)  # V_re
+        y_ri[s, n, 1] = vmag * np.sin(vang_rad)  # V_im
+    return torch.from_numpy(y_ri)
+
+
 class AuxDataset(Dataset):
     def __init__(
         self,
@@ -161,42 +191,56 @@ class AuxDataset(Dataset):
 
 
 class GlobalLocalAuxBase(nn.Module):
-    def __init__(self, n_nodes: int, hidden: int, node_out_dim: int, dropout: float):
+    def __init__(
+        self,
+        n_nodes: int,
+        hidden: int,
+        node_out_dim: int,
+        voltage_out_components: int,
+        dropout_global: float,
+        dropout_aux: float,
+    ):
         super().__init__()
         self.n_nodes = int(n_nodes)
+        self.voltage_out_components = int(voltage_out_components)
+        dg = float(dropout_global)
+        da = float(dropout_aux)
         self.node_proj = nn.Linear(hidden, node_out_dim)
-        self.local_head = nn.Linear(hidden, 1)
+        self.local_head = nn.Linear(hidden, self.voltage_out_components)
         gdim = self.n_nodes * node_out_dim
         self.global_head = nn.Sequential(
             nn.Linear(gdim, gdim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dg),
             nn.Linear(gdim, gdim // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(gdim // 2, self.n_nodes),
+            nn.Dropout(dg),
+            nn.Linear(gdim // 2, self.n_nodes * self.voltage_out_components),
         )
         self.aux_proj = nn.Linear(gdim, hidden)
+        self.aux_dropout = nn.Dropout(da)
         self.aux_reg_heads = nn.ModuleList()  # 12 heads, set by caller
         self.aux_cap_heads = nn.ModuleList()  # 10 heads, set by caller
 
     def _readout(self, h: torch.Tensor, bvec: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        local = self.local_head(h).squeeze(-1)
+        local = self.local_head(h)
         z = self.node_proj(h)
         if bvec is None:
-            local = local.view(1, self.n_nodes)
+            local = local.view(1, self.n_nodes, self.voltage_out_components)
             z = z.view(1, self.n_nodes, -1)
         else:
             b = int(bvec.max().item()) + 1
-            local = local.view(b, self.n_nodes)
+            local = local.view(b, self.n_nodes, self.voltage_out_components)
             z = z.view(b, self.n_nodes, -1)
         g = z.reshape(z.size(0), -1)  # [B, gdim]
-        delta = self.global_head(g)
+        delta = self.global_head(g).view(local.size(0), self.n_nodes, self.voltage_out_components)
         v_pred = local + delta
+        if self.voltage_out_components == 1:
+            v_pred = v_pred.squeeze(-1)
         return v_pred, g
 
     def _aux_logits(self, g: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        h = F.relu(self.aux_proj(g))
+        h = self.aux_dropout(F.relu(self.aux_proj(g)))
         reg_logits = [head(h) for head in self.aux_reg_heads]  # each [B, Cj]
         cap_logits = [head(h) for head in self.aux_cap_heads]  # each [B, Ck]
         return reg_logits, cap_logits
@@ -212,18 +256,28 @@ class HomoGINEGlobalLocalAux(GlobalLocalAuxBase):
         hidden: int,
         n_layers: int,
         node_out_dim: int,
-        dropout: float,
+        voltage_out_components: int,
+        dropout_trunk: float,
+        dropout_global: float,
+        dropout_aux: float,
         node_emb_dim: int,
         edge_emb_dim: int,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
-        super().__init__(n_nodes=n_nodes, hidden=hidden, node_out_dim=node_out_dim, dropout=dropout)
+        super().__init__(
+            n_nodes=n_nodes,
+            hidden=hidden,
+            node_out_dim=node_out_dim,
+            voltage_out_components=voltage_out_components,
+            dropout_global=dropout_global,
+            dropout_aux=dropout_aux,
+        )
         self.n_nodes = n_nodes
         self.num_edges = num_edges
         self.node_emb_dim = max(0, int(node_emb_dim))
         self.edge_emb_dim = max(0, int(edge_emb_dim))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(float(dropout_trunk))
 
         self.node_emb = nn.Embedding(n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
@@ -276,15 +330,25 @@ class HomoGCNGlobalLocalAux(GlobalLocalAuxBase):
         hidden: int,
         n_layers: int,
         node_out_dim: int,
-        dropout: float,
+        voltage_out_components: int,
+        dropout_trunk: float,
+        dropout_global: float,
+        dropout_aux: float,
         node_emb_dim: int,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
-        super().__init__(n_nodes=n_nodes, hidden=hidden, node_out_dim=node_out_dim, dropout=dropout)
+        super().__init__(
+            n_nodes=n_nodes,
+            hidden=hidden,
+            node_out_dim=node_out_dim,
+            voltage_out_components=voltage_out_components,
+            dropout_global=dropout_global,
+            dropout_aux=dropout_aux,
+        )
         self.n_nodes = n_nodes
         self.node_emb_dim = max(0, int(node_emb_dim))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(float(dropout_trunk))
         self.node_emb = nn.Embedding(n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         eff_in = in_dim + self.node_emb_dim
         self.input_proj = nn.Linear(eff_in, hidden)
@@ -468,8 +532,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--node_out_dim", type=int, default=2)
-    p.add_argument("--dropout", type=float, default=0.15)
-    p.add_argument("--disable_dropout", action="store_true")
+    p.add_argument(
+        "--dropout_trunk",
+        type=float,
+        default=0.0,
+        help="Dropout after each GNN layer (GINE/GCN). 0 = off.",
+    )
+    p.add_argument(
+        "--dropout_global",
+        type=float,
+        default=0.0,
+        help="Dropout inside the global ΔV MLP on concatenated node embeddings. 0 = off.",
+    )
+    p.add_argument(
+        "--dropout_aux",
+        type=float,
+        default=0.0,
+        help="Dropout on aux path (after aux_proj, before regulator/cap heads). 0 = off.",
+    )
+    p.add_argument(
+        "--disable_dropout",
+        action="store_true",
+        help="Force dropout_trunk, dropout_global, and dropout_aux to 0.",
+    )
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--patience", type=int, default=25)
@@ -498,6 +583,13 @@ def parse_args() -> argparse.Namespace:
         help="After warmup, linearly ramp aux weight multiplier from 0 to 1 over this many epochs. 0 = jump to full λ.",
     )
     p.add_argument("--cache_tensor", type=str, default="")
+    p.add_argument(
+        "--voltage-target",
+        type=str,
+        choices=("vmag", "complex_ri"),
+        default="vmag",
+        help="Voltage training target: vmag (default) or complex_ri (MSE on V_re,V_im).",
+    )
     return p.parse_args()
 
 
@@ -518,7 +610,12 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = repo / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    drop = 0.0 if args.disable_dropout else float(args.dropout)
+    if args.disable_dropout:
+        dropout_trunk = dropout_global = dropout_aux = 0.0
+    else:
+        dropout_trunk = float(args.dropout_trunk)
+        dropout_global = float(args.dropout_global)
+        dropout_aux = float(args.dropout_aux)
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
 
     if cache_path and cache_path.is_file():
@@ -568,6 +665,13 @@ def main() -> None:
     x, mean, std = _zscore_features_train(x, train_idx)
     torch.save({"mean": mean, "std": std, "feat_cols": ["p_load_kw", "q_load_kvar"]}, out_dir / "feature_norm_pq.pt")
 
+    voltage_target_mode = str(args.voltage_target).strip().lower()
+    if voltage_target_mode == "complex_ri":
+        yv = _load_voltage_target_complex_ri(nodes_path, sample_ids, node_to_local)
+        print("Voltage target mode: complex_ri (training on V_re,V_im)", flush=True)
+    else:
+        print("Voltage target mode: vmag (training on |V|)", flush=True)
+
     aux = _load_aux_targets(meta_path, sample_ids)
     y_reg = [d["y_idx"] for d in aux["reg"]]
     y_cap = [d["y_idx"] for d in aux["cap"]]
@@ -591,7 +695,10 @@ def main() -> None:
             hidden=args.hidden,
             n_layers=args.layers,
             node_out_dim=args.node_out_dim,
-            dropout=drop,
+            voltage_out_components=(2 if voltage_target_mode == "complex_ri" else 1),
+            dropout_trunk=dropout_trunk,
+            dropout_global=dropout_global,
+            dropout_aux=dropout_aux,
             node_emb_dim=max(0, int(args.node_emb_dim)),
             edge_emb_dim=max(0, int(args.edge_emb_dim)),
             reg_nclasses=reg_nclasses,
@@ -604,7 +711,10 @@ def main() -> None:
             hidden=args.hidden,
             n_layers=args.layers,
             node_out_dim=args.node_out_dim,
-            dropout=drop,
+            voltage_out_components=(2 if voltage_target_mode == "complex_ri" else 1),
+            dropout_trunk=dropout_trunk,
+            dropout_global=dropout_global,
+            dropout_aux=dropout_aux,
             node_emb_dim=max(0, int(args.node_emb_dim)),
             reg_nclasses=reg_nclasses,
             cap_nclasses=cap_nclasses,
@@ -614,7 +724,11 @@ def main() -> None:
         print("model=gcn ignores edge_emb_dim", flush=True)
 
     emb_tag = f"_ne{int(args.node_emb_dim)}_ee{int(args.edge_emb_dim)}"
-    do_tag = "_do0" if drop == 0.0 else f"_do{drop:g}"
+
+    def _fmt_do(x: float) -> str:
+        return f"{x:g}" if x > 0 else "0"
+
+    do_tag = f"_dt{_fmt_do(dropout_trunk)}_dg{_fmt_do(dropout_global)}_da{_fmt_do(dropout_aux)}"
     ckpt = out_dir / (
         f"homo_{args.model}_global_localres_pq_aux_h{args.hidden}_L{args.layers}_nout{args.node_out_dim}"
         f"{emb_tag}{do_tag}_best.pt"
@@ -628,7 +742,8 @@ def main() -> None:
     print(
         f"aux λ (targets): reg={args.lambda_reg} cap={args.lambda_cap} | "
         f"warmup_epochs={args.aux_warmup_epochs} ramp_epochs={args.aux_ramp_epochs} | "
-        f"dropout={drop} | node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
+        f"DO trunk={dropout_trunk} global={dropout_global} aux={dropout_aux} | "
+        f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
         flush=True,
     )
     print("Starting training...", flush=True)
@@ -667,7 +782,9 @@ def main() -> None:
         "node_out_dim": int(args.node_out_dim),
         "node_emb_dim": int(args.node_emb_dim),
         "edge_emb_dim": int(args.edge_emb_dim),
-        "dropout": float(drop),
+        "dropout_trunk": float(dropout_trunk),
+        "dropout_global": float(dropout_global),
+        "dropout_aux": float(dropout_aux),
         "train_frac": float(args.train_frac),
         "seed": int(args.seed),
         "lambda_reg": float(args.lambda_reg),
@@ -678,6 +795,7 @@ def main() -> None:
             "reg": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["reg"]],
             "cap": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["cap"]],
         },
+        "voltage_target_mode": voltage_target_mode,
     }
     with open(out_dir / "train_metrics_global_localres_aux.json", "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
