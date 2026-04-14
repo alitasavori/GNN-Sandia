@@ -198,6 +198,7 @@ def run_compare_homo_global_localres(
     show_plots: bool = False,
     worst_k: int = 0,
     save_per_node_mae_csv: bool = False,
+    debug_features: int = 0,
 ) -> None:
     device = resolve_inference_device(device)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +365,8 @@ def run_compare_homo_global_localres(
     node_to_idx = {n: i for i, n in enumerate(node_order_l)}
     t_hours = np.arange(npts, dtype=np.float32) * (step_min / 60.0)
 
+    debug_nodes_l = [str(n).strip().lower() for n in plot_nodes] if plot_nodes else []
+
     v_dss = np.full((npts, n_nodes), np.nan, dtype=np.float32)
     v_pred = np.full((npts, n_nodes), np.nan, dtype=np.float32)
     v_local = np.full((npts, n_nodes), np.nan, dtype=np.float32)
@@ -438,10 +441,39 @@ def run_compare_homo_global_localres(
             x[ni, 1] = float(node_q.get(nk, 0.0))
         feat_build_s += time.perf_counter() - t0
 
+        if debug_features > 0 and i < int(debug_features):
+            nnz = int(np.sum(np.abs(x) > 0.0))
+            nnz_rows = int(np.sum((np.abs(x[:, 0]) + np.abs(x[:, 1])) > 0.0))
+            print(
+                f"[compare_homo_mv_daily_global_localres][debug] t={i} mult={m_t:.6g} "
+                f"raw_x nnz_entries={nnz}/{x.size} nnz_rows={nnz_rows}/{n_nodes} "
+                f"p_range=[{float(x[:,0].min()):.3g},{float(x[:,0].max()):.3g}] "
+                f"q_range=[{float(x[:,1].min()):.3g},{float(x[:,1].max()):.3g}]",
+                flush=True,
+            )
+            for dn in debug_nodes_l:
+                jdn = node_to_idx.get(dn)
+                if jdn is None:
+                    continue
+                print(
+                    f"[compare_homo_mv_daily_global_localres][debug] node {dn}: "
+                    f"P={x[jdn,0]:.6g} Q={x[jdn,1]:.6g} | "
+                    f"DSS_V={float(v_dss[i,jdn]):.6g}",
+                    flush=True,
+                )
+
         # GNN inference.
         t0 = time.perf_counter()
         xb = torch.from_numpy(x).view(1, n_nodes, 2)
         xb = ((xb - feat_mean) / feat_std).squeeze(0).to(device)
+        if debug_features > 0 and i < int(debug_features):
+            xb_cpu = xb.detach().cpu()
+            print(
+                f"[compare_homo_mv_daily_global_localres][debug] xb_norm "
+                f"mean={float(xb_cpu.mean()):.6g} std={float(xb_cpu.std(unbiased=False)):.6g} "
+                f"min={float(xb_cpu.min()):.6g} max={float(xb_cpu.max()):.6g}",
+                flush=True,
+            )
         data = Data(x=xb, edge_index=edge_index, edge_attr=edge_attr)
         with torch.no_grad():
             if voltage_target_mode == "complex_ri":
@@ -458,6 +490,13 @@ def run_compare_homo_global_localres(
                 v_local[i, :] = local_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
                 v_delta[i, :] = delta_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
         gnn_s += time.perf_counter() - t0
+        if debug_features > 0 and i < int(debug_features):
+            vp = v_pred[i, :]
+            print(
+                f"[compare_homo_mv_daily_global_localres][debug] v_pred range "
+                f"[{float(np.nanmin(vp)):.6g},{float(np.nanmax(vp)):.6g}] mean={float(np.nanmean(vp)):.6g}",
+                flush=True,
+            )
 
     # Metrics and outputs.
     m = np.isfinite(v_dss) & np.isfinite(v_pred)
@@ -656,6 +695,13 @@ def main() -> None:
         action="store_true",
         help="Write daily_per_node_mae.csv (even if --worst-k is 0).",
     )
+    p.add_argument(
+        "--debug-features",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Print feature+prediction stats for first N timesteps (helps diagnose near-zero predictions due to mapping/norm mismatch).",
+    )
     args = p.parse_args()
 
     run_compare_homo_global_localres(
@@ -675,6 +721,7 @@ def main() -> None:
         show_plots=args.show_plots,
         worst_k=int(args.worst_k),
         save_per_node_mae_csv=bool(args.save_per_node_mae_csv),
+        debug_features=int(args.debug_features),
     )
 
 
