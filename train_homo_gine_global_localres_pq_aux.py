@@ -555,6 +555,12 @@ def eval_voltage_metrics(
         pred = model(batch)
         y_true = batch.y
         if voltage_target_mode == "complex_ri":
+            # pred: [B, N, 2]. PyG stacks targets as batch.y: [B*N, 2] (same node order as batch.x).
+            b = int(batch.num_graphs)
+            if pred.dim() != 3:
+                raise RuntimeError(f"complex_ri eval expected pred [B,N,2], got shape {tuple(pred.shape)}")
+            nloc = int(pred.size(1))
+            y_true = y_true.view(b, nloc, 2)
             # pred, y_true: [B, N, 2] with [V_re, V_im]
             pr = pred[..., 0]
             pi = pred[..., 1]
