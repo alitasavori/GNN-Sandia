@@ -132,7 +132,7 @@ def _load_aux_targets(meta_csv: Path, sample_ids: list[int]) -> dict:
 def _load_voltage_target_complex_ri(
     nodes_csv: Path,
     sample_ids: list[int],
-    node_to_local: dict[int, int],
+    node_to_local: dict[str, int],
 ) -> torch.Tensor:
     """
     Build voltage targets as real/imag from vmag_pu + vang_deg.
@@ -142,10 +142,10 @@ def _load_voltage_target_complex_ri(
     S = len(sample_ids)
     N = len(node_to_local)
     y_ri = np.zeros((S, N, 2), dtype=np.float32)
-    usecols = ["sample_id", "node_idx", "vmag_pu", "vang_deg"]
+    usecols = ["sample_id", "node", "vmag_pu", "vang_deg"]
     for chunk in pd.read_csv(nodes_csv, usecols=usecols, chunksize=500_000):
         row_s = chunk["sample_id"].map(lambda v: sid_to_i.get(_norm_sid(v), -1)).to_numpy(dtype=np.int64)
-        row_n = chunk["node_idx"].map(lambda v: node_to_local.get(int(v), -1)).to_numpy(dtype=np.int64)
+        row_n = chunk["node"].map(lambda v: node_to_local.get(str(v).strip(), -1)).to_numpy(dtype=np.int64)
         valid = (row_s >= 0) & (row_n >= 0)
         if not np.any(valid):
             continue
@@ -156,6 +156,12 @@ def _load_voltage_target_complex_ri(
         vang_rad = np.deg2rad(vang_deg)
         y_ri[s, n, 0] = vmag * np.cos(vang_rad)  # V_re
         y_ri[s, n, 1] = vmag * np.sin(vang_rad)  # V_im
+    n_nonzero = int(np.count_nonzero(np.abs(y_ri) > 0.0))
+    if n_nonzero == 0:
+        raise RuntimeError(
+            "complex_ri target tensor is all zeros; node mapping likely failed. "
+            "Check that nodes CSV 'node' names match _load_nodes_pq_target ordering."
+        )
     return torch.from_numpy(y_ri)
 
 

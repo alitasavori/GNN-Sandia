@@ -61,6 +61,21 @@ def _state_dict_voltage_only(state_dict: dict) -> tuple[dict, int]:
     return out, n_strip
 
 
+def _validate_feature_norm_pack(norm_pack: dict, norm_path: Path) -> None:
+    if "mean" not in norm_pack or "std" not in norm_pack:
+        raise RuntimeError(f"Invalid feature norm pack (missing mean/std): {norm_path}")
+    mean = np.asarray(norm_pack["mean"], dtype=np.float32).reshape(-1)
+    std = np.asarray(norm_pack["std"], dtype=np.float32).reshape(-1)
+    if mean.size != 2 or std.size != 2:
+        raise RuntimeError(
+            f"Expected 2 feature norm entries (P,Q), got mean={mean.size} std={std.size} from {norm_path}"
+        )
+    if not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError(f"Non-finite feature norm stats in {norm_path}")
+    if np.any(std <= 0):
+        raise RuntimeError(f"Non-positive feature std in {norm_path}")
+
+
 def _per_node_mae_rmse(v_pred: np.ndarray, v_dss: np.ndarray, node_order_l: list[str]) -> pd.DataFrame:
     """One row per GNN node: MAE/RMSE over timesteps where both pred and DSS are finite."""
     rows: list[dict[str, object]] = []
@@ -251,6 +266,18 @@ def run_compare_homo_global_localres(
     node_emb_dim = int(meta.get("node_emb_dim", 0))
     edge_emb_dim = int(meta.get("edge_emb_dim", 0))
     dropout = _infer_dropout_from_meta(meta)
+    if voltage_target_mode == "complex_ri":
+        vm = meta.get("val_voltage_metrics", {}) if isinstance(meta.get("val_voltage_metrics"), dict) else {}
+        mae_vmag = float(vm.get("mae_vmag_pu", float("nan")))
+        mae_ang = float(vm.get("mae_angle_deg", float("nan")))
+        # Defensive guard for a known bad-training signature:
+        # near-zero vmag MAE together with ~random angle MAE often means complex targets were malformed.
+        if np.isfinite(mae_vmag) and np.isfinite(mae_ang) and mae_vmag < 1e-3 and mae_ang > 30.0:
+            raise RuntimeError(
+                "Suspicious complex_ri checkpoint: val MAE(vmag) is near zero but angle MAE is very large. "
+                "This is a known sign of malformed complex targets (often near-zero V_re/V_im labels). "
+                "Retrain with corrected complex target construction."
+            )
 
     # Build canonical node ordering from first sample in nodes CSV.
     x_tmp, _y_tmp, _sids, node_order, node_to_local = _load_nodes_pq_target(nodes_path)
@@ -261,6 +288,7 @@ def run_compare_homo_global_localres(
     edge_attr = edge_attr.to(device)
 
     norm_pack = torch.load(norm_path, map_location="cpu", weights_only=False)
+    _validate_feature_norm_pack(norm_pack, norm_path)
     feat_mean = torch.as_tensor(norm_pack["mean"], dtype=torch.float32).view(1, 1, -1)
     feat_std = torch.as_tensor(norm_pack["std"], dtype=torch.float32).clamp_min(1e-8).view(1, 1, -1)
 
@@ -338,10 +366,15 @@ def run_compare_homo_global_localres(
             print(f"[compare_homo_mv_daily_global_localres] stripped {n_aux} aux_* keys from checkpoint (voltage-only inference)", flush=True)
     missing_unexpected = model.load_state_dict(state_dict, strict=False)
     if missing_unexpected.missing_keys or missing_unexpected.unexpected_keys:
-        print(
-            "[compare_homo_mv_daily_global_localres] load_state_dict(strict=False): "
-            f"missing={missing_unexpected.missing_keys} unexpected={missing_unexpected.unexpected_keys}",
-            flush=True,
+        missing_n = len(missing_unexpected.missing_keys)
+        unexpected_n = len(missing_unexpected.unexpected_keys)
+        sample_missing = missing_unexpected.missing_keys[:8]
+        sample_unexpected = missing_unexpected.unexpected_keys[:8]
+        raise RuntimeError(
+            "Checkpoint/model mismatch during inference. "
+            f"missing_keys={missing_n} unexpected_keys={unexpected_n}. "
+            f"Examples missing={sample_missing} unexpected={sample_unexpected}. "
+            "This usually means checkpoint, train-metrics JSON, and/or model settings are not from the same run."
         )
     model.eval()
 
