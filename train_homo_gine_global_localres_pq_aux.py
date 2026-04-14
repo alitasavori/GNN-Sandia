@@ -577,12 +577,8 @@ def eval_voltage_metrics(
     loader: DataLoader,
     device: torch.device,
     voltage_target_mode: str,
-    y_mean: torch.Tensor,
-    y_std: torch.Tensor,
 ) -> dict[str, float]:
     model.eval()
-    y_mean = y_mean.to(device)
-    y_std = y_std.to(device)
     sum_abs_v = 0.0
     sum_sq_v = 0.0
     n_v = 0
@@ -591,8 +587,8 @@ def eval_voltage_metrics(
     n_a = 0
     for batch in loader:
         batch = batch.to(device)
-        pred_n = model(batch)
-        pred = pred_n * y_std + y_mean
+        # Model predicts in raw voltage space; normalization is used only inside the loss.
+        pred = model(batch)
         y_true = batch.y
         if voltage_target_mode == "complex_ri":
             # pred: [B, N, 2]. PyG stacks targets as batch.y: [B*N, 2] (same node order as batch.x).
@@ -921,10 +917,13 @@ def main() -> None:
     # Evaluate the best checkpoint on val/test with physical metrics.
     best_state = torch.load(ckpt, map_location=device, weights_only=False)
     model.load_state_dict(best_state, strict=False)
-    val_voltage_metrics = eval_voltage_metrics(model, val_loader, device, voltage_target_mode, y_mean, y_std)
-    test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode, y_mean, y_std)
+    val_voltage_metrics = eval_voltage_metrics(model, val_loader, device, voltage_target_mode)
+    test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode)
 
     meta_out = {
+        # This is the checkpointing objective (normalized target space), not physical pu^2.
+        "best_val_mse_normalized": (None if args.skip_train else float(best_val_mse)),
+        # Backward-compat alias for old consumers; same numeric value as normalized MSE.
         "best_val_mse_pu2": (None if args.skip_train else float(best_val_mse)),
         "nodes_csv": str(nodes_path),
         "edge_catalog_csv": str(edges_path),
@@ -973,7 +972,7 @@ def main() -> None:
     metrics_path = out_dir / "train_metrics_global_localres_aux.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
-    print("Best val MSE:", "(skipped --skip_train)" if args.skip_train else best_val_mse, flush=True)
+    print("Best val MSE (normalized target space):", "(skipped --skip_train)" if args.skip_train else best_val_mse, flush=True)
     print("Val voltage metrics:", val_voltage_metrics, flush=True)
     print("Test voltage metrics:", test_voltage_metrics, flush=True)
     print("Saved checkpoint:", ckpt, flush=True)
