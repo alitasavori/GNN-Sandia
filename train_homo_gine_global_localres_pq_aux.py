@@ -670,6 +670,11 @@ def parse_args() -> argparse.Namespace:
         default="vmag",
         help="Voltage training target: vmag (default) or complex_ri (MSE on V_re,V_im).",
     )
+    p.add_argument(
+        "--skip_train",
+        action="store_true",
+        help="Load existing best checkpoint from --out_dir (same naming as training) and only run val/test voltage metrics + write JSON. Requires matching data args and seed.",
+    )
     return p.parse_args()
 
 
@@ -836,26 +841,33 @@ def main() -> None:
         f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
         flush=True,
     )
-    print("Starting training...", flush=True)
-    t_train_start = time.perf_counter()
+    if args.skip_train:
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"--skip_train requires checkpoint at {ckpt}")
+        print(f"--skip_train: loading {ckpt}", flush=True)
+        best_val_mse = float("nan")
+        train_seconds = 0.0
+    else:
+        print("Starting training...", flush=True)
+        t_train_start = time.perf_counter()
 
-    best_val_mse = train_loop(
-        model,
-        train_loader,
-        val_loader,
-        device,
-        epochs=args.epochs,
-        patience=args.patience,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        lambda_reg=float(args.lambda_reg),
-        lambda_cap=float(args.lambda_cap),
-        aux_warmup_epochs=int(args.aux_warmup_epochs),
-        aux_ramp_epochs=int(args.aux_ramp_epochs),
-        checkpoint_path=ckpt,
-        log_every=args.log_every,
-    )
-    train_seconds = float(time.perf_counter() - t_train_start)
+        best_val_mse = train_loop(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=args.epochs,
+            patience=args.patience,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            lambda_reg=float(args.lambda_reg),
+            lambda_cap=float(args.lambda_cap),
+            aux_warmup_epochs=int(args.aux_warmup_epochs),
+            aux_ramp_epochs=int(args.aux_ramp_epochs),
+            checkpoint_path=ckpt,
+            log_every=args.log_every,
+        )
+        train_seconds = float(time.perf_counter() - t_train_start)
 
     # Evaluate the best checkpoint on val/test with physical metrics.
     best_state = torch.load(ckpt, map_location=device, weights_only=False)
@@ -864,7 +876,7 @@ def main() -> None:
     test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode)
 
     meta_out = {
-        "best_val_mse_pu2": float(best_val_mse),
+        "best_val_mse_pu2": (None if args.skip_train else float(best_val_mse)),
         "nodes_csv": str(nodes_path),
         "edge_catalog_csv": str(edges_path),
         "meta_csv": str(meta_path),
@@ -895,6 +907,7 @@ def main() -> None:
             "cap": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["cap"]],
         },
         "voltage_target_mode": voltage_target_mode,
+        "skip_train": bool(args.skip_train),
         "train_seconds": train_seconds,
         "split_counts": {
             "train": int(len(train_idx)),
@@ -906,7 +919,7 @@ def main() -> None:
     }
     with open(out_dir / "train_metrics_global_localres_aux.json", "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
-    print("Best val MSE:", best_val_mse, flush=True)
+    print("Best val MSE:", "(skipped --skip_train)" if args.skip_train else best_val_mse, flush=True)
     print("Saved:", ckpt, flush=True)
 
 
