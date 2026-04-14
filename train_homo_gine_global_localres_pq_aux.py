@@ -917,10 +917,14 @@ def main() -> None:
         "val_voltage_metrics": val_voltage_metrics,
         "test_voltage_metrics": test_voltage_metrics,
     }
-    with open(out_dir / "train_metrics_global_localres_aux.json", "w", encoding="utf-8") as f:
+    metrics_path = out_dir / "train_metrics_global_localres_aux.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
     print("Best val MSE:", "(skipped --skip_train)" if args.skip_train else best_val_mse, flush=True)
-    print("Saved:", ckpt, flush=True)
+    print("Val voltage metrics:", val_voltage_metrics, flush=True)
+    print("Test voltage metrics:", test_voltage_metrics, flush=True)
+    print("Saved checkpoint:", ckpt, flush=True)
+    print("Saved metrics JSON:", metrics_path, flush=True)
 
 
 if __name__ == "__main__":
