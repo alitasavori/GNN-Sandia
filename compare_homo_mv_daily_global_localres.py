@@ -218,11 +218,18 @@ def run_compare_homo_global_localres(
     else:
         p0 = (ckpt.parent / "train_metrics_global_localres.json").resolve()
         p1 = (ckpt.parent / "train_metrics_global_localres_aux.json").resolve()
-        if p0.is_file():
-            meta_path = p0
-        elif p1.is_file():
+        # Prefer aux JSON when present: non-aux JSON is easy to leave stale beside *_aux_* checkpoints
+        # and would force vmag mode + wrong model class (local/ΔV plots break or look zero).
+        if p1.is_file():
             meta_path = p1
             print(f"[compare_homo_mv_daily_global_localres] using train metrics: {meta_path}", flush=True)
+            if p0.is_file():
+                print(
+                    f"[compare_homo_mv_daily_global_localres] (ignored non-aux metrics: {p0.name}; remove it or pass --train-metrics explicitly)",
+                    flush=True,
+                )
+        elif p0.is_file():
+            meta_path = p0
         else:
             meta_path = p0
     norm_path = Path(feature_norm_path).resolve() if feature_norm_path else (ckpt.parent / "feature_norm_pq.pt")
