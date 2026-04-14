@@ -1,0 +1,58 @@
+{
+  "daily_profile_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\8500-node\\5minDayShape4.csv",
+  "npts": 288,
+  "n_nonconv": 0,
+  "n_nodes": 1177,
+  "checkpoint_dir": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\mlp_cvnn_compare_8500",
+  "real_checkpoint": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\mlp_cvnn_compare_8500\\real_mlp_best.pt",
+  "cvnn_checkpoint": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\mlp_cvnn_compare_8500\\cvnn_mlp_best.pt",
+  "metrics_real": {
+    "mae_vmag_pu": 0.0034385169856250286,
+    "rmse_vmag_pu": 0.00422148872166872,
+    "mae_angle_deg": 0.027901172637939453,
+    "rmse_angle_deg": 0.034566480666399
+  },
+  "metrics_cvnn": {
+    "mae_vmag_pu": 0.0034404180478304625,
+    "rmse_vmag_pu": 0.00423280056566,
+    "mae_angle_deg": 0.03249339014291763,
+    "rmse_angle_deg": 0.043213583528995514
+  },
+  "timing_seconds": {
+    "real_forward_total_s": 0.4649141000245436,
+    "cvnn_forward_total_s": 1.269791199996689
+  },
+  "worst_k": 5,
+  "worst_nodes_by_real_mae": [
+    {
+      "node": "l2764403.1",
+      "mae_real_pu": 0.0049036284908652306,
+      "mae_cvnn_pu": 0.004561580717563629,
+      "n_valid": 288
+    },
+    {
+      "node": "l2785537.1",
+      "mae_real_pu": 0.0049034710973501205,
+      "mae_cvnn_pu": 0.004561398644000292,
+      "n_valid": 288
+    },
+    {
+      "node": "l2748157.1",
+      "mae_real_pu": 0.004903414286673069,
+      "mae_cvnn_pu": 0.004561656154692173,
+      "n_valid": 288
+    },
+    {
+      "node": "l2935559.1",
+      "mae_real_pu": 0.004897455219179392,
+      "mae_cvnn_pu": 0.004512922838330269,
+      "n_valid": 288
+    },
+    {
+      "node": "l2804252.1",
+      "mae_real_pu": 0.004896836820989847,
+      "mae_cvnn_pu": 0.004512744955718517,
+      "n_valid": 288
+    }
+  ]
+}

@@ -367,6 +367,7 @@ def run_compare(
     ymin: float,
     ymax: float,
     mv_sx_mapping: Path | None = None,
+    daily_profile_csv: str | Path | None = None,
     reg_tap_diag: bool = True,
     device: str | None = None,
     show_plots: bool = True,
@@ -437,7 +438,9 @@ def run_compare(
     base_kw = np.array([float(d["kw"]) for d in loads], dtype=np.float64)
     base_kvar = np.array([float(d["kvar"]) for d in loads], dtype=np.float64)
     base_names = [str(d["name"]) for d in loads]
-    mL = rd8500._daily_profile_5min(npts=npts)
+    prof_path = rd8500._resolve_daily_profile_csv(daily_profile_csv)
+    print(f"[compare_hetero_mv_daily] daily profile: {prof_path}", flush=True)
+    mL = rd8500._daily_profile_5min(npts=npts, profile_csv=daily_profile_csv)
 
     all_nodes = []
     for n in dss.Circuit.AllNodeNames():
@@ -865,6 +868,7 @@ def run_compare_juxtapose(
     ymin: float,
     ymax: float,
     mv_sx_mapping: Path | None,
+    daily_profile_csv: str | Path | None = None,
     top_disagree: int = 10,
     disagree_scope: str = "load",
     also_plot_nodes: list[str] | None = None,
@@ -944,7 +948,9 @@ def run_compare_juxtapose(
     base_kw = np.array([float(d["kw"]) for d in loads], dtype=np.float64)
     base_kvar = np.array([float(d["kvar"]) for d in loads], dtype=np.float64)
     base_names = [str(d["name"]) for d in loads]
-    mL = rd8500._daily_profile_5min(npts=npts)
+    prof_path_j = rd8500._resolve_daily_profile_csv(daily_profile_csv)
+    print(f"[compare_hetero_mv_daily] juxtapose daily profile: {prof_path_j}", flush=True)
+    mL = rd8500._daily_profile_5min(npts=npts, profile_csv=daily_profile_csv)
 
     all_nodes: list[str] = []
     for n in dss.Circuit.AllNodeNames():
@@ -1393,6 +1399,13 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, default=Path("gnn2_daily_compare_8500_output"))
     p.add_argument("--nodes", type=str, default="m1026891.1,m1026891.2,m1026891.3", help="Comma-separated nodes to plot")
     p.add_argument("--npts", type=int, default=288)
+    p.add_argument(
+        "--daily-profile",
+        type=str,
+        default="5minDayShape.csv",
+        metavar="CSV",
+        help="Load-shape file under 8500-node/ (e.g. 5minDayShape.csv, 5minDayShape2.csv, 5minDayShape3.csv) or absolute path.",
+    )
     p.add_argument("--step-min", type=int, default=5)
     p.add_argument("--ymin", type=float, default=0.85)
     p.add_argument("--ymax", type=float, default=1.10)
@@ -1487,6 +1500,7 @@ def main() -> None:
             ymin=float(args.ymin),
             ymax=float(args.ymax),
             mv_sx_mapping=mv_path,
+            daily_profile_csv=str(args.daily_profile),
             top_disagree=int(args.top_disagree),
             disagree_scope=str(args.disagree_scope),
             also_plot_nodes=[x.strip() for x in str(args.also_nodes).split(",") if x.strip()],
@@ -1508,6 +1522,7 @@ def main() -> None:
             ymin=float(args.ymin),
             ymax=float(args.ymax),
             mv_sx_mapping=mv_path,
+            daily_profile_csv=str(args.daily_profile),
             reg_tap_diag=reg_diag,
             device=args.device,
             show_plots=args.show_plots,

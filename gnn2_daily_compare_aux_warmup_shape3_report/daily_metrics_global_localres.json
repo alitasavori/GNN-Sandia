@@ -1,0 +1,55 @@
+{
+  "mae_pu": 0.0035329037345945835,
+  "rmse_pu": 0.004530034493654966,
+  "mean_mae_pu_per_node": 0.003532903816194108,
+  "n_nodes": 1177,
+  "npts": 288,
+  "nonconv": 0,
+  "daily_profile_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\8500-node\\5minDayShape3.csv",
+  "worst_k": 5,
+  "worst_nodes_by_mae": [
+    {
+      "node": "l2860499.2",
+      "mae_pu": 0.005157957784831524,
+      "rmse_pu": 0.006043777335435152,
+      "n_valid": 288
+    },
+    {
+      "node": "l3141394.2",
+      "mae_pu": 0.0050905789248645306,
+      "rmse_pu": 0.005847418215125799,
+      "n_valid": 288
+    },
+    {
+      "node": "l2897784.2",
+      "mae_pu": 0.005040598101913929,
+      "rmse_pu": 0.005949618294835091,
+      "n_valid": 288
+    },
+    {
+      "node": "l2801902.2",
+      "mae_pu": 0.005031673703342676,
+      "rmse_pu": 0.005758157465606928,
+      "n_valid": 288
+    },
+    {
+      "node": "l2935567.2",
+      "mae_pu": 0.005026465747505426,
+      "rmse_pu": 0.005881560035049915,
+      "n_valid": 288
+    }
+  ],
+  "timing": {
+    "n_ok": 288,
+    "open_apply_s_total": 1.1575780999883136,
+    "open_reassert_s_total": 0.01201170001149876,
+    "open_solve_only_s_total": 46.01836370001911,
+    "open_get_s_total": 2.113705099982326,
+    "feature_build_s_total": 1.6482034999826283,
+    "gnn_forward_only_s_total": 20.9918082999975,
+    "gnn_bucket_s_total": 20.9918082999975
+  },
+  "checkpoint": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\homo_gine_global_localres_pq_aux_h64_L3_nout4_ne16_ee8_do0_best.pt",
+  "train_metrics": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\train_metrics_global_localres_aux.json",
+  "feature_norm": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\feature_norm_pq.pt"
+}

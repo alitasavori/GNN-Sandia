@@ -1,0 +1,14 @@
+{
+  "best_val_mae_pu": 1.3748010782843034,
+  "nodes_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\datasets_gnn2\\loadtype_8500_dailyagg\\Heterogenous GNN dataset\\nodes\\hetero_mv_nodes_load_transformer_reg_tap_only.csv",
+  "edge_catalog_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\datasets_gnn2\\loadtype_8500_dailyagg\\Heterogenous GNN dataset\\edges\\hetero_mv_edge_catalog.csv",
+  "n_samples": 8,
+  "n_nodes": 1177,
+  "n_features": 15,
+  "model": "gine",
+  "hidden": 128,
+  "layers": 4,
+  "train_frac": 0.8,
+  "seed": 42,
+  "extra_csvs_used": []
+}

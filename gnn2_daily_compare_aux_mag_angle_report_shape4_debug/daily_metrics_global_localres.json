@@ -1,0 +1,56 @@
+{
+  "voltage_target_mode": "complex_ri",
+  "mae_pu": 1.0274147987365723,
+  "rmse_pu": 1.0274876356124878,
+  "mean_mae_pu_per_node": 1.0274149936037542,
+  "n_nodes": 1177,
+  "npts": 288,
+  "nonconv": 0,
+  "daily_profile_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\8500-node\\5minDayShape4.csv",
+  "worst_k": 5,
+  "worst_nodes_by_mae": [
+    {
+      "node": "l2823592.1",
+      "mae_pu": 1.0498124361038208,
+      "rmse_pu": 1.0498160123825073,
+      "n_valid": 288
+    },
+    {
+      "node": "l2801909.3",
+      "mae_pu": 1.0492150783538818,
+      "rmse_pu": 1.049217939376831,
+      "n_valid": 288
+    },
+    {
+      "node": "l2936270.1",
+      "mae_pu": 1.047485113143921,
+      "rmse_pu": 1.0474903583526611,
+      "n_valid": 288
+    },
+    {
+      "node": "l3086078.1",
+      "mae_pu": 1.04744553565979,
+      "rmse_pu": 1.0474507808685303,
+      "n_valid": 288
+    },
+    {
+      "node": "l3217057.1",
+      "mae_pu": 1.04736328125,
+      "rmse_pu": 1.0473685264587402,
+      "n_valid": 288
+    }
+  ],
+  "timing": {
+    "n_ok": 288,
+    "open_apply_s_total": 1.3658873000031235,
+    "open_reassert_s_total": 0.013739799998802482,
+    "open_solve_only_s_total": 64.3945758000109,
+    "open_get_s_total": 3.102522999991379,
+    "feature_build_s_total": 2.459845999999743,
+    "gnn_forward_only_s_total": 28.510368899986133,
+    "gnn_bucket_s_total": 28.510368899986133
+  },
+  "checkpoint": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_mag_angle_fresh\\homo_gine_global_localres_pq_aux_h64_L3_nout4_ne16_ee8_dt0_dg0_da0_best.pt",
+  "train_metrics": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_mag_angle_fresh\\train_metrics_global_localres_aux.json",
+  "feature_norm": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_mag_angle_fresh\\feature_norm_pq.pt"
+}

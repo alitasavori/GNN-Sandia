@@ -273,6 +273,7 @@ def run_compare_homo(
     ymin: float,
     ymax: float,
     mv_sx_mapping: Path | None = None,
+    daily_profile_csv: str | Path | None = None,
     nodes_csv: Path | None = None,
     train_metrics_path: Path | None = None,
     feature_norm_path: Path | None = None,
@@ -422,7 +423,9 @@ def run_compare_homo(
     base_kw = np.array([float(d["kw"]) for d in loads], dtype=np.float64)
     base_kvar = np.array([float(d["kvar"]) for d in loads], dtype=np.float64)
     base_names = [str(d["name"]) for d in loads]
-    mL = rd8500._daily_profile_5min(npts=npts)
+    prof_path = rd8500._resolve_daily_profile_csv(daily_profile_csv)
+    print(f"[compare_homo_mv_daily] daily profile: {prof_path}", flush=True)
+    mL = rd8500._daily_profile_5min(npts=npts, profile_csv=daily_profile_csv)
 
     all_nodes: list[str] = []
     for n in dss.Circuit.AllNodeNames():

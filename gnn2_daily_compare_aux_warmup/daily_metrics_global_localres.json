@@ -1,0 +1,20 @@
+{
+  "mae_pu": 0.0038402401842176914,
+  "rmse_pu": 0.004798011854290962,
+  "npts": 288,
+  "nonconv": 0,
+  "daily_profile_csv": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\8500-node\\5minDayShape.csv",
+  "timing": {
+    "n_ok": 288,
+    "open_apply_s_total": 1.140988200015272,
+    "open_reassert_s_total": 0.011454400038928725,
+    "open_solve_only_s_total": 45.37722990000111,
+    "open_get_s_total": 1.9852113999695575,
+    "feature_build_s_total": 1.59692449999784,
+    "gnn_forward_only_s_total": 20.465287800030637,
+    "gnn_bucket_s_total": 20.465287800030637
+  },
+  "checkpoint": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\homo_gine_global_localres_pq_aux_h64_L3_nout4_ne16_ee8_do0_best.pt",
+  "train_metrics": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\train_metrics_global_localres_aux.json",
+  "feature_norm": "C:\\Users\\alita\\OneDrive\\Desktop\\GNN2\\gnn2_architecture_search\\homo_mv_8500\\checkpoints_homo_gine_global_localres_pq_aux_warmup\\feature_norm_pq.pt"
+}

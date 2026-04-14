@@ -215,14 +215,21 @@ class GlobalLocalAuxBase(nn.Module):
         self.node_proj = nn.Linear(hidden, node_out_dim)
         self.local_head = nn.Linear(hidden, self.voltage_out_components)
         gdim = self.n_nodes * node_out_dim
+        out_dim = self.n_nodes * self.voltage_out_components
+        hidden_x = max(1, out_dim // 2)
         self.global_head = nn.Sequential(
-            nn.Linear(gdim, gdim),
+            # MLP-style global residual head: x -> x/2 -> x/2 -> x,
+            # where x = n_nodes * voltage_out_components.
+            nn.Linear(gdim, out_dim),
             nn.ReLU(),
             nn.Dropout(dg),
-            nn.Linear(gdim, gdim // 2),
+            nn.Linear(out_dim, hidden_x),
             nn.ReLU(),
             nn.Dropout(dg),
-            nn.Linear(gdim // 2, self.n_nodes * self.voltage_out_components),
+            nn.Linear(hidden_x, hidden_x),
+            nn.ReLU(),
+            nn.Dropout(dg),
+            nn.Linear(hidden_x, out_dim),
         )
         self.aux_proj = nn.Linear(gdim, hidden)
         self.aux_dropout = nn.Dropout(da)
@@ -444,6 +451,8 @@ def train_loop(
     lambda_cap: float,
     aux_warmup_epochs: int,
     aux_ramp_epochs: int,
+    y_mean_flat: torch.Tensor,
+    y_std_flat: torch.Tensor,
     checkpoint_path: Path,
     log_every: int,
 ) -> float:
@@ -452,6 +461,8 @@ def train_loop(
     mse = nn.MSELoss()
     best = float("inf")
     bad = 0
+    y_mean_flat = y_mean_flat.to(device)
+    y_std_flat = y_std_flat.to(device)
 
     def _flatten_voltage_tensor(t: torch.Tensor, n_graphs: int) -> torch.Tensor:
         # vmag mode: [B, N] -> [B, N]
@@ -474,7 +485,9 @@ def train_loop(
             v_pred_f = _flatten_voltage_tensor(v_pred, batch.num_graphs)
             yr = batch.y_reg.view(batch.num_graphs, -1).long()  # [B, 12]
             yc = batch.y_cap.view(batch.num_graphs, -1).long()  # [B, 10]
-            lv = mse(v_pred_f, yv)
+            yv_n = (yv - y_mean_flat) / y_std_flat
+            v_pred_n = (v_pred_f - y_mean_flat) / y_std_flat
+            lv = mse(v_pred_n, yv_n)
             lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
             loss = lv + lr_reg * lr_aux + lr_cap * lc_aux
             opt.zero_grad()
@@ -502,7 +515,9 @@ def train_loop(
                 v_pred_f = _flatten_voltage_tensor(v_pred, batch.num_graphs)
                 yr = batch.y_reg.view(batch.num_graphs, -1).long()
                 yc = batch.y_cap.view(batch.num_graphs, -1).long()
-                lv = mse(v_pred_f, yv)
+                yv_n = (yv - y_mean_flat) / y_std_flat
+                v_pred_n = (v_pred_f - y_mean_flat) / y_std_flat
+                lv = mse(v_pred_n, yv_n)
                 lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
                 va_mse += float(lv.item()) * batch.num_graphs
                 va_mae += float((v_pred_f - yv).abs().mean(dim=1).sum().item())
@@ -542,14 +557,32 @@ def _angle_diff_deg(pred_deg: torch.Tensor, true_deg: torch.Tensor) -> torch.Ten
     return (d + 180.0) % 360.0 - 180.0
 
 
+def _compute_voltage_target_norm(
+    y: torch.Tensor,
+    train_idx: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute per-output normalization stats from train split only.
+    Returns tensors with shape [1, N] for vmag, or [1, N, 2] for complex_ri.
+    """
+    y_train = y[train_idx]
+    y_mean = y_train.mean(dim=0, keepdim=True)
+    y_std = y_train.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    return y_mean, y_std
+
+
 @torch.no_grad()
 def eval_voltage_metrics(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     voltage_target_mode: str,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
 ) -> dict[str, float]:
     model.eval()
+    y_mean = y_mean.to(device)
+    y_std = y_std.to(device)
     sum_abs_v = 0.0
     sum_sq_v = 0.0
     n_v = 0
@@ -558,7 +591,8 @@ def eval_voltage_metrics(
     n_a = 0
     for batch in loader:
         batch = batch.to(device)
-        pred = model(batch)
+        pred_n = model(batch)
+        pred = pred_n * y_std + y_mean
         y_true = batch.y
         if voltage_target_mode == "complex_ri":
             # pred: [B, N, 2]. PyG stacks targets as batch.y: [B*N, 2] (same node order as batch.x).
@@ -781,6 +815,13 @@ def main() -> None:
     train_ds = Subset(ds, train_idx.tolist())
     val_ds = Subset(ds, val_idx.tolist())
     test_ds = Subset(ds, test_idx.tolist())
+    y_mean, y_std = _compute_voltage_target_norm(yv, train_idx)
+    y_mean_flat = y_mean.reshape(1, -1)
+    y_std_flat = y_std.reshape(1, -1)
+    torch.save(
+        {"y_mean": y_mean.cpu(), "y_std": y_std.cpu(), "voltage_target_mode": voltage_target_mode},
+        out_dir / "voltage_target_norm.pt",
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.type == "cuda"
     nw = int(args.num_workers)
@@ -870,6 +911,8 @@ def main() -> None:
             lambda_cap=float(args.lambda_cap),
             aux_warmup_epochs=int(args.aux_warmup_epochs),
             aux_ramp_epochs=int(args.aux_ramp_epochs),
+            y_mean_flat=y_mean_flat,
+            y_std_flat=y_std_flat,
             checkpoint_path=ckpt,
             log_every=args.log_every,
         )
@@ -878,8 +921,8 @@ def main() -> None:
     # Evaluate the best checkpoint on val/test with physical metrics.
     best_state = torch.load(ckpt, map_location=device, weights_only=False)
     model.load_state_dict(best_state, strict=False)
-    val_voltage_metrics = eval_voltage_metrics(model, val_loader, device, voltage_target_mode)
-    test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode)
+    val_voltage_metrics = eval_voltage_metrics(model, val_loader, device, voltage_target_mode, y_mean, y_std)
+    test_voltage_metrics = eval_voltage_metrics(model, test_loader, device, voltage_target_mode, y_mean, y_std)
 
     meta_out = {
         "best_val_mse_pu2": (None if args.skip_train else float(best_val_mse)),
@@ -913,6 +956,10 @@ def main() -> None:
             "cap": [{"name": d["name"], "n_classes": len(d["classes"])} for d in aux["cap"]],
         },
         "voltage_target_mode": voltage_target_mode,
+        "voltage_target_normalization": {
+            "enabled": True,
+            "stats_path": str((out_dir / "voltage_target_norm.pt").resolve()),
+        },
         "skip_train": bool(args.skip_train),
         "train_seconds": train_seconds,
         "split_counts": {

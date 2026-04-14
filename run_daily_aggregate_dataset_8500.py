@@ -121,10 +121,33 @@ def _compile_8500_daily_setup() -> None:
     dss.Text.Command("set maxcontroliter=20000")
 
 
-def _daily_profile_5min(npts: int = 288) -> np.ndarray:
-    csv_path = REPO_ROOT / "8500-node" / "5minDayShape.csv"
+def _resolve_daily_profile_csv(profile_csv: str | Path | None) -> Path:
+    """
+    Resolve path to a two-column (time, multiplier) daily shape CSV.
+
+    - ``None`` → ``8500-node/5minDayShape.csv`` (original default).
+    - Absolute path that exists → used as-is.
+    - Otherwise: ``8500-node/<basename>`` (e.g. ``5minDayShape2.csv``).
+    """
+    default_name = "5minDayShape.csv"
+    if profile_csv is None:
+        csv_path = REPO_ROOT / "8500-node" / default_name
+    else:
+        p = Path(profile_csv)
+        if p.is_file():
+            csv_path = p.resolve()
+        else:
+            csv_path = (REPO_ROOT / "8500-node" / p.name).resolve()
     if not csv_path.is_file():
-        raise FileNotFoundError(f"Missing daily profile CSV: {csv_path}")
+        raise FileNotFoundError(
+            f"Missing daily profile CSV: {csv_path}\n"
+            f"  (requested profile_csv={profile_csv!r}; place file under {REPO_ROOT / '8500-node'} or pass an absolute path.)"
+        )
+    return csv_path
+
+
+def _daily_profile_5min(npts: int = 288, profile_csv: str | Path | None = None) -> np.ndarray:
+    csv_path = _resolve_daily_profile_csv(profile_csv)
     return inj.read_profile_csv_two_col_noheader(str(csv_path), npts=npts, debug=False).astype(np.float32)
 
 

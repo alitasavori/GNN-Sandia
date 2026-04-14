@@ -132,6 +132,13 @@ def _zscore_features_train(x: torch.Tensor, train_idx: np.ndarray) -> tuple[torc
     return (x - mean) / std, mean.squeeze(0), std.squeeze(0)
 
 
+def _compute_target_norm(y: torch.Tensor, train_idx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    yt = y[train_idx]
+    mean = yt.mean(dim=0, keepdim=True)
+    std = yt.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    return mean, std
+
+
 class _GlobalLocalBase(nn.Module):
     def __init__(self, n_nodes: int, hidden: int, node_out_dim: int, dropout: float):
         super().__init__()
@@ -139,14 +146,21 @@ class _GlobalLocalBase(nn.Module):
         self.node_proj = nn.Linear(hidden, node_out_dim)
         self.local_head = nn.Linear(hidden, 1)
         gdim = self.n_nodes * node_out_dim
+        out_dim = self.n_nodes
+        hidden_x = max(1, out_dim // 2)
         self.global_head = nn.Sequential(
-            nn.Linear(gdim, gdim),
+            # MLP-style global residual head: x -> x/2 -> x/2 -> x,
+            # where x = n_nodes for vmag prediction.
+            nn.Linear(gdim, out_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(gdim, gdim // 2),
+            nn.Linear(out_dim, hidden_x),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(gdim // 2, self.n_nodes),
+            nn.Linear(hidden_x, hidden_x),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_x, out_dim),
         )
 
     def _combine(self, h: torch.Tensor, bvec: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -292,6 +306,8 @@ def train_loop(
     patience: int,
     lr: float,
     weight_decay: float,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
     checkpoint_path: Path,
     log_every: int,
 ) -> float:
@@ -300,6 +316,8 @@ def train_loop(
     criterion = nn.MSELoss()
     best = float("inf")
     bad = 0
+    y_mean = y_mean.to(device)
+    y_std = y_std.to(device)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -309,7 +327,9 @@ def train_loop(
             batch = batch.to(device)
             pred = model(batch)  # [B,N]
             tgt = batch.y.view(batch.num_graphs, -1)  # [B,N]
-            loss = criterion(pred, tgt)
+            pred_n = (pred - y_mean) / y_std
+            tgt_n = (tgt - y_mean) / y_std
+            loss = criterion(pred_n, tgt_n)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -328,7 +348,9 @@ def train_loop(
                 batch = batch.to(device)
                 pred = model(batch)
                 tgt = batch.y.view(batch.num_graphs, -1)
-                loss = criterion(pred, tgt)
+                pred_n = (pred - y_mean) / y_std
+                tgt_n = (tgt - y_mean) / y_std
+                loss = criterion(pred_n, tgt_n)
                 va_mse += float(loss.item()) * batch.num_graphs
                 va_mae += float((pred - tgt).abs().mean(dim=1).sum().item())
                 n_val += int(batch.num_graphs)
@@ -469,6 +491,8 @@ def main() -> None:
 
     x, mean, std = _zscore_features_train(x, np.array(train_idx, dtype=np.int64))
     torch.save({"mean": mean, "std": std, "feat_cols": list(NODE_FEAT_COLS)}, out_dir / "feature_norm_pq.pt")
+    y_mean, y_std = _compute_target_norm(y, np.array(train_idx, dtype=np.int64))
+    torch.save({"mean": y_mean.cpu(), "std": y_std.cpu()}, out_dir / "target_norm_vmag.pt")
 
     dataset = HomoGlobalDataset(x, y, edge_index, edge_attr)
     train_ds = Subset(dataset, train_idx)
@@ -540,6 +564,8 @@ def main() -> None:
         patience=args.patience,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        y_mean=y_mean,
+        y_std=y_std,
         checkpoint_path=ckpt,
         log_every=args.log_every,
     )
@@ -561,6 +587,10 @@ def main() -> None:
         "node_emb_dim": int(ned),
         "edge_emb_dim": int(eed),
         "dropout": float(drop),
+        "target_normalization": {
+            "enabled": True,
+            "stats_path": str((out_dir / "target_norm_vmag.pt").resolve()),
+        },
         "train_frac": float(args.train_frac),
         "seed": int(args.seed),
     }
