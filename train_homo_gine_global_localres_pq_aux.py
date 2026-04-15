@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -208,11 +209,14 @@ class GlobalLocalAuxBase(nn.Module):
         dropout_aux: float,
         global_proj_dim: int,
         global_hidden_dim: int,
+        global_gate_learnable: bool,
+        global_gate_init_scale: float,
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
         self.voltage_out_components = int(voltage_out_components)
         self.global_residual_scale = 1.0
+        self.global_gate_learnable_enabled = bool(global_gate_learnable)
         dg = float(dropout_global)
         da = float(dropout_aux)
         self.node_proj = nn.Linear(hidden, node_out_dim)
@@ -251,9 +255,23 @@ class GlobalLocalAuxBase(nn.Module):
         self.aux_dropout = nn.Dropout(da)
         self.aux_reg_heads = nn.ModuleList()  # 12 heads, set by caller
         self.aux_cap_heads = nn.ModuleList()  # 10 heads, set by caller
+        if self.global_gate_learnable_enabled:
+            p0 = float(global_gate_init_scale)
+            if p0 < 0.0 or p0 > 1.0:
+                raise ValueError("--global_gate_init_scale must be in [0,1].")
+            p0 = min(max(p0, 1e-4), 1.0 - 1e-4)
+            logit0 = math.log(p0 / (1.0 - p0))
+            self.global_gate_logit = nn.Parameter(torch.tensor(logit0, dtype=torch.float32))
+        else:
+            self.register_parameter("global_gate_logit", None)
 
     def set_global_residual_scale(self, scale: float) -> None:
         self.global_residual_scale = float(scale)
+
+    def get_learned_global_gate(self) -> float | None:
+        if self.global_gate_logit is None:
+            return None
+        return float(torch.sigmoid(self.global_gate_logit.detach()).item())
 
     def _readout(self, h: torch.Tensor, bvec: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         local = self.local_head(h)
@@ -268,7 +286,10 @@ class GlobalLocalAuxBase(nn.Module):
         g = z.reshape(z.size(0), -1)  # [B, gdim]
         g_in = self.global_proj(g) if self.global_proj is not None else g
         delta = self.global_head(g_in).view(local.size(0), self.n_nodes, self.voltage_out_components)
-        delta = delta * self.global_residual_scale
+        gate = float(self.global_residual_scale)
+        if self.global_gate_logit is not None:
+            gate = gate * torch.sigmoid(self.global_gate_logit).to(dtype=delta.dtype, device=delta.device)
+        delta = delta * gate
         v_pred = local + delta
         if self.voltage_out_components == 1:
             v_pred = v_pred.squeeze(-1)
@@ -299,6 +320,8 @@ class HomoGINEGlobalLocalAux(GlobalLocalAuxBase):
         edge_emb_dim: int,
         global_proj_dim: int,
         global_hidden_dim: int,
+        global_gate_learnable: bool,
+        global_gate_init_scale: float,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
@@ -311,6 +334,8 @@ class HomoGINEGlobalLocalAux(GlobalLocalAuxBase):
             dropout_aux=dropout_aux,
             global_proj_dim=global_proj_dim,
             global_hidden_dim=global_hidden_dim,
+            global_gate_learnable=global_gate_learnable,
+            global_gate_init_scale=global_gate_init_scale,
         )
         self.n_nodes = n_nodes
         self.num_edges = num_edges
@@ -376,6 +401,8 @@ class HomoGCNGlobalLocalAux(GlobalLocalAuxBase):
         node_emb_dim: int,
         global_proj_dim: int,
         global_hidden_dim: int,
+        global_gate_learnable: bool,
+        global_gate_init_scale: float,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
@@ -388,6 +415,8 @@ class HomoGCNGlobalLocalAux(GlobalLocalAuxBase):
             dropout_aux=dropout_aux,
             global_proj_dim=global_proj_dim,
             global_hidden_dim=global_hidden_dim,
+            global_gate_learnable=global_gate_learnable,
+            global_gate_init_scale=global_gate_init_scale,
         )
         self.n_nodes = n_nodes
         self.node_emb_dim = max(0, int(node_emb_dim))
@@ -534,6 +563,9 @@ def train_loop(
         model_ref = getattr(model, "_orig_mod", model)
         if hasattr(model_ref, "set_global_residual_scale"):
             model_ref.set_global_residual_scale(global_scale)
+        learned_global_gate = None
+        if hasattr(model_ref, "get_learned_global_gate"):
+            learned_global_gate = model_ref.get_learned_global_gate()
         lr_reg = float(lambda_reg) * aux_scale
         lr_cap = float(lambda_cap) * aux_scale
         model.train()
@@ -599,8 +631,13 @@ def train_loop(
             bad += 1
 
         if ep == 1 or ep % max(1, log_every) == 0:
+            gate_dbg = (
+                f"learned_gate={learned_global_gate:.4f} eff_global={(learned_global_gate * global_scale):.4f} "
+                if learned_global_gate is not None
+                else ""
+            )
             print(
-                f"Epoch {ep:4d} | aux_scale={aux_scale:.4f} global_scale={global_scale:.4f} "
+                f"Epoch {ep:4d} | aux_scale={aux_scale:.4f} global_scale={global_scale:.4f} {gate_dbg}"
                 f"eff_λ_reg={lr_reg:.6f} eff_λ_cap={lr_cap:.6f} | "
                 f"train_mae={tr_mae:.6f} train_mse={tr_mse:.6f} "
                 f"aux_reg={tr_auxr:.4f} aux_cap={tr_auxc:.4f} | "
@@ -807,6 +844,17 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Starting global residual scale in [0,1]. Default 1 keeps legacy behavior.",
     )
+    p.add_argument(
+        "--global_gate_learnable",
+        action="store_true",
+        help="Enable learnable global gate g=Sigmoid(logit), applied as effective_scale=schedule_scale*g.",
+    )
+    p.add_argument(
+        "--global_gate_init_scale",
+        type=float,
+        default=1.0,
+        help="Initial value for learnable global gate in [0,1] (used only with --global_gate_learnable).",
+    )
     p.add_argument("--cache_tensor", type=str, default="")
     p.add_argument(
         "--voltage-target",
@@ -963,6 +1011,8 @@ def main() -> None:
             edge_emb_dim=max(0, int(args.edge_emb_dim)),
             global_proj_dim=global_proj_dim,
             global_hidden_dim=max(1, int(args.global_hidden_dim)),
+            global_gate_learnable=bool(args.global_gate_learnable),
+            global_gate_init_scale=float(args.global_gate_init_scale),
             reg_nclasses=reg_nclasses,
             cap_nclasses=cap_nclasses,
         )
@@ -980,6 +1030,8 @@ def main() -> None:
             node_emb_dim=max(0, int(args.node_emb_dim)),
             global_proj_dim=global_proj_dim,
             global_hidden_dim=max(1, int(args.global_hidden_dim)),
+            global_gate_learnable=bool(args.global_gate_learnable),
+            global_gate_init_scale=float(args.global_gate_init_scale),
             reg_nclasses=reg_nclasses,
             cap_nclasses=cap_nclasses,
         )
@@ -1007,7 +1059,8 @@ def main() -> None:
         f"aux λ (targets): reg={args.lambda_reg} cap={args.lambda_cap} | "
         f"warmup_epochs={args.aux_warmup_epochs} ramp_epochs={args.aux_ramp_epochs} | "
         f"global_gate: start={args.global_gate_start_scale} warmup={args.global_gate_warmup_epochs} "
-        f"ramp={args.global_gate_ramp_epochs} | "
+        f"ramp={args.global_gate_ramp_epochs} learnable={bool(args.global_gate_learnable)} "
+        f"init={args.global_gate_init_scale} | "
         f"global_proj_dim={global_proj_dim} global_hidden_dim={args.global_hidden_dim} | "
         f"DO trunk={dropout_trunk} global={dropout_global} aux={dropout_aux} | "
         f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
@@ -1077,6 +1130,8 @@ def main() -> None:
         "global_gate_start_scale": float(args.global_gate_start_scale),
         "global_gate_warmup_epochs": int(args.global_gate_warmup_epochs),
         "global_gate_ramp_epochs": int(args.global_gate_ramp_epochs),
+        "global_gate_learnable": bool(args.global_gate_learnable),
+        "global_gate_init_scale": float(args.global_gate_init_scale),
         "dropout_trunk": float(dropout_trunk),
         "dropout_global": float(dropout_global),
         "dropout_aux": float(dropout_aux),
