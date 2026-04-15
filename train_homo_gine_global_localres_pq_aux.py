@@ -206,35 +206,54 @@ class GlobalLocalAuxBase(nn.Module):
         voltage_out_components: int,
         dropout_global: float,
         dropout_aux: float,
+        global_proj_dim: int,
+        global_hidden_dim: int,
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
         self.voltage_out_components = int(voltage_out_components)
+        self.global_residual_scale = 1.0
         dg = float(dropout_global)
         da = float(dropout_aux)
         self.node_proj = nn.Linear(hidden, node_out_dim)
         self.local_head = nn.Linear(hidden, self.voltage_out_components)
         gdim = self.n_nodes * node_out_dim
         out_dim = self.n_nodes * self.voltage_out_components
-        hidden_x = max(1, out_dim // 2)
-        self.global_head = nn.Sequential(
-            # MLP-style global residual head: x -> x/2 -> x/2 -> x,
-            # where x = n_nodes * voltage_out_components.
-            nn.Linear(gdim, out_dim),
-            nn.ReLU(),
-            nn.Dropout(dg),
-            nn.Linear(out_dim, hidden_x),
-            nn.ReLU(),
-            nn.Dropout(dg),
-            nn.Linear(hidden_x, hidden_x),
-            nn.ReLU(),
-            nn.Dropout(dg),
-            nn.Linear(hidden_x, out_dim),
-        )
+        proj_dim = max(0, int(global_proj_dim))
+        self.global_proj = nn.Linear(gdim, proj_dim) if proj_dim > 0 else None
+        if self.global_proj is None:
+            hidden_x = max(1, out_dim // 2)
+            self.global_head = nn.Sequential(
+                # Backward-compatible default global residual head.
+                nn.Linear(gdim, out_dim),
+                nn.ReLU(),
+                nn.Dropout(dg),
+                nn.Linear(out_dim, hidden_x),
+                nn.ReLU(),
+                nn.Dropout(dg),
+                nn.Linear(hidden_x, hidden_x),
+                nn.ReLU(),
+                nn.Dropout(dg),
+                nn.Linear(hidden_x, out_dim),
+            )
+        else:
+            hidden_g = max(1, int(global_hidden_dim))
+            self.global_head = nn.Sequential(
+                nn.Linear(proj_dim, hidden_g),
+                nn.ReLU(),
+                nn.Dropout(dg),
+                nn.Linear(hidden_g, hidden_g),
+                nn.ReLU(),
+                nn.Dropout(dg),
+                nn.Linear(hidden_g, out_dim),
+            )
         self.aux_proj = nn.Linear(gdim, hidden)
         self.aux_dropout = nn.Dropout(da)
         self.aux_reg_heads = nn.ModuleList()  # 12 heads, set by caller
         self.aux_cap_heads = nn.ModuleList()  # 10 heads, set by caller
+
+    def set_global_residual_scale(self, scale: float) -> None:
+        self.global_residual_scale = float(scale)
 
     def _readout(self, h: torch.Tensor, bvec: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         local = self.local_head(h)
@@ -247,7 +266,9 @@ class GlobalLocalAuxBase(nn.Module):
             local = local.view(b, self.n_nodes, self.voltage_out_components)
             z = z.view(b, self.n_nodes, -1)
         g = z.reshape(z.size(0), -1)  # [B, gdim]
-        delta = self.global_head(g).view(local.size(0), self.n_nodes, self.voltage_out_components)
+        g_in = self.global_proj(g) if self.global_proj is not None else g
+        delta = self.global_head(g_in).view(local.size(0), self.n_nodes, self.voltage_out_components)
+        delta = delta * self.global_residual_scale
         v_pred = local + delta
         if self.voltage_out_components == 1:
             v_pred = v_pred.squeeze(-1)
@@ -276,6 +297,8 @@ class HomoGINEGlobalLocalAux(GlobalLocalAuxBase):
         dropout_aux: float,
         node_emb_dim: int,
         edge_emb_dim: int,
+        global_proj_dim: int,
+        global_hidden_dim: int,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
@@ -286,6 +309,8 @@ class HomoGINEGlobalLocalAux(GlobalLocalAuxBase):
             voltage_out_components=voltage_out_components,
             dropout_global=dropout_global,
             dropout_aux=dropout_aux,
+            global_proj_dim=global_proj_dim,
+            global_hidden_dim=global_hidden_dim,
         )
         self.n_nodes = n_nodes
         self.num_edges = num_edges
@@ -349,6 +374,8 @@ class HomoGCNGlobalLocalAux(GlobalLocalAuxBase):
         dropout_global: float,
         dropout_aux: float,
         node_emb_dim: int,
+        global_proj_dim: int,
+        global_hidden_dim: int,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
@@ -359,6 +386,8 @@ class HomoGCNGlobalLocalAux(GlobalLocalAuxBase):
             voltage_out_components=voltage_out_components,
             dropout_global=dropout_global,
             dropout_aux=dropout_aux,
+            global_proj_dim=global_proj_dim,
+            global_hidden_dim=global_hidden_dim,
         )
         self.n_nodes = n_nodes
         self.node_emb_dim = max(0, int(node_emb_dim))
@@ -437,6 +466,26 @@ def _aux_lambda_scale(epoch_1based: int, warmup_epochs: int, ramp_epochs: int) -
     return float(t) / float(ramp_epochs)
 
 
+def _global_residual_scale(epoch_1based: int, warmup_epochs: int, ramp_epochs: int, start_scale: float) -> float:
+    """
+    Global residual scale in [start_scale, 1].
+    """
+    s0 = float(start_scale)
+    if s0 < 0.0 or s0 > 1.0:
+        raise ValueError("--global_gate_start_scale must be in [0,1].")
+    if warmup_epochs <= 0 and ramp_epochs <= 0:
+        return 1.0
+    if epoch_1based <= warmup_epochs:
+        return s0
+    if ramp_epochs <= 0:
+        return 1.0
+    t = epoch_1based - warmup_epochs
+    if t > ramp_epochs:
+        return 1.0
+    alpha = float(t) / float(ramp_epochs)
+    return s0 + alpha * (1.0 - s0)
+
+
 def train_loop(
     model: nn.Module,
     train_loader: DataLoader,
@@ -451,6 +500,9 @@ def train_loop(
     lambda_cap: float,
     aux_warmup_epochs: int,
     aux_ramp_epochs: int,
+    global_gate_warmup_epochs: int,
+    global_gate_ramp_epochs: int,
+    global_gate_start_scale: float,
     y_mean_flat: torch.Tensor,
     y_std_flat: torch.Tensor,
     checkpoint_path: Path,
@@ -473,6 +525,15 @@ def train_loop(
 
     for ep in range(1, epochs + 1):
         aux_scale = _aux_lambda_scale(ep, aux_warmup_epochs, aux_ramp_epochs)
+        global_scale = _global_residual_scale(
+            ep,
+            global_gate_warmup_epochs,
+            global_gate_ramp_epochs,
+            global_gate_start_scale,
+        )
+        model_ref = getattr(model, "_orig_mod", model)
+        if hasattr(model_ref, "set_global_residual_scale"):
+            model_ref.set_global_residual_scale(global_scale)
         lr_reg = float(lambda_reg) * aux_scale
         lr_cap = float(lambda_cap) * aux_scale
         model.train()
@@ -539,7 +600,8 @@ def train_loop(
 
         if ep == 1 or ep % max(1, log_every) == 0:
             print(
-                f"Epoch {ep:4d} | aux_scale={aux_scale:.4f} eff_λ_reg={lr_reg:.6f} eff_λ_cap={lr_cap:.6f} | "
+                f"Epoch {ep:4d} | aux_scale={aux_scale:.4f} global_scale={global_scale:.4f} "
+                f"eff_λ_reg={lr_reg:.6f} eff_λ_cap={lr_cap:.6f} | "
                 f"train_mae={tr_mae:.6f} train_mse={tr_mse:.6f} "
                 f"aux_reg={tr_auxr:.4f} aux_cap={tr_auxc:.4f} | "
                 f"val_mae={va_mae:.6f} val_mse={va_mse:.6f} aux_reg={va_auxr:.4f} aux_cap={va_auxc:.4f} | "
@@ -684,6 +746,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--node_emb_dim", type=int, default=0)
     p.add_argument("--edge_emb_dim", type=int, default=0)
+    p.add_argument(
+        "--global_proj_dim",
+        type=int,
+        default=0,
+        help="If >0, add global bottleneck Linear(gdim->proj_dim) before global head. 0 keeps legacy head.",
+    )
+    p.add_argument(
+        "--global_hidden_dim",
+        type=int,
+        default=1024,
+        help="Hidden width used by bottlenecked global head (proj->hidden->hidden->out).",
+    )
+    p.add_argument(
+        "--enforce_small_node_out_without_proj",
+        action="store_true",
+        help="If set, require node_out_dim <= --max_node_out_without_proj when global_proj_dim=0.",
+    )
+    p.add_argument(
+        "--max_node_out_without_proj",
+        type=int,
+        default=4,
+        help="Upper bound enforced only when --enforce_small_node_out_without_proj is set and no bottleneck is used.",
+    )
+    p.add_argument(
+        "--warn_node_out_threshold",
+        type=int,
+        default=8,
+        help="Emit warning when global_proj_dim=0 and node_out_dim >= this value.",
+    )
     p.add_argument("--lambda_reg", type=float, default=0.2)
     p.add_argument("--lambda_cap", type=float, default=0.1)
     p.add_argument(
@@ -697,6 +788,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="After warmup, linearly ramp aux weight multiplier from 0 to 1 over this many epochs. 0 = jump to full λ.",
+    )
+    p.add_argument(
+        "--global_gate_warmup_epochs",
+        type=int,
+        default=0,
+        help="Keep global residual scale at --global_gate_start_scale for this many epochs.",
+    )
+    p.add_argument(
+        "--global_gate_ramp_epochs",
+        type=int,
+        default=0,
+        help="Linearly ramp global residual scale to 1 after warmup. 0 = jump to 1.",
+    )
+    p.add_argument(
+        "--global_gate_start_scale",
+        type=float,
+        default=1.0,
+        help="Starting global residual scale in [0,1]. Default 1 keeps legacy behavior.",
     )
     p.add_argument("--cache_tensor", type=str, default="")
     p.add_argument(
@@ -737,6 +846,19 @@ def main() -> None:
         dropout_trunk = float(args.dropout_trunk)
         dropout_global = float(args.dropout_global)
         dropout_aux = float(args.dropout_aux)
+    global_proj_dim = max(0, int(args.global_proj_dim))
+    if global_proj_dim == 0 and int(args.node_out_dim) >= int(args.warn_node_out_threshold):
+        print(
+            f"Warning: node_out_dim={args.node_out_dim} without bottleneck can greatly increase global-head params. "
+            "Consider --global_proj_dim 256 (or 384).",
+            flush=True,
+        )
+    if args.enforce_small_node_out_without_proj and global_proj_dim == 0:
+        if int(args.node_out_dim) > int(args.max_node_out_without_proj):
+            raise ValueError(
+                "node_out_dim exceeds --max_node_out_without_proj without bottleneck. "
+                "Reduce --node_out_dim or set --global_proj_dim > 0."
+            )
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
 
     node_to_local = None
@@ -839,6 +961,8 @@ def main() -> None:
             dropout_aux=dropout_aux,
             node_emb_dim=max(0, int(args.node_emb_dim)),
             edge_emb_dim=max(0, int(args.edge_emb_dim)),
+            global_proj_dim=global_proj_dim,
+            global_hidden_dim=max(1, int(args.global_hidden_dim)),
             reg_nclasses=reg_nclasses,
             cap_nclasses=cap_nclasses,
         )
@@ -854,6 +978,8 @@ def main() -> None:
             dropout_global=dropout_global,
             dropout_aux=dropout_aux,
             node_emb_dim=max(0, int(args.node_emb_dim)),
+            global_proj_dim=global_proj_dim,
+            global_hidden_dim=max(1, int(args.global_hidden_dim)),
             reg_nclasses=reg_nclasses,
             cap_nclasses=cap_nclasses,
         )
@@ -880,6 +1006,9 @@ def main() -> None:
     print(
         f"aux λ (targets): reg={args.lambda_reg} cap={args.lambda_cap} | "
         f"warmup_epochs={args.aux_warmup_epochs} ramp_epochs={args.aux_ramp_epochs} | "
+        f"global_gate: start={args.global_gate_start_scale} warmup={args.global_gate_warmup_epochs} "
+        f"ramp={args.global_gate_ramp_epochs} | "
+        f"global_proj_dim={global_proj_dim} global_hidden_dim={args.global_hidden_dim} | "
         f"DO trunk={dropout_trunk} global={dropout_global} aux={dropout_aux} | "
         f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
         flush=True,
@@ -907,6 +1036,9 @@ def main() -> None:
             lambda_cap=float(args.lambda_cap),
             aux_warmup_epochs=int(args.aux_warmup_epochs),
             aux_ramp_epochs=int(args.aux_ramp_epochs),
+            global_gate_warmup_epochs=int(args.global_gate_warmup_epochs),
+            global_gate_ramp_epochs=int(args.global_gate_ramp_epochs),
+            global_gate_start_scale=float(args.global_gate_start_scale),
             y_mean_flat=y_mean_flat,
             y_std_flat=y_std_flat,
             checkpoint_path=ckpt,
@@ -940,6 +1072,11 @@ def main() -> None:
         "node_out_dim": int(args.node_out_dim),
         "node_emb_dim": int(args.node_emb_dim),
         "edge_emb_dim": int(args.edge_emb_dim),
+        "global_proj_dim": int(global_proj_dim),
+        "global_hidden_dim": int(args.global_hidden_dim),
+        "global_gate_start_scale": float(args.global_gate_start_scale),
+        "global_gate_warmup_epochs": int(args.global_gate_warmup_epochs),
+        "global_gate_ramp_epochs": int(args.global_gate_ramp_epochs),
         "dropout_trunk": float(dropout_trunk),
         "dropout_global": float(dropout_global),
         "dropout_aux": float(dropout_aux),
