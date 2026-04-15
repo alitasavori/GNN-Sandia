@@ -536,9 +536,18 @@ def train_loop(
     y_std_flat: torch.Tensor,
     checkpoint_path: Path,
     log_every: int,
+    lr_plateau_factor: float,
+    lr_plateau_patience: int,
+    lr_min: float,
 ) -> float:
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    sch = ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=10)
+    sch = ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=float(lr_plateau_factor),
+        patience=int(lr_plateau_patience),
+        min_lr=float(lr_min),
+    )
     mse = nn.MSELoss()
     best = float("inf")
     bad = 0
@@ -774,6 +783,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=25)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument(
+        "--lr_plateau_factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau: multiply LR by this factor when val plateaus (default 0.5, legacy).",
+    )
+    p.add_argument(
+        "--lr_plateau_patience",
+        type=int,
+        default=10,
+        help="ReduceLROnPlateau: epochs with no val improvement before reducing LR.",
+    )
+    p.add_argument(
+        "--lr_min",
+        type=float,
+        default=0.0,
+        help="ReduceLROnPlateau: minimum LR (0 = PyTorch default, no floor).",
+    )
     p.add_argument("--train_frac", type=float, default=0.8)
     p.add_argument("--val_frac", type=float, default=0.1, help="Validation fraction; test gets remaining samples.")
     p.add_argument("--seed", type=int, default=42)
@@ -1063,7 +1090,8 @@ def main() -> None:
         f"init={args.global_gate_init_scale} | "
         f"global_proj_dim={global_proj_dim} global_hidden_dim={args.global_hidden_dim} | "
         f"DO trunk={dropout_trunk} global={dropout_global} aux={dropout_aux} | "
-        f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim}",
+        f"node_emb={args.node_emb_dim} edge_emb={args.edge_emb_dim} | "
+        f"lr_plateau: factor={args.lr_plateau_factor} patience={args.lr_plateau_patience} min={args.lr_min}",
         flush=True,
     )
     if args.skip_train:
@@ -1096,6 +1124,9 @@ def main() -> None:
             y_std_flat=y_std_flat,
             checkpoint_path=ckpt,
             log_every=args.log_every,
+            lr_plateau_factor=float(args.lr_plateau_factor),
+            lr_plateau_patience=int(args.lr_plateau_patience),
+            lr_min=float(args.lr_min),
         )
         train_seconds = float(time.perf_counter() - t_train_start)
 
@@ -1137,6 +1168,9 @@ def main() -> None:
         "dropout_aux": float(dropout_aux),
         "train_frac": float(args.train_frac),
         "val_frac": float(args.val_frac),
+        "lr_plateau_factor": float(args.lr_plateau_factor),
+        "lr_plateau_patience": int(args.lr_plateau_patience),
+        "lr_min": float(args.lr_min),
         "seed": int(args.seed),
         "lambda_reg": float(args.lambda_reg),
         "lambda_cap": float(args.lambda_cap),
