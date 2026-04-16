@@ -138,6 +138,15 @@ def main() -> None:
 
     import run_daily_aggregate_dataset_8500 as gen
 
+    def _resolve_ood_profile_path(profile_arg: str) -> Path:
+        """Match ``_daily_ood`` + ``_resolve_daily_profile_csv`` so we fail fast with a clear path."""
+        p = Path(profile_arg)
+        probe: str | Path = p if p.is_file() else p.name
+        return gen._resolve_daily_profile_csv(probe)
+
+    prof_resolved = _resolve_ood_profile_path(args.daily_profile)
+    print(f"daily profile CSV (resolved): {prof_resolved}", flush=True)
+
     # --- Patch output paths so we never overwrite the default training bundle ---
     gen.OUT_DIR = out_root
     gen.EDGE_CSV = gen.OUT_DIR / "gnn_edges_phase_static.csv"
