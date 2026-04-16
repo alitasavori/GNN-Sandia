@@ -8,7 +8,8 @@ Aux tasks (training-time supervision):
   - 12 regulator tap classifications
   - 10 capacitor step classifications
 
-Aux heads read the GINE+MLP voltage output vector directly.
+Aux heads read the same GINE+MLP voltage output vector each: one deep MLP per
+reg/cap task (VREG4B-style widths), not a shared bottleneck + linear classifiers.
 """
 from __future__ import annotations
 
@@ -166,6 +167,33 @@ class RealMLP(nn.Module):
         return self.net(x)
 
 
+def build_aux_task_head(
+    in_dim: int,
+    n_classes: int,
+    depth: int,
+    dropout: float,
+    first_hidden: int,
+) -> nn.Module:
+    """Per-task classifier matching ``train_vreg4b_global_gnn_grid.build_tap_head`` logic."""
+    if depth < 1:
+        raise ValueError("aux_head_depth must be >= 1")
+    widths: list[int] = []
+    h = int(first_hidden)
+    for _ in range(depth):
+        widths.append(max(h, 32))
+        h = max(h // 2, 64)
+    layers: list[nn.Module] = []
+    d_in = in_dim
+    for out_d in widths:
+        layers.append(nn.Linear(d_in, out_d))
+        layers.append(nn.ReLU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        d_in = out_d
+    layers.append(nn.Linear(d_in, n_classes))
+    return nn.Sequential(*layers)
+
+
 class GINEEncoder(nn.Module):
     def __init__(
         self,
@@ -227,7 +255,9 @@ class GINEPlusMLPAux(nn.Module):
         n_nodes: int,
         encoder: GINEEncoder,
         hidden_mlp: int,
-        aux_hidden: int,
+        aux_head_depth: int,
+        aux_head_dropout: float,
+        aux_head_first_hidden: int,
         reg_nclasses: list[int],
         cap_nclasses: list[int],
     ):
@@ -236,16 +266,24 @@ class GINEPlusMLPAux(nn.Module):
         self.encoder = encoder
         self.voltage_mlp = RealMLP(in_dim=2 * self.n_nodes, out_dim=2 * self.n_nodes, hidden=hidden_mlp)
         aux_in = 2 * self.n_nodes
-        self.aux_proj = nn.Linear(aux_in, aux_hidden)
-        self.aux_reg_heads = nn.ModuleList([nn.Linear(aux_hidden, c) for c in reg_nclasses])
-        self.aux_cap_heads = nn.ModuleList([nn.Linear(aux_hidden, c) for c in cap_nclasses])
+        self.aux_reg_heads = nn.ModuleList(
+            [
+                build_aux_task_head(aux_in, c, aux_head_depth, aux_head_dropout, aux_head_first_hidden)
+                for c in reg_nclasses
+            ]
+        )
+        self.aux_cap_heads = nn.ModuleList(
+            [
+                build_aux_task_head(aux_in, c, aux_head_depth, aux_head_dropout, aux_head_first_hidden)
+                for c in cap_nclasses
+            ]
+        )
 
     def forward_train(self, batch: Data) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         state_flat = self.encoder(batch)
         v_pred_n = self.voltage_mlp(state_flat)
-        h_aux = F.relu(self.aux_proj(v_pred_n))
-        reg_logits = [head(h_aux) for head in self.aux_reg_heads]
-        cap_logits = [head(h_aux) for head in self.aux_cap_heads]
+        reg_logits = [head(v_pred_n) for head in self.aux_reg_heads]
+        cap_logits = [head(v_pred_n) for head in self.aux_cap_heads]
         return v_pred_n, reg_logits, cap_logits
 
     def forward(self, batch: Data) -> torch.Tensor:
@@ -341,7 +379,8 @@ def _evaluate_aux_accuracy(model: GINEPlusMLPAux, dl: DataLoader, device: torch.
 
 @dataclass
 class RunResult:
-    best_val_mse: float
+    best_val_voltage_mse: float
+    best_val_combined_obj: float
     test_mae_vmag: float
     test_rmse_vmag: float
     test_mae_angle_deg: float
@@ -365,7 +404,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--state_dim", type=int, default=2)
     p.add_argument("--hidden_mlp", type=int, default=1024)
-    p.add_argument("--aux_hidden", type=int, default=512)
+    p.add_argument(
+        "--aux_hidden",
+        type=int,
+        default=512,
+        help="First hidden width in each aux task MLP (same role as 512 in vreg4b tap head).",
+    )
+    p.add_argument(
+        "--aux_head_depth",
+        type=int,
+        default=2,
+        help="Number of Linear+ReLU blocks per aux head before logits (vreg4b head_depth).",
+    )
+    p.add_argument("--aux_head_dropout", type=float, default=0.15)
     p.add_argument("--node_emb_dim", type=int, default=16)
     p.add_argument("--edge_emb_dim", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -383,7 +434,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_cap", type=float, default=0.01)
     p.add_argument("--aux_warmup_epochs", type=int, default=30)
     p.add_argument("--aux_ramp_epochs", type=int, default=20)
-    p.add_argument("--log_every", type=int, default=1, help="Print training log every N epochs (1 = every epoch).")
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument(
+        "--early_stop_on",
+        type=str,
+        default="voltage",
+        choices=("voltage", "combined"),
+        help="Patience / best checkpoint: val MSE on voltage only, or full training objective.",
+    )
     return p.parse_args()
 
 
@@ -392,6 +450,8 @@ def main() -> None:
     _set_seed(args.seed)
     if int(args.state_dim) != 2:
         raise ValueError("This script expects state_dim=2 to match the baseline GINE+MLP trunk.")
+    if int(args.aux_head_depth) < 1:
+        raise ValueError("--aux_head_depth must be >= 1.")
 
     repo = Path(__file__).resolve().parent
     data_root = Path(args.data_root)
@@ -486,11 +546,14 @@ def main() -> None:
         edge_emb_dim=int(args.edge_emb_dim),
         dropout=0.0 if args.disable_dropout else float(args.dropout),
     )
+    aux_head_dropout = 0.0 if args.disable_dropout else float(args.aux_head_dropout)
     model = GINEPlusMLPAux(
         n_nodes=n_nodes,
         encoder=encoder,
         hidden_mlp=int(args.hidden_mlp),
-        aux_hidden=int(args.aux_hidden),
+        aux_head_depth=int(args.aux_head_depth),
+        aux_head_dropout=aux_head_dropout,
+        aux_head_first_hidden=int(args.aux_hidden),
         reg_nclasses=reg_nclasses,
         cap_nclasses=cap_nclasses,
     ).to(device)
@@ -499,7 +562,8 @@ def main() -> None:
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=8)
     mse = nn.MSELoss()
 
-    best_val = float("inf")
+    best_val_voltage = float("inf")
+    best_val_combined = float("inf")
     best_state = None
     bad = 0
     t0 = time.perf_counter()
@@ -525,7 +589,8 @@ def main() -> None:
             opt.step()
 
         model.eval()
-        val_loss = 0.0
+        val_sum_v = 0.0
+        val_sum_obj = 0.0
         nv = 0
         with torch.no_grad():
             for batch in dl_va:
@@ -538,24 +603,35 @@ def main() -> None:
                 lv = mse(v_pred_n, yv_n)
                 lr_aux, lc_aux = _aux_loss(reg_logits, cap_logits, yr, yc)
                 ltot = lv + eff_reg * lr_aux + eff_cap * lc_aux
-                val_loss += float(ltot.item()) * batch.num_graphs
+                val_sum_v += float(lv.item()) * batch.num_graphs
+                val_sum_obj += float(ltot.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
-        val_loss /= max(nv, 1)
-        sch.step(val_loss)
+        val_v_mse = val_sum_v / max(nv, 1)
+        val_loss = val_sum_obj / max(nv, 1)
+        sch_metric = val_v_mse if args.early_stop_on == "voltage" else val_loss
+        sch.step(sch_metric)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if args.early_stop_on == "voltage":
+            improved = val_v_mse < best_val_voltage
+        else:
+            improved = val_loss < best_val_combined
+        if val_v_mse < best_val_voltage:
+            best_val_voltage = val_v_mse
+        if val_loss < best_val_combined:
+            best_val_combined = val_loss
+        if improved:
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
         else:
             bad += 1
 
-        le = max(1, int(args.log_every))
-        if ep == 1 or ep % le == 0:
+        if ep == 1 or ep % int(args.log_every) == 0:
             print(
                 f"[gine+mlp+aux] epoch {ep:4d}/{args.epochs} aux_scale={aux_scale:.4f} "
                 f"eff_lambda_reg={eff_reg:.5f} eff_lambda_cap={eff_cap:.5f} "
-                f"val_obj={val_loss:.6f} best={best_val:.6f}",
+                f"val_v_mse={val_v_mse:.6f} val_obj={val_loss:.6f} "
+                f"best_val_{args.early_stop_on}="
+                f"{best_val_voltage if args.early_stop_on == 'voltage' else best_val_combined:.6f}",
                 flush=True,
             )
         if bad >= args.patience:
@@ -578,7 +654,10 @@ def main() -> None:
             "layers": int(args.layers),
             "state_dim": int(args.state_dim),
             "hidden_mlp": int(args.hidden_mlp),
-            "aux_hidden": int(args.aux_hidden),
+            "aux_head_first_hidden": int(args.aux_hidden),
+            "aux_head_depth": int(args.aux_head_depth),
+            "aux_head_dropout": float(aux_head_dropout),
+            "early_stop_on": str(args.early_stop_on),
             "node_emb_dim": int(args.node_emb_dim),
             "edge_emb_dim": int(args.edge_emb_dim),
             "x_mean": x_mean,
@@ -594,7 +673,8 @@ def main() -> None:
     torch.save(y_std, out_dir / "y_std.pt")
 
     result = RunResult(
-        best_val_mse=float(best_val),
+        best_val_voltage_mse=float(best_val_voltage),
+        best_val_combined_obj=float(best_val_combined),
         test_mae_vmag=met["mae_vmag_pu"],
         test_rmse_vmag=met["rmse_vmag_pu"],
         test_mae_angle_deg=met["mae_angle_deg"],
@@ -618,7 +698,10 @@ def main() -> None:
             "layers": int(args.layers),
             "state_dim": int(args.state_dim),
             "hidden_mlp": int(args.hidden_mlp),
-            "aux_hidden": int(args.aux_hidden),
+            "aux_head_first_hidden": int(args.aux_hidden),
+            "aux_head_depth": int(args.aux_head_depth),
+            "aux_head_dropout": float(aux_head_dropout),
+            "early_stop_on": str(args.early_stop_on),
             "node_emb_dim": int(args.node_emb_dim),
             "edge_emb_dim": int(args.edge_emb_dim),
         },
