@@ -383,6 +383,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_cap", type=float, default=0.01)
     p.add_argument("--aux_warmup_epochs", type=int, default=30)
     p.add_argument("--aux_ramp_epochs", type=int, default=20)
+    p.add_argument("--log_every", type=int, default=1, help="Print training log every N epochs (1 = every epoch).")
     return p.parse_args()
 
 
@@ -549,7 +550,8 @@ def main() -> None:
         else:
             bad += 1
 
-        if ep == 1 or ep % 10 == 0:
+        le = max(1, int(args.log_every))
+        if ep == 1 or ep % le == 0:
             print(
                 f"[gine+mlp+aux] epoch {ep:4d}/{args.epochs} aux_scale={aux_scale:.4f} "
                 f"eff_lambda_reg={eff_reg:.5f} eff_lambda_cap={eff_cap:.5f} "

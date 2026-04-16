@@ -66,11 +66,25 @@ cmd = [
     "--lambda_cap", "0.01",
     "--aux_warmup_epochs", "30",
     "--aux_ramp_epochs", "20",
+    "--log_every", "1",
     "--disable_dropout",
 ]
 
 print(" ".join(cmd))
-subprocess.run(cmd, cwd=REPO, check=True)
+# Stream stdout line-by-line so Colab shows each epoch as it runs (subprocess.run buffers until exit).
+with subprocess.Popen(
+    cmd,
+    cwd=REPO,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    bufsize=1,
+    universal_newlines=True,
+) as p:
+    for line in p.stdout:
+        print(line, end="")
+    rc = p.wait()
+if rc != 0:
+    raise subprocess.CalledProcessError(rc, cmd)
 print("Saved run bundle:", out_dir)
 ```
 
