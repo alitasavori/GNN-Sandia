@@ -275,6 +275,63 @@ def _run_model_collect_errors(
     }
 
 
+def _training_bundle_peer(ood_root: Path) -> Path:
+    """Sibling ``loadtype_8500_dailyagg`` next to ``..._ood_stress`` (static topology)."""
+    p = ood_root.parent / "loadtype_8500_dailyagg"
+    return p if p.is_dir() else Path()
+
+
+def _resolve_nodes_csv(ood_root: Path, nodes_arg: str) -> Path:
+    """Prefer OOD tree; try common layouts under ``ood_root`` only (not training ID data)."""
+    rel = Path(nodes_arg)
+    if rel.is_file():
+        return rel.resolve()
+    name = rel.name
+    candidates = [
+        ood_root / rel,
+        ood_root / "Heterogenous GNN dataset" / "nodes" / name,
+        ood_root / name,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        "Could not find OOD hetero nodes CSV (PQ + voltages for OOD samples). Tried:\n  "
+        + tried
+        + "\n\nBuild it on the OOD bundle (see generate_ood_daily_aggregate_dataset_8500.py footer), e.g.:\n"
+        "  python aggregate_mv_node_dataset_8500.py ...\n"
+        "  python build_hetero_mv_node_type_datasets.py ...\n"
+        "  python merge_load_transformer_reg_tap_only.py --dataset-root \"<OOD_ROOT>\"\n"
+        "Or pass an absolute path: --nodes_csv C:\\\\...\\\\hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+    )
+
+
+def _resolve_edges_csv(ood_root: Path, edges_arg: str) -> tuple[Path, str]:
+    rel = Path(edges_arg)
+    if rel.is_file():
+        return rel.resolve(), "explicit"
+    name = rel.name
+    candidates: list[tuple[Path, str]] = [
+        (ood_root / rel, "ood_data_root"),
+        (ood_root / "Heterogenous GNN dataset" / "edges" / name, "ood_data_root"),
+        (ood_root / name, "ood_data_root"),
+    ]
+    peer = _training_bundle_peer(ood_root)
+    if peer.is_dir():
+        candidates.append((peer / rel, "training_bundle_peer (static topology)"))
+        candidates.append((peer / "Heterogenous GNN dataset" / "edges" / name, "training_bundle_peer (static topology)"))
+    for c, tag in candidates:
+        if c.is_file():
+            return c.resolve(), tag
+    tried = "\n  ".join(str(c[0]) for c in candidates)
+    raise FileNotFoundError(
+        "Could not find compacted line-edge CSV. Tried:\n  "
+        + tried
+        + "\nPass --edge_catalog_csv as an absolute path, or sync edges from training (see generate_ood --sync-static-from)."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OOD eval for GNN-only vs GINE+MLP complex voltage checkpoints.")
     p.add_argument(
@@ -317,15 +374,16 @@ def main() -> None:
     ood_root = Path(args.ood_data_root)
     if not ood_root.is_absolute():
         ood_root = (repo / ood_root).resolve()
-    nodes_path = Path(args.nodes_csv)
-    if not nodes_path.is_absolute():
-        nodes_path = (ood_root / nodes_path).resolve()
-    edges_path = Path(args.edge_catalog_csv)
-    if not edges_path.is_absolute():
-        edges_path = (ood_root / edges_path).resolve()
-    for pth in (nodes_path, edges_path):
-        if not pth.is_file():
-            raise FileNotFoundError(pth)
+    if not ood_root.is_dir():
+        raise FileNotFoundError(f"OOD data root is not a directory: {ood_root}")
+
+    nodes_path = _resolve_nodes_csv(ood_root, str(args.nodes_csv))
+    edges_path, edges_source = _resolve_edges_csv(ood_root, str(args.edge_catalog_csv))
+    if edges_source.startswith("training_bundle"):
+        print(
+            f"Note: using edge catalog from training bundle (static line topology): {edges_path}",
+            flush=True,
+        )
 
     dist_arg = str(args.electrical_distance_csv).strip()
     if dist_arg:
