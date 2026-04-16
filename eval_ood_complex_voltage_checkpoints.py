@@ -281,29 +281,59 @@ def _training_bundle_peer(ood_root: Path) -> Path:
     return p if p.is_dir() else Path()
 
 
+_NODES_REQUIRED = frozenset(
+    {"sample_id", "node", "node_idx", "vmag_pu", "vang_deg", "p_load_kw", "q_load_kvar"},
+)
+
+
+def _nodes_csv_usable(path: Path) -> bool:
+    import pandas as pd
+
+    try:
+        cols = set(pd.read_csv(path, nrows=0).columns.astype(str).str.strip())
+    except Exception:
+        return False
+    return _NODES_REQUIRED.issubset(cols)
+
+
 def _resolve_nodes_csv(ood_root: Path, nodes_arg: str) -> Path:
-    """Prefer OOD tree; try common layouts under ``ood_root`` only (not training ID data)."""
+    """Resolve OOD node table: hetero tap-only, or pre-merge MV/GNN CSVs under ``ood_root``."""
     rel = Path(nodes_arg)
-    if rel.is_file():
+    if rel.is_file() and _nodes_csv_usable(rel):
         return rel.resolve()
     name = rel.name
-    candidates = [
+    candidates: list[Path] = [
         ood_root / rel,
         ood_root / "Heterogenous GNN dataset" / "nodes" / name,
         ood_root / name,
+        ood_root / "gnn_node_features_and_targets_mv_only.csv",
+        ood_root / "gnn_node_features_and_targets.csv",
     ]
+    tried_lines: list[str] = []
     for c in candidates:
-        if c.is_file():
-            return c.resolve()
-    tried = "\n  ".join(str(c) for c in candidates)
+        if not c.is_file():
+            tried_lines.append(f"{c}  (missing)")
+            continue
+        if not _nodes_csv_usable(c):
+            tried_lines.append(f"{c}  (wrong columns; need {_NODES_REQUIRED})")
+            continue
+        print(f"Using nodes CSV: {c}", flush=True)
+        if c.name.startswith("gnn_node_features"):
+            print(
+                "  (MV / full GNN node CSV — OK if node count matches checkpoints; "
+                "prefer hetero tap-only after merge for exact training layout.)",
+                flush=True,
+            )
+        return c.resolve()
+    tried = "\n  ".join(tried_lines)
     raise FileNotFoundError(
-        "Could not find OOD hetero nodes CSV (PQ + voltages for OOD samples). Tried:\n  "
+        "Could not find a usable OOD nodes CSV (need sample_id, node, node_idx, vmag_pu, vang_deg, p_load_kw, q_load_kvar). Tried:\n  "
         + tried
-        + "\n\nBuild it on the OOD bundle (see generate_ood_daily_aggregate_dataset_8500.py footer), e.g.:\n"
-        "  python aggregate_mv_node_dataset_8500.py ...\n"
-        "  python build_hetero_mv_node_type_datasets.py ...\n"
-        "  python merge_load_transformer_reg_tap_only.py --dataset-root \"<OOD_ROOT>\"\n"
-        "Or pass an absolute path: --nodes_csv C:\\\\...\\\\hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+        + "\n\nEither:\n"
+        "  A) Run aggregate_mv_node_dataset_8500.py → build_hetero_mv_node_type_datasets.py → "
+        "merge_load_transformer_reg_tap_only.py --dataset-root \"<OOD_ROOT>\" (see generate_ood_daily_aggregate_dataset_8500.py), or\n"
+        "  B) Ensure OOD root contains gnn_node_features_and_targets_mv_only.csv (after step 1 of that pipeline), or\n"
+        "  C) Pass --nodes_csv with an absolute path to a compatible CSV.\n"
     )
 
 
