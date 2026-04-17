@@ -309,6 +309,15 @@ def _resolve_nodes_csv(ood_root: Path, nodes_arg: str) -> Path:
         ood_root / "gnn_node_features_and_targets_mv_only.csv",
         ood_root / "gnn_node_features_and_targets.csv",
     ]
+    parent = ood_root.parent
+    if parent.is_dir():
+        candidates.extend(
+            [
+                parent / "gnn_node_features_and_targets_mv_only.csv",
+                parent / "gnn_node_features_and_targets.csv",
+                parent / "Heterogenous GNN dataset" / "nodes" / name,
+            ]
+        )
     tried_lines: list[str] = []
     for c in candidates:
         if not c.is_file():
@@ -408,6 +417,17 @@ def main() -> None:
         raise FileNotFoundError(f"OOD data root is not a directory: {ood_root}")
 
     nodes_path = _resolve_nodes_csv(ood_root, str(args.nodes_csv))
+    try:
+        if not str(nodes_path.resolve()).startswith(str(ood_root.resolve())):
+            print(
+                "WARNING: node features CSV is outside --ood_data_root. "
+                "If that file is the in-distribution (training) bundle, metrics are not true OOD. "
+                "Place gnn_node_features_and_targets*.csv inside the OOD stress folder, or pass an "
+                "absolute --nodes_csv pointing at the OOD-generated node table.",
+                flush=True,
+            )
+    except Exception:
+        pass
     edges_path, edges_source = _resolve_edges_csv(ood_root, str(args.edge_catalog_csv))
     if edges_source.startswith("training_bundle"):
         print(
