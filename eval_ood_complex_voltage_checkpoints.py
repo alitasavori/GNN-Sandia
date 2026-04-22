@@ -45,8 +45,41 @@ from train_gine_plus_mlp_complex_voltage import (
     GraphVoltageDataset,
     _build_complex_targets,
 )
+from train_gine_plus_mlp_aux_complex_voltage import GINEPlusMLPAux as GINEPlusMLPAuxVoltage
+from train_gine_plus_mlp_aux_complex_voltage import GINEEncoder as GINEEncoderAux
 from train_gnn_only_compare_complex_voltage import GNNOnlyVoltageModel
+from train_compare_mlp_cvnn_complex_voltage import ComplexMLP, RealMLP
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges, _load_nodes_pq_target
+
+
+class _RealMLPAsGraph(nn.Module):
+    """Adapter: RealMLP on flattened [B,2N] but called with PyG batch."""
+
+    def __init__(self, mlp: RealMLP, n_nodes: int):
+        super().__init__()
+        self.mlp = mlp
+        self.n_nodes = int(n_nodes)
+
+    def forward(self, batch: Data) -> torch.Tensor:
+        b = int(batch.num_graphs)
+        x_flat = batch.x.view(b, self.n_nodes, 2).reshape(b, 2 * self.n_nodes)
+        return self.mlp(x_flat)  # [B, 2N] normalized [V_re, V_im]
+
+
+class _ComplexMLPAsGraph(nn.Module):
+    """Adapter: ComplexMLP on complex [B,N] but called with PyG batch."""
+
+    def __init__(self, cvnn: ComplexMLP, n_nodes: int):
+        super().__init__()
+        self.cvnn = cvnn
+        self.n_nodes = int(n_nodes)
+
+    def forward(self, batch: Data) -> torch.Tensor:
+        b = int(batch.num_graphs)
+        x_ri = batch.x.view(b, self.n_nodes, 2)
+        z_in = torch.complex(x_ri[..., 0], x_ri[..., 1])  # [B, N]
+        z_pred_n = self.cvnn(z_in)  # complex normalized
+        return torch.stack([z_pred_n.real, z_pred_n.imag], dim=-1).reshape(b, 2 * self.n_nodes)
 
 
 def _angle_diff_deg(pred_rad: torch.Tensor, true_rad: torch.Tensor) -> torch.Tensor:
@@ -61,8 +94,28 @@ def _load_ckpt_dict(path: Path) -> dict[str, Any]:
 
 def _load_norm_tensors(ckpt: dict[str, Any], ckpt_path: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     parent = ckpt_path.parent
+    # Real MLP checkpoint stores x/y normalization in-checkpoint.
     if all(k in ckpt for k in ("x_mean", "x_std", "y_mean", "y_std")):
         return ckpt["x_mean"], ckpt["x_std"], ckpt["y_mean"], ckpt["y_std"]
+    # Real MLP checkpoint from train_compare_mlp_cvnn_complex_voltage.py:
+    # y stats are in-checkpoint, x stats are sidecar x_mean.pt/x_std.pt.
+    if all(k in ckpt for k in ("y_mean", "y_std")):
+        xm = torch.load(parent / "x_mean.pt", map_location="cpu", weights_only=True)
+        xs = torch.load(parent / "x_std.pt", map_location="cpu", weights_only=True)
+        ym = torch.as_tensor(ckpt["y_mean"], dtype=torch.float32).view(1, -1)
+        ys = torch.as_tensor(ckpt["y_std"], dtype=torch.float32).view(1, -1)
+        return xm, xs, ym, ys
+    # CVNN checkpoint stores per-component y normalization in-checkpoint; x stats beside ckpt.
+    if all(k in ckpt for k in ("y_mean_re", "y_std_re", "y_mean_im", "y_std_im")):
+        xm = torch.load(parent / "x_mean.pt", map_location="cpu", weights_only=True)
+        xs = torch.load(parent / "x_std.pt", map_location="cpu", weights_only=True)
+        ymr = torch.as_tensor(ckpt["y_mean_re"], dtype=torch.float32).view(1, -1)
+        ysr = torch.as_tensor(ckpt["y_std_re"], dtype=torch.float32).view(1, -1)
+        ymi = torch.as_tensor(ckpt["y_mean_im"], dtype=torch.float32).view(1, -1)
+        ysi = torch.as_tensor(ckpt["y_std_im"], dtype=torch.float32).view(1, -1)
+        ym = torch.stack([ymr, ymi], dim=-1).reshape(1, -1)
+        ys = torch.stack([ysr, ysi], dim=-1).reshape(1, -1)
+        return xm, xs, ym, ys
     xm = torch.load(parent / "x_mean.pt", map_location="cpu", weights_only=True)
     xs = torch.load(parent / "x_std.pt", map_location="cpu", weights_only=True)
     ym = torch.load(parent / "y_mean.pt", map_location="cpu", weights_only=True)
@@ -75,6 +128,36 @@ def _infer_num_edges_from_state(sd: dict[str, torch.Tensor]) -> Optional[int]:
     if w is None:
         return None
     return int(w.shape[0])
+
+
+def _infer_aux_head_nclasses(sd: dict[str, torch.Tensor], prefix: str) -> list[int]:
+    """
+    Infer per-head class counts from aux head final linear weights.
+    Supports nn.Sequential heads where final layer index may vary.
+    """
+    import re
+
+    by_head: dict[int, list[tuple[int, int]]] = {}
+    pat = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.(\d+)\.weight$")
+    for k, w in sd.items():
+        m = pat.match(k)
+        if m is None:
+            continue
+        h_idx = int(m.group(1))
+        layer_idx = int(m.group(2))
+        if not isinstance(w, torch.Tensor) or w.ndim != 2:
+            continue
+        out_dim = int(w.shape[0])
+        by_head.setdefault(h_idx, []).append((layer_idx, out_dim))
+    if not by_head:
+        return []
+    out: list[int] = []
+    for h in range(max(by_head.keys()) + 1):
+        layers = sorted(by_head.get(h, []), key=lambda t: t[0])
+        if not layers:
+            raise ValueError(f"Missing aux head index {h} for prefix {prefix}")
+        out.append(int(layers[-1][1]))
+    return out
 
 
 def _classify_and_build_model(ckpt_path: Path, ckpt: dict[str, Any], n_nodes_ood: int, n_edges_ood: int) -> tuple[nn.Module, str]:
@@ -108,6 +191,41 @@ def _classify_and_build_model(ckpt_path: Path, ckpt: dict[str, Any], n_nodes_ood
         tag = f"gnn_only:{mt}"
         return model, tag
     if "hidden_mlp" in ckpt and any(k.startswith("encoder.") for k in sd):
+        if any(k.startswith("aux_reg_heads.") or k.startswith("aux_cap_heads.") for k in sd):
+            n_nodes = int(ckpt.get("n_nodes", n_nodes_ood))
+            if n_nodes != n_nodes_ood:
+                raise ValueError(f"{ckpt_path}: ckpt n_nodes={n_nodes} != OOD n_nodes={n_nodes_ood}")
+            n_e_ckpt = _infer_num_edges_from_state(sd)
+            n_e = int(n_e_ckpt if n_e_ckpt is not None else n_edges_ood)
+            if n_e != n_edges_ood:
+                raise ValueError(
+                    f"{ckpt_path}: GINE+MLP+aux ckpt num_edges={n_e} vs OOD={n_edges_ood}; graphs must align."
+                )
+            reg_nclasses = _infer_aux_head_nclasses(sd, "aux_reg_heads")
+            cap_nclasses = _infer_aux_head_nclasses(sd, "aux_cap_heads")
+            enc = GINEEncoderAux(
+                in_dim=2,
+                n_nodes=n_nodes,
+                num_edges=n_e,
+                hidden=int(ckpt["hidden_gnn"]),
+                n_layers=int(ckpt["layers"]),
+                state_dim=int(ckpt.get("state_dim", 2)),
+                node_emb_dim=int(ckpt["node_emb_dim"]),
+                edge_emb_dim=int(ckpt["edge_emb_dim"]),
+                dropout=0.0,
+            )
+            model = GINEPlusMLPAuxVoltage(
+                n_nodes=n_nodes,
+                encoder=enc,
+                hidden_mlp=int(ckpt["hidden_mlp"]),
+                aux_head_depth=int(ckpt.get("aux_head_depth", 1)),
+                aux_head_dropout=0.0,
+                aux_head_first_hidden=int(ckpt.get("aux_head_first_hidden", ckpt.get("aux_hidden", 512))),
+                reg_nclasses=reg_nclasses,
+                cap_nclasses=cap_nclasses,
+            )
+            model.load_state_dict(sd, strict=True)
+            return model, "gine_plus_mlp_aux"
         n_nodes = int(ckpt.get("n_nodes", n_nodes_ood))
         if n_nodes != n_nodes_ood:
             raise ValueError(f"{ckpt_path}: ckpt n_nodes={n_nodes} != OOD n_nodes={n_nodes_ood}")
@@ -131,8 +249,31 @@ def _classify_and_build_model(ckpt_path: Path, ckpt: dict[str, Any], n_nodes_ood
         model = GINEPlusMLP(encoder=enc, mlp_hidden=int(ckpt["hidden_mlp"]), n_nodes=n_nodes)
         model.load_state_dict(sd, strict=True)
         return model, "gine_plus_mlp"
+    # Real MLP checkpoint from train_compare_mlp_cvnn_complex_voltage.py
+    if all(k in ckpt for k in ("in_dim", "out_dim", "hidden")):
+        in_dim = int(ckpt["in_dim"])
+        out_dim = int(ckpt["out_dim"])
+        n_nodes = in_dim // 2
+        if in_dim != 2 * n_nodes_ood or out_dim != 2 * n_nodes_ood:
+            raise ValueError(
+                f"{ckpt_path}: RealMLP dim mismatch in/out=({in_dim},{out_dim}) vs OOD expects {2*n_nodes_ood}."
+            )
+        mlp = RealMLP(in_dim=in_dim, out_dim=out_dim, hidden=int(ckpt["hidden"]))
+        mlp.load_state_dict(sd, strict=True)
+        return _RealMLPAsGraph(mlp=mlp, n_nodes=n_nodes_ood), "real_mlp_flat"
+    # CVNN MLP checkpoint from train_compare_mlp_cvnn_complex_voltage.py
+    if all(k in ckpt for k in ("in_dim_complex", "out_dim_complex", "hidden")):
+        n_in = int(ckpt["in_dim_complex"])
+        n_out = int(ckpt["out_dim_complex"])
+        if n_in != n_nodes_ood or n_out != n_nodes_ood:
+            raise ValueError(
+                f"{ckpt_path}: CVNN dim mismatch in/out=({n_in},{n_out}) vs OOD expects {n_nodes_ood}."
+            )
+        cvnn = ComplexMLP(in_dim=n_in, out_dim=n_out, hidden=int(ckpt["hidden"]))
+        cvnn.load_state_dict(sd, strict=True)
+        return _ComplexMLPAsGraph(cvnn=cvnn, n_nodes=n_nodes_ood), "cvnn_mlp_flat"
     raise ValueError(
-        f"{ckpt_path}: unrecognized checkpoint (need model_type for GNN-only or hidden_mlp+encoder.* for GINE+MLP)"
+        f"{ckpt_path}: unrecognized checkpoint (supported: GNN-only, GINE+MLP(+aux), real_mlp, cvnn_mlp)."
     )
 
 
@@ -197,8 +338,27 @@ def _run_model_collect_errors(
         batch = batch.to(device)
         b = int(batch.num_graphs)
         n = dist_per_node.shape[0]
-        xn = (batch.x - x_mean.to(device)) / x_std.to(device)
-        batch_n = Data(x=xn, y=batch.y, edge_index=batch.edge_index, edge_attr=batch.edge_attr, batch=batch.batch)
+        x_mean_dev = x_mean.to(device)
+        x_std_dev = x_std.to(device)
+        # Support both training normalization layouts:
+        # 1) per-feature (P,Q): x_mean shape [1,2] or [2]
+        # 2) flattened per-node feature: x_mean shape [1,2N] or [2N] (MLP/CVNN checkpoints)
+        if int(x_mean_dev.numel()) == 2:
+            xm2 = x_mean_dev.view(1, 2)
+            xs2 = x_std_dev.view(1, 2)
+            xn = (batch.x - xm2) / xs2
+        elif int(x_mean_dev.numel()) == 2 * n:
+            x_flat = batch.x.view(b, n, 2).reshape(b, 2 * n)
+            xm = x_mean_dev.view(1, 2 * n)
+            xs = x_std_dev.view(1, 2 * n)
+            x_flat_n = (x_flat - xm) / xs
+            xn = x_flat_n.view(b, n, 2).reshape(b * n, 2)
+        else:
+            raise ValueError(
+                f"Unsupported x normalization shape: numel={int(x_mean_dev.numel())}, expected 2 or {2*n}."
+            )
+        batch_n = batch.clone()
+        batch_n.x = xn
         pred_n = model(batch_n)
         pred = pred_n * y_std.to(device) + y_mean.to(device)
         tgt = batch.y.view(b, n, 2)
@@ -371,6 +531,36 @@ def _resolve_edges_csv(ood_root: Path, edges_arg: str) -> tuple[Path, str]:
     )
 
 
+def _check_nodes_match_ood_meta(nodes_path: Path, ood_root: Path) -> None:
+    """
+    Guardrail: if OOD meta exists, ensure node sample_id universe matches it.
+    This prevents accidental evaluation on parent/training node CSVs.
+    """
+    import pandas as pd
+
+    meta_path = ood_root / "gnn_sample_meta.csv"
+    if not meta_path.is_file():
+        return
+    meta = pd.read_csv(meta_path, usecols=["sample_id"])
+    meta_ids = set(meta["sample_id"].astype(str).tolist())
+    if not meta_ids:
+        return
+    node_ids = set(pd.read_csv(nodes_path, usecols=["sample_id"])["sample_id"].astype(str).unique().tolist())
+    if node_ids != meta_ids:
+        only_nodes = len(node_ids - meta_ids)
+        only_meta = len(meta_ids - node_ids)
+        raise ValueError(
+            "Node CSV sample_id set does not match OOD gnn_sample_meta.csv.\n"
+            f"  nodes_csv: {nodes_path}\n"
+            f"  ood_meta:  {meta_path}\n"
+            f"  unique sample_id counts -> nodes: {len(node_ids)}, meta: {len(meta_ids)}\n"
+            f"  ids only in nodes_csv: {only_nodes}\n"
+            f"  ids only in ood_meta:  {only_meta}\n"
+            "Use a nodes CSV generated inside --ood_data_root (e.g. OOD "
+            "gnn_node_features_and_targets_mv_only.csv or merged hetero tap-only file)."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OOD eval for GNN-only vs GINE+MLP complex voltage checkpoints.")
     p.add_argument(
@@ -454,6 +644,7 @@ def main() -> None:
     print(f"Nodes:    {nodes_path}", flush=True)
     print(f"Edges:    {edges_path}", flush=True)
     print(f"Dist CSV: {dist_csv}", flush=True)
+    _check_nodes_match_ood_meta(nodes_path, ood_root)
 
     x, _y_unused, sample_ids, node_order, node_to_local = _load_nodes_pq_target(nodes_path)
     edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
