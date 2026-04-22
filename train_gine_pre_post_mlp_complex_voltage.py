@@ -1,8 +1,8 @@
 """
-Train: node-wise pre-MLP -> GINE trunk -> global post-MLP for complex voltage.
+Train: global pre-MLP -> GINE trunk -> global post-MLP for complex voltage.
 
 Requested architecture:
-  - MLP before GNN (shared across nodes): (P,Q) -> learned node features.
+  - One global MLP before GNN: flattened all-node PQ -> learned all-node features.
   - GNN trunk on graph.
   - One global MLP after GNN (no per-node MLP heads) -> flattened [V_re, V_im].
   - No auxiliary heads/tasks.
@@ -110,8 +110,12 @@ class GINEPrePostMLP(nn.Module):
         self.edge_emb_dim = max(0, int(edge_emb_dim))
         self.dropout = nn.Dropout(float(dropout))
 
-        # Shared pre-MLP for each node: (P,Q) -> pre_out_dim
-        self.pre_mlp = RealMLP(in_dim=2, out_dim=int(pre_out_dim), hidden=int(pre_hidden))
+        # Global pre-MLP: [B, 2N] -> [B, N*pre_out_dim]
+        self.pre_global_mlp = RealMLP(
+            in_dim=2 * self.n_nodes,
+            out_dim=self.n_nodes * int(pre_out_dim),
+            hidden=int(pre_hidden),
+        )
 
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
@@ -147,7 +151,10 @@ class GINEPrePostMLP(nn.Module):
     def forward(self, batch: Data) -> torch.Tensor:
         x = batch.x  # [B*N, 2]
         ea = batch.edge_attr
-        x = self.pre_mlp(x)  # [B*N, pre_out_dim]
+        # Global pre-MLP over all nodes (requested): [B,2N] -> [B,N*pre_out_dim]
+        x_flat = x.view(batch.num_graphs, self.n_nodes * 2)
+        x_pre_flat = self.pre_global_mlp(x_flat)
+        x = x_pre_flat.view(batch.num_graphs * self.n_nodes, -1)  # [B*N, pre_out_dim]
         if self.node_emb is not None:
             x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
         if self.edge_emb is not None:
@@ -214,7 +221,7 @@ class RunResult:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train pre-MLP + GINE + post-MLP (no aux) for complex voltage.")
+    p = argparse.ArgumentParser(description="Train global pre-MLP + GINE + global post-MLP (no aux) for complex voltage.")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
@@ -457,7 +464,7 @@ def main() -> None:
         checkpoint=str(ckpt_path.resolve()),
     )
     report = {
-        "task": "Pre-MLP + GINE + Post-MLP (global), no aux, no per-node heads",
+        "task": "Global pre-MLP + GINE + global post-MLP, no aux, no per-node heads",
         "dataset_nodes_csv": str(nodes_path),
         "dataset_edges_csv": str(edges_path),
         "n_samples": int(n),
@@ -465,6 +472,7 @@ def main() -> None:
         "split": {"train": int(len(idx_train)), "val": int(len(idx_val)), "test": int(len(idx_test))},
         "model": {
             "type": "gine_pre_post_mlp_no_aux",
+            "pre_mode": "global_flattened_all_nodes",
             "pre_hidden": int(args.pre_hidden),
             "pre_out_dim": int(args.pre_out_dim),
             "hidden_gnn": int(args.hidden_gnn),
