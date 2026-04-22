@@ -444,9 +444,11 @@ def main() -> None:
         sch.step(val_v_mse)
 
         live_val = _evaluate_voltage(model, dl_va, device, y_mean, y_std)
+        curr_lr = float(opt.param_groups[0]["lr"])
         history.append(
             {
                 "epoch": float(ep),
+                "lr": curr_lr,
                 "val_mse_norm": float(val_v_mse),
                 "val_mae_vmag_pu": float(live_val["mae_vmag_pu"]),
                 "val_rmse_vmag_pu": float(live_val["rmse_vmag_pu"]),
@@ -464,6 +466,7 @@ def main() -> None:
         if ep == 1 or ep % int(args.log_every) == 0:
             print(
                 f"[gine+per-node-heads] epoch {ep:4d}/{args.epochs} "
+                f"lr={curr_lr:.6g} "
                 f"val_mse_norm={val_v_mse:.6f} "
                 f"val_mae_vmag={live_val['mae_vmag_pu']:.6f} "
                 f"val_rmse_vmag={live_val['rmse_vmag_pu']:.6f} "
