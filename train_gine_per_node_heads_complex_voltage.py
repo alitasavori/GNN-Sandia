@@ -86,6 +86,40 @@ class RealMLP(nn.Module):
         return self.net(x)
 
 
+class NodeWiseMLP(nn.Module):
+    """
+    Vectorized non-shared MLPs: one MLP per node, executed in batched tensor ops.
+    Architecture per node: in_dim -> hidden -> hidden -> out_dim.
+    """
+
+    def __init__(self, *, n_nodes: int, in_dim: int, hidden: int, out_dim: int):
+        super().__init__()
+        self.n_nodes = int(n_nodes)
+        self.in_dim = int(in_dim)
+        self.hidden = int(hidden)
+        self.out_dim = int(out_dim)
+
+        self.w1 = nn.Parameter(torch.empty(self.n_nodes, self.hidden, self.in_dim))
+        self.b1 = nn.Parameter(torch.zeros(self.n_nodes, self.hidden))
+        self.w2 = nn.Parameter(torch.empty(self.n_nodes, self.hidden, self.hidden))
+        self.b2 = nn.Parameter(torch.zeros(self.n_nodes, self.hidden))
+        self.w3 = nn.Parameter(torch.empty(self.n_nodes, self.out_dim, self.hidden))
+        self.b3 = nn.Parameter(torch.zeros(self.n_nodes, self.out_dim))
+
+        nn.init.xavier_uniform_(self.w1)
+        nn.init.xavier_uniform_(self.w2)
+        nn.init.xavier_uniform_(self.w3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, in_dim]
+        h1 = torch.einsum("bni,nhi->bnh", x, self.w1) + self.b1.unsqueeze(0)
+        h1 = F.relu(h1)
+        h2 = torch.einsum("bnh,nkh->bnk", h1, self.w2) + self.b2.unsqueeze(0)
+        h2 = F.relu(h2)
+        y = torch.einsum("bnk,nok->bno", h2, self.w3) + self.b3.unsqueeze(0)
+        return y
+
+
 class GINEEncoderState(nn.Module):
     def __init__(
         self,
@@ -169,18 +203,20 @@ class GINEPerNodeHeads(nn.Module):
             hidden=max(self.global_ctx_dim * 2, 64),
         )
         in_dim = self.state_dim + self.global_ctx_dim
-        self.node_heads = nn.ModuleList([RealMLP(in_dim=in_dim, out_dim=2, hidden=int(head_hidden)) for _ in range(self.n_nodes)])
+        self.node_mlp = NodeWiseMLP(
+            n_nodes=self.n_nodes,
+            in_dim=in_dim,
+            hidden=int(head_hidden),
+            out_dim=2,
+        )
 
     def forward(self, batch: Data) -> torch.Tensor:
         s = self.encoder(batch)  # [B,N,S]
         s_flat = s.reshape(s.size(0), self.n_nodes * self.state_dim)  # [B, N*S]
         g = self.global_proj(s_flat)  # [B, global_ctx_dim]
-        outs: list[torch.Tensor] = []
-        for j, head in enumerate(self.node_heads):
-            local_j = s[:, j, :]  # [B,S]
-            head_in = torch.cat([local_j, g], dim=1)  # [B, S + global_ctx_dim]
-            outs.append(head(head_in))  # [B,2]
-        pred = torch.stack(outs, dim=1)  # [B,N,2]
+        g_rep = g.unsqueeze(1).expand(-1, self.n_nodes, -1)  # [B,N,G]
+        head_in = torch.cat([s, g_rep], dim=-1)  # [B,N,S+G]
+        pred = self.node_mlp(head_in)  # [B,N,2]
         return pred.reshape(pred.size(0), 2 * self.n_nodes)
 
 
