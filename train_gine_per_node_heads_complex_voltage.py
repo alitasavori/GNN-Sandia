@@ -295,6 +295,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--disable_dropout", action="store_true")
     p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument(
+        "--lr_sched_factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau factor (new_lr = lr * factor).",
+    )
+    p.add_argument(
+        "--lr_sched_patience",
+        type=int,
+        default=8,
+        help="ReduceLROnPlateau patience (epochs with no improvement before LR drop).",
+    )
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--patience", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
@@ -407,7 +419,12 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=8)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=float(args.lr_sched_factor),
+        patience=int(args.lr_sched_patience),
+    )
     mse = nn.MSELoss()
 
     best_val_mse = float("inf")
