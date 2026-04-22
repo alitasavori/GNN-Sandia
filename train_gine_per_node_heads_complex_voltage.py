@@ -144,25 +144,42 @@ class GINEEncoderState(nn.Module):
 class GINEPerNodeHeads(nn.Module):
     """
     One MLP per node (non-shared).
-    Each node head input = concat(local_state_i, global_mean_state, global_max_state).
+    Each node head input = concat(local_state_i, learned_global_context).
     """
 
-    def __init__(self, *, encoder: GINEEncoderState, n_nodes: int, state_dim: int, head_hidden: int):
+    def __init__(
+        self,
+        *,
+        encoder: GINEEncoderState,
+        n_nodes: int,
+        state_dim: int,
+        head_hidden: int,
+        global_ctx_dim: int,
+    ):
         super().__init__()
         self.encoder = encoder
         self.n_nodes = int(n_nodes)
         self.state_dim = int(state_dim)
-        in_dim = self.state_dim * 3
+        self.global_ctx_dim = int(global_ctx_dim)
+        if self.global_ctx_dim <= 0:
+            raise ValueError("global_ctx_dim must be >= 1")
+        self.global_proj = RealMLP(
+            in_dim=self.n_nodes * self.state_dim,
+            out_dim=self.global_ctx_dim,
+            hidden=max(self.global_ctx_dim * 2, 64),
+        )
+        in_dim = self.state_dim + self.global_ctx_dim
         self.node_heads = nn.ModuleList([RealMLP(in_dim=in_dim, out_dim=2, hidden=int(head_hidden)) for _ in range(self.n_nodes)])
 
     def forward(self, batch: Data) -> torch.Tensor:
         s = self.encoder(batch)  # [B,N,S]
-        g_mean = s.mean(dim=1, keepdim=True).expand(-1, self.n_nodes, -1)  # [B,N,S]
-        g_max = s.max(dim=1, keepdim=True).values.expand(-1, self.n_nodes, -1)  # [B,N,S]
-        f = torch.cat([s, g_mean, g_max], dim=-1)  # [B,N,3S]
+        s_flat = s.reshape(s.size(0), self.n_nodes * self.state_dim)  # [B, N*S]
+        g = self.global_proj(s_flat)  # [B, global_ctx_dim]
         outs: list[torch.Tensor] = []
         for j, head in enumerate(self.node_heads):
-            outs.append(head(f[:, j, :]))  # [B,2]
+            local_j = s[:, j, :]  # [B,S]
+            head_in = torch.cat([local_j, g], dim=1)  # [B, S + global_ctx_dim]
+            outs.append(head(head_in))  # [B,2]
         pred = torch.stack(outs, dim=1)  # [B,N,2]
         return pred.reshape(pred.size(0), 2 * self.n_nodes)
 
@@ -231,6 +248,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--state_dim", type=int, default=2)
     p.add_argument("--head_hidden", type=int, default=128)
+    p.add_argument(
+        "--global_ctx_dim",
+        type=int,
+        default=64,
+        help="Learned global bottleneck size produced from flattened trunk state.",
+    )
     p.add_argument("--node_emb_dim", type=int, default=16)
     p.add_argument("--edge_emb_dim", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -344,6 +367,7 @@ def main() -> None:
         n_nodes=n_nodes,
         state_dim=int(args.state_dim),
         head_hidden=int(args.head_hidden),
+        global_ctx_dim=int(args.global_ctx_dim),
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -429,6 +453,7 @@ def main() -> None:
             "layers": int(args.layers),
             "state_dim": int(args.state_dim),
             "head_hidden": int(args.head_hidden),
+            "global_ctx_dim": int(args.global_ctx_dim),
             "node_emb_dim": int(args.node_emb_dim),
             "edge_emb_dim": int(args.edge_emb_dim),
             "x_mean": x_mean,
@@ -453,7 +478,7 @@ def main() -> None:
         checkpoint=str(ckpt_path.resolve()),
     )
     report = {
-        "task": "GINE + one-MLP-per-node heads (input: local state + global context), no aux",
+        "task": "GINE + one-MLP-per-node heads (input: local state + learned global context), no aux",
         "dataset_nodes_csv": str(nodes_path),
         "dataset_edges_csv": str(edges_path),
         "n_samples": int(n),
@@ -465,9 +490,10 @@ def main() -> None:
             "layers": int(args.layers),
             "state_dim": int(args.state_dim),
             "head_hidden": int(args.head_hidden),
+            "global_ctx_dim": int(args.global_ctx_dim),
             "node_emb_dim": int(args.node_emb_dim),
             "edge_emb_dim": int(args.edge_emb_dim),
-            "global_context": "mean+max pooled trunk state",
+            "global_context": "learned bottleneck from flattened trunk state",
         },
         "result": result.__dict__,
         "history": history,
