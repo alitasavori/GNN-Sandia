@@ -223,6 +223,13 @@ class RunResult:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train global pre-MLP + GINE + global post-MLP (no aux) for complex voltage.")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
+    p.add_argument(
+        "--dataset_variant",
+        type=str,
+        choices=("load_only", "full_mv"),
+        default="load_only",
+        help="Choose default node/edge CSVs. Explicit --nodes_csv/--edge_catalog_csv still override.",
+    )
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
     p.add_argument("--out_dir", type=str, default="gine_pre_post_mlp_complex_8500")
@@ -263,8 +270,20 @@ def main() -> None:
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
         data_root = (repo / data_root).resolve()
-    nodes_path = Path(args.nodes_csv) if Path(args.nodes_csv).is_absolute() else (data_root / args.nodes_csv).resolve()
-    edges_path = Path(args.edge_catalog_csv) if Path(args.edge_catalog_csv).is_absolute() else (data_root / args.edge_catalog_csv).resolve()
+    nodes_rel = str(args.nodes_csv).strip()
+    edges_rel = str(args.edge_catalog_csv).strip()
+    nodes_is_default = nodes_rel == "Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv"
+    edges_is_default = edges_rel == "Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv"
+    if args.dataset_variant == "full_mv":
+        # Keep backward compatibility: only switch defaults when caller did not explicitly pass custom CSVs.
+        if nodes_is_default:
+            nodes_rel = "gnn_node_features_and_targets_full_mv.csv"
+        if edges_is_default:
+            edges_rel = "gnn_edges_phase_static_full_mv.csv"
+        if str(args.data_root).strip() == "datasets_gnn2/loadtype_8500_dailyagg":
+            data_root = (repo / "datasets_gnn2" / "loadtype_8500_dailyagg_full_mv").resolve()
+    nodes_path = Path(nodes_rel) if Path(nodes_rel).is_absolute() else (data_root / nodes_rel).resolve()
+    edges_path = Path(edges_rel) if Path(edges_rel).is_absolute() else (data_root / edges_rel).resolve()
     for p in (nodes_path, edges_path):
         if not p.is_file():
             raise FileNotFoundError(p)
