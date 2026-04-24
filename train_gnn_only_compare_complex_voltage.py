@@ -120,11 +120,13 @@ class GNNOnlyVoltageModel(nn.Module):
         node_emb_dim: int,
         edge_emb_dim: int,
         gps_heads: int,
+        gps_mlp_state_dim: int,
+        gps_mlp_post_hidden: int,
         dropout: float,
     ):
         super().__init__()
         mt = str(model_type).strip().lower()
-        if mt not in {"gine", "sage", "gcn", "gps"}:
+        if mt not in {"gine", "sage", "gcn", "gps", "gps_mlp"}:
             raise ValueError(f"Unsupported model_type={model_type}")
         self.model_type = mt
         self.n_nodes = int(n_nodes)
@@ -132,12 +134,13 @@ class GNNOnlyVoltageModel(nn.Module):
         self.node_emb_dim = max(0, int(node_emb_dim))
         self.edge_emb_dim = max(0, int(edge_emb_dim))
         self.gps_heads = int(gps_heads)
+        self.gps_mlp_state_dim = int(gps_mlp_state_dim)
         self.dropout = nn.Dropout(float(dropout))
 
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if (self.edge_emb_dim > 0 and mt == "gine") else None
 
-        self.gps_global_feats = 3 if mt == "gps" else 0
+        self.gps_global_feats = 3 if mt in {"gps", "gps_mlp"} else 0
         eff_in = in_dim + self.node_emb_dim + self.gps_global_feats
         self.input_proj = nn.Linear(eff_in, hidden)
         self.convs = nn.ModuleList()
@@ -153,7 +156,7 @@ class GNNOnlyVoltageModel(nn.Module):
             for _ in range(int(layers)):
                 self.convs.append(SAGEConv(hidden, hidden))
                 self.norms.append(nn.LayerNorm(hidden))
-        elif mt == "gps":
+        elif mt in {"gps", "gps_mlp"}:
             for _ in range(int(layers)):
                 self.convs.append(GPSBlock(hidden=hidden, heads=self.gps_heads, dropout=dropout))
         else:  # gcn
@@ -161,7 +164,20 @@ class GNNOnlyVoltageModel(nn.Module):
                 self.convs.append(GCNConv(hidden, hidden))
                 self.norms.append(nn.LayerNorm(hidden))
 
-        self.out_head = nn.Linear(hidden, 2)  # [V_re, V_im]
+        if mt == "gps_mlp":
+            if self.gps_mlp_state_dim <= 0:
+                raise ValueError("--gps_mlp_state_dim must be >= 1 when using model=gps_mlp.")
+            self.state_head = nn.Linear(hidden, self.gps_mlp_state_dim)
+            self.post_mlp = nn.Sequential(
+                nn.Linear(self.n_nodes * self.gps_mlp_state_dim, int(gps_mlp_post_hidden)),
+                nn.ReLU(),
+                nn.Linear(int(gps_mlp_post_hidden), int(gps_mlp_post_hidden)),
+                nn.ReLU(),
+                nn.Linear(int(gps_mlp_post_hidden), 2 * self.n_nodes),
+            )
+            self.out_head = None
+        else:
+            self.out_head = nn.Linear(hidden, 2)  # [V_re, V_im]
 
     def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
@@ -208,7 +224,7 @@ class GNNOnlyVoltageModel(nn.Module):
             for conv, norm in zip(self.convs, self.norms):
                 h_msg = F.relu(conv(h, batch.edge_index))
                 h = h + self.dropout(norm(h_msg))
-        elif self.model_type == "gps":
+        elif self.model_type in {"gps", "gps_mlp"}:
             for blk in self.convs:
                 h = blk(h, batch.edge_index, batch.batch if hasattr(batch, "batch") else None)
         else:  # gcn
@@ -217,6 +233,10 @@ class GNNOnlyVoltageModel(nn.Module):
             for conv, norm in zip(self.convs, self.norms):
                 h_msg = F.relu(conv(h, batch.edge_index, edge_weight=ew))
                 h = h + self.dropout(norm(h_msg))
+
+        if self.model_type == "gps_mlp":
+            s = self.state_head(h).view(batch.num_graphs, self.n_nodes, self.gps_mlp_state_dim)
+            return self.post_mlp(s.reshape(batch.num_graphs, self.n_nodes * self.gps_mlp_state_dim))
 
         out = self.out_head(h)  # [B*N,2]
         return out.view(batch.num_graphs, self.n_nodes, 2).reshape(batch.num_graphs, 2 * self.n_nodes)
@@ -300,6 +320,8 @@ def _train_one(
         node_emb_dim=int(args.node_emb_dim),
         edge_emb_dim=int(args.edge_emb_dim),
         gps_heads=int(args.gps_heads),
+        gps_mlp_state_dim=int(args.gps_mlp_state_dim),
+        gps_mlp_post_hidden=int(args.gps_mlp_post_hidden),
         dropout=0.0 if args.disable_dropout else float(args.dropout),
     ).to(device)
 
@@ -389,12 +411,12 @@ def _train_one(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Compare GNN-only models (gine,sage,gcn,gps) for complex voltage prediction.")
+    p = argparse.ArgumentParser(description="Compare GNN models (gine,sage,gcn,gps,gps_mlp) for complex voltage prediction.")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
     p.add_argument("--out_dir", type=str, default="gnn_only_compare_complex_8500")
-    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn,gps}.")
+    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn,gps,gps_mlp}.")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--hidden", type=int, default=64)
@@ -402,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--node_emb_dim", type=int, default=16)
     p.add_argument("--edge_emb_dim", type=int, default=8)
     p.add_argument("--gps_heads", type=int, default=4, help="Only used when model includes gps.")
+    p.add_argument("--gps_mlp_state_dim", type=int, default=4, help="Only used when model includes gps_mlp.")
+    p.add_argument("--gps_mlp_post_hidden", type=int, default=1024, help="Only used when model includes gps_mlp.")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--disable_dropout", action="store_true")
     p.add_argument("--lr", type=float, default=5e-4)
@@ -422,7 +446,7 @@ def main() -> None:
     _set_seed(args.seed)
 
     models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
-    allowed = {"gine", "sage", "gcn", "gps"}
+    allowed = {"gine", "sage", "gcn", "gps", "gps_mlp"}
     if not models or any(m not in allowed for m in models):
         raise ValueError(f"--models must be comma-separated subset of {sorted(allowed)}")
 
