@@ -71,6 +71,42 @@ class GraphVoltageDataset(Dataset):
         return Data(x=self.x[i], y=self.y_ri[i], edge_index=self.edge_index, edge_attr=self.edge_attr)
 
 
+class GPSBlock(nn.Module):
+    def __init__(self, *, hidden: int, heads: int, dropout: float):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(f"hidden ({hidden}) must be divisible by gps_heads ({heads}).")
+        self.local = GCNConv(hidden, hidden)
+        self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden),
+            nn.Dropout(dropout),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor | None) -> torch.Tensor:
+        h_local = self.drop(F.gelu(self.local(x, edge_index)))
+        if batch is None:
+            x_seq = x.unsqueeze(0)
+            h_global, _ = self.attn(x_seq, x_seq, x_seq)
+            h_global = h_global.squeeze(0)
+        else:
+            h_global = torch.zeros_like(x)
+            for bi in batch.unique(sorted=True):
+                m = batch == bi
+                xg = x[m].unsqueeze(0)
+                hg, _ = self.attn(xg, xg, xg)
+                h_global[m] = hg.squeeze(0)
+        x = self.norm1(x + h_local + h_global)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+
 class GNNOnlyVoltageModel(nn.Module):
     def __init__(
         self,
@@ -83,23 +119,26 @@ class GNNOnlyVoltageModel(nn.Module):
         num_edges: int,
         node_emb_dim: int,
         edge_emb_dim: int,
+        gps_heads: int,
         dropout: float,
     ):
         super().__init__()
         mt = str(model_type).strip().lower()
-        if mt not in {"gine", "sage", "gcn"}:
+        if mt not in {"gine", "sage", "gcn", "gps"}:
             raise ValueError(f"Unsupported model_type={model_type}")
         self.model_type = mt
         self.n_nodes = int(n_nodes)
         self.num_edges = int(num_edges)
         self.node_emb_dim = max(0, int(node_emb_dim))
         self.edge_emb_dim = max(0, int(edge_emb_dim))
+        self.gps_heads = int(gps_heads)
         self.dropout = nn.Dropout(float(dropout))
 
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if (self.edge_emb_dim > 0 and mt == "gine") else None
 
-        eff_in = in_dim + self.node_emb_dim
+        self.gps_global_feats = 3 if mt == "gps" else 0
+        eff_in = in_dim + self.node_emb_dim + self.gps_global_feats
         self.input_proj = nn.Linear(eff_in, hidden)
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -114,6 +153,9 @@ class GNNOnlyVoltageModel(nn.Module):
             for _ in range(int(layers)):
                 self.convs.append(SAGEConv(hidden, hidden))
                 self.norms.append(nn.LayerNorm(hidden))
+        elif mt == "gps":
+            for _ in range(int(layers)):
+                self.convs.append(GPSBlock(hidden=hidden, heads=self.gps_heads, dropout=dropout))
         else:  # gcn
             for _ in range(int(layers)):
                 self.convs.append(GCNConv(hidden, hidden))
@@ -127,8 +169,30 @@ class GNNOnlyVoltageModel(nn.Module):
     def _edge_ids(self, e_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.num_edges, device=device, dtype=torch.long).repeat(e_total // self.num_edges)
 
+    def _append_gps_global_feats(self, x: torch.Tensor, batch: torch.Tensor | None) -> torch.Tensor:
+        if self.gps_global_feats <= 0:
+            return x
+        if batch is None:
+            total_p = x[:, 0].sum().view(1, 1).expand(x.size(0), 1)
+            total_q = x[:, 1].sum().view(1, 1).expand(x.size(0), 1)
+            mean_f = x.mean().view(1, 1).expand(x.size(0), 1)
+            gf = torch.cat([total_p, total_q, mean_f], dim=1)
+            return torch.cat([x, gf], dim=1)
+        out = torch.zeros(x.size(0), self.gps_global_feats, device=x.device, dtype=x.dtype)
+        for bi in batch.unique(sorted=True):
+            m = batch == bi
+            xb = x[m]
+            total_p = xb[:, 0].sum()
+            total_q = xb[:, 1].sum()
+            mean_f = xb.mean()
+            out[m, 0] = total_p
+            out[m, 1] = total_q
+            out[m, 2] = mean_f
+        return torch.cat([x, out], dim=1)
+
     def forward(self, batch: Data) -> torch.Tensor:
         x = batch.x
+        x = self._append_gps_global_feats(x, batch.batch if hasattr(batch, "batch") else None)
         if self.node_emb is not None:
             x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
         h = self.input_proj(x)
@@ -144,6 +208,9 @@ class GNNOnlyVoltageModel(nn.Module):
             for conv, norm in zip(self.convs, self.norms):
                 h_msg = F.relu(conv(h, batch.edge_index))
                 h = h + self.dropout(norm(h_msg))
+        elif self.model_type == "gps":
+            for blk in self.convs:
+                h = blk(h, batch.edge_index, batch.batch if hasattr(batch, "batch") else None)
         else:  # gcn
             z = torch.sqrt(batch.edge_attr[:, 0] ** 2 + batch.edge_attr[:, 1] ** 2).clamp(min=1e-6)
             ew = 1.0 / z
@@ -232,6 +299,7 @@ def _train_one(
         num_edges=n_edges,
         node_emb_dim=int(args.node_emb_dim),
         edge_emb_dim=int(args.edge_emb_dim),
+        gps_heads=int(args.gps_heads),
         dropout=0.0 if args.disable_dropout else float(args.dropout),
     ).to(device)
 
@@ -277,7 +345,7 @@ def _train_one(
             bad = 0
         else:
             bad += 1
-        if ep == 1 or ep % 10 == 0:
+        if ep == 1 or ep % max(1, int(args.log_every)) == 0:
             print(f"[{model_type}] epoch {ep:4d}/{args.epochs} val_mse_norm={val_loss:.6f} best={best_val:.6f}", flush=True)
         if bad >= args.patience:
             print(f"[{model_type}] early stopping at epoch {ep}", flush=True)
@@ -321,18 +389,19 @@ def _train_one(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Compare GNN-only models (gine,sage,gcn) for complex voltage prediction.")
+    p = argparse.ArgumentParser(description="Compare GNN-only models (gine,sage,gcn,gps) for complex voltage prediction.")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
     p.add_argument("--out_dir", type=str, default="gnn_only_compare_complex_8500")
-    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn}.")
+    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn,gps}.")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--node_emb_dim", type=int, default=16)
     p.add_argument("--edge_emb_dim", type=int, default=8)
+    p.add_argument("--gps_heads", type=int, default=4, help="Only used when model includes gps.")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--disable_dropout", action="store_true")
     p.add_argument("--lr", type=float, default=5e-4)
@@ -343,6 +412,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--sample_frac", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--cache_tensor", type=str, default="")
     return p.parse_args()
 
@@ -352,7 +422,7 @@ def main() -> None:
     _set_seed(args.seed)
 
     models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
-    allowed = {"gine", "sage", "gcn"}
+    allowed = {"gine", "sage", "gcn", "gps"}
     if not models or any(m not in allowed for m in models):
         raise ValueError(f"--models must be comma-separated subset of {sorted(allowed)}")
 
