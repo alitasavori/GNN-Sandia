@@ -530,12 +530,34 @@ def main() -> None:
     torch.save(y_mean, out_dir / "y_mean.pt")
     torch.save(y_std, out_dir / "y_std.pt")
 
-    ds = GraphVoltageDataset(x_n, y_ri, edge_index, edge_attr)
-    dl_tr = DataLoader(Subset(ds, idx_train.tolist()), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    dl_va = DataLoader(Subset(ds, idx_val.tolist()), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    dl_te = DataLoader(Subset(ds, idx_test.tolist()), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ds = GraphVoltageDataset(x_n, y_ri, edge_index, edge_attr)
+    pin = device.type == "cuda"
+    nw = int(args.num_workers)
+    dl_tr = DataLoader(
+        Subset(ds, idx_train.tolist()),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
+    dl_va = DataLoader(
+        Subset(ds, idx_val.tolist()),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
+    dl_te = DataLoader(
+        Subset(ds, idx_test.tolist()),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=pin,
+        persistent_workers=nw > 0,
+    )
     print(f"Device={device} n_nodes={n_nodes} n_edges={int(edge_index.shape[1])} models={models}", flush=True)
 
     results: dict[str, dict] = {}
