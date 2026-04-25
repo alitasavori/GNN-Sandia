@@ -224,6 +224,9 @@ class DAGPSModel(nn.Module):
         edge_dim: int,
         dropout: float,
         gradient_checkpointing: bool = False,
+        per_node_heads: bool = False,
+        per_device_cap_head: bool = False,
+        per_device_reg_head: bool = False,
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
@@ -233,6 +236,9 @@ class DAGPSModel(nn.Module):
         self.n_reg = int(n_reg)
         self.n_system = int(n_system)
         self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.per_node_heads = bool(per_node_heads)
+        self.per_device_cap_head = bool(per_device_cap_head)
+        self.per_device_reg_head = bool(per_device_reg_head)
         self.g_tokens = int(n_cap + n_reg + n_system)
         self.node_in = nn.Sequential(
             nn.Linear(2, hidden),
@@ -252,9 +258,31 @@ class DAGPSModel(nn.Module):
                 for _ in range(int(n_layers))
             ]
         )
-        self.volt_head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 2))
-        self.cap_head = nn.Linear(hidden, 1, bias=False)
-        self.reg_head = nn.Linear(hidden, 1, bias=False)
+        if self.per_node_heads:
+            self.volt_W = nn.Parameter(torch.randn(self.n_nodes, self.hidden, 2) * 0.02)
+            self.volt_b = nn.Parameter(torch.zeros(self.n_nodes, 2))
+            self.volt_head = None
+        else:
+            self.volt_head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 2))
+            self.volt_W = None
+            self.volt_b = None
+        if self.per_device_cap_head:
+            self.cap_W = nn.Parameter(torch.randn(self.n_cap, self.hidden) * 0.02)
+            self.cap_b = nn.Parameter(torch.zeros(self.n_cap))
+            self.cap_head = None
+        else:
+            self.cap_head = nn.Linear(hidden, 1, bias=False)
+            self.cap_W = None
+            self.cap_b = None
+
+        if self.per_device_reg_head:
+            self.reg_W = nn.Parameter(torch.randn(self.n_reg, self.hidden) * 0.02)
+            self.reg_b = nn.Parameter(torch.zeros(self.n_reg))
+            self.reg_head = None
+        else:
+            self.reg_head = nn.Linear(hidden, 1, bias=False)
+            self.reg_W = None
+            self.reg_b = None
 
     def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = data.x
@@ -280,9 +308,23 @@ class DAGPSModel(nn.Module):
             else:
                 h, T = blk(h, T, data.edge_index, data.edge_attr, bptr)
 
-        volt = self.volt_head(h)
-        cap_logits = self.cap_head(T[:, : self.n_cap, :]).squeeze(-1)
-        reg_pred = self.reg_head(T[:, self.n_cap : self.n_cap + self.n_reg, :]).squeeze(-1)
+        if self.per_node_heads:
+            h_per = h.view(B, self.n_nodes, self.hidden)
+            volt = torch.einsum("bnd,ndo->bno", h_per, self.volt_W) + self.volt_b
+            volt = volt.reshape(B * self.n_nodes, 2)
+        else:
+            volt = self.volt_head(h)
+        T_cap = T[:, : self.n_cap, :]
+        if self.per_device_cap_head:
+            cap_logits = (T_cap * self.cap_W.unsqueeze(0)).sum(-1) + self.cap_b.unsqueeze(0)
+        else:
+            cap_logits = self.cap_head(T_cap).squeeze(-1)
+
+        T_reg = T[:, self.n_cap : self.n_cap + self.n_reg, :]
+        if self.per_device_reg_head:
+            reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
+        else:
+            reg_pred = self.reg_head(T_reg).squeeze(-1)
         return volt, cap_logits, reg_pred
 
 
@@ -451,6 +493,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Checkpoint each GPS block in training to save activation memory (~30%% slower).",
     )
+    p.add_argument(
+        "--per_node_heads",
+        action="store_true",
+        help="Use independent per-node voltage decoder instead of shared MLP head.",
+    )
+    p.add_argument(
+        "--per_device_cap_head",
+        action="store_true",
+        help="Use independent decoder per cap bank token instead of shared linear.",
+    )
+    p.add_argument(
+        "--per_device_reg_head",
+        action="store_true",
+        help="Use independent decoder per regulator token instead of shared linear.",
+    )
     return p.parse_args()
 
 
@@ -593,6 +650,9 @@ def main() -> None:
         edge_dim=int(edge_attr.size(1)),
         dropout=dropout,
         gradient_checkpointing=bool(args.gradient_checkpointing),
+        per_node_heads=bool(args.per_node_heads),
+        per_device_cap_head=bool(args.per_device_cap_head),
+        per_device_reg_head=bool(args.per_device_reg_head),
     ).to(device)
     model = base_model
     if device.type == "cuda" and not args.no_compile:
@@ -707,6 +767,9 @@ def main() -> None:
             "n_cap": n_cap,
             "n_reg": n_reg,
             "n_system_tokens": n_sys,
+            "per_node_heads": bool(args.per_node_heads),
+            "per_device_cap_head": bool(args.per_device_cap_head),
+            "per_device_reg_head": bool(args.per_device_reg_head),
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
         },
