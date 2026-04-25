@@ -377,14 +377,16 @@ def evaluate(
     for batch in dl:
         batch = batch.to(device)
         yb = batch.y.view(batch.num_graphs, -1)
+        y_cap = batch.y_cap.view(batch.num_graphs, -1)
+        y_reg = batch.y_reg.view(batch.num_graphs, -1)
         with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
             v_n, c_log, r_p = model(batch)
         preds.append((v_n * y_std.to(device) + y_mean.to(device)).view(batch.num_graphs, -1).cpu())
         tgts.append(yb.cpu())
         cap_logits_all.append(c_log.cpu())
-        cap_tgt_all.append(batch.y_cap.cpu())
+        cap_tgt_all.append(y_cap.cpu())
         reg_pred_all.append(r_p.cpu())
-        reg_tgt_all.append(batch.y_reg.cpu())
+        reg_tgt_all.append(y_reg.cpu())
     pred = torch.cat(preds, dim=0)
     tgt = torch.cat(tgts, dim=0)
     met = _metrics_voltage(pred, tgt)
@@ -630,13 +632,15 @@ def main() -> None:
         for batch in dl_tr:
             batch = batch.to(device)
             yb = batch.y.view(batch.num_graphs, -1)
+            y_cap = batch.y_cap.view(batch.num_graphs, -1)
+            y_reg = batch.y_reg.view(batch.num_graphs, -1)
             yb_n = (yb - y_mean_d) / y_std_d
             opt.zero_grad(set_to_none=True)
             with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
                 v_n, c_log, r_p = model(batch)
                 loss_v = mse(v_n.view_as(yb_n), yb_n)
-                loss_c = bce(c_log, batch.y_cap.to(device))
-                loss_r = mse(r_p, batch.y_reg.to(device))
+                loss_c = bce(c_log, y_cap)
+                loss_r = mse(r_p, y_reg)
                 loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -656,12 +660,14 @@ def main() -> None:
             for batch in dl_va:
                 batch = batch.to(device)
                 yb = batch.y.view(batch.num_graphs, -1)
+                y_cap = batch.y_cap.view(batch.num_graphs, -1)
+                y_reg = batch.y_reg.view(batch.num_graphs, -1)
                 yb_n = (yb - y_mean_d) / y_std_d
                 with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
                     v_n, c_log, r_p = model(batch)
                     lv = mse(v_n.view_as(yb_n), yb_n)
-                    lc = bce(c_log, batch.y_cap.to(device))
-                    lr_ = mse(r_p, batch.y_reg.to(device))
+                    lc = bce(c_log, y_cap)
+                    lr_ = mse(r_p, y_reg)
                     lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                 val_tot += float(lt.item()) * batch.num_graphs
                 val_v += float(lv.item()) * batch.num_graphs
