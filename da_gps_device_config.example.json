@@ -1,0 +1,41 @@
+{
+  "_comment": "Map each supervised latent token to a host MV node (exact string as in nodes CSV / node index) and list meta_csv columns in the same token order: caps first, then regs.",
+  "cap_host_nodes": [
+    "R42246.1", "R42246.2", "R42246.3",
+    "R42247.1", "R42247.2", "R42247.3",
+    "R20185.1", "R20185.2", "R20185.3",
+    "R18242.1"
+  ],
+  "reg_host_nodes": [
+    "_HVMV_Sub_LSB.1", "_HVMV_Sub_LSB.2", "_HVMV_Sub_LSB.3",
+    "190-8593.1", "190-8593.2", "190-8593.3",
+    "190-8581.1", "190-8581.2", "190-8581.3",
+    "190-7361.1", "190-7361.2", "190-7361.3"
+  ],
+  "cap_target_cols": [
+    "cap_capbank0a_n_steps_on",
+    "cap_capbank0b_n_steps_on",
+    "cap_capbank0c_n_steps_on",
+    "cap_capbank1a_n_steps_on",
+    "cap_capbank1b_n_steps_on",
+    "cap_capbank1c_n_steps_on",
+    "cap_capbank2a_n_steps_on",
+    "cap_capbank2b_n_steps_on",
+    "cap_capbank2c_n_steps_on",
+    "cap_capbank3_n_steps_on"
+  ],
+  "reg_target_cols": [
+    "reg_feeder_rega_tap_pu",
+    "reg_feeder_regb_tap_pu",
+    "reg_feeder_regc_tap_pu",
+    "reg_vreg2_a_tap_pu",
+    "reg_vreg2_b_tap_pu",
+    "reg_vreg2_c_tap_pu",
+    "reg_vreg3_a_tap_pu",
+    "reg_vreg3_b_tap_pu",
+    "reg_vreg3_c_tap_pu",
+    "reg_vreg4_a_tap_pu",
+    "reg_vreg4_b_tap_pu",
+    "reg_vreg4_c_tap_pu"
+  ]
+}
