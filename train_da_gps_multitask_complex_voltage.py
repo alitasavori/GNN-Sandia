@@ -1,13 +1,12 @@
 """
-Device-Aware GPS (DA-GPS): Perceiver-style latent tokens + cross-attention + local MPNN,
+DA-GPS v2: Perceiver-style latent tokens + cross-attention + local MPNN,
 multitask voltage + cap (BCE) + regulator (MSE on z-scored taps).
 
-Global features per graph (broadcast to every node before the node MLP):
-  g = [ sum(P), sum(Q), g3 ] with g3 = z-scored slack |V| (pu) when --substation_node_idx is set,
-  else g3 = mean P over the graph (not mean of P and Q together).
-
-Expects full-MV static graph (same topology for all samples) and aux labels in meta_csv.
-Device→bus mapping: JSON (see da_gps_device_config.example.json).
+v2 alignment:
+- Node inputs are raw [P, Q] only (no PE, no global scalars).
+- Tokens are pure learnable parameters (no host-node warm start).
+- No effective-resistance attention bias.
+- Aux targets are hardcoded in-script (old aux-trainer style).
 """
 from __future__ import annotations
 
@@ -23,11 +22,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, Subset
 from torch.utils.checkpoint import checkpoint
-
-try:
-    from torch_scatter import scatter as _scatter_op
-except Exception:  # pragma: no cover
-    _scatter_op = None
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_batch
@@ -35,50 +29,33 @@ from torch_geometric.utils import to_dense_batch
 from train_gnn_only_compare_complex_voltage import _build_complex_targets
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges, _load_nodes_pq_target
 
+TARGET_REG_COLS: tuple[str, ...] = (
+    "reg_feeder_rega_tap_pu",
+    "reg_feeder_regb_tap_pu",
+    "reg_feeder_regc_tap_pu",
+    "reg_vreg2_a_tap_pu",
+    "reg_vreg2_b_tap_pu",
+    "reg_vreg2_c_tap_pu",
+    "reg_vreg3_a_tap_pu",
+    "reg_vreg3_b_tap_pu",
+    "reg_vreg3_c_tap_pu",
+    "reg_vreg4_a_tap_pu",
+    "reg_vreg4_b_tap_pu",
+    "reg_vreg4_c_tap_pu",
+)
 
-def _scatter_reduce(
-    src: torch.Tensor,
-    index: torch.Tensor,
-    dim_size: int,
-    reduce: str,
-) -> torch.Tensor:
-    """Per-graph reduction: index is [0..B-1] per node. Fallback if torch_scatter missing."""
-    if _scatter_op is not None:
-        return _scatter_op(src, index, dim=0, dim_size=dim_size, reduce=reduce)
-    if reduce == "sum":
-        out = src.new_zeros(dim_size, *src.shape[1:])
-        out.index_add_(0, index, src)
-        return out
-    if reduce == "mean":
-        s = _scatter_reduce(src, index, dim_size, "sum")
-        ones = torch.ones(index.size(0), device=src.device, dtype=src.dtype)
-        c = _scatter_reduce(ones, index, dim_size, "sum")
-        if s.dim() > 1:
-            c = c.unsqueeze(-1)
-        return s / c.clamp_min(1e-8)
-    raise ValueError(f"reduce={reduce} not supported in fallback scatter")
-
-
-def _batched_global_features(
-    x: torch.Tensor,
-    batch: torch.Tensor,
-    *,
-    v_sub_per_graph: torch.Tensor | None,
-) -> torch.Tensor:
-    """
-    Per-node broadcast: [sum P, sum Q, third] for each node's graph.
-    Third = v_sub_per_graph (slack |V| pu) when provided; else mean P over that graph.
-    """
-    B = int(batch.max().item()) + 1
-    p = x[:, 0]
-    q = x[:, 1]
-    sum_p = _scatter_reduce(p, batch, B, "sum")[batch]
-    sum_q = _scatter_reduce(q, batch, B, "sum")[batch]
-    if v_sub_per_graph is not None:
-        g3 = v_sub_per_graph[batch]
-    else:
-        g3 = _scatter_reduce(p, batch, B, "mean")[batch]
-    return torch.stack([sum_p, sum_q, g3], dim=-1)
+TARGET_CAP_COLS: tuple[str, ...] = (
+    "cap_capbank0a_n_steps_on",
+    "cap_capbank0b_n_steps_on",
+    "cap_capbank0c_n_steps_on",
+    "cap_capbank1a_n_steps_on",
+    "cap_capbank1b_n_steps_on",
+    "cap_capbank1c_n_steps_on",
+    "cap_capbank2a_n_steps_on",
+    "cap_capbank2b_n_steps_on",
+    "cap_capbank2c_n_steps_on",
+    "cap_capbank3_n_steps_on",
+)
 
 
 def _set_seed(seed: int) -> None:
@@ -93,74 +70,6 @@ def _norm_sid(s: object) -> int:
         return int(float(s))
     except Exception:
         return int(str(s).strip())
-
-
-def load_device_config(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    for k in ("cap_host_nodes", "reg_host_nodes", "cap_target_cols", "reg_target_cols"):
-        if k not in data:
-            raise ValueError(f"device config {path} missing required key {k!r}")
-    caps = data["cap_host_nodes"]
-    regs = data["reg_host_nodes"]
-    ccols = data["cap_target_cols"]
-    rcols = data["reg_target_cols"]
-    if len(caps) != len(ccols):
-        raise ValueError(f"cap_host_nodes ({len(caps)}) vs cap_target_cols ({len(ccols)})")
-    if len(regs) != len(rcols):
-        raise ValueError(f"reg_host_nodes ({len(regs)}) vs reg_target_cols ({len(rcols)})")
-    return data
-
-
-def _resolve_node_idx(node_to_local: dict[str, int], name: str) -> int:
-    s = str(name).strip()
-    if s in node_to_local:
-        return int(node_to_local[s])
-    low = {k.lower(): v for k, v in node_to_local.items()}
-    if s.lower() in low:
-        return int(low[s.lower()])
-    raise KeyError(f"Node {name!r} not in graph node list (check device JSON).")
-
-
-def pe_from_pinv(Lp: np.ndarray) -> torch.Tensor:
-    """PE_i from L+: row stats of Omega_ij = L+_ii + L+_jj - 2 L+_ij."""
-    n = int(Lp.shape[0])
-    diag = np.diag(Lp)
-    Omega = diag.reshape(-1, 1) + diag.reshape(1, -1) - 2.0 * Lp
-    pe = np.zeros((n, 5), dtype=np.float32)
-    for i in range(n):
-        row = Omega[i, :].astype(np.float64)
-        pe[i, 0] = float(row.min())
-        pe[i, 1] = float(row.max())
-        pe[i, 2] = float(row.std())
-        pe[i, 3] = float(np.median(row))
-        pe[i, 4] = float(row.mean())
-    return torch.from_numpy(pe)
-
-
-def build_omega_device_columns(Lp: np.ndarray, host_indices: list[int]) -> np.ndarray:
-    """Omega[:, host_j] for each device j. Lp is N×N Moore–Penrose inverse of L."""
-    n = Lp.shape[0]
-    out = np.zeros((n, len(host_indices)), dtype=np.float32)
-    diag = np.diag(Lp)
-    for j, h in enumerate(host_indices):
-        out[:, j] = diag + Lp[h, h] - 2.0 * Lp[:, h]
-    return out
-
-
-def laplacian_pinv(edge_index: torch.Tensor, edge_attr: torch.Tensor, n_nodes: int, min_x: float = 1e-4) -> np.ndarray:
-    ei = edge_index.cpu().numpy()
-    ea = edge_attr.cpu().numpy()
-    n = int(n_nodes)
-    L = np.zeros((n, n), dtype=np.float64)
-    for k in range(ei.shape[1]):
-        u, v = int(ei[0, k]), int(ei[1, k])
-        x = float(abs(ea[k, 1]))
-        w = 1.0 / max(x, min_x)
-        L[u, u] += w
-        L[v, v] += w
-        L[u, v] -= w
-        L[v, u] -= w
-    return np.linalg.pinv(L, rcond=1e-9)
 
 
 def _multihead_cross_attn(
@@ -205,7 +114,7 @@ class EdgeAttnMPNN(nn.Module):
         super().__init__()
         self.msg = nn.Sequential(nn.Linear(2 * d + edge_dim, d), nn.ReLU(), nn.Linear(d, d))
         self.gate = nn.Linear(d, 1)
-        self.self_lin = nn.Linear(d, d)
+        self.node_mlp = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, d))
         self.drop = nn.Dropout(dropout)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
@@ -214,7 +123,7 @@ class EdgeAttnMPNN(nn.Module):
         alpha = torch.sigmoid(self.gate(m))
         acc = torch.zeros_like(h)
         acc.index_add_(0, col, alpha * m)
-        return self.drop(self.self_lin(h) + acc)
+        return self.drop(self.node_mlp(torch.cat([h, acc], dim=-1)))
 
 
 class DAGPSBlock(nn.Module):
@@ -224,7 +133,6 @@ class DAGPSBlock(nn.Module):
         hidden: int,
         heads: int,
         edge_dim: int,
-        n_dev: int,
         dropout: float,
     ):
         super().__init__()
@@ -232,7 +140,6 @@ class DAGPSBlock(nn.Module):
             raise ValueError("hidden must divide heads")
         self.hidden = hidden
         self.heads = heads
-        self.n_dev = int(n_dev)
         self.dropout_p = float(dropout)
         self.wq_nt = nn.Linear(hidden, hidden)
         self.wk_nt = nn.Linear(hidden, hidden)
@@ -261,7 +168,6 @@ class DAGPSBlock(nn.Module):
             nn.Linear(hidden * 4, hidden),
             nn.Dropout(dropout),
         )
-        self.beta = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -270,7 +176,6 @@ class DAGPSBlock(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         batch: torch.Tensor,
-        omega_dev: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h_dense, node_mask = to_dense_batch(h_in, batch)
         B, N, _ = h_dense.shape
@@ -288,13 +193,6 @@ class DAGPSBlock(nn.Module):
         T_mid = self.norm_t2(T_mid + self.ffn_t(T_mid))
 
         attn_bias = None
-        if omega_dev is not None and self.n_dev > 0:
-            o = omega_dev.to(h_dense.device, dtype=h_dense.dtype)
-            bias_ng = -self.beta * o.unsqueeze(0).expand(B, -1, -1)
-            Gtok = T_mid.size(1)
-            attn_bias = h_dense.new_zeros(B, N, Gtok)
-            attn_bias[:, :, : self.n_dev] = bias_ng
-            attn_bias = attn_bias.masked_fill(~node_mask.unsqueeze(-1), 0.0)
 
         q2 = self.wq_tn(h_dense)
         k2 = self.wk_tn(T_mid)
@@ -323,10 +221,6 @@ class DAGPSModel(nn.Module):
         n_cap: int,
         n_reg: int,
         n_system: int,
-        pe_static: torch.Tensor,
-        cap_host_idx: torch.Tensor,
-        reg_host_idx: torch.Tensor,
-        omega_dev: torch.Tensor | None,
         edge_dim: int,
         dropout: float,
         gradient_checkpointing: bool = False,
@@ -340,29 +234,19 @@ class DAGPSModel(nn.Module):
         self.n_system = int(n_system)
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.g_tokens = int(n_cap + n_reg + n_system)
-        pe_dim = int(pe_static.size(1))
-        self.register_buffer("pe_static", pe_static)
         self.node_in = nn.Sequential(
-            nn.Linear(2 + pe_dim + 3, hidden),
-            nn.LayerNorm(hidden),
+            nn.Linear(2, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
         )
         self.token_latent = nn.Parameter(torch.randn(self.g_tokens, hidden) * 0.02)
-        self.token_pe_proj = nn.Linear(pe_dim, hidden)
-        self.register_buffer("cap_host_idx", cap_host_idx.long().clamp(0, pe_static.size(0) - 1))
-        self.register_buffer("reg_host_idx", reg_host_idx.long().clamp(0, pe_static.size(0) - 1))
-        if omega_dev is not None:
-            self.register_buffer("omega_dev", omega_dev)
-        else:
-            self.omega_dev = None
         self.blocks = nn.ModuleList(
             [
                 DAGPSBlock(
                     hidden=hidden,
                     heads=heads,
                     edge_dim=edge_dim,
-                    n_dev=n_cap + n_reg,
                     dropout=dropout,
                 )
                 for _ in range(int(n_layers))
@@ -375,29 +259,13 @@ class DAGPSModel(nn.Module):
     def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = data.x
         batch = data.batch if hasattr(data, "batch") and data.batch is not None else None
-        pe0 = self.pe_static.to(x.device, dtype=x.dtype)
         if batch is None:
-            pe = pe0
             B = 1
         else:
             B = int(batch.max().item()) + 1
-            pe = pe0.unsqueeze(0).expand(B, -1, -1).reshape(-1, pe0.size(-1))
-        v_sub_graph: torch.Tensor | None = None
-        if hasattr(data, "v_sub") and data.v_sub is not None:
-            v_sub_graph = data.v_sub.view(-1)
-        if batch is None:
-            b_one = x.new_zeros(x.size(0), dtype=torch.long)
-            g = _batched_global_features(x, b_one, v_sub_per_graph=v_sub_graph)
-        else:
-            g = _batched_global_features(x, batch, v_sub_per_graph=v_sub_graph)
-        h = self.node_in(torch.cat([x, pe, g], dim=-1))
-        T = self.token_latent.unsqueeze(0).expand(B, -1, -1).clone()
-        for k in range(self.n_cap):
-            T[:, k] = T[:, k] + self.token_pe_proj(pe0[self.cap_host_idx[k]])
-        for k in range(self.n_reg):
-            T[:, self.n_cap + k] = T[:, self.n_cap + k] + self.token_pe_proj(pe0[self.reg_host_idx[k]])
+        h = self.node_in(x)
+        T = self.token_latent.unsqueeze(0).repeat(B, 1, 1)
         bptr = batch if batch is not None else torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        od = self.omega_dev if hasattr(self, "omega_dev") and self.omega_dev is not None else None
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
                 h, T = checkpoint(
@@ -407,11 +275,10 @@ class DAGPSModel(nn.Module):
                     data.edge_index,
                     data.edge_attr,
                     bptr,
-                    od,
                     use_reentrant=False,
                 )
             else:
-                h, T = blk(h, T, data.edge_index, data.edge_attr, bptr, od)
+                h, T = blk(h, T, data.edge_index, data.edge_attr, bptr)
 
         volt = self.volt_head(h)
         cap_logits = self.cap_head(T[:, : self.n_cap, :]).squeeze(-1)
@@ -428,7 +295,6 @@ class DAGPSDataset(Dataset):
         y_reg: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
-        v_sub: torch.Tensor | None = None,
     ):
         self.x = x
         self.y_ri = y_ri
@@ -436,13 +302,12 @@ class DAGPSDataset(Dataset):
         self.y_reg = y_reg
         self.edge_index = edge_index
         self.edge_attr = edge_attr
-        self.v_sub = v_sub
 
     def __len__(self) -> int:
         return int(self.x.shape[0])
 
     def __getitem__(self, i: int) -> Data:
-        d = Data(
+        return Data(
             x=self.x[i],
             y=self.y_ri[i],
             edge_index=self.edge_index,
@@ -450,35 +315,6 @@ class DAGPSDataset(Dataset):
             y_cap=self.y_cap[i],
             y_reg=self.y_reg[i],
         )
-        if self.v_sub is not None:
-            d.v_sub = self.v_sub[i].view(1)
-        return d
-
-
-def _load_substation_vmag(
-    nodes_csv: Path,
-    sample_ids: list[int],
-    substation_node_idx: int,
-) -> torch.Tensor:
-    """|V| pu at the configured node index (e.g. slack); one value per sample_id."""
-    import pandas as pd
-
-    sid_to_i = {int(s): j for j, s in enumerate(sample_ids)}
-    out = np.full(len(sample_ids), np.nan, dtype=np.float32)
-    usecols = ["sample_id", "node_idx", "vmag_pu"]
-    for chunk in pd.read_csv(nodes_csv, usecols=usecols, chunksize=500_000):
-        row_s = chunk["sample_id"].map(lambda v: sid_to_i.get(int(float(v)), -1)).to_numpy(dtype=np.int64)
-        ni = chunk["node_idx"].to_numpy(dtype=np.int64)
-        valid = (row_s >= 0) & (ni == int(substation_node_idx))
-        if not np.any(valid):
-            continue
-        out[row_s[valid]] = chunk.loc[valid, "vmag_pu"].to_numpy(dtype=np.float32)
-    if np.isnan(out).any():
-        miss = int(np.isnan(out).sum())
-        raise ValueError(
-            f"substation node_idx={substation_node_idx}: missing vmag for {miss}/{len(sample_ids)} samples; check nodes CSV / index"
-        )
-    return torch.from_numpy(out)
 
 
 def _load_meta_aux(
@@ -565,12 +401,11 @@ def evaluate(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="DA-GPS multitask: voltage + cap + reg (full MV).")
+    p = argparse.ArgumentParser(description="DA-GPS v2 multitask: voltage + cap + reg (full MV, hardcoded aux cols).")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg_full_mv")
     p.add_argument("--nodes_csv", type=str, default="gnn_node_features_and_targets_full_mv.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="gnn_edges_phase_static_full_mv.csv")
     p.add_argument("--meta_csv", type=str, default="gnn_sample_meta.csv")
-    p.add_argument("--device_config_json", type=str, required=True, help="Path to device/host/column mapping JSON.")
     p.add_argument("--n_system_tokens", type=int, default=10, help="Unsupervised latent tokens after cap+reg tokens.")
     p.add_argument("--out_dir", type=str, default="da_gps_multitask_full_mv")
     p.add_argument("--epochs", type=int, default=200)
@@ -578,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=5)
     p.add_argument("--heads", type=int, default=8)
-    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--disable_dropout", action="store_true")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
@@ -592,20 +427,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers; 0 only for tiny debug runs.")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--cache_tensor", type=str, default="")
-    p.add_argument("--pe_cache", type=str, default="", help="Optional .pt path for cached PE + omega_dev.")
     p.add_argument(
         "--early_stop_on",
         type=str,
         default="total",
         choices=("total", "voltage"),
         help="Validation metric for best checkpoint / patience.",
-    )
-    p.add_argument(
-        "--substation_node_idx",
-        type=int,
-        default=None,
-        help="If set, third global = vmag_pu for this node_idx from nodes CSV (slack / substation |V|). "
-        "Else third global = mean P over the graph (not mixed P&Q).",
     )
     p.add_argument(
         "--no_amp",
@@ -637,11 +464,6 @@ def main() -> None:
     nodes_path = Path(args.nodes_csv) if Path(args.nodes_csv).is_absolute() else (data_root / args.nodes_csv).resolve()
     edges_path = Path(args.edge_catalog_csv) if Path(args.edge_catalog_csv).is_absolute() else (data_root / args.edge_catalog_csv).resolve()
     meta_path = Path(args.meta_csv) if Path(args.meta_csv).is_absolute() else (data_root / args.meta_csv).resolve()
-    dev_cfg_path = Path(args.device_config_json) if Path(args.device_config_json).is_absolute() else (repo / args.device_config_json).resolve()
-    if not dev_cfg_path.is_file():
-        dev_cfg_path = Path(args.device_config_json).resolve()
-    if not dev_cfg_path.is_file():
-        raise FileNotFoundError(dev_cfg_path)
 
     for pth in (nodes_path, edges_path, meta_path):
         if not pth.is_file():
@@ -652,9 +474,8 @@ def main() -> None:
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dev = load_device_config(dev_cfg_path)
-    cap_cols = list(dev["cap_target_cols"])
-    reg_cols = list(dev["reg_target_cols"])
+    cap_cols = list(TARGET_CAP_COLS)
+    reg_cols = list(TARGET_REG_COLS)
     n_cap = len(cap_cols)
     n_reg = len(reg_cols)
     n_sys = int(args.n_system_tokens)
@@ -684,39 +505,7 @@ def main() -> None:
         _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_pq_target(nodes_path)
         del _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp
 
-    cap_hosts = [_resolve_node_idx(node_to_local, n) for n in dev["cap_host_nodes"]]
-    reg_hosts = [_resolve_node_idx(node_to_local, n) for n in dev["reg_host_nodes"]]
-    cap_idx_t = torch.tensor(cap_hosts, dtype=torch.long)
-    reg_idx_t = torch.tensor(reg_hosts, dtype=torch.long)
-
     n_nodes = int(x.shape[1])
-    pe_path = Path(args.pe_cache).resolve() if args.pe_cache else None
-    if pe_path and pe_path.is_file():
-        print(f"Loading PE cache: {pe_path}", flush=True)
-        pe_pack = torch.load(pe_path, map_location="cpu", weights_only=False)
-        pe_static = pe_pack["pe_static"]
-        omega_dev = pe_pack["omega_dev"]
-        if int(omega_dev.shape[1]) != n_cap + n_reg:
-            raise ValueError(
-                f"PE cache omega_dev columns {omega_dev.shape[1]} != n_cap+n_reg {n_cap + n_reg}; delete cache or fix JSON"
-            )
-    else:
-        print("Computing effective-resistance PE + omega device columns (dense pinv; one-time)...", flush=True)
-        t0 = time.perf_counter()
-        Lp = laplacian_pinv(edge_index, edge_attr, n_nodes)
-        pe_static = pe_from_pinv(Lp)
-        host_all = cap_hosts + reg_hosts
-        omega_np = build_omega_device_columns(Lp, host_all)
-        omega_dev = torch.from_numpy(omega_np)
-        if int(omega_dev.shape[1]) != n_cap + n_reg:
-            raise ValueError(
-                f"omega_dev columns {omega_dev.shape[1]} != n_cap+n_reg {n_cap + n_reg} (check device JSON hosts)"
-            )
-        print(f"  done in {time.perf_counter() - t0:.1f}s", flush=True)
-        if pe_path:
-            pe_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"pe_static": pe_static, "omega_dev": omega_dev}, pe_path)
-            print(f"Wrote PE cache: {pe_path}", flush=True)
 
     y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
     y_cap, y_reg = _load_meta_aux(meta_path, sample_ids, cap_cols, reg_cols)
@@ -762,23 +551,8 @@ def main() -> None:
     torch.save(reg_mean, out_dir / "reg_mean.pt")
     torch.save(reg_std, out_dir / "reg_std.pt")
 
-    v_sub_n: torch.Tensor | None = None
-    if args.substation_node_idx is not None:
-        v_raw = _load_substation_vmag(nodes_path, sample_ids, int(args.substation_node_idx))
-        v_m = v_raw[idx_train].mean()
-        v_s = v_raw[idx_train].std(unbiased=False).clamp_min(1e-6)
-        v_sub_n = (v_raw - v_m) / v_s
-        torch.save(v_m, out_dir / "v_sub_mean.pt")
-        torch.save(v_s, out_dir / "v_sub_std.pt")
-        print(
-            f"Third global: z-scored vmag_pu at node_idx={int(args.substation_node_idx)} (train mean/std).",
-            flush=True,
-        )
-    else:
-        print("Third global: mean P per graph (not V_sub; pass --substation_node_idx to use slack |V|).", flush=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, v_sub=v_sub_n)
+    ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
     pin = device.type == "cuda"
     nw = int(args.num_workers)
     dl_tr = DataLoader(
@@ -814,10 +588,6 @@ def main() -> None:
         n_cap=n_cap,
         n_reg=n_reg,
         n_system=n_sys,
-        pe_static=pe_static,
-        cap_host_idx=cap_idx_t,
-        reg_host_idx=reg_idx_t,
-        omega_dev=omega_dev,
         edge_dim=int(edge_attr.size(1)),
         dropout=dropout,
         gradient_checkpointing=bool(args.gradient_checkpointing),
@@ -931,7 +701,6 @@ def main() -> None:
             "n_cap": n_cap,
             "n_reg": n_reg,
             "n_system_tokens": n_sys,
-            "device_config": str(dev_cfg_path.resolve()),
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
         },
@@ -942,7 +711,6 @@ def main() -> None:
         "nodes_csv": str(nodes_path),
         "edges_csv": str(edges_path),
         "meta_csv": str(meta_path),
-        "device_config": str(dev_cfg_path.resolve()),
         "n_samples": n,
         "n_nodes": n_nodes,
         "g_tokens": g_tot,
