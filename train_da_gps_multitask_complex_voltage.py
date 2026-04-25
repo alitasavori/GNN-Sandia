@@ -689,6 +689,8 @@ def main() -> None:
 
     for ep in range(1, args.epochs + 1):
         model.train()
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = 0.0
+        train_n = 0
         for batch in dl_tr:
             batch = batch.to(device)
             yb = batch.y.view(batch.num_graphs, -1)
@@ -712,9 +714,16 @@ def main() -> None:
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
+            with torch.no_grad():
+                train_loss_sum += float(loss.item()) * batch.num_graphs
+                train_v_sum += float(loss_v.item()) * batch.num_graphs
+                train_c_sum += float(loss_c.item()) * batch.num_graphs
+                train_r_sum += float(loss_r.item()) * batch.num_graphs
+                train_n += int(batch.num_graphs)
 
         model.eval()
         val_tot = val_v = 0.0
+        val_c_sum = val_r_sum = 0.0
         nv = 0
         with torch.no_grad():
             for batch in dl_va:
@@ -731,9 +740,17 @@ def main() -> None:
                     lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                 val_tot += float(lt.item()) * batch.num_graphs
                 val_v += float(lv.item()) * batch.num_graphs
+                val_c_sum += float(lc.item()) * batch.num_graphs
+                val_r_sum += float(lr_.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
+        val_c = val_c_sum / max(nv, 1)
+        val_r = val_r_sum / max(nv, 1)
+        train_v = train_v_sum / max(train_n, 1)
+        train_c = train_c_sum / max(train_n, 1)
+        train_r = train_r_sum / max(train_n, 1)
+        train_tot = train_loss_sum / max(train_n, 1)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
         if crit < best_val:
@@ -744,7 +761,10 @@ def main() -> None:
             bad += 1
         if ep == 1 or ep % max(1, int(args.log_every)) == 0:
             print(
-                f"[da_gps] epoch {ep:4d}/{args.epochs} val_tot={val_tot:.6f} val_volt={val_v:.6f} best={best_val:.6f}",
+                f"[da_gps] epoch {ep:4d}/{args.epochs} "
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f} "
+                f"| val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| best={best_val:.4f}",
                 flush=True,
             )
         if bad >= args.patience:
