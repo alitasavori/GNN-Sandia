@@ -393,11 +393,18 @@ def _metrics_voltage(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[str, 
     d_ang = (d_ang + math.pi) % (2.0 * math.pi) - math.pi
     ang_err_deg = torch.rad2deg(d_ang)
     vmag_err = pred_mag - true_mag
+    var_true = ((true_mag - true_mag.mean(dim=0, keepdim=True)) ** 2).mean(dim=0)
+    mse_node = ((pred_mag - true_mag) ** 2).mean(dim=0)
+    r2_per_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+    worst_node_mae = (pred_mag - true_mag).abs().max(dim=1).values.mean()
     return {
         "mae_vmag_pu": float(vmag_err.abs().mean().item()),
         "rmse_vmag_pu": float(torch.sqrt((vmag_err * vmag_err).mean()).item()),
         "mae_angle_deg": float(ang_err_deg.abs().mean().item()),
         "rmse_angle_deg": float(torch.sqrt((ang_err_deg * ang_err_deg).mean()).item()),
+        "r2_vmag_mean": float(r2_per_node.mean().item()),
+        "r2_vmag_min": float(r2_per_node.min().item()),
+        "mae_vmag_worst_node": float(worst_node_mae.item()),
     }
 
 
@@ -423,7 +430,8 @@ def evaluate(
         y_reg = batch.y_reg.view(batch.num_graphs, -1)
         with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
             v_n, c_log, r_p = model(batch)
-        preds.append((v_n * y_std.to(device) + y_mean.to(device)).view(batch.num_graphs, -1).cpu())
+        v_n_flat = v_n.view(batch.num_graphs, -1)
+        preds.append((v_n_flat * y_std.to(device) + y_mean.to(device)).cpu())
         tgts.append(yb.cpu())
         cap_logits_all.append(c_log.cpu())
         cap_tgt_all.append(y_cap.cpu())
