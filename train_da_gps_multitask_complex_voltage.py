@@ -215,12 +215,15 @@ class DAGPSModel(nn.Module):
         self,
         *,
         n_nodes: int,
+        num_edges: int,
         hidden: int,
         heads: int,
         n_layers: int,
         n_cap: int,
         n_reg: int,
         n_system: int,
+        node_emb_dim: int,
+        edge_emb_dim: int,
         edge_dim: int,
         dropout: float,
         gradient_checkpointing: bool = False,
@@ -230,29 +233,35 @@ class DAGPSModel(nn.Module):
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
+        self.num_edges = int(num_edges)
         self.hidden = int(hidden)
         self.heads = int(heads)
         self.n_cap = int(n_cap)
         self.n_reg = int(n_reg)
         self.n_system = int(n_system)
+        self.node_emb_dim = max(0, int(node_emb_dim))
+        self.edge_emb_dim = max(0, int(edge_emb_dim))
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.per_node_heads = bool(per_node_heads)
         self.per_device_cap_head = bool(per_device_cap_head)
         self.per_device_reg_head = bool(per_device_reg_head)
         self.g_tokens = int(n_cap + n_reg + n_system)
+        self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
+        self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
         self.node_in = nn.Sequential(
-            nn.Linear(2, hidden),
+            nn.Linear(2 + self.node_emb_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
         )
+        eff_edge_dim = int(edge_dim + self.edge_emb_dim)
         self.token_latent = nn.Parameter(torch.randn(self.g_tokens, hidden) * 0.02)
         self.blocks = nn.ModuleList(
             [
                 DAGPSBlock(
                     hidden=hidden,
                     heads=heads,
-                    edge_dim=edge_dim,
+                    edge_dim=eff_edge_dim,
                     dropout=dropout,
                 )
                 for _ in range(int(n_layers))
@@ -284,8 +293,19 @@ class DAGPSModel(nn.Module):
             self.reg_W = None
             self.reg_b = None
 
+    def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
+        return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
+
+    def _edge_ids(self, e_total: int, device: torch.device) -> torch.Tensor:
+        return torch.arange(self.num_edges, device=device, dtype=torch.long).repeat(e_total // self.num_edges)
+
     def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = data.x
+        ea = data.edge_attr
+        if self.node_emb is not None:
+            x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
+        if self.edge_emb is not None:
+            ea = torch.cat([ea, self.edge_emb(self._edge_ids(ea.size(0), ea.device))], dim=-1)
         batch = data.batch if hasattr(data, "batch") and data.batch is not None else None
         if batch is None:
             B = 1
@@ -301,12 +321,12 @@ class DAGPSModel(nn.Module):
                     h,
                     T,
                     data.edge_index,
-                    data.edge_attr,
+                    ea,
                     bptr,
                     use_reentrant=False,
                 )
             else:
-                h, T = blk(h, T, data.edge_index, data.edge_attr, bptr)
+                h, T = blk(h, T, data.edge_index, ea, bptr)
 
         if self.per_node_heads:
             h_per = h.view(B, self.n_nodes, self.hidden)
@@ -465,6 +485,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=5)
     p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--node_emb_dim", type=int, default=0, help="Optional learned node-id embedding dim.")
+    p.add_argument("--edge_emb_dim", type=int, default=0, help="Optional learned edge-id embedding dim.")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--disable_dropout", action="store_true")
     p.add_argument("--lr", type=float, default=5e-4)
@@ -649,12 +671,15 @@ def main() -> None:
 
     base_model = DAGPSModel(
         n_nodes=n_nodes,
+        num_edges=int(edge_index.shape[1]),
         hidden=int(args.hidden),
         heads=int(args.heads),
         n_layers=int(args.layers),
         n_cap=n_cap,
         n_reg=n_reg,
         n_system=n_sys,
+        node_emb_dim=int(args.node_emb_dim),
+        edge_emb_dim=int(args.edge_emb_dim),
         edge_dim=int(edge_attr.size(1)),
         dropout=dropout,
         gradient_checkpointing=bool(args.gradient_checkpointing),
@@ -817,6 +842,8 @@ def main() -> None:
             "n_cap": n_cap,
             "n_reg": n_reg,
             "n_system_tokens": n_sys,
+            "node_emb_dim": int(args.node_emb_dim),
+            "edge_emb_dim": int(args.edge_emb_dim),
             "per_node_heads": bool(args.per_node_heads),
             "per_device_cap_head": bool(args.per_device_cap_head),
             "per_device_reg_head": bool(args.per_device_reg_head),
