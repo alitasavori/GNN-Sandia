@@ -187,11 +187,18 @@ def _metrics_from_ri_flat(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[
     true_ang = torch.atan2(true_im, true_re)
     ang_err_deg = _angle_diff_deg(pred_ang, true_ang)
     vmag_err = pred_mag - true_mag
+    var_true = ((true_mag - true_mag.mean(dim=0, keepdim=True)) ** 2).mean(dim=0)
+    mse_node = ((pred_mag - true_mag) ** 2).mean(dim=0)
+    r2_per_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+    worst_node_mae = (pred_mag - true_mag).abs().max(dim=1).values.mean()
     return {
         "mae_vmag_pu": float(vmag_err.abs().mean().item()),
         "rmse_vmag_pu": float(torch.sqrt((vmag_err * vmag_err).mean()).item()),
         "mae_angle_deg": float(ang_err_deg.abs().mean().item()),
         "rmse_angle_deg": float(torch.sqrt((ang_err_deg * ang_err_deg).mean()).item()),
+        "r2_vmag_mean": float(r2_per_node.mean().item()),
+        "r2_vmag_min": float(r2_per_node.min().item()),
+        "mae_vmag_worst_node": float(worst_node_mae.item()),
     }
 
 
@@ -418,6 +425,9 @@ def main() -> None:
                 "val_mae_vmag_pu": float(live_val["mae_vmag_pu"]),
                 "val_rmse_vmag_pu": float(live_val["rmse_vmag_pu"]),
                 "val_mae_angle_deg": float(live_val["mae_angle_deg"]),
+                "val_r2_mean": float(live_val["r2_vmag_mean"]),
+                "val_r2_min": float(live_val["r2_vmag_min"]),
+                "val_worst_mae": float(live_val["mae_vmag_worst_node"]),
             }
         )
 
@@ -435,6 +445,9 @@ def main() -> None:
                 f"val_mse_norm={val_v_mse:.6f} "
                 f"val_mae_vmag={live_val['mae_vmag_pu']:.6f} "
                 f"val_rmse_vmag={live_val['rmse_vmag_pu']:.6f} "
+                f"val_r2_mean={live_val['r2_vmag_mean']:.4f} "
+                f"val_r2_min={live_val['r2_vmag_min']:.4f} "
+                f"val_worst_mae={live_val['mae_vmag_worst_node']:.4f} "
                 f"best_val_mse={best_val_mse:.6f}",
                 flush=True,
             )
