@@ -733,6 +733,10 @@ def main() -> None:
         val_tot = val_v = 0.0
         val_c_sum = val_r_sum = 0.0
         nv = 0
+        val_sum_true = torch.zeros(n_nodes, device=device)
+        val_sum_true2 = torch.zeros(n_nodes, device=device)
+        val_sum_se = torch.zeros(n_nodes, device=device)
+        val_sum_worst = 0.0
         with torch.no_grad():
             for batch in dl_va:
                 batch = batch.to(device)
@@ -751,10 +755,27 @@ def main() -> None:
                 val_c_sum += float(lc.item()) * batch.num_graphs
                 val_r_sum += float(lr_.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
+                v_flat = v_n.view(batch.num_graphs, -1)
+                pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
+                true_ri = yb.view(batch.num_graphs, n_nodes, 2)
+                pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
+                true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
+                err = pred_mag - true_mag
+                val_sum_true += true_mag.sum(dim=0)
+                val_sum_true2 += (true_mag * true_mag).sum(dim=0)
+                val_sum_se += (err * err).sum(dim=0)
+                val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
         val_c = val_c_sum / max(nv, 1)
         val_r = val_r_sum / max(nv, 1)
+        true_mean = val_sum_true / max(nv, 1)
+        var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
+        mse_node = val_sum_se / max(nv, 1)
+        r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+        val_r2_mean = float(r2_node.mean().item())
+        val_r2_min = float(r2_node.min().item())
+        val_worst_node_mae = val_sum_worst / max(nv, 1)
         train_v = train_v_sum / max(train_n, 1)
         train_c = train_c_sum / max(train_n, 1)
         train_r = train_r_sum / max(train_n, 1)
@@ -772,6 +793,7 @@ def main() -> None:
                 f"[da_gps] epoch {ep:4d}/{args.epochs} "
                 f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f} "
                 f"| val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
                 f"| best={best_val:.4f}",
                 flush=True,
             )
