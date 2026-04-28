@@ -560,6 +560,21 @@ def _metrics_voltage(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[str, 
     }
 
 
+def _cast_batch_float_tensors(batch: Data) -> Data:
+    # Defensive cast: keep graph index tensors as-is, force numeric tensors to float32.
+    if hasattr(batch, "x") and batch.x is not None:
+        batch.x = batch.x.float()
+    if hasattr(batch, "y") and batch.y is not None:
+        batch.y = batch.y.float()
+    if hasattr(batch, "edge_attr") and batch.edge_attr is not None:
+        batch.edge_attr = batch.edge_attr.float()
+    if hasattr(batch, "y_cap") and batch.y_cap is not None:
+        batch.y_cap = batch.y_cap.float()
+    if hasattr(batch, "y_reg") and batch.y_reg is not None:
+        batch.y_reg = batch.y_reg.float()
+    return batch
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -577,6 +592,7 @@ def evaluate(
     reg_pred_all, reg_tgt_all = [], []
     for batch in dl:
         batch = batch.to(device)
+        batch = _cast_batch_float_tensors(batch)
         yb = batch.y.view(batch.num_graphs, -1)
         y_cap = batch.y_cap.view(batch.num_graphs, -1)
         y_reg = batch.y_reg.view(batch.num_graphs, -1)
@@ -1040,6 +1056,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             for batch in dl_tr:
                 batch = batch.to(device)
+                batch = _cast_batch_float_tensors(batch)
                 yb = batch.y.view(batch.num_graphs, -1)
                 y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
                 y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
@@ -1109,6 +1126,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 )
                 for batch in dl_va:
                     batch = batch.to(device)
+                    batch = _cast_batch_float_tensors(batch)
                     yb = batch.y.view(batch.num_graphs, -1)
                     y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
                     y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
@@ -1561,6 +1579,7 @@ def main() -> None:
         train_n = 0
         for batch in dl_tr:
             batch = batch.to(device)
+            batch = _cast_batch_float_tensors(batch)
             yb = batch.y.view(batch.num_graphs, -1)
             y_cap = batch.y_cap.view(batch.num_graphs, -1)
             y_reg = batch.y_reg.view(batch.num_graphs, -1)
@@ -1600,6 +1619,7 @@ def main() -> None:
         with torch.no_grad():
             for batch in dl_va:
                 batch = batch.to(device)
+                batch = _cast_batch_float_tensors(batch)
                 yb = batch.y.view(batch.num_graphs, -1)
                 y_cap = batch.y_cap.view(batch.num_graphs, -1)
                 y_reg = batch.y_reg.view(batch.num_graphs, -1)
