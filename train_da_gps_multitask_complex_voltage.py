@@ -665,7 +665,11 @@ def _ensure_chunk_tensor_cache(
             sids = [int(x) for x in sids.tolist()]
         else:
             sids = list(sids)
-        return z["x"], z["y_ri"], z["y_cap"], z["y_reg"], sids, ntl
+        x = z["x"].to(dtype=torch.float32)
+        y_ri = z["y_ri"].to(dtype=torch.float32)
+        y_cap = z["y_cap"].to(dtype=torch.float32)
+        y_reg = z["y_reg"].to(dtype=torch.float32)
+        return x, y_ri, y_cap, y_reg, sids, ntl
 
     if not np_.is_file() or not mp_.is_file():
         raise FileNotFoundError(f"{np_} / {mp_}")
@@ -676,9 +680,13 @@ def _ensure_chunk_tensor_cache(
         node_pe_cols=node_pe_cols,
         selected_sample_ids=selected_sample_ids,
     )
+    x = x.to(dtype=torch.float32)
+    y_ri = y_ri.to(dtype=torch.float32)
     if ref_ntl is not None and node_to_local != ref_ntl:
         raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
     y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
+    y_cap = y_cap.to(dtype=torch.float32)
+    y_reg = y_reg.to(dtype=torch.float32)
     cache_pt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -740,8 +748,8 @@ def _evaluate_multi_chunks(
             cache_pt=cpt,
             ref_ntl=ref_ntl,
         )
-        y_reg_n = (y_reg - reg_mean) / reg_std
-        x_n = (x - x_mean) / x_std
+        y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+        x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
         ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
         dl = DataLoader(
             Subset(ds, idx_te.tolist()),
@@ -1019,8 +1027,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 cache_pt=cpt,
                 ref_ntl=ref_ntl,
             )
-            y_reg_n = (y_reg - reg_mean) / reg_std
-            x_n = (x - x_mean) / x_std
+            y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+            x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
             ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
             dl_tr = DataLoader(
                 Subset(ds, idx_train_list[ci_i].tolist()),
@@ -1088,8 +1096,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     cache_pt=cpt,
                     ref_ntl=ref_ntl,
                 )
-                y_reg_n = (y_reg - reg_mean) / reg_std
-                x_n = (x - x_mean) / x_std
+                y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+                x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
                 ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
                 dl_va = DataLoader(
                     Subset(ds, idx_val_list[ci].tolist()),
@@ -1382,8 +1390,10 @@ def main() -> None:
     if cache_path and cache_path.is_file():
         print(f"Loading cache: {cache_path}", flush=True)
         pack = torch.load(cache_path, map_location="cpu", weights_only=False)
-        x = pack["x"]
+        x = pack["x"].to(dtype=torch.float32)
         y_ri = pack.get("y_ri")
+        if y_ri is not None:
+            y_ri = y_ri.to(dtype=torch.float32)
         edge_index = pack["edge_index"]
         edge_attr = pack["edge_attr"]
         sample_ids = pack["sample_ids"]
@@ -1394,6 +1404,8 @@ def main() -> None:
             node_pe_csv=node_pe_csv,
             node_pe_cols=node_pe_cols,
         )
+        x = x.to(dtype=torch.float32)
+        y_ri = y_ri.to(dtype=torch.float32)
         edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1418,6 +1430,8 @@ def main() -> None:
     if y_ri is None:
         y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
     y_cap, y_reg = _load_meta_aux(meta_path, sample_ids, cap_cols, reg_cols)
+    y_cap = y_cap.to(dtype=torch.float32)
+    y_reg = y_reg.to(dtype=torch.float32)
 
     if args.sample_frac < 1.0:
         k = max(1, int(round(len(sample_ids) * args.sample_frac)))
@@ -1451,7 +1465,7 @@ def main() -> None:
 
     reg_mean = y_reg[idx_train].mean(dim=0, keepdim=True)
     reg_std = y_reg[idx_train].std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-    y_reg_n = (y_reg - reg_mean) / reg_std
+    y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
 
     torch.save(x_mean, out_dir / "x_mean.pt")
     torch.save(x_std, out_dir / "x_std.pt")
