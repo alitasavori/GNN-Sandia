@@ -125,10 +125,19 @@ def _load_nodes_features_complex_targets(
             if miss:
                 raise ValueError(f"{node_pe_csv} missing PE columns: {miss}")
             pe_map = pe_df.set_index("node")[pe_cols]
-            miss_nodes = [n for n in node_order if n not in pe_map.index]
+            # In this dataset, PE is often computed for a filtered graph-node set,
+            # while node samples may include extra source/substation nodes.
+            # Keep PE where available; zero-fill missing nodes.
+            pe_aligned = pe_map.reindex(node_order)
+            miss_nodes = pe_aligned.index[pe_aligned.isna().any(axis=1)].tolist()
             if miss_nodes:
-                raise ValueError(f"{node_pe_csv}: missing {len(miss_nodes)} nodes (showing up to 5): {miss_nodes[:5]}")
-            pe_mat = pe_map.loc[node_order].to_numpy(dtype=np.float32)
+                print(
+                    f"WARNING: {node_pe_csv} missing PE for {len(miss_nodes)} nodes "
+                    f"(showing up to 5): {miss_nodes[:5]} -- filling zeros.",
+                    flush=True,
+                )
+                pe_aligned = pe_aligned.fillna(0.0)
+            pe_mat = pe_aligned.to_numpy(dtype=np.float32)
             print(f"Using PE from {node_pe_csv} with columns: {pe_cols}", flush=True)
 
     d_dyn = len(node_feature_cols)
