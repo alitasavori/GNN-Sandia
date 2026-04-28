@@ -1,0 +1,36 @@
+! REV 3
+!----------------------------------------------------------------------------------------------------------------------------
+! OpenDSS script to run IEEE 8500-node feeder in DAILY mode (5-minute resolution)
+! Balanced Load Case
+!----------------------------------------------------------------------------------------------------------------------------
+
+! Compile balanced 8500 master
+Compile (Master.dss)
+
+! Daily load multiplier from local CSV (time,value with 288 points at 5-minute spacing)
+! CSV path is relative to this script location (8500-node folder).
+New Loadshape.Day5min npts=288 interval=0.0833333333333333 mult=(file=5minDayShape.csv, col=2, header=no)
+
+! Apply this daily profile to all loads.
+BatchEdit Load..* Daily=Day5min
+
+! Solver settings for daily run
+Set maxiterations=20
+Set mode=daily
+Set stepsize=5m
+Set number=288
+
+! Optional monitor/energymeter
+New Energymeter.m1 Line.ln5815900-1 1
+
+! Run full day
+Solve
+
+! Optional output/plots
+Set ShowExport=yes
+Export Voltages
+Export Currents
+Export Powers
+
+summary
+show taps

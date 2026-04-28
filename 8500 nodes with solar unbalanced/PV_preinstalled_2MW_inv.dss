@@ -1,0 +1,33 @@
+! ============================================================================
+! Pre-installed PV Systems (2 x 1000 kW = 2 MW total)
+! PV1: Constant PF (MPPT only)
+! PV2: VoltVar with Q limited to +/-0.44 pu of kVA rating
+! ============================================================================
+
+! Daily irradiance profile (5-minute, 288 points).
+! irr_day_001.csv format is (time,value), so use column 2 as multiplier.
+New Loadshape.IrradDay001 npts=288 interval=0.0833333333333333 mult=(file=irr_day_001.csv, col=2, header=no)
+
+! --- PV1: 1000 kW, Constant PF (no reactive support) ---
+New PVSystem.PV1  Bus1=p850080  Phases=3  kVA=1000  kV=12.47
+~ Pmpp=1000  PF=1.0  %Cutin=0.1  %Cutout=0.1
+~ irradiance=1.0  Temperature=25  Daily=IrradDay001
+
+! --- PV2: 1000 kW, VoltVar with Q = +/-0.44 pu ---
+New PVSystem.PV2  Bus1=l3235256  Phases=3  kVA=1000  kV=12.47
+~ Pmpp=1000  PF=1.0  %Cutin=0.1  %Cutout=0.1
+~ irradiance=1.0  Temperature=25  Daily=IrradDay001
+
+! --- VoltVar Curve: Q limited to +/-0.44 pu of kVA ---
+! At V=0.92: inject +0.44 (support voltage)
+! At V=0.98: zero (deadband start)
+! At V=1.02: zero (deadband end)
+! At V=1.08: absorb -0.44 (suppress overvoltage)
+New XYCurve.vv_curve_044  npts=4
+~ xarray=[0.92  0.98  1.02  1.08]
+~ yarray=[0.44  0.0   0.0  -0.44]
+
+New InvControl.PV2_VV  Mode=VOLTVAR  voltage_curvex_ref=rated
+~ vvc_curve1=vv_curve_044
+~ DERList=[PVSystem.PV2]
+~ RefReactivePower=VARMAX
