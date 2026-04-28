@@ -98,14 +98,34 @@ def _load_nodes_features_complex_targets(
     node_feature_cols: list[str],
     node_pe_csv: Path | None,
     node_pe_cols: str,
+    selected_sample_ids: list[int] | None = None,
+    csv_chunksize: int = 500_000,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[str], dict[str, int]]:
     import pandas as pd
 
     req = ["sample_id", "node", "node_idx", "vmag_pu", "vang_deg", *node_feature_cols]
     print(f"Loading nodes: {nodes_csv}", flush=True)
-    df = pd.read_csv(nodes_csv, usecols=req)
-    sample_ids = sorted(df["sample_id"].unique().tolist())
-    first = df[df["sample_id"] == sample_ids[0]].sort_values("node_idx")
+    if selected_sample_ids is not None:
+        sample_ids = [int(_norm_sid(s)) for s in selected_sample_ids]
+    else:
+        sid_set_all: set[int] = set()
+        for ch in pd.read_csv(nodes_csv, usecols=["sample_id"], chunksize=int(csv_chunksize)):
+            sid_set_all.update(int(_norm_sid(s)) for s in ch["sample_id"].tolist())
+        sample_ids = sorted(sid_set_all)
+    if not sample_ids:
+        raise RuntimeError(f"No sample IDs found for {nodes_csv}")
+    selected_set = set(sample_ids)
+
+    sid0 = int(sample_ids[0])
+    first_rows = []
+    for ch in pd.read_csv(nodes_csv, usecols=["sample_id", "node", "node_idx"], chunksize=int(csv_chunksize)):
+        sid_col = ch["sample_id"].map(_norm_sid)
+        sub = ch.loc[sid_col == sid0, ["node", "node_idx"]]
+        if len(sub):
+            first_rows.append(sub)
+    if not first_rows:
+        raise RuntimeError(f"sample_id={sid0} not found in {nodes_csv}")
+    first = pd.concat(first_rows, ignore_index=True).sort_values("node_idx")
     node_order = first["node"].astype(str).str.strip().str.lower().tolist()
     node_to_local = {n: i for i, n in enumerate(node_order)}
     n_nodes = len(node_order)
@@ -147,20 +167,27 @@ def _load_nodes_features_complex_targets(
     if pe_mat is not None:
         x_np[:, :, d_dyn:] = pe_mat[None, :, :]
 
-    for si, sid in enumerate(sample_ids):
-        if si > 0 and si % 500 == 0:
-            print(f"  stacked {si}/{len(sample_ids)} samples...", flush=True)
-        sub = df[df["sample_id"] == sid].sort_values("node_idx")
-        if len(sub) != n_nodes:
-            raise RuntimeError(f"sample_id={sid}: expected {n_nodes}, got {len(sub)}")
-        if sub["node"].astype(str).str.strip().str.lower().tolist() != node_order:
-            raise RuntimeError(f"sample_id={sid}: node order mismatch")
+    sid_to_i = {int(s): i for i, s in enumerate(sample_ids)}
+    fill_counts = np.zeros((len(sample_ids),), dtype=np.int64)
+    for ch in pd.read_csv(nodes_csv, usecols=req, chunksize=int(csv_chunksize)):
+        sid_arr = ch["sample_id"].map(_norm_sid).to_numpy(dtype=np.int64)
+        node_arr = ch["node"].astype(str).str.strip().str.lower().map(node_to_local).fillna(-1).to_numpy(dtype=np.int64)
+        valid = np.array([(int(s) in selected_set) for s in sid_arr], dtype=bool) & (node_arr >= 0)
+        if not np.any(valid):
+            continue
+        s_local = np.array([sid_to_i[int(s)] for s in sid_arr[valid]], dtype=np.int64)
+        n_local = node_arr[valid]
         for j, c in enumerate(node_feature_cols):
-            x_np[si, :, j] = sub[c].to_numpy(np.float32)
-        vmag = sub["vmag_pu"].to_numpy(np.float32)
-        vang_rad = np.deg2rad(sub["vang_deg"].to_numpy(np.float32))
-        y_ri_np[si, :, 0] = vmag * np.cos(vang_rad)
-        y_ri_np[si, :, 1] = vmag * np.sin(vang_rad)
+            x_np[s_local, n_local, j] = ch.loc[valid, c].to_numpy(dtype=np.float32)
+        vmag = ch.loc[valid, "vmag_pu"].to_numpy(dtype=np.float32)
+        vang_rad = np.deg2rad(ch.loc[valid, "vang_deg"].to_numpy(dtype=np.float32))
+        y_ri_np[s_local, n_local, 0] = vmag * np.cos(vang_rad)
+        y_ri_np[s_local, n_local, 1] = vmag * np.sin(vang_rad)
+        np.add.at(fill_counts, s_local, 1)
+    bad = np.where(fill_counts != n_nodes)[0]
+    if len(bad):
+        sid_bad = [sample_ids[int(i)] for i in bad[:5]]
+        raise RuntimeError(f"Incomplete node rows for {len(bad)} samples in {nodes_csv}; sample_ids like {sid_bad}")
 
     return torch.from_numpy(x_np), torch.from_numpy(y_ri_np), sample_ids, node_order, node_to_local
 
@@ -588,6 +615,30 @@ def _file_digest(path: Path, chunk_bytes: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _select_sample_ids_from_meta(meta_csv: Path, sample_frac: float, seed: int, chunk_idx: int) -> list[int] | None:
+    if float(sample_frac) >= 1.0:
+        return None
+    import pandas as pd
+
+    df = pd.read_csv(meta_csv, usecols=["sample_id"])
+    sids = [int(_norm_sid(s)) for s in df["sample_id"].tolist()]
+    if not sids:
+        return []
+    rng = np.random.default_rng(int(seed) + int(chunk_idx) * 100_003)
+    k = max(1, int(round(len(sids) * float(sample_frac))))
+    pick = rng.choice(len(sids), size=k, replace=False)
+    pick_sorted = np.sort(pick)
+    return [int(sids[i]) for i in pick_sorted]
+
+
+def _chunk_cache_path(cache_dir: Path, chunk_name: str, sample_frac: float, seed: int, chunk_idx: int) -> Path:
+    if float(sample_frac) >= 1.0:
+        tag = "full"
+    else:
+        tag = f"sf{float(sample_frac):.6f}_s{int(seed)}_c{int(chunk_idx)}"
+    return cache_dir / f"{chunk_name}__{tag}.pt"
+
+
 def _ensure_chunk_tensor_cache(
     chunk_dir: Path,
     *,
@@ -596,6 +647,7 @@ def _ensure_chunk_tensor_cache(
     node_feature_cols: list[str],
     node_pe_csv: Path | None,
     node_pe_cols: str,
+    selected_sample_ids: list[int] | None,
     cap_cols: list[str],
     reg_cols: list[str],
     cache_pt: Path,
@@ -622,6 +674,7 @@ def _ensure_chunk_tensor_cache(
         node_feature_cols=node_feature_cols,
         node_pe_csv=node_pe_csv,
         node_pe_cols=node_pe_cols,
+        selected_sample_ids=selected_sample_ids,
     )
     if ref_ntl is not None and node_to_local != ref_ntl:
         raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
@@ -646,6 +699,8 @@ def _evaluate_multi_chunks(
     model: nn.Module,
     chunk_dirs: list[Path],
     idx_lists: list[np.ndarray],
+    cache_pts: list[Path],
+    selected_ids_list: list[list[int] | None],
     *,
     nodes_name: str,
     meta_name: str,
@@ -669,10 +724,9 @@ def _evaluate_multi_chunks(
 ) -> dict[str, float]:
     met_acc: dict[str, float] | None = None
     wtot = 0
-    for ch, idx_te in zip(chunk_dirs, idx_lists):
+    for ch, idx_te, cpt, sel_ids in zip(chunk_dirs, idx_lists, cache_pts, selected_ids_list):
         if len(idx_te) == 0:
             continue
-        cpt = cache_dir / f"{ch.name}.pt"
         x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
             ch,
             nodes_name=nodes_name,
@@ -680,6 +734,7 @@ def _evaluate_multi_chunks(
             node_feature_cols=node_feature_cols,
             node_pe_csv=node_pe_csv,
             node_pe_cols=node_pe_cols,
+            selected_sample_ids=sel_ids,
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             cache_pt=cpt,
@@ -780,6 +835,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     idx_train_list: list[np.ndarray] = []
     idx_val_list: list[np.ndarray] = []
     idx_test_list: list[np.ndarray] = []
+    selected_ids_list: list[list[int] | None] = []
+    cache_pts: list[Path] = []
 
     sum_x: torch.Tensor | None = None
     sum_x2: torch.Tensor | None = None
@@ -798,7 +855,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     n_node_features = 0
 
     for ci, ch in enumerate(chunk_dirs):
-        cpt = cache_dir / f"{ch.name}.pt"
+        meta_path = ch / meta_name
+        sel_ids = _select_sample_ids_from_meta(meta_path, float(args.sample_frac), int(args.seed), ci)
+        selected_ids_list.append(sel_ids)
+        cpt = _chunk_cache_path(cache_dir, ch.name, float(args.sample_frac), int(args.seed), ci)
+        cache_pts.append(cpt)
         x, y_ri, y_cap, y_reg, _sids, ntl = _ensure_chunk_tensor_cache(
             ch,
             nodes_name=nodes_name,
@@ -806,6 +867,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             node_feature_cols=node_feature_cols,
             node_pe_csv=node_pe_csv,
             node_pe_cols=node_pe_cols,
+            selected_sample_ids=sel_ids,
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             cache_pt=cpt,
@@ -824,13 +886,6 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             sum_reg = torch.zeros(n_reg, dtype=torch.float64)
             sum_reg2 = torch.zeros(n_reg, dtype=torch.float64)
         assert sum_x is not None and sum_x2 is not None and sum_y is not None and sum_reg is not None and edge_index is not None
-
-        if args.sample_frac < 1.0:
-            k = max(1, int(round(x.shape[0] * args.sample_frac)))
-            x = x[:k]
-            y_ri = y_ri[:k]
-            y_cap = y_cap[:k]
-            y_reg = y_reg[:k]
 
         n = int(x.shape[0])
         rng = np.random.default_rng(int(args.seed) + ci * 100_003)
@@ -948,8 +1003,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         train_n = 0
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
-            ch = chunk_dirs[int(ci)]
-            cpt = cache_dir / f"{ch.name}.pt"
+            ci_i = int(ci)
+            ch = chunk_dirs[ci_i]
+            cpt = cache_pts[ci_i]
             x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
                 ch,
                 nodes_name=nodes_name,
@@ -957,22 +1013,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 node_feature_cols=node_feature_cols,
                 node_pe_csv=node_pe_csv,
                 node_pe_cols=node_pe_cols,
+                selected_sample_ids=selected_ids_list[ci_i],
                 cap_cols=cap_cols,
                 reg_cols=reg_cols,
                 cache_pt=cpt,
                 ref_ntl=ref_ntl,
             )
-            if args.sample_frac < 1.0:
-                k = max(1, int(round(x.shape[0] * args.sample_frac)))
-                x = x[:k]
-                y_ri = y_ri[:k]
-                y_cap = y_cap[:k]
-                y_reg = y_reg[:k]
             y_reg_n = (y_reg - reg_mean) / reg_std
             x_n = (x - x_mean) / x_std
             ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
             dl_tr = DataLoader(
-                Subset(ds, idx_train_list[int(ci)].tolist()),
+                Subset(ds, idx_train_list[ci_i].tolist()),
                 batch_size=args.batch_size,
                 shuffle=True,
                 num_workers=nw,
@@ -1023,7 +1074,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         val_sum_worst = 0.0
         with torch.no_grad():
             for ci, ch in enumerate(chunk_dirs):
-                cpt = cache_dir / f"{ch.name}.pt"
+                cpt = cache_pts[ci]
                 x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
                     ch,
                     nodes_name=nodes_name,
@@ -1031,17 +1082,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     node_feature_cols=node_feature_cols,
                     node_pe_csv=node_pe_csv,
                     node_pe_cols=node_pe_cols,
+                    selected_sample_ids=selected_ids_list[ci],
                     cap_cols=cap_cols,
                     reg_cols=reg_cols,
                     cache_pt=cpt,
                     ref_ntl=ref_ntl,
                 )
-                if args.sample_frac < 1.0:
-                    k = max(1, int(round(x.shape[0] * args.sample_frac)))
-                    x = x[:k]
-                    y_ri = y_ri[:k]
-                    y_cap = y_cap[:k]
-                    y_reg = y_reg[:k]
                 y_reg_n = (y_reg - reg_mean) / reg_std
                 x_n = (x - x_mean) / x_std
                 ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
@@ -1127,6 +1173,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         model,
         chunk_dirs,
         idx_test_list,
+        cache_pts,
+        selected_ids_list,
         nodes_name=nodes_name,
         meta_name=meta_name,
         node_feature_cols=node_feature_cols,
