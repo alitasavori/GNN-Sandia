@@ -3,7 +3,7 @@ DA-GPS v2: Perceiver-style latent tokens + cross-attention + local MPNN,
 multitask voltage + cap (BCE) + regulator (MSE on z-scored taps).
 
 v2 alignment:
-- Node inputs are raw [P, Q] only (no PE, no global scalars).
+- Node inputs: dynamic columns from nodes CSV (default load P/Q) plus optional shared PE columns from a single master CSV.
 - Tokens are pure learnable parameters (no host-node warm start).
 - No effective-resistance attention bias.
 - Aux targets are hardcoded in-script (old aux-trainer style).
@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fnmatch
+import gc
+import hashlib
 import json
 import math
 import time
@@ -27,7 +30,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_batch
 
 from train_gnn_only_compare_complex_voltage import _build_complex_targets
-from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges, _load_nodes_pq_target
+from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 TARGET_REG_COLS: tuple[str, ...] = (
     "reg_feeder_rega_tap_pu",
@@ -70,6 +73,87 @@ def _norm_sid(s: object) -> int:
         return int(float(s))
     except Exception:
         return int(str(s).strip())
+
+
+def _parse_csv_cols(spec: str) -> list[str]:
+    cols = [c.strip() for c in str(spec).split(",") if c.strip()]
+    if not cols:
+        raise ValueError("node feature column list is empty.")
+    return cols
+
+
+def _resolve_pe_cols(pe_df_cols: list[str], pe_spec: str) -> list[str]:
+    spec = str(pe_spec).strip().lower()
+    if spec in ("", "none"):
+        return []
+    if spec == "auto":
+        cols = [c for c in pe_df_cols if str(c).lower().startswith("pe_")]
+        return sorted(cols)
+    return _parse_csv_cols(pe_spec)
+
+
+def _load_nodes_features_complex_targets(
+    nodes_csv: Path,
+    *,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[str], dict[str, int]]:
+    import pandas as pd
+
+    req = ["sample_id", "node", "node_idx", "vmag_pu", "vang_deg", *node_feature_cols]
+    print(f"Loading nodes: {nodes_csv}", flush=True)
+    df = pd.read_csv(nodes_csv, usecols=req)
+    sample_ids = sorted(df["sample_id"].unique().tolist())
+    first = df[df["sample_id"] == sample_ids[0]].sort_values("node_idx")
+    node_order = first["node"].astype(str).str.strip().str.lower().tolist()
+    node_to_local = {n: i for i, n in enumerate(node_order)}
+    n_nodes = len(node_order)
+
+    pe_cols: list[str] = []
+    pe_mat = None
+    if node_pe_csv is not None:
+        if not node_pe_csv.is_file():
+            raise FileNotFoundError(node_pe_csv)
+        pe_df = pd.read_csv(node_pe_csv)
+        if "node" not in pe_df.columns:
+            raise ValueError(f"{node_pe_csv} must contain a 'node' column.")
+        pe_df["node"] = pe_df["node"].astype(str).str.strip().str.lower()
+        pe_cols = _resolve_pe_cols(list(pe_df.columns), node_pe_cols)
+        if pe_cols:
+            miss = [c for c in pe_cols if c not in pe_df.columns]
+            if miss:
+                raise ValueError(f"{node_pe_csv} missing PE columns: {miss}")
+            pe_map = pe_df.set_index("node")[pe_cols]
+            miss_nodes = [n for n in node_order if n not in pe_map.index]
+            if miss_nodes:
+                raise ValueError(f"{node_pe_csv}: missing {len(miss_nodes)} nodes (showing up to 5): {miss_nodes[:5]}")
+            pe_mat = pe_map.loc[node_order].to_numpy(dtype=np.float32)
+            print(f"Using PE from {node_pe_csv} with columns: {pe_cols}", flush=True)
+
+    d_dyn = len(node_feature_cols)
+    d_pe = 0 if pe_mat is None else int(pe_mat.shape[1])
+    x_np = np.zeros((len(sample_ids), n_nodes, d_dyn + d_pe), dtype=np.float32)
+    y_ri_np = np.zeros((len(sample_ids), n_nodes, 2), dtype=np.float32)
+    if pe_mat is not None:
+        x_np[:, :, d_dyn:] = pe_mat[None, :, :]
+
+    for si, sid in enumerate(sample_ids):
+        if si > 0 and si % 500 == 0:
+            print(f"  stacked {si}/{len(sample_ids)} samples...", flush=True)
+        sub = df[df["sample_id"] == sid].sort_values("node_idx")
+        if len(sub) != n_nodes:
+            raise RuntimeError(f"sample_id={sid}: expected {n_nodes}, got {len(sub)}")
+        if sub["node"].astype(str).str.strip().str.lower().tolist() != node_order:
+            raise RuntimeError(f"sample_id={sid}: node order mismatch")
+        for j, c in enumerate(node_feature_cols):
+            x_np[si, :, j] = sub[c].to_numpy(np.float32)
+        vmag = sub["vmag_pu"].to_numpy(np.float32)
+        vang_rad = np.deg2rad(sub["vang_deg"].to_numpy(np.float32))
+        y_ri_np[si, :, 0] = vmag * np.cos(vang_rad)
+        y_ri_np[si, :, 1] = vmag * np.sin(vang_rad)
+
+    return torch.from_numpy(x_np), torch.from_numpy(y_ri_np), sample_ids, node_order, node_to_local
 
 
 def _multihead_cross_attn(
@@ -222,6 +306,7 @@ class DAGPSModel(nn.Module):
         n_cap: int,
         n_reg: int,
         n_system: int,
+        node_in_dim: int,
         node_emb_dim: int,
         edge_emb_dim: int,
         edge_dim: int,
@@ -239,6 +324,7 @@ class DAGPSModel(nn.Module):
         self.n_cap = int(n_cap)
         self.n_reg = int(n_reg)
         self.n_system = int(n_system)
+        self.node_in_dim = int(node_in_dim)
         self.node_emb_dim = max(0, int(node_emb_dim))
         self.edge_emb_dim = max(0, int(edge_emb_dim))
         self.gradient_checkpointing = bool(gradient_checkpointing)
@@ -249,7 +335,7 @@ class DAGPSModel(nn.Module):
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
         self.node_in = nn.Sequential(
-            nn.Linear(2 + self.node_emb_dim, hidden),
+            nn.Linear(self.node_in_dim + self.node_emb_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
@@ -388,7 +474,17 @@ def _load_meta_aux(
     import pandas as pd
 
     usecols = ["sample_id", *cap_cols, *reg_cols]
-    df = pd.read_csv(meta_csv, usecols=usecols)
+    df = pd.read_csv(meta_csv)
+    ren = {}
+    for c in df.columns:
+        cs = str(c)
+        if cs.startswith("cap_") or cs.startswith("reg_"):
+            cl = cs.lower()
+            if cl != cs:
+                ren[c] = cl
+    if ren:
+        df = df.rename(columns=ren)
+    df = df[usecols]
     lk = {_norm_sid(k): j for j, k in enumerate(df["sample_id"].tolist())}
     miss = [sid for sid in sample_ids if _norm_sid(sid) not in lk]
     if miss:
@@ -472,12 +568,645 @@ def evaluate(
     return met
 
 
+def _file_digest(path: Path, chunk_bytes: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(chunk_bytes)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _ensure_chunk_tensor_cache(
+    chunk_dir: Path,
+    *,
+    nodes_name: str,
+    meta_name: str,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    cache_pt: Path,
+    ref_ntl: dict[str, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
+    np_ = chunk_dir / nodes_name
+    mp_ = chunk_dir / meta_name
+    if cache_pt.is_file():
+        z = torch.load(cache_pt, map_location="cpu", weights_only=False)
+        ntl = z["node_to_local"]
+        if ref_ntl is not None and ntl != ref_ntl:
+            raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+        sids = z["sample_ids"]
+        if isinstance(sids, torch.Tensor):
+            sids = [int(x) for x in sids.tolist()]
+        else:
+            sids = list(sids)
+        return z["x"], z["y_ri"], z["y_cap"], z["y_reg"], sids, ntl
+
+    if not np_.is_file() or not mp_.is_file():
+        raise FileNotFoundError(f"{np_} / {mp_}")
+    x, y_ri, sample_ids, _, node_to_local = _load_nodes_features_complex_targets(
+        np_,
+        node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
+        node_pe_cols=node_pe_cols,
+    )
+    if ref_ntl is not None and node_to_local != ref_ntl:
+        raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+    y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
+    cache_pt.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "x": x,
+            "y_ri": y_ri,
+            "y_cap": y_cap,
+            "y_reg": y_reg,
+            "sample_ids": sample_ids,
+            "node_to_local": node_to_local,
+        },
+        cache_pt,
+    )
+    print(f"Wrote chunk tensor cache: {cache_pt}", flush=True)
+    return x, y_ri, y_cap, y_reg, sample_ids, node_to_local
+
+
+def _evaluate_multi_chunks(
+    model: nn.Module,
+    chunk_dirs: list[Path],
+    idx_lists: list[np.ndarray],
+    *,
+    nodes_name: str,
+    meta_name: str,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    cache_dir: Path,
+    ref_ntl: dict[str, int],
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    reg_mean: torch.Tensor,
+    reg_std: torch.Tensor,
+    device: torch.device,
+    use_amp: bool,
+) -> dict[str, float]:
+    met_acc: dict[str, float] | None = None
+    wtot = 0
+    for ch, idx_te in zip(chunk_dirs, idx_lists):
+        if len(idx_te) == 0:
+            continue
+        cpt = cache_dir / f"{ch.name}.pt"
+        x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+            ch,
+            nodes_name=nodes_name,
+            meta_name=meta_name,
+            node_feature_cols=node_feature_cols,
+            node_pe_csv=node_pe_csv,
+            node_pe_cols=node_pe_cols,
+            cap_cols=cap_cols,
+            reg_cols=reg_cols,
+            cache_pt=cpt,
+            ref_ntl=ref_ntl,
+        )
+        y_reg_n = (y_reg - reg_mean) / reg_std
+        x_n = (x - x_mean) / x_std
+        ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+        dl = DataLoader(
+            Subset(ds, idx_te.tolist()),
+            batch_size=min(64, max(1, len(idx_te))),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
+        met = evaluate(model, dl, device, y_mean, y_std, reg_mean, reg_std, use_amp=use_amp)
+        w = int(len(idx_te))
+        if met_acc is None:
+            met_acc = {k: met[k] * w for k in met}
+        else:
+            for k in met:
+                met_acc[k] += met[k] * w
+        wtot += w
+        del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl
+        gc.collect()
+    if met_acc is None or wtot == 0:
+        return {
+            "mae_vmag_pu": float("nan"),
+            "rmse_vmag_pu": float("nan"),
+            "mae_angle_deg": float("nan"),
+            "rmse_angle_deg": float("nan"),
+            "r2_vmag_mean": float("nan"),
+            "r2_vmag_min": float("nan"),
+            "mae_vmag_worst_node": float("nan"),
+            "cap_bce": float("nan"),
+            "reg_mse_normalized": float("nan"),
+            "reg_mse_tap_pu": float("nan"),
+        }
+    return {k: met_acc[k] / float(wtot) for k in met_acc}
+
+
+def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
+    """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
+    _set_seed(args.seed)
+    dropout = 0.0 if args.disable_dropout else float(args.dropout)
+
+    chunk_parent = Path(args.chunk_parent).resolve()
+    if not chunk_parent.is_dir():
+        raise FileNotFoundError(chunk_parent)
+
+    glob_pat = str(args.chunk_subdir_glob)
+    chunk_dirs = sorted(
+        [p for p in chunk_parent.iterdir() if p.is_dir() and fnmatch.fnmatch(p.name, glob_pat)],
+        key=lambda p: p.name,
+    )
+    if not chunk_dirs:
+        raise FileNotFoundError(f"No subdirs matching {glob_pat!r} under {chunk_parent}")
+
+    nodes_name = Path(args.nodes_csv).name
+    edge_name = Path(args.edge_catalog_csv).name
+    meta_name = Path(args.meta_csv).name
+    node_feature_cols = _parse_csv_cols(args.node_feature_cols)
+    node_pe_csv = Path(args.node_pe_csv).resolve() if str(args.node_pe_csv).strip() else None
+    node_pe_cols = str(args.node_pe_cols)
+
+    out_dir = Path(args.out_dir)
+    if not out_dir.is_absolute():
+        out_dir = (repo / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = out_dir / "chunk_tensor_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.cache_tensor:
+        print(
+            "Note: --cache_tensor is ignored in --chunk_parent mode (per-chunk caches live under out_dir/chunk_tensor_cache).",
+            flush=True,
+        )
+
+    cap_cols = list(TARGET_CAP_COLS)
+    reg_cols = list(TARGET_REG_COLS)
+    n_cap = len(cap_cols)
+    n_reg = len(reg_cols)
+    n_sys = int(args.n_system_tokens)
+    g_tot = n_cap + n_reg + n_sys
+
+    ref_digest = _file_digest(chunk_dirs[0] / edge_name)
+    for ch in chunk_dirs[1:]:
+        ep = ch / edge_name
+        if not ep.is_file():
+            raise FileNotFoundError(ep)
+        if _file_digest(ep) != ref_digest:
+            raise RuntimeError(f"Edge catalog differs from first chunk (must be identical topology): {ep}")
+
+    print(f"[chunk_parent] {len(chunk_dirs)} chunks under {chunk_parent}", flush=True)
+    for d in chunk_dirs:
+        print(f"  - {d.name}", flush=True)
+
+    idx_train_list: list[np.ndarray] = []
+    idx_val_list: list[np.ndarray] = []
+    idx_test_list: list[np.ndarray] = []
+
+    sum_x: torch.Tensor | None = None
+    sum_x2: torch.Tensor | None = None
+    cnt_x = 0
+    sum_y: torch.Tensor | None = None
+    sum_y2: torch.Tensor | None = None
+    cnt_y = 0
+    sum_reg: torch.Tensor | None = None
+    sum_reg2: torch.Tensor | None = None
+    cnt_reg = 0
+
+    ref_ntl: dict[str, int] | None = None
+    edge_index: torch.Tensor | None = None
+    edge_attr: torch.Tensor | None = None
+    n_nodes = 0
+    n_node_features = 0
+
+    for ci, ch in enumerate(chunk_dirs):
+        cpt = cache_dir / f"{ch.name}.pt"
+        x, y_ri, y_cap, y_reg, _sids, ntl = _ensure_chunk_tensor_cache(
+            ch,
+            nodes_name=nodes_name,
+            meta_name=meta_name,
+            node_feature_cols=node_feature_cols,
+            node_pe_csv=node_pe_csv,
+            node_pe_cols=node_pe_cols,
+            cap_cols=cap_cols,
+            reg_cols=reg_cols,
+            cache_pt=cpt,
+            ref_ntl=ref_ntl,
+        )
+        if ci == 0:
+            ref_ntl = ntl
+            n_nodes = int(x.shape[1])
+            n_node_features = int(x.shape[2])
+            ep = ch / edge_name
+            edge_index, edge_attr = _load_compacted_edges(ep, ref_ntl)
+            sum_x = torch.zeros(n_node_features, dtype=torch.float64)
+            sum_x2 = torch.zeros(n_node_features, dtype=torch.float64)
+            sum_y = torch.zeros(n_nodes * 2, dtype=torch.float64)
+            sum_y2 = torch.zeros(n_nodes * 2, dtype=torch.float64)
+            sum_reg = torch.zeros(n_reg, dtype=torch.float64)
+            sum_reg2 = torch.zeros(n_reg, dtype=torch.float64)
+        assert sum_x is not None and sum_x2 is not None and sum_y is not None and sum_reg is not None and edge_index is not None
+
+        if args.sample_frac < 1.0:
+            k = max(1, int(round(x.shape[0] * args.sample_frac)))
+            x = x[:k]
+            y_ri = y_ri[:k]
+            y_cap = y_cap[:k]
+            y_reg = y_reg[:k]
+
+        n = int(x.shape[0])
+        rng = np.random.default_rng(int(args.seed) + ci * 100_003)
+        perm = rng.permutation(n)
+        n_train = int(n * args.train_frac)
+        n_val = int(n * args.val_frac)
+        n_test = n - n_train - n_val
+        if min(n_train, n_val, n_test) < 1:
+            raise ValueError(f"Invalid train/val/test split for chunk {ch.name}.")
+        idx_train_list.append(perm[:n_train])
+        idx_val_list.append(perm[n_train : n_train + n_val])
+        idx_test_list.append(perm[n_train + n_val :])
+
+        itr = idx_train_list[-1]
+        xt = x[itr].reshape(-1, n_node_features).to(dtype=torch.float64)
+        sum_x += xt.sum(dim=0)
+        sum_x2 += (xt * xt).sum(dim=0)
+        cnt_x += int(xt.shape[0])
+
+        yt = y_ri[itr].reshape(len(itr), -1).to(dtype=torch.float64)
+        sum_y += yt.sum(dim=0)
+        sum_y2 += (yt * yt).sum(dim=0)
+        cnt_y += len(itr)
+
+        rt = y_reg[itr].to(dtype=torch.float64)
+        sum_reg += rt.sum(dim=0)
+        sum_reg2 += (rt * rt).sum(dim=0)
+        cnt_reg += len(itr)
+
+        del x, y_ri, y_cap, y_reg
+        gc.collect()
+
+    assert ref_ntl is not None and edge_index is not None and edge_attr is not None
+    assert sum_y is not None and cnt_x > 0
+
+    assert sum_x is not None and sum_x2 is not None
+    x_mean = (sum_x / float(cnt_x)).view(1, n_node_features).float()
+    x_var = sum_x2 / float(cnt_x) - (sum_x / float(cnt_x)) ** 2
+    x_std = torch.sqrt(x_var.clamp_min(1e-24)).view(1, n_node_features).clamp_min(1e-8)
+
+    y_mean = (sum_y / float(cnt_y)).view(1, -1).float()
+    y_var = sum_y2 / float(cnt_y) - (sum_y / float(cnt_y)) ** 2
+    y_std = torch.sqrt(y_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6)
+
+    reg_mean = (sum_reg / float(cnt_reg)).view(1, -1).float()
+    reg_var = sum_reg2 / float(cnt_reg) - (sum_reg / float(cnt_reg)) ** 2
+    reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6)
+
+    torch.save(x_mean, out_dir / "x_mean.pt")
+    torch.save(x_std, out_dir / "x_std.pt")
+    torch.save(y_mean, out_dir / "y_mean.pt")
+    torch.save(y_std, out_dir / "y_std.pt")
+    torch.save(reg_mean, out_dir / "reg_mean.pt")
+    torch.save(reg_std, out_dir / "reg_std.pt")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin = device.type == "cuda"
+    nw = int(args.num_workers)
+
+    base_model = DAGPSModel(
+        n_nodes=n_nodes,
+        num_edges=int(edge_index.shape[1]),
+        hidden=int(args.hidden),
+        heads=int(args.heads),
+        n_layers=int(args.layers),
+        n_cap=n_cap,
+        n_reg=n_reg,
+        n_system=n_sys,
+        node_in_dim=n_node_features,
+        node_emb_dim=int(args.node_emb_dim),
+        edge_emb_dim=int(args.edge_emb_dim),
+        edge_dim=int(edge_attr.size(1)),
+        dropout=dropout,
+        gradient_checkpointing=bool(args.gradient_checkpointing),
+        per_node_heads=bool(args.per_node_heads),
+        per_device_cap_head=bool(args.per_device_cap_head),
+        per_device_reg_head=bool(args.per_device_reg_head),
+    ).to(device)
+    model = base_model
+    if device.type == "cuda" and not args.no_compile:
+        try:
+            model = torch.compile(base_model)  # type: ignore[assignment]
+            print("torch.compile: enabled", flush=True)
+        except Exception as ex:  # pragma: no cover
+            print(f"torch.compile: skipped ({ex})", flush=True)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=8)
+    mse = nn.MSELoss()
+    bce = nn.BCEWithLogitsLoss()
+
+    y_mean_d = y_mean.to(device)
+    y_std_d = y_std.to(device)
+    reg_mean_d = reg_mean.to(device)
+    reg_std_d = reg_std.to(device)
+    use_amp = device.type == "cuda" and not args.no_amp
+    if use_amp:
+        from torch.cuda.amp import GradScaler as _GradScaler
+
+        scaler = _GradScaler()
+        print("AMP (autocast + GradScaler): enabled", flush=True)
+    else:
+        scaler = None
+    if args.gradient_checkpointing:
+        print("gradient_checkpointing: per-block recompute (training only)", flush=True)
+
+    best_val = float("inf")
+    best_state = None
+    bad = 0
+    t0 = time.perf_counter()
+
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = 0.0
+        train_n = 0
+        train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
+        for ci in train_order:
+            ch = chunk_dirs[int(ci)]
+            cpt = cache_dir / f"{ch.name}.pt"
+            x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+                ch,
+                nodes_name=nodes_name,
+                meta_name=meta_name,
+                node_feature_cols=node_feature_cols,
+                node_pe_csv=node_pe_csv,
+                node_pe_cols=node_pe_cols,
+                cap_cols=cap_cols,
+                reg_cols=reg_cols,
+                cache_pt=cpt,
+                ref_ntl=ref_ntl,
+            )
+            if args.sample_frac < 1.0:
+                k = max(1, int(round(x.shape[0] * args.sample_frac)))
+                x = x[:k]
+                y_ri = y_ri[:k]
+                y_cap = y_cap[:k]
+                y_reg = y_reg[:k]
+            y_reg_n = (y_reg - reg_mean) / reg_std
+            x_n = (x - x_mean) / x_std
+            ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+            dl_tr = DataLoader(
+                Subset(ds, idx_train_list[int(ci)].tolist()),
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=nw,
+                pin_memory=pin,
+                persistent_workers=nw > 0,
+            )
+            for batch in dl_tr:
+                batch = batch.to(device)
+                yb = batch.y.view(batch.num_graphs, -1)
+                y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
+                y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+                yb_n = (yb - y_mean_d) / y_std_d
+                opt.zero_grad(set_to_none=True)
+                with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                    v_n, c_log, r_p = model(batch)
+                    loss_v = mse(v_n.view_as(yb_n), yb_n)
+                    loss_c = bce(c_log, y_cap_b)
+                    loss_r = mse(r_p, y_reg_b)
+                    loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+                with torch.no_grad():
+                    train_loss_sum += float(loss.item()) * batch.num_graphs
+                    train_v_sum += float(loss_v.item()) * batch.num_graphs
+                    train_c_sum += float(loss_c.item()) * batch.num_graphs
+                    train_r_sum += float(loss_r.item()) * batch.num_graphs
+                    train_n += int(batch.num_graphs)
+            del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl_tr
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        model.eval()
+        val_tot = val_v = 0.0
+        val_c_sum = val_r_sum = 0.0
+        nv = 0
+        val_sum_true = torch.zeros(n_nodes, device=device)
+        val_sum_true2 = torch.zeros(n_nodes, device=device)
+        val_sum_se = torch.zeros(n_nodes, device=device)
+        val_sum_worst = 0.0
+        with torch.no_grad():
+            for ci, ch in enumerate(chunk_dirs):
+                cpt = cache_dir / f"{ch.name}.pt"
+                x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+                    ch,
+                    nodes_name=nodes_name,
+                    meta_name=meta_name,
+                    node_feature_cols=node_feature_cols,
+                    node_pe_csv=node_pe_csv,
+                    node_pe_cols=node_pe_cols,
+                    cap_cols=cap_cols,
+                    reg_cols=reg_cols,
+                    cache_pt=cpt,
+                    ref_ntl=ref_ntl,
+                )
+                if args.sample_frac < 1.0:
+                    k = max(1, int(round(x.shape[0] * args.sample_frac)))
+                    x = x[:k]
+                    y_ri = y_ri[:k]
+                    y_cap = y_cap[:k]
+                    y_reg = y_reg[:k]
+                y_reg_n = (y_reg - reg_mean) / reg_std
+                x_n = (x - x_mean) / x_std
+                ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+                dl_va = DataLoader(
+                    Subset(ds, idx_val_list[ci].tolist()),
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=nw,
+                    pin_memory=pin,
+                    persistent_workers=nw > 0,
+                )
+                for batch in dl_va:
+                    batch = batch.to(device)
+                    yb = batch.y.view(batch.num_graphs, -1)
+                    y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
+                    y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+                    yb_n = (yb - y_mean_d) / y_std_d
+                    with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                        v_n, c_log, r_p = model(batch)
+                        lv = mse(v_n.view_as(yb_n), yb_n)
+                        lc = bce(c_log, y_cap_b)
+                        lr_ = mse(r_p, y_reg_b)
+                        lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                    val_tot += float(lt.item()) * batch.num_graphs
+                    val_v += float(lv.item()) * batch.num_graphs
+                    val_c_sum += float(lc.item()) * batch.num_graphs
+                    val_r_sum += float(lr_.item()) * batch.num_graphs
+                    nv += int(batch.num_graphs)
+                    v_flat = v_n.view(batch.num_graphs, -1)
+                    pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
+                    true_ri = yb.view(batch.num_graphs, n_nodes, 2)
+                    pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
+                    true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
+                    err = pred_mag - true_mag
+                    val_sum_true += true_mag.sum(dim=0)
+                    val_sum_true2 += (true_mag * true_mag).sum(dim=0)
+                    val_sum_se += (err * err).sum(dim=0)
+                    val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
+                del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl_va
+                gc.collect()
+
+        val_tot /= max(nv, 1)
+        val_v /= max(nv, 1)
+        val_c = val_c_sum / max(nv, 1)
+        val_r = val_r_sum / max(nv, 1)
+        true_mean = val_sum_true / max(nv, 1)
+        var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
+        mse_node = val_sum_se / max(nv, 1)
+        r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+        val_r2_mean = float(r2_node.mean().item())
+        val_r2_min = float(r2_node.min().item())
+        val_worst_node_mae = val_sum_worst / max(nv, 1)
+        train_v = train_v_sum / max(train_n, 1)
+        train_c = train_c_sum / max(train_n, 1)
+        train_r = train_r_sum / max(train_n, 1)
+        train_tot = train_loss_sum / max(train_n, 1)
+        sch.step(val_tot)
+        crit = val_tot if args.early_stop_on == "total" else val_v
+        if crit < best_val:
+            best_val = crit
+            best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+        if ep == 1 or ep % max(1, int(args.log_every)) == 0:
+            print(
+                f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f} "
+                f"| val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
+                f"| best={best_val:.4f}",
+                flush=True,
+            )
+        if bad >= args.patience:
+            print(f"[da_gps chunk_parent] early stop at epoch {ep}", flush=True)
+            break
+
+    train_seconds = time.perf_counter() - t0
+    if best_state is not None:
+        base_model.load_state_dict(best_state)
+
+    met = _evaluate_multi_chunks(
+        model,
+        chunk_dirs,
+        idx_test_list,
+        nodes_name=nodes_name,
+        meta_name=meta_name,
+        node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
+        node_pe_cols=node_pe_cols,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        cache_dir=cache_dir,
+        ref_ntl=ref_ntl,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=y_mean,
+        y_std=y_std,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        device=device,
+        use_amp=use_amp,
+    )
+
+    ckpt = out_dir / "da_gps_multitask_best.pt"
+    torch.save(
+        {
+            "model_state_dict": base_model.state_dict(),
+            "n_nodes": n_nodes,
+            "hidden": int(args.hidden),
+            "layers": int(args.layers),
+            "heads": int(args.heads),
+            "n_cap": n_cap,
+            "n_reg": n_reg,
+            "n_system_tokens": n_sys,
+            "node_emb_dim": int(args.node_emb_dim),
+            "edge_emb_dim": int(args.edge_emb_dim),
+            "per_node_heads": bool(args.per_node_heads),
+            "per_device_cap_head": bool(args.per_device_cap_head),
+            "per_device_reg_head": bool(args.per_device_reg_head),
+            "cap_target_cols": cap_cols,
+            "reg_target_cols": reg_cols,
+            "chunk_parent": str(chunk_parent),
+            "chunk_folders": [str(p) for p in chunk_dirs],
+        },
+        ckpt,
+    )
+    report = {
+        "task": "DA-GPS multitask chunk_parent",
+        "chunk_parent": str(chunk_parent),
+        "chunks": [str(p) for p in chunk_dirs],
+        "normalization": "aggregated train statistics across all chunks",
+        "chunk_tensor_cache_dir": str(cache_dir),
+        "n_chunks": len(chunk_dirs),
+        "hyperparameters": vars(args),
+        "test_metrics": met,
+        "train_seconds": train_seconds,
+        "checkpoint": str(ckpt.resolve()),
+    }
+    (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(
+        f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
+        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  time={train_seconds:.1f}s",
+        flush=True,
+    )
+    print(f"Saved {ckpt}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="DA-GPS v2 multitask: voltage + cap + reg (full MV, hardcoded aux cols).")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg_full_mv")
     p.add_argument("--nodes_csv", type=str, default="gnn_node_features_and_targets_full_mv.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="gnn_edges_phase_static_full_mv.csv")
     p.add_argument("--meta_csv", type=str, default="gnn_sample_meta.csv")
+    p.add_argument(
+        "--node_feature_cols",
+        type=str,
+        default="p_load_kw,q_load_kvar",
+        help="Comma-separated dynamic node feature columns from nodes_csv.",
+    )
+    p.add_argument(
+        "--node_pe_csv",
+        type=str,
+        default="",
+        help="Optional single PE CSV shared by all chunks/runs (e.g., gnn_node_index_master.csv).",
+    )
+    p.add_argument(
+        "--node_pe_cols",
+        type=str,
+        default="auto",
+        help="'auto' to use all pe_* columns from node_pe_csv, 'none' to disable, or comma list (e.g. pe_1,pe_2).",
+    )
     p.add_argument("--n_system_tokens", type=int, default=10, help="Unsupervised latent tokens after cap+reg tokens.")
     p.add_argument("--out_dir", type=str, default="da_gps_multitask_full_mv")
     p.add_argument("--epochs", type=int, default=200)
@@ -538,21 +1267,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use independent decoder per regulator token instead of shared linear.",
     )
+    p.add_argument(
+        "--chunk_parent",
+        type=str,
+        default="",
+        help="If set, train sequentially on each matching subfolder (see --chunk_subdir_glob) without merging CSVs. "
+        "Filenames are --nodes_csv / --edge_catalog_csv / --meta_csv inside each folder. "
+        "Normalization aggregates train-split statistics across all chunks. Tensor caches go to out_dir/chunk_tensor_cache/.",
+    )
+    p.add_argument(
+        "--chunk_subdir_glob",
+        type=str,
+        default="run_*",
+        help="Only used with --chunk_parent: fnmatch pattern for subdirectory names (e.g. run_*).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    repo = Path(__file__).resolve().parent
+    if str(args.chunk_parent).strip():
+        main_multi_chunk(args, repo)
+        return
+
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
 
-    repo = Path(__file__).resolve().parent
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
         data_root = (repo / data_root).resolve()
     nodes_path = Path(args.nodes_csv) if Path(args.nodes_csv).is_absolute() else (data_root / args.nodes_csv).resolve()
     edges_path = Path(args.edge_catalog_csv) if Path(args.edge_catalog_csv).is_absolute() else (data_root / args.edge_catalog_csv).resolve()
     meta_path = Path(args.meta_csv) if Path(args.meta_csv).is_absolute() else (data_root / args.meta_csv).resolve()
+    node_feature_cols = _parse_csv_cols(args.node_feature_cols)
+    node_pe_csv = Path(args.node_pe_csv).resolve() if str(args.node_pe_csv).strip() else None
+    node_pe_cols = str(args.node_pe_cols)
 
     for pth in (nodes_path, edges_path, meta_path):
         if not pth.is_file():
@@ -576,27 +1326,40 @@ def main() -> None:
         print(f"Loading cache: {cache_path}", flush=True)
         pack = torch.load(cache_path, map_location="cpu", weights_only=False)
         x = pack["x"]
+        y_ri = pack.get("y_ri")
         edge_index = pack["edge_index"]
         edge_attr = pack["edge_attr"]
         sample_ids = pack["sample_ids"]
     else:
-        x, _y_unused, sample_ids, _node_order, node_to_local = _load_nodes_pq_target(nodes_path)
+        x, y_ri, sample_ids, _node_order, node_to_local = _load_nodes_features_complex_targets(
+            nodes_path,
+            node_feature_cols=node_feature_cols,
+            node_pe_csv=node_pe_csv,
+            node_pe_cols=node_pe_cols,
+        )
         edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
-                {"x": x, "edge_index": edge_index, "edge_attr": edge_attr, "sample_ids": sample_ids},
+                {"x": x, "y_ri": y_ri, "edge_index": edge_index, "edge_attr": edge_attr, "sample_ids": sample_ids},
                 cache_path,
             )
             print(f"Wrote cache: {cache_path}", flush=True)
 
     if node_to_local is None:
-        _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_pq_target(nodes_path)
+        _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_features_complex_targets(
+            nodes_path,
+            node_feature_cols=node_feature_cols,
+            node_pe_csv=node_pe_csv,
+            node_pe_cols=node_pe_cols,
+        )
         del _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp
 
     n_nodes = int(x.shape[1])
+    n_node_features = int(x.shape[2])
 
-    y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
+    if y_ri is None:
+        y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
     y_cap, y_reg = _load_meta_aux(meta_path, sample_ids, cap_cols, reg_cols)
 
     if args.sample_frac < 1.0:
@@ -620,7 +1383,7 @@ def main() -> None:
     idx_val = perm[n_train : n_train + n_val]
     idx_test = perm[n_train + n_val :]
 
-    xt = x[idx_train].reshape(-1, 2)
+    xt = x[idx_train].reshape(-1, n_node_features)
     x_mean = xt.mean(dim=0, keepdim=True)
     x_std = xt.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
     x_n = (x - x_mean) / x_std
@@ -678,6 +1441,7 @@ def main() -> None:
         n_cap=n_cap,
         n_reg=n_reg,
         n_system=n_sys,
+        node_in_dim=n_node_features,
         node_emb_dim=int(args.node_emb_dim),
         edge_emb_dim=int(args.edge_emb_dim),
         edge_dim=int(edge_attr.size(1)),
