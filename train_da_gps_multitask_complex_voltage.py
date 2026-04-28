@@ -948,15 +948,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     assert sum_x is not None and sum_x2 is not None
     x_mean = (sum_x / float(cnt_x)).view(1, n_node_features).float()
     x_var = sum_x2 / float(cnt_x) - (sum_x / float(cnt_x)) ** 2
-    x_std = torch.sqrt(x_var.clamp_min(1e-24)).view(1, n_node_features).clamp_min(1e-8)
+    x_std = torch.sqrt(x_var.clamp_min(1e-24)).view(1, n_node_features).clamp_min(1e-8).float()
 
     y_mean = (sum_y / float(cnt_y)).view(1, -1).float()
     y_var = sum_y2 / float(cnt_y) - (sum_y / float(cnt_y)) ** 2
-    y_std = torch.sqrt(y_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6)
+    y_std = torch.sqrt(y_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
 
     reg_mean = (sum_reg / float(cnt_reg)).view(1, -1).float()
     reg_var = sum_reg2 / float(cnt_reg) - (sum_reg / float(cnt_reg)) ** 2
-    reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6)
+    reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
 
     torch.save(x_mean, out_dir / "x_mean.pt")
     torch.save(x_std, out_dir / "x_std.pt")
@@ -1001,10 +1001,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
 
-    y_mean_d = y_mean.to(device)
-    y_std_d = y_std.to(device)
-    reg_mean_d = reg_mean.to(device)
-    reg_std_d = reg_std.to(device)
+    y_mean_d = y_mean.to(device).float()
+    y_std_d = y_std.to(device).float()
+    reg_mean_d = reg_mean.to(device).float()
+    reg_std_d = reg_std.to(device).float()
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
@@ -1474,15 +1474,15 @@ def main() -> None:
 
     xt = x[idx_train].reshape(-1, n_node_features)
     x_mean = xt.mean(dim=0, keepdim=True)
-    x_std = xt.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+    x_std = xt.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8).float()
     x_n = (x - x_mean) / x_std
 
     y_train = y_ri[idx_train].reshape(len(idx_train), -1)
     y_mean = y_train.mean(dim=0, keepdim=True)
-    y_std = y_train.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    y_std = y_train.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6).float()
 
     reg_mean = y_reg[idx_train].mean(dim=0, keepdim=True)
-    reg_std = y_reg[idx_train].std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    reg_std = y_reg[idx_train].std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6).float()
     y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
 
     torch.save(x_mean, out_dir / "x_mean.pt")
@@ -1553,10 +1553,10 @@ def main() -> None:
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
 
-    y_mean_d = y_mean.to(device)
-    y_std_d = y_std.to(device)
-    reg_mean_d = reg_mean.to(device)
-    reg_std_d = reg_std.to(device)
+    y_mean_d = y_mean.to(device).float()
+    y_std_d = y_std.to(device).float()
+    reg_mean_d = reg_mean.to(device).float()
+    reg_std_d = reg_std.to(device).float()
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
