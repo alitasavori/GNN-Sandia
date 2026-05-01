@@ -28,7 +28,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GINEConv, SAGEConv
 
-from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges, _load_nodes_pq_target
+from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 
 def _set_seed(seed: int) -> None:
@@ -36,6 +36,46 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _parse_node_feature_cols(spec: str) -> list[str]:
+    cols = [c.strip() for c in str(spec).split(",") if c.strip()]
+    if not cols:
+        raise ValueError("--node_feature_cols must provide at least one column.")
+    return cols
+
+
+def _load_nodes_features_target(
+    nodes_csv: Path,
+    node_feature_cols: list[str],
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[str], dict[str, int]]:
+    import pandas as pd
+
+    usecols = ["sample_id", "node", "node_idx", "vmag_pu", *node_feature_cols]
+    print(f"Loading nodes: {nodes_csv}", flush=True)
+    df = pd.read_csv(nodes_csv, usecols=usecols)
+    sample_ids = sorted(df["sample_id"].unique().tolist())
+    first = df[df["sample_id"] == sample_ids[0]].sort_values("node_idx")
+    node_order = first["node"].astype(str).str.strip().tolist()
+    node_to_local = {n: i for i, n in enumerate(node_order)}
+    n_nodes = len(node_order)
+    n_feat = len(node_feature_cols)
+
+    x_np = np.zeros((len(sample_ids), n_nodes, n_feat), dtype=np.float32)
+    y_np = np.zeros((len(sample_ids), n_nodes), dtype=np.float32)
+
+    for si, sid in enumerate(sample_ids):
+        if si > 0 and si % 1000 == 0:
+            print(f"  stacked {si}/{len(sample_ids)} samples...", flush=True)
+        sub = df[df["sample_id"] == sid].sort_values("node_idx")
+        if len(sub) != n_nodes:
+            raise RuntimeError(f"sample_id={sid}: expected {n_nodes}, got {len(sub)}")
+        if sub["node"].astype(str).str.strip().tolist() != node_order:
+            raise RuntimeError(f"sample_id={sid}: node order mismatch")
+        x_np[si, :, :] = sub[node_feature_cols].to_numpy(np.float32)
+        y_np[si, :] = sub["vmag_pu"].to_numpy(np.float32)
+
+    return torch.from_numpy(x_np), torch.from_numpy(y_np), sample_ids, node_order, node_to_local
 
 
 def _build_complex_targets(nodes_csv: Path, sample_ids: list[int], node_to_local: dict[str, int]) -> torch.Tensor:
@@ -111,6 +151,7 @@ def _load_chunked_dataset(
     chunk_subdir_glob: str,
     nodes_csv_name: str,
     edges_csv_name: str,
+    node_feature_cols: list[str],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
     chunk_dirs = sorted([p for p in chunk_parent.glob(chunk_subdir_glob) if p.is_dir()])
     if not chunk_dirs:
@@ -134,7 +175,9 @@ def _load_chunked_dataset(
             if not p.is_file():
                 raise FileNotFoundError(p)
 
-        x_i, _y_unused, sids_i, _node_order_i, node_to_local_i = _load_nodes_pq_target(nodes_path)
+        x_i, _y_unused, sids_i, _node_order_i, node_to_local_i = _load_nodes_features_target(
+            nodes_path, node_feature_cols
+        )
         if node_to_local_ref is None:
             node_to_local_ref = node_to_local_i
             edge_index_ref, edge_attr_ref = _load_compacted_edges(edges_path, node_to_local_ref)
@@ -504,6 +547,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
+    p.add_argument("--node_feature_cols", type=str, default="p_load_kw,q_load_kvar,p_pv_kw,p_bess_kw,q_bess_kvar")
     p.add_argument("--chunk_parent", type=str, default="", help="If set, reads all chunk folders and concatenates samples.")
     p.add_argument("--chunk_subdir_glob", type=str, default="run_*")
     p.add_argument("--meta_csv", type=str, default="gnn_sample_meta.csv", help="Accepted for CLI parity; not used by this trainer.")
@@ -536,6 +580,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _set_seed(args.seed)
+    node_feature_cols = _parse_node_feature_cols(args.node_feature_cols)
 
     models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
     allowed = {"gine", "sage", "gcn"}
@@ -561,6 +606,7 @@ def main() -> None:
             chunk_subdir_glob=str(args.chunk_subdir_glob),
             nodes_csv_name=str(args.nodes_csv),
             edges_csv_name=str(args.edge_catalog_csv),
+            node_feature_cols=node_feature_cols,
         )
     else:
         nodes_path = Path(args.nodes_csv)
@@ -581,7 +627,9 @@ def main() -> None:
             edge_attr = pack["edge_attr"]
             sample_ids = pack["sample_ids"]
         else:
-            x, _y_unused, sample_ids, _node_order, node_to_local = _load_nodes_pq_target(nodes_path)
+            x, _y_unused, sample_ids, _node_order, node_to_local = _load_nodes_features_target(
+                nodes_path, node_feature_cols
+            )
             edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
             if cache_path:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,7 +640,9 @@ def main() -> None:
                 print(f"Wrote cache: {cache_path}", flush=True)
 
         if node_to_local is None:
-            _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_pq_target(nodes_path)
+            _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_features_target(
+                nodes_path, node_feature_cols
+            )
             del _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp
         y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
 
@@ -681,6 +731,7 @@ def main() -> None:
         "task": "GNN+MLP (no local/global split) PQ -> complex voltage [V_re,V_im]",
         "dataset_nodes_csv": str(args.nodes_csv),
         "dataset_edges_csv": str(args.edge_catalog_csv),
+        "node_feature_cols": node_feature_cols,
         "chunk_parent": str(chunk_parent) if chunk_parent is not None else "",
         "chunk_subdir_glob": str(args.chunk_subdir_glob),
         "n_samples": int(n),
