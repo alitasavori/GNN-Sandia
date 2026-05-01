@@ -608,14 +608,38 @@ def main() -> None:
     node_to_local = None
     edge_shared_csv = Path(args.edge_shared_csv).resolve() if str(args.edge_shared_csv).strip() else None
     if chunk_parent is not None:
-        x, y_ri, edge_index, edge_attr, sample_ids, node_to_local = _load_chunked_dataset(
-            chunk_parent=chunk_parent,
-            chunk_subdir_glob=str(args.chunk_subdir_glob),
-            nodes_csv_name=str(args.nodes_csv),
-            edges_csv_name=str(args.edge_catalog_csv),
-            node_feature_cols=node_feature_cols,
-            edge_shared_csv=edge_shared_csv,
-        )
+        if cache_path and cache_path.is_file():
+            print(f"Loading cache: {cache_path}", flush=True)
+            pack = torch.load(cache_path, map_location="cpu", weights_only=False)
+            x = pack["x"]
+            y_ri = pack["y_ri"]
+            edge_index = pack["edge_index"]
+            edge_attr = pack["edge_attr"]
+            sample_ids = pack["sample_ids"]
+            node_to_local = pack["node_to_local"]
+        else:
+            x, y_ri, edge_index, edge_attr, sample_ids, node_to_local = _load_chunked_dataset(
+                chunk_parent=chunk_parent,
+                chunk_subdir_glob=str(args.chunk_subdir_glob),
+                nodes_csv_name=str(args.nodes_csv),
+                edges_csv_name=str(args.edge_catalog_csv),
+                node_feature_cols=node_feature_cols,
+                edge_shared_csv=edge_shared_csv,
+            )
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "x": x,
+                        "y_ri": y_ri,
+                        "edge_index": edge_index,
+                        "edge_attr": edge_attr,
+                        "sample_ids": sample_ids,
+                        "node_to_local": node_to_local,
+                    },
+                    cache_path,
+                )
+                print(f"Wrote cache: {cache_path}", flush=True)
     else:
         nodes_path = Path(args.nodes_csv)
         if not nodes_path.is_absolute():
