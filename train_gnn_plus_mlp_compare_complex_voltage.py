@@ -318,6 +318,32 @@ def _metrics_from_ri_flat(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[
     }
 
 
+def _val_r2_and_worst_mae_from_ri(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> tuple[float, float, float]:
+    """
+    Compute DA-GPS-style validation diagnostics on |V|:
+      - mean/min R^2 across nodes
+      - worst-node MAE across nodes
+    """
+    bsz, two_n = pred_ri.shape
+    n_nodes = two_n // 2
+    pred = pred_ri.view(bsz, n_nodes, 2)
+    true = true_ri.view(bsz, n_nodes, 2)
+    pred_mag = torch.sqrt(pred[..., 0] * pred[..., 0] + pred[..., 1] * pred[..., 1] + 1e-12)
+    true_mag = torch.sqrt(true[..., 0] * true[..., 0] + true[..., 1] * true[..., 1] + 1e-12)
+
+    mae_per_node = (pred_mag - true_mag).abs().mean(dim=0)  # [N]
+    worst_mae = float(mae_per_node.max().item())
+
+    # R^2 per node over batch dimension
+    y_true_mean = true_mag.mean(dim=0, keepdim=True)
+    ss_res = ((true_mag - pred_mag) ** 2).sum(dim=0)
+    ss_tot = ((true_mag - y_true_mean) ** 2).sum(dim=0).clamp_min(1e-12)
+    r2 = 1.0 - ss_res / ss_tot
+    r2_mean = float(r2.mean().item())
+    r2_min = float(r2.min().item())
+    return r2_mean, r2_min, worst_mae
+
+
 @torch.no_grad()
 def _evaluate(model: nn.Module, dl: DataLoader, device: torch.device, y_mean: torch.Tensor, y_std: torch.Tensor) -> dict[str, float]:
     model.eval()
@@ -348,6 +374,7 @@ def _train_one(
     y_std: torch.Tensor,
     device: torch.device,
     out_dir: Path,
+    run_label: str,
 ) -> RunResult:
     encoder = GNNEncoder2D(
         model_type=model_type,
@@ -373,6 +400,8 @@ def _train_one(
 
     for ep in range(1, args.epochs + 1):
         model.train()
+        train_loss_sum = 0.0
+        n_train_seen = 0
         for batch in dl_tr:
             batch = batch.to(device)
             yb = batch.y.view(batch.num_graphs, -1)
@@ -383,10 +412,16 @@ def _train_one(
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            train_loss_sum += float(loss.item()) * int(batch.num_graphs)
+            n_train_seen += int(batch.num_graphs)
+
+        train_loss = train_loss_sum / max(n_train_seen, 1)
 
         model.eval()
         val_loss = 0.0
         nv = 0
+        val_preds = []
+        val_tgts = []
         with torch.no_grad():
             for batch in dl_va:
                 batch = batch.to(device)
@@ -396,7 +431,16 @@ def _train_one(
                 lv = mse(pred_n, yb_n)
                 val_loss += float(lv.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
+                yp = pred_n * y_std.to(device) + y_mean.to(device)
+                val_preds.append(yp.detach().cpu())
+                val_tgts.append(yb.detach().cpu())
         val_loss /= max(nv, 1)
+        if val_preds:
+            val_pred = torch.cat(val_preds, dim=0)
+            val_tgt = torch.cat(val_tgts, dim=0)
+            val_r2_mean, val_r2_min, val_worst_mae = _val_r2_and_worst_mae_from_ri(val_pred, val_tgt)
+        else:
+            val_r2_mean, val_r2_min, val_worst_mae = float("nan"), float("nan"), float("nan")
         sch.step(val_loss)
         if val_loss < best_val:
             best_val = val_loss
@@ -405,7 +449,14 @@ def _train_one(
         else:
             bad += 1
         if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            print(f"[{model_type}] epoch {ep:4d}/{args.epochs} val_mse_norm={val_loss:.6f} best={best_val:.6f}", flush=True)
+            print(
+                f"[{model_type} {run_label}] epoch {ep:4d}/{args.epochs} | "
+                f"train_tot={train_loss:.4f} train_volt={train_loss:.4f} | "
+                f"val_tot={val_loss:.4f} val_volt={val_loss:.4f} | "
+                f"val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+                f"val_worst_mae={val_worst_mae:.4f} | best={best_val:.4f}",
+                flush=True,
+            )
         if bad >= args.patience:
             print(f"[{model_type}] early stopping at epoch {ep}", flush=True)
             break
@@ -602,6 +653,7 @@ def main() -> None:
     print(f"Device={device} n_nodes={n_nodes} n_edges={int(edge_index.shape[1])} models={models}", flush=True)
 
     results: dict[str, dict] = {}
+    run_label = "chunk_parent" if chunk_parent is not None else "single_csv"
     for m in models:
         print(f"\n=== Training {m.upper()} (GNN+MLP no local/global split) ===", flush=True)
         res = _train_one(
@@ -617,6 +669,7 @@ def main() -> None:
             y_std=y_std,
             device=device,
             out_dir=out_dir,
+            run_label=run_label,
         )
         results[m] = res.__dict__
         print(
