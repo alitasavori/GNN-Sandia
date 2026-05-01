@@ -828,7 +828,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if not out_dir.is_absolute():
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.cache_tensor:
+    if str(args.cache_dir).strip():
+        cache_dir = Path(args.cache_dir).resolve()
+        print(f"chunk_parent cache override via --cache_dir: {cache_dir}", flush=True)
+    elif args.cache_tensor:
         cache_override = Path(args.cache_tensor).resolve()
         if cache_override.suffix.lower() == ".pt":
             cache_dir = cache_override.parent / f"{cache_override.stem}_chunk_tensor_cache"
@@ -1319,6 +1322,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers; 0 only for tiny debug runs.")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--cache_tensor", type=str, default="")
+    p.add_argument(
+        "--cache_dir",
+        type=str,
+        default="",
+        help="Chunk mode only: directory for per-chunk tensor caches. Lets you reuse cache across runs while keeping out_dir timestamped.",
+    )
     p.add_argument(
         "--early_stop_on",
         type=str,
