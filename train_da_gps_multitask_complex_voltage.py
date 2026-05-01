@@ -828,14 +828,20 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if not out_dir.is_absolute():
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = out_dir / "chunk_tensor_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
     if args.cache_tensor:
-        print(
-            "Note: --cache_tensor is ignored in --chunk_parent mode (per-chunk caches live under out_dir/chunk_tensor_cache).",
-            flush=True,
-        )
+        cache_override = Path(args.cache_tensor).resolve()
+        if cache_override.suffix.lower() == ".pt":
+            cache_dir = cache_override.parent / f"{cache_override.stem}_chunk_tensor_cache"
+            print(
+                f"chunk_parent cache override from --cache_tensor file path -> using directory: {cache_dir}",
+                flush=True,
+            )
+        else:
+            cache_dir = cache_override
+            print(f"chunk_parent cache override: {cache_dir}", flush=True)
+    else:
+        cache_dir = out_dir / "chunk_tensor_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     cap_cols = list(TARGET_CAP_COLS)
     reg_cols = list(TARGET_REG_COLS)
