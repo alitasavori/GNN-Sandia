@@ -152,6 +152,7 @@ def _load_chunked_dataset(
     nodes_csv_name: str,
     edges_csv_name: str,
     node_feature_cols: list[str],
+    edge_shared_csv: Path | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
     chunk_dirs = sorted([p for p in chunk_parent.glob(chunk_subdir_glob) if p.is_dir()])
     if not chunk_dirs:
@@ -171,7 +172,8 @@ def _load_chunked_dataset(
     for i, ch in enumerate(chunk_dirs):
         nodes_path = (ch / nodes_csv_name).resolve()
         edges_path = (ch / edges_csv_name).resolve()
-        for p in (nodes_path, edges_path):
+        edge_path_to_check = edge_shared_csv if edge_shared_csv is not None else edges_path
+        for p in (nodes_path, edge_path_to_check):
             if not p.is_file():
                 raise FileNotFoundError(p)
 
@@ -180,7 +182,10 @@ def _load_chunked_dataset(
         )
         if node_to_local_ref is None:
             node_to_local_ref = node_to_local_i
-            edge_index_ref, edge_attr_ref = _load_compacted_edges(edges_path, node_to_local_ref)
+            edge_path = edge_shared_csv if edge_shared_csv is not None else edges_path
+            if edge_shared_csv is not None:
+                print(f"Using shared edges from {edge_path}", flush=True)
+            edge_index_ref, edge_attr_ref = _load_compacted_edges(edge_path, node_to_local_ref)
         else:
             if node_to_local_i != node_to_local_ref:
                 raise RuntimeError(f"{ch.name}: node order/mapping mismatch vs first chunk")
@@ -550,6 +555,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--node_feature_cols", type=str, default="p_load_kw,q_load_kvar,p_pv_kw,p_bess_kw,q_bess_kvar")
     p.add_argument("--chunk_parent", type=str, default="", help="If set, reads all chunk folders and concatenates samples.")
     p.add_argument("--chunk_subdir_glob", type=str, default="run_*")
+    p.add_argument("--edge_shared_csv", type=str, default="", help="Optional single shared edge CSV used for all chunks.")
     p.add_argument("--meta_csv", type=str, default="gnn_sample_meta.csv", help="Accepted for CLI parity; not used by this trainer.")
     p.add_argument("--out_dir", type=str, default="gnn_plus_mlp_compare_complex_8500")
     p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn}.")
@@ -600,6 +606,7 @@ def main() -> None:
     chunk_parent = Path(args.chunk_parent).resolve() if str(args.chunk_parent).strip() else None
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
     node_to_local = None
+    edge_shared_csv = Path(args.edge_shared_csv).resolve() if str(args.edge_shared_csv).strip() else None
     if chunk_parent is not None:
         x, y_ri, edge_index, edge_attr, sample_ids, node_to_local = _load_chunked_dataset(
             chunk_parent=chunk_parent,
@@ -607,6 +614,7 @@ def main() -> None:
             nodes_csv_name=str(args.nodes_csv),
             edges_csv_name=str(args.edge_catalog_csv),
             node_feature_cols=node_feature_cols,
+            edge_shared_csv=edge_shared_csv,
         )
     else:
         nodes_path = Path(args.nodes_csv)
@@ -731,6 +739,7 @@ def main() -> None:
         "task": "GNN+MLP (no local/global split) PQ -> complex voltage [V_re,V_im]",
         "dataset_nodes_csv": str(args.nodes_csv),
         "dataset_edges_csv": str(args.edge_catalog_csv),
+        "edge_shared_csv": str(args.edge_shared_csv),
         "node_feature_cols": node_feature_cols,
         "chunk_parent": str(chunk_parent) if chunk_parent is not None else "",
         "chunk_subdir_glob": str(args.chunk_subdir_glob),
