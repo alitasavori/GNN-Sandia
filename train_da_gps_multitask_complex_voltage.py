@@ -211,17 +211,29 @@ def _multihead_cross_attn(
     qh = query.view(B, L, n_heads, dh).transpose(1, 2)
     kh = key.view(B, S, n_heads, dh).transpose(1, 2)
     vh = value.view(B, S, n_heads, dh).transpose(1, 2)
-    scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(dh)
+    attn_mask = None
     if attn_bias is not None:
-        scores = scores + attn_bias.unsqueeze(1)
+        # Accept (B, L, S) bias and broadcast across heads.
+        attn_mask = attn_bias.unsqueeze(1)
     if key_padding_mask is not None:
-        scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+        # Build additive mask where padded keys are -inf.
+        kp_mask = torch.zeros((B, 1, L, S), device=query.device, dtype=query.dtype)
+        kp_mask = kp_mask.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+        attn_mask = kp_mask if attn_mask is None else (attn_mask + kp_mask)
     if query_padding_mask is not None:
-        scores = scores.masked_fill(~query_padding_mask.unsqueeze(1).unsqueeze(-1), float("-inf"))
-    attn = torch.softmax(scores, dim=-1)
-    attn = torch.nan_to_num(attn, nan=0.0)
-    attn = F.dropout(attn, dropout_p, training)
-    out = torch.matmul(attn, vh).transpose(1, 2).contiguous().view(B, L, d)
+        # Fully mask invalid query positions.
+        q_mask = torch.zeros((B, 1, L, S), device=query.device, dtype=query.dtype)
+        q_mask = q_mask.masked_fill(~query_padding_mask.unsqueeze(1).unsqueeze(-1), float("-inf"))
+        attn_mask = q_mask if attn_mask is None else (attn_mask + q_mask)
+
+    out = F.scaled_dot_product_attention(
+        qh,
+        kh,
+        vh,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p if training else 0.0,
+    )
+    out = out.transpose(1, 2).contiguous().view(B, L, d)
     if query_padding_mask is not None:
         out = out * query_padding_mask.unsqueeze(-1).to(out.dtype)
     return out
@@ -296,10 +308,14 @@ class DAGPSBlock(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         batch: torch.Tensor,
+        h_dense: torch.Tensor | None = None,
+        node_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h_dense, node_mask = to_dense_batch(h_in, batch)
-        B, N, _ = h_dense.shape
-        key_pad = ~node_mask
+        if h_dense is None or node_mask is None:
+            h_dense, node_mask = to_dense_batch(h_in, batch)
+
+        has_padding = int(h_in.size(0)) != int(h_dense.size(0) * h_dense.size(1))
+        key_pad = (~node_mask) if has_padding else None
 
         q = self.wq_nt(T_in)
         k = self.wk_nt(h_dense)
@@ -319,10 +335,10 @@ class DAGPSBlock(nn.Module):
         v2 = self.wv_tn(T_mid)
         zh = _multihead_cross_attn(
             q2, k2, v2, n_heads=self.heads, dropout_p=self.dropout_p, training=self.training,
-            key_padding_mask=None, attn_bias=attn_bias, query_padding_mask=node_mask,
+            key_padding_mask=None, attn_bias=attn_bias, query_padding_mask=node_mask if has_padding else None,
         )
         zh = self.wo_tn(zh)
-        z_flat = zh[node_mask]
+        z_flat = zh[node_mask] if has_padding else zh.reshape(-1, zh.size(-1))
 
         h_loc = self.mpnn(h_in, edge_index, edge_attr)
         h_mid = self.norm_h_mid(h_in + z_flat + h_loc)
@@ -429,13 +445,12 @@ class DAGPSModel(nn.Module):
         if self.edge_emb is not None:
             ea = torch.cat([ea, self.edge_emb(self._edge_ids(ea.size(0), ea.device))], dim=-1)
         batch = data.batch if hasattr(data, "batch") and data.batch is not None else None
-        if batch is None:
-            B = 1
-        else:
-            B = int(batch.max().item()) + 1
+        B = int(data.num_graphs) if hasattr(data, "num_graphs") else 1
         h = self.node_in(x)
         T = self.token_latent.unsqueeze(0).repeat(B, 1, 1)
         bptr = batch if batch is not None else torch.zeros(h.size(0), dtype=torch.long, device=h.device)
+        h_dense, node_mask = to_dense_batch(h, bptr)
+        can_view_dense = int(h.size(0)) == int(h_dense.size(0) * h_dense.size(1))
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
                 h, T = checkpoint(
@@ -445,10 +460,17 @@ class DAGPSModel(nn.Module):
                     data.edge_index,
                     ea,
                     bptr,
+                    h_dense,
+                    node_mask,
                     use_reentrant=False,
                 )
             else:
-                h, T = blk(h, T, data.edge_index, ea, bptr)
+                h, T = blk(h, T, data.edge_index, ea, bptr, h_dense, node_mask)
+            if can_view_dense:
+                h_dense = h.view(h_dense.size(0), h_dense.size(1), h.size(-1))
+            else:
+                h_dense = torch.zeros_like(h_dense)
+                h_dense[node_mask] = h
 
         if self.per_node_heads:
             h_per = h.view(B, self.n_nodes, self.hidden)
