@@ -25,8 +25,9 @@ from torch.utils.data import Dataset, Subset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GINEConv, SAGEConv
+from torch_geometric.utils import to_dense_batch
 
-from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges, _load_nodes_pq_target
+from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 
 def _set_seed(seed: int) -> None:
@@ -34,6 +35,50 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _parse_node_feature_cols(spec: str) -> list[str]:
+    cols = [c.strip() for c in str(spec).split(",") if c.strip()]
+    if not cols:
+        raise ValueError("--node_feature_cols must provide at least one column.")
+    return cols
+
+
+def _load_nodes_features_target(
+    nodes_csv: Path,
+    node_feature_cols: list[str],
+    selected_sample_ids: list[int] | None = None,
+) -> tuple[torch.Tensor, list[int], list[str], dict[str, int]]:
+    import pandas as pd
+
+    usecols = ["sample_id", "node", "node_idx", *node_feature_cols]
+    print(f"Loading nodes: {nodes_csv}", flush=True)
+    df = pd.read_csv(nodes_csv, usecols=usecols)
+    sample_ids = sorted(int(x) for x in df["sample_id"].unique().tolist())
+    if selected_sample_ids is not None:
+        keep = {int(x) for x in selected_sample_ids}
+        sample_ids = [sid for sid in sample_ids if sid in keep]
+        if not sample_ids:
+            raise RuntimeError(f"No selected sample IDs found in {nodes_csv}")
+        df = df[df["sample_id"].astype(int).isin(sample_ids)].copy()
+    first = df[df["sample_id"] == sample_ids[0]].sort_values("node_idx")
+    node_order = first["node"].astype(str).str.strip().tolist()
+    node_to_local = {n: i for i, n in enumerate(node_order)}
+    n_nodes = len(node_order)
+    n_feat = len(node_feature_cols)
+
+    x_np = np.zeros((len(sample_ids), n_nodes, n_feat), dtype=np.float32)
+    for si, sid in enumerate(sample_ids):
+        if si > 0 and si % 1000 == 0:
+            print(f"  stacked {si}/{len(sample_ids)} samples...", flush=True)
+        sub = df[df["sample_id"] == sid].sort_values("node_idx")
+        if len(sub) != n_nodes:
+            raise RuntimeError(f"sample_id={sid}: expected {n_nodes}, got {len(sub)}")
+        if sub["node"].astype(str).str.strip().tolist() != node_order:
+            raise RuntimeError(f"sample_id={sid}: node order mismatch")
+        x_np[si, :, :] = sub[node_feature_cols].to_numpy(np.float32)
+
+    return torch.from_numpy(x_np), sample_ids, node_order, node_to_local
 
 
 def _build_complex_targets(nodes_csv: Path, sample_ids: list[int], node_to_local: dict[str, int]) -> torch.Tensor:
@@ -55,6 +100,200 @@ def _build_complex_targets(nodes_csv: Path, sample_ids: list[int], node_to_local
         y_ri[s, n, 0] = vmag * np.cos(vang_rad)
         y_ri[s, n, 1] = vmag * np.sin(vang_rad)
     return torch.from_numpy(y_ri)
+
+
+def _append_shared_pe_features(
+    x: torch.Tensor,
+    *,
+    node_to_local: dict[str, int],
+    node_pe_csv: Path,
+    node_pe_cols: str,
+) -> torch.Tensor:
+    import pandas as pd
+
+    if not node_pe_csv.is_file():
+        raise FileNotFoundError(node_pe_csv)
+    pe_df = pd.read_csv(node_pe_csv)
+    if "node" not in pe_df.columns:
+        raise ValueError(f"{node_pe_csv} must contain 'node' column.")
+
+    if str(node_pe_cols).strip().lower() == "auto":
+        pe_cols = [c for c in pe_df.columns if str(c).lower().startswith("pe_")]
+    else:
+        pe_cols = [c.strip() for c in str(node_pe_cols).split(",") if c.strip()]
+    if not pe_cols:
+        raise ValueError("No PE columns selected/found. Use --node_pe_cols auto or provide explicit column names.")
+
+    pe_map_exact: dict[str, np.ndarray] = {}
+    pe_map_lower: dict[str, np.ndarray] = {}
+    for _, r in pe_df[["node", *pe_cols]].iterrows():
+        n = str(r["node"]).strip()
+        v = np.asarray([float(r[c]) for c in pe_cols], dtype=np.float32)
+        pe_map_exact[n] = v
+        pe_map_lower[n.lower()] = v
+
+    pe_np = np.zeros((len(node_to_local), len(pe_cols)), dtype=np.float32)
+    missing = 0
+    for n, i in node_to_local.items():
+        v = pe_map_exact.get(n, pe_map_lower.get(n.lower()))
+        if v is None:
+            missing += 1
+            continue
+        pe_np[i, :] = v
+
+    pe = torch.from_numpy(pe_np).unsqueeze(0).expand(int(x.shape[0]), -1, -1)
+    print(f"Using PE from {node_pe_csv} with columns: {pe_cols}", flush=True)
+    if missing > 0:
+        print(f"[warn] PE missing for {missing}/{len(node_to_local)} nodes; zero-filled.", flush=True)
+    return torch.cat([x, pe], dim=-1)
+
+
+def _select_chunk_sample_ids(sids: list[int], sample_frac: float, seed: int, chunk_idx: int) -> list[int]:
+    if float(sample_frac) >= 1.0:
+        return [int(x) for x in sids]
+    if not (0.0 < float(sample_frac) <= 1.0):
+        raise ValueError("--sample_frac must be in (0,1].")
+    if len(sids) == 0:
+        return []
+    rng = np.random.default_rng(int(seed) + int(chunk_idx) * 100_003)
+    k = max(1, int(round(len(sids) * float(sample_frac))))
+    pick = rng.choice(len(sids), size=k, replace=False)
+    pick_sorted = np.sort(pick)
+    return [int(sids[i]) for i in pick_sorted]
+
+
+def _chunk_cache_path(cache_dir: Path, chunk_name: str, sample_frac: float, seed: int, chunk_idx: int) -> Path:
+    if float(sample_frac) >= 1.0:
+        tag = "full"
+    else:
+        tag = f"sf{float(sample_frac):.6f}_s{int(seed)}_c{int(chunk_idx)}"
+    return cache_dir / f"{chunk_name}__{tag}.pt"
+
+
+def _ensure_chunk_tensor_cache_gnn(
+    chunk_dir: Path,
+    *,
+    nodes_name: str,
+    node_feature_cols: list[str],
+    selected_sample_ids: list[int] | None,
+    cache_pt: Path,
+    ref_ntl: dict[str, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
+    np_ = chunk_dir / nodes_name
+    if cache_pt.is_file():
+        z = torch.load(cache_pt, map_location="cpu", weights_only=False)
+        if not all(k in z for k in ("x", "y_ri", "sample_ids", "node_to_local")):
+            raise RuntimeError(f"Cache missing required keys: {cache_pt}")
+        ntl = z["node_to_local"]
+        if ref_ntl is not None and ntl != ref_ntl:
+            raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+        sids = z["sample_ids"]
+        if isinstance(sids, torch.Tensor):
+            sids = [int(x) for x in sids.tolist()]
+        else:
+            sids = [int(x) for x in list(sids)]
+        x = z["x"].to(dtype=torch.float32)
+        y_ri = z["y_ri"].to(dtype=torch.float32)
+        return x, y_ri, sids, ntl
+
+    if not np_.is_file():
+        raise FileNotFoundError(np_)
+    x, sample_ids, _node_order, node_to_local = _load_nodes_features_target(
+        np_,
+        node_feature_cols=node_feature_cols,
+        selected_sample_ids=selected_sample_ids,
+    )
+    y_ri = _build_complex_targets(np_, sample_ids, node_to_local).to(dtype=torch.float32)
+    x = x.to(dtype=torch.float32)
+    if ref_ntl is not None and node_to_local != ref_ntl:
+        raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+    cache_pt.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "x": x,
+            "y_ri": y_ri,
+            "sample_ids": sample_ids,
+            "node_to_local": node_to_local,
+        },
+        cache_pt,
+    )
+    print(f"Wrote chunk tensor cache: {cache_pt}", flush=True)
+    return x, y_ri, sample_ids, node_to_local
+
+
+def _load_chunked_dataset(
+    *,
+    chunk_parent: Path,
+    chunk_subdir_glob: str,
+    nodes_csv_name: str,
+    edges_csv_name: str,
+    node_feature_cols: list[str],
+    edge_shared_csv: Path | None,
+    cache_dir: Path | None,
+    sample_frac: float,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
+    chunk_dirs = sorted([p for p in chunk_parent.glob(chunk_subdir_glob) if p.is_dir()])
+    if not chunk_dirs:
+        raise FileNotFoundError(f"No chunk dirs matched {chunk_subdir_glob!r} under {chunk_parent}")
+
+    print(f"[chunk_parent] {len(chunk_dirs)} chunks under {chunk_parent}", flush=True)
+    for ch in chunk_dirs:
+        print(f"  - {ch.name}", flush=True)
+
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    sample_ids_all: list[int] = []
+    node_to_local_ref: dict[str, int] | None = None
+    edge_index_ref: torch.Tensor | None = None
+    edge_attr_ref: torch.Tensor | None = None
+
+    for i, ch in enumerate(chunk_dirs):
+        nodes_path = (ch / nodes_csv_name).resolve()
+        edges_path = (ch / edges_csv_name).resolve()
+        edge_path_to_check = edge_shared_csv if edge_shared_csv is not None else edges_path
+        for p in (nodes_path, edge_path_to_check):
+            if not p.is_file():
+                raise FileNotFoundError(p)
+
+        if cache_dir is not None:
+            full_sids = sorted(int(x) for x in __import__("pandas").read_csv(nodes_path, usecols=["sample_id"])["sample_id"].unique().tolist())
+            selected_sids = _select_chunk_sample_ids(full_sids, float(sample_frac), int(seed), int(i))
+            cache_pt = _chunk_cache_path(cache_dir, ch.name, float(sample_frac), int(seed), int(i))
+            x_i, y_i, sids_i, node_to_local_i = _ensure_chunk_tensor_cache_gnn(
+                ch,
+                nodes_name=nodes_csv_name,
+                node_feature_cols=node_feature_cols,
+                selected_sample_ids=selected_sids,
+                cache_pt=cache_pt,
+                ref_ntl=node_to_local_ref,
+            )
+        else:
+            x_i, sids_i, _node_order_i, node_to_local_i = _load_nodes_features_target(
+                nodes_path, node_feature_cols
+            )
+            y_i = _build_complex_targets(nodes_path, sids_i, node_to_local_i)
+
+        if node_to_local_ref is None:
+            node_to_local_ref = node_to_local_i
+            edge_path = edge_shared_csv if edge_shared_csv is not None else edges_path
+            if edge_shared_csv is not None:
+                print(f"Using shared edges from {edge_path}", flush=True)
+            edge_index_ref, edge_attr_ref = _load_compacted_edges(edge_path, node_to_local_ref)
+        else:
+            if node_to_local_i != node_to_local_ref:
+                raise RuntimeError(f"{ch.name}: node order/mapping mismatch vs first chunk")
+
+        xs.append(x_i)
+        ys.append(y_i)
+        sample_ids_all.extend(sids_i)
+        print(f"[chunk {i+1}/{len(chunk_dirs)}] samples={len(sids_i)}", flush=True)
+
+    assert node_to_local_ref is not None
+    assert edge_index_ref is not None and edge_attr_ref is not None
+    x = torch.cat(xs, dim=0)
+    y_ri = torch.cat(ys, dim=0)
+    return x, y_ri, edge_index_ref, edge_attr_ref, sample_ids_all, node_to_local_ref
 
 
 class GraphVoltageDataset(Dataset):
@@ -96,12 +335,10 @@ class GPSBlock(nn.Module):
             h_global, _ = self.attn(x_seq, x_seq, x_seq)
             h_global = h_global.squeeze(0)
         else:
-            h_global = torch.zeros_like(x)
-            for bi in batch.unique(sorted=True):
-                m = batch == bi
-                xg = x[m].unsqueeze(0)
-                hg, _ = self.attn(xg, xg, xg)
-                h_global[m] = hg.squeeze(0)
+            x_dense, node_mask = to_dense_batch(x, batch)
+            key_padding_mask = ~node_mask
+            hg, _ = self.attn(x_dense, x_dense, x_dense, key_padding_mask=key_padding_mask)
+            h_global = hg[node_mask]
         x = self.norm1(x + h_local + h_global)
         x = self.norm2(x + self.ffn(x))
         return x
@@ -280,6 +517,26 @@ def _metrics_from_ri_flat(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[
     }
 
 
+def _val_r2_and_worst_mae_from_ri(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> tuple[float, float, float]:
+    bsz, two_n = pred_ri.shape
+    n_nodes = two_n // 2
+    pred = pred_ri.view(bsz, n_nodes, 2)
+    true = true_ri.view(bsz, n_nodes, 2)
+    pred_mag = torch.sqrt(pred[..., 0] * pred[..., 0] + pred[..., 1] * pred[..., 1] + 1e-12)
+    true_mag = torch.sqrt(true[..., 0] * true[..., 0] + true[..., 1] * true[..., 1] + 1e-12)
+
+    mae_per_node = (pred_mag - true_mag).abs().mean(dim=0)
+    worst_mae = float(mae_per_node.max().item())
+
+    y_true_mean = true_mag.mean(dim=0, keepdim=True)
+    ss_res = ((true_mag - pred_mag) ** 2).sum(dim=0)
+    ss_tot = ((true_mag - y_true_mean) ** 2).sum(dim=0).clamp_min(1e-12)
+    r2 = 1.0 - ss_res / ss_tot
+    r2_mean = float(r2.mean().item())
+    r2_min = float(r2.min().item())
+    return r2_mean, r2_min, worst_mae
+
+
 @torch.no_grad()
 def _evaluate(model: nn.Module, dl: DataLoader, device: torch.device, y_mean: torch.Tensor, y_std: torch.Tensor) -> dict[str, float]:
     model.eval()
@@ -300,6 +557,7 @@ def _train_one(
     *,
     model_type: str,
     args: argparse.Namespace,
+    in_dim: int,
     n_nodes: int,
     n_edges: int,
     dl_tr: DataLoader,
@@ -309,10 +567,11 @@ def _train_one(
     y_std: torch.Tensor,
     device: torch.device,
     out_dir: Path,
+    run_label: str,
 ) -> RunResult:
     model = GNNOnlyVoltageModel(
         model_type=model_type,
-        in_dim=2,
+        in_dim=in_dim,
         hidden=int(args.hidden),
         layers=int(args.layers),
         n_nodes=n_nodes,
@@ -336,6 +595,8 @@ def _train_one(
 
     for ep in range(1, args.epochs + 1):
         model.train()
+        train_loss_sum = 0.0
+        n_train_seen = 0
         for batch in dl_tr:
             batch = batch.to(device)
             yb = batch.y.view(batch.num_graphs, -1)
@@ -346,10 +607,16 @@ def _train_one(
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            train_loss_sum += float(loss.item()) * int(batch.num_graphs)
+            n_train_seen += int(batch.num_graphs)
+
+        train_loss = train_loss_sum / max(n_train_seen, 1)
 
         model.eval()
         val_loss = 0.0
         nv = 0
+        val_preds = []
+        val_tgts = []
         with torch.no_grad():
             for batch in dl_va:
                 batch = batch.to(device)
@@ -359,7 +626,16 @@ def _train_one(
                 lv = mse(pred_n, yb_n)
                 val_loss += float(lv.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
+                yp = pred_n * y_std.to(device) + y_mean.to(device)
+                val_preds.append(yp.detach().cpu())
+                val_tgts.append(yb.detach().cpu())
         val_loss /= max(nv, 1)
+        if val_preds:
+            val_pred = torch.cat(val_preds, dim=0)
+            val_tgt = torch.cat(val_tgts, dim=0)
+            val_r2_mean, val_r2_min, val_worst_mae = _val_r2_and_worst_mae_from_ri(val_pred, val_tgt)
+        else:
+            val_r2_mean, val_r2_min, val_worst_mae = float("nan"), float("nan"), float("nan")
         sch.step(val_loss)
         if val_loss < best_val:
             best_val = val_loss
@@ -368,7 +644,14 @@ def _train_one(
         else:
             bad += 1
         if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            print(f"[{model_type}] epoch {ep:4d}/{args.epochs} val_mse_norm={val_loss:.6f} best={best_val:.6f}", flush=True)
+            print(
+                f"[{model_type} {run_label}] epoch {ep:4d}/{args.epochs} | "
+                f"train_tot={train_loss:.4f} train_volt={train_loss:.4f} | "
+                f"val_tot={val_loss:.4f} val_volt={val_loss:.4f} | "
+                f"val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+                f"val_worst_mae={val_worst_mae:.4f} | best={best_val:.4f}",
+                flush=True,
+            )
         if bad >= args.patience:
             print(f"[{model_type}] early stopping at epoch {ep}", flush=True)
             break
@@ -411,12 +694,17 @@ def _train_one(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Compare GNN models (gine,sage,gcn,gps,gps_mlp) for complex voltage prediction.")
+    p = argparse.ArgumentParser(description="Compare GNN-only models (gine,sage,gcn) for complex voltage prediction.")
     p.add_argument("--data_root", type=str, default="datasets_gnn2/loadtype_8500_dailyagg")
     p.add_argument("--nodes_csv", type=str, default="Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv")
     p.add_argument("--edge_catalog_csv", type=str, default="Heterogenous GNN dataset/edges/hetero_mv_line_edges_load_only_compacted.csv")
+    p.add_argument("--node_feature_cols", type=str, default="p_load_kw,q_load_kvar")
+    p.add_argument("--chunk_parent", type=str, default="", help="If set, reads all chunk folders and concatenates samples.")
+    p.add_argument("--chunk_subdir_glob", type=str, default="run_*")
+    p.add_argument("--edge_shared_csv", type=str, default="", help="Optional single shared edge CSV used for all chunks.")
+    p.add_argument("--meta_csv", type=str, default="gnn_sample_meta.csv", help="Accepted for CLI parity; not used by this trainer.")
     p.add_argument("--out_dir", type=str, default="gnn_only_compare_complex_8500")
-    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn,gps,gps_mlp}.")
+    p.add_argument("--models", type=str, default="gine,sage,gcn", help="Comma-separated list from {gine,sage,gcn}.")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--hidden", type=int, default=64)
@@ -438,15 +726,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--cache_tensor", type=str, default="")
+    p.add_argument(
+        "--cache_dir",
+        type=str,
+        default="",
+        help="Chunk mode only: directory for per-chunk tensor caches (GPS-compatible naming).",
+    )
+    p.add_argument("--node_pe_csv", type=str, default="")
+    p.add_argument("--node_pe_cols", type=str, default="auto")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     _set_seed(args.seed)
+    node_feature_cols = _parse_node_feature_cols(args.node_feature_cols)
 
     models = [m.strip().lower() for m in str(args.models).split(",") if m.strip()]
-    allowed = {"gine", "sage", "gcn", "gps", "gps_mlp"}
+    allowed = {"gine", "sage", "gcn"}
     if not models or any(m not in allowed for m in models):
         raise ValueError(f"--models must be comma-separated subset of {sorted(allowed)}")
 
@@ -469,32 +766,108 @@ def main() -> None:
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    chunk_parent = Path(args.chunk_parent).resolve() if str(args.chunk_parent).strip() else None
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
-    node_to_local = None
-    if cache_path and cache_path.is_file():
-        print(f"Loading cache: {cache_path}", flush=True)
-        pack = torch.load(cache_path, map_location="cpu", weights_only=False)
-        x = pack["x"]
-        edge_index = pack["edge_index"]
-        edge_attr = pack["edge_attr"]
-        sample_ids = pack["sample_ids"]
-    else:
-        x, _y_unused, sample_ids, _node_order, node_to_local = _load_nodes_pq_target(nodes_path)
-        edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
-        if cache_path:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {"x": x, "edge_index": edge_index, "edge_attr": edge_attr, "sample_ids": sample_ids},
-                cache_path,
+    cache_dir = Path(args.cache_dir).resolve() if str(args.cache_dir).strip() else None
+    node_to_local: dict[str, int] | None = None
+    edge_shared_csv = Path(args.edge_shared_csv).resolve() if str(args.edge_shared_csv).strip() else None
+    sample_frac_applied_in_chunk = False
+    if chunk_parent is not None:
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            x, y_ri, edge_index, edge_attr, sample_ids, node_to_local = _load_chunked_dataset(
+                chunk_parent=chunk_parent,
+                chunk_subdir_glob=str(args.chunk_subdir_glob),
+                nodes_csv_name=str(args.nodes_csv),
+                edges_csv_name=str(args.edge_catalog_csv),
+                node_feature_cols=node_feature_cols,
+                edge_shared_csv=edge_shared_csv,
+                cache_dir=cache_dir,
+                sample_frac=float(args.sample_frac),
+                seed=int(args.seed),
             )
-            print(f"Wrote cache: {cache_path}", flush=True)
+            sample_frac_applied_in_chunk = float(args.sample_frac) < 1.0
+        elif cache_path and cache_path.is_file():
+            print(f"Loading cache: {cache_path}", flush=True)
+            pack = torch.load(cache_path, map_location="cpu", weights_only=False)
+            x = pack["x"]
+            y_ri = pack["y_ri"]
+            edge_index = pack["edge_index"]
+            edge_attr = pack["edge_attr"]
+            sample_ids = pack["sample_ids"]
+            node_to_local = pack["node_to_local"]
+        else:
+            x, y_ri, edge_index, edge_attr, sample_ids, node_to_local = _load_chunked_dataset(
+                chunk_parent=chunk_parent,
+                chunk_subdir_glob=str(args.chunk_subdir_glob),
+                nodes_csv_name=str(args.nodes_csv),
+                edges_csv_name=str(args.edge_catalog_csv),
+                node_feature_cols=node_feature_cols,
+                edge_shared_csv=edge_shared_csv,
+                cache_dir=None,
+                sample_frac=1.0,
+                seed=int(args.seed),
+            )
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "x": x,
+                        "y_ri": y_ri,
+                        "edge_index": edge_index,
+                        "edge_attr": edge_attr,
+                        "sample_ids": sample_ids,
+                        "node_to_local": node_to_local,
+                    },
+                    cache_path,
+                )
+                print(f"Wrote cache: {cache_path}", flush=True)
+    else:
+        nodes_path = Path(args.nodes_csv)
+        if not nodes_path.is_absolute():
+            nodes_path = (data_root / nodes_path).resolve()
+        edges_path = Path(args.edge_catalog_csv)
+        if not edges_path.is_absolute():
+            edges_path = (data_root / edges_path).resolve()
+        for p in (nodes_path, edges_path):
+            if not p.is_file():
+                raise FileNotFoundError(p)
 
-    if node_to_local is None:
-        _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_pq_target(nodes_path)
-        del _x_tmp, _y_tmp, _sid_tmp, _node_order_tmp
-    y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
+        if cache_path and cache_path.is_file():
+            print(f"Loading cache: {cache_path}", flush=True)
+            pack = torch.load(cache_path, map_location="cpu", weights_only=False)
+            x = pack["x"]
+            edge_index = pack["edge_index"]
+            edge_attr = pack["edge_attr"]
+            sample_ids = pack["sample_ids"]
+        else:
+            x, sample_ids, _node_order, node_to_local = _load_nodes_features_target(nodes_path, node_feature_cols)
+            edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {"x": x, "edge_index": edge_index, "edge_attr": edge_attr, "sample_ids": sample_ids},
+                    cache_path,
+                )
+                print(f"Wrote cache: {cache_path}", flush=True)
 
-    if args.sample_frac < 1.0:
+        if node_to_local is None:
+            _x_tmp, _sid_tmp, _node_order_tmp, node_to_local = _load_nodes_features_target(nodes_path, node_feature_cols)
+            del _x_tmp, _sid_tmp, _node_order_tmp
+        y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
+
+    if args.node_pe_csv:
+        node_pe_path = Path(args.node_pe_csv)
+        if not node_pe_path.is_absolute():
+            node_pe_path = (repo / node_pe_path).resolve()
+        x = _append_shared_pe_features(
+            x,
+            node_to_local=node_to_local,
+            node_pe_csv=node_pe_path,
+            node_pe_cols=args.node_pe_cols,
+        )
+
+    if args.sample_frac < 1.0 and not sample_frac_applied_in_chunk:
         if not (0.0 < args.sample_frac <= 1.0):
             raise ValueError("--sample_frac must be in (0,1].")
         k = max(1, int(round(len(sample_ids) * args.sample_frac)))
@@ -516,7 +889,8 @@ def main() -> None:
     idx_test = perm[n_train + n_val :]
     print(f"Split train/val/test = {len(idx_train)}/{len(idx_val)}/{len(idx_test)}", flush=True)
 
-    xt = x[idx_train].reshape(-1, 2)
+    in_dim = int(x.shape[-1])
+    xt = x[idx_train].reshape(-1, in_dim)
     x_mean = xt.mean(dim=0, keepdim=True)
     x_std = xt.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
     x_n = (x - x_mean) / x_std
@@ -561,11 +935,13 @@ def main() -> None:
     print(f"Device={device} n_nodes={n_nodes} n_edges={int(edge_index.shape[1])} models={models}", flush=True)
 
     results: dict[str, dict] = {}
+    run_label = "chunk_parent" if chunk_parent is not None else "single_csv"
     for m in models:
         print(f"\n=== Training {m.upper()} (GNN-only) ===", flush=True)
         res = _train_one(
             model_type=m,
             args=args,
+            in_dim=in_dim,
             n_nodes=n_nodes,
             n_edges=int(edge_index.shape[1]),
             dl_tr=dl_tr,
@@ -575,6 +951,7 @@ def main() -> None:
             y_std=y_std,
             device=device,
             out_dir=out_dir,
+            run_label=run_label,
         )
         results[m] = res.__dict__
         print(
@@ -584,10 +961,15 @@ def main() -> None:
 
     report = {
         "task": "GNN-only PQ -> complex voltage [V_re,V_im]",
-        "dataset_nodes_csv": str(nodes_path),
-        "dataset_edges_csv": str(edges_path),
+        "dataset_nodes_csv": str(args.nodes_csv),
+        "dataset_edges_csv": str(args.edge_catalog_csv),
+        "edge_shared_csv": str(args.edge_shared_csv),
+        "node_feature_cols": node_feature_cols,
+        "chunk_parent": str(chunk_parent) if chunk_parent is not None else "",
+        "chunk_subdir_glob": str(args.chunk_subdir_glob),
         "n_samples": int(n),
         "n_nodes": int(n_nodes),
+        "node_input_dim": int(in_dim),
         "split": {"train": int(len(idx_train)), "val": int(len(idx_val)), "test": int(len(idx_test))},
         "models_requested": models,
         "hyperparameters": {
@@ -602,6 +984,9 @@ def main() -> None:
             "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
             "seed": int(args.seed),
+            "log_every": int(args.log_every),
+            "node_pe_csv": str(args.node_pe_csv),
+            "node_pe_cols": str(args.node_pe_cols),
         },
         "results": results,
         "normalization": {
