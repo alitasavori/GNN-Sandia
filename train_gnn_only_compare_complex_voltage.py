@@ -751,22 +751,25 @@ def main() -> None:
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
         data_root = (repo / data_root).resolve()
-    nodes_path = Path(args.nodes_csv)
-    if not nodes_path.is_absolute():
-        nodes_path = (data_root / nodes_path).resolve()
-    edges_path = Path(args.edge_catalog_csv)
-    if not edges_path.is_absolute():
-        edges_path = (data_root / edges_path).resolve()
-    for p in (nodes_path, edges_path):
-        if not p.is_file():
-            raise FileNotFoundError(p)
+    chunk_parent = Path(args.chunk_parent).resolve() if str(args.chunk_parent).strip() else None
+
+    # Single-CSV mode only: nodes_csv / edge_catalog_csv live under data_root.
+    # Chunk mode uses those names as filenames inside each run_* folder — do not resolve here.
+    if chunk_parent is None:
+        nodes_path = Path(args.nodes_csv)
+        if not nodes_path.is_absolute():
+            nodes_path = (data_root / nodes_path).resolve()
+        edges_path = Path(args.edge_catalog_csv)
+        if not edges_path.is_absolute():
+            edges_path = (data_root / edges_path).resolve()
+        for p in (nodes_path, edges_path):
+            if not p.is_file():
+                raise FileNotFoundError(p)
 
     out_dir = Path(args.out_dir)
     if not out_dir.is_absolute():
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    chunk_parent = Path(args.chunk_parent).resolve() if str(args.chunk_parent).strip() else None
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
     cache_dir = Path(args.cache_dir).resolve() if str(args.cache_dir).strip() else None
     node_to_local: dict[str, int] | None = None
