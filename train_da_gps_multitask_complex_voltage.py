@@ -689,6 +689,7 @@ def _ensure_chunk_tensor_cache(
     cap_cols: list[str],
     reg_cols: list[str],
     cache_pt: Path,
+    bootstrap_gnn_cache_pt: Path | None,
     ref_ntl: dict[str, int] | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
     np_ = chunk_dir / nodes_name
@@ -708,6 +709,49 @@ def _ensure_chunk_tensor_cache(
         y_cap = z["y_cap"].to(dtype=torch.float32)
         y_reg = z["y_reg"].to(dtype=torch.float32)
         return x, y_ri, y_cap, y_reg, sids, ntl
+
+    if bootstrap_gnn_cache_pt is not None and bootstrap_gnn_cache_pt.is_file():
+        z = torch.load(bootstrap_gnn_cache_pt, map_location="cpu", weights_only=False)
+        need = {"x", "y_ri", "sample_ids", "node_to_local"}
+        if need.issubset(set(z.keys())):
+            node_to_local = z["node_to_local"]
+            if ref_ntl is not None and node_to_local != ref_ntl:
+                raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+            sample_ids = z["sample_ids"]
+            if isinstance(sample_ids, torch.Tensor):
+                sample_ids = [int(x) for x in sample_ids.tolist()]
+            else:
+                sample_ids = [int(x) for x in list(sample_ids)]
+            x = z["x"].to(dtype=torch.float32)
+            y_ri = z["y_ri"].to(dtype=torch.float32)
+            if selected_sample_ids is not None:
+                want = set(int(s) for s in selected_sample_ids)
+                keep_idx = [i for i, sid in enumerate(sample_ids) if int(sid) in want]
+                if not keep_idx:
+                    raise RuntimeError(f"No selected sample IDs found in bootstrap GNN cache: {bootstrap_gnn_cache_pt}")
+                idx_t = torch.tensor(keep_idx, dtype=torch.long)
+                x = x.index_select(0, idx_t)
+                y_ri = y_ri.index_select(0, idx_t)
+                sample_ids = [sample_ids[i] for i in keep_idx]
+            if not mp_.is_file():
+                raise FileNotFoundError(mp_)
+            y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
+            y_cap = y_cap.to(dtype=torch.float32)
+            y_reg = y_reg.to(dtype=torch.float32)
+            cache_pt.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "x": x,
+                    "y_ri": y_ri,
+                    "y_cap": y_cap,
+                    "y_reg": y_reg,
+                    "sample_ids": sample_ids,
+                    "node_to_local": node_to_local,
+                },
+                cache_pt,
+            )
+            print(f"Bootstrapped DA cache from GNN cache: {bootstrap_gnn_cache_pt} -> {cache_pt}", flush=True)
+            return x, y_ri, y_cap, y_reg, sample_ids, node_to_local
 
     if not np_.is_file() or not mp_.is_file():
         raise FileNotFoundError(f"{np_} / {mp_}")
@@ -756,6 +800,7 @@ def _evaluate_multi_chunks(
     cap_cols: list[str],
     reg_cols: list[str],
     cache_dir: Path,
+    bootstrap_gnn_cache_dir: Path | None,
     ref_ntl: dict[str, int],
     edge_index: torch.Tensor,
     edge_attr: torch.Tensor,
@@ -784,6 +829,7 @@ def _evaluate_multi_chunks(
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             cache_pt=cpt,
+            bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
             ref_ntl=ref_ntl,
         )
         y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
@@ -867,6 +913,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     else:
         cache_dir = out_dir / "chunk_tensor_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap_gnn_cache_dir = Path(args.bootstrap_gnn_cache_dir).resolve() if str(args.bootstrap_gnn_cache_dir).strip() else None
+    if bootstrap_gnn_cache_dir is not None:
+        print(f"bootstrap GNN cache dir: {bootstrap_gnn_cache_dir}", flush=True)
 
     cap_cols = list(TARGET_CAP_COLS)
     reg_cols = list(TARGET_REG_COLS)
@@ -926,6 +975,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             cache_pt=cpt,
+            bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
             ref_ntl=ref_ntl,
         )
         if ci == 0:
@@ -1072,6 +1122,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 cap_cols=cap_cols,
                 reg_cols=reg_cols,
                 cache_pt=cpt,
+                bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
                 ref_ntl=ref_ntl,
             )
             y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
@@ -1142,6 +1193,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     cap_cols=cap_cols,
                     reg_cols=reg_cols,
                     cache_pt=cpt,
+                    bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
                     ref_ntl=ref_ntl,
                 )
                 y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
@@ -1240,6 +1292,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         cap_cols=cap_cols,
         reg_cols=reg_cols,
         cache_dir=cache_dir,
+        bootstrap_gnn_cache_dir=bootstrap_gnn_cache_dir,
         ref_ntl=ref_ntl,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -1349,6 +1402,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Chunk mode only: directory for per-chunk tensor caches. Lets you reuse cache across runs while keeping out_dir timestamped.",
+    )
+    p.add_argument(
+        "--bootstrap_gnn_cache_dir",
+        type=str,
+        default="",
+        help="Chunk mode only: optional directory of GNN chunk caches (run_*__*.pt with x,y_ri,sample_ids,node_to_local). "
+        "If DA cache is missing, bootstrap from GNN cache and compute only y_cap/y_reg from meta.",
     )
     p.add_argument(
         "--early_stop_on",
