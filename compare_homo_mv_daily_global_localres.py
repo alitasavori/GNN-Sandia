@@ -12,6 +12,10 @@ Optional ``--worst-k K``: rank all load-type nodes by time-mean |V_pred−V_dss|
 save ``daily_per_node_mae.csv``, print top-K, and save figures under
 ``monitoring_plots/worst_by_mae/``. JSON adds ``mean_mae_pu_per_node`` and
 ``worst_nodes_by_mae``.
+
+``--plots-only`` with ``--plot-node`` (and no worst-k / per-node CSV flags) skips
+``daily_metrics_global_localres.json`` and writes only the requested node PNGs under
+``monitoring_plots/``.
 """
 
 from __future__ import annotations
@@ -335,9 +339,17 @@ def run_compare_homo_global_localres(
     electrical_distance_csv: Path | None = None,
     save_per_node_mae_csv: bool = False,
     debug_features: int = 0,
+    plots_only: bool = False,
 ) -> None:
     device = resolve_inference_device(device)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if plots_only:
+        if not plot_nodes:
+            raise ValueError("--plots-only requires at least one --plot-node (no other figures are produced).")
+        if worst_k > 0 or worst_k_per_dist_bin > 0 or save_per_node_mae_csv:
+            raise ValueError(
+                "--plots-only cannot be combined with --worst-k, --worst-k-per-dist-bin, or --save-per-node-mae-csv."
+            )
 
     ckpt = Path(checkpoint).resolve()
     if not ckpt.is_file():
@@ -992,7 +1004,8 @@ def run_compare_homo_global_localres(
             )
         ),
     }
-    (out_dir / "daily_metrics_global_localres.json").write_text(json.dumps(out_metrics, indent=2), encoding="utf-8")
+    if not plots_only:
+        (out_dir / "daily_metrics_global_localres.json").write_text(json.dumps(out_metrics, indent=2), encoding="utf-8")
 
     plots_dir = out_dir / "monitoring_plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1239,6 +1252,11 @@ def main() -> None:
         metavar="N",
         help="Print feature+prediction stats for first N timesteps (helps diagnose near-zero predictions due to mapping/norm mismatch).",
     )
+    p.add_argument(
+        "--plots-only",
+        action="store_true",
+        help="Skip daily_metrics_global_localres.json; write only --plot-node PNGs under monitoring_plots/ (use worst-k=0, no --save-per-node-mae-csv).",
+    )
     args = p.parse_args()
 
     run_compare_homo_global_localres(
@@ -1262,6 +1280,7 @@ def main() -> None:
         electrical_distance_csv=args.electrical_distance_csv.resolve() if args.electrical_distance_csv else None,
         save_per_node_mae_csv=bool(args.save_per_node_mae_csv),
         debug_features=int(args.debug_features),
+        plots_only=bool(args.plots_only),
     )
 
 
