@@ -16,6 +16,10 @@ save ``daily_per_node_mae.csv``, print top-K, and save figures under
 ``--plots-only`` with ``--plot-node`` (and no worst-k / per-node CSV flags) skips
 ``daily_metrics_global_localres.json`` and writes only the requested node PNGs under
 ``monitoring_plots/``.
+
+GNN-only checkpoints with ``input_proj`` in_dim>2 (e.g. PQ + PV/BESS + PE): pass
+``--gnn-node-pe-csv`` / ``--gnn-node-pe-cols`` and optional ``--gnn-static-mvagg-csv``
+(first ``sample_id``) so features match training normalization.
 """
 
 from __future__ import annotations
@@ -121,6 +125,91 @@ def _validate_feature_norm_pack(norm_pack: dict, norm_path: Path) -> None:
         raise RuntimeError(f"Non-finite feature norm stats in {norm_path}")
     if np.any(std <= 0):
         raise RuntimeError(f"Non-positive feature std in {norm_path}")
+
+
+def _gnn_only_input_dim_from_state_dict(sd: dict[str, torch.Tensor]) -> int:
+    w = sd.get("input_proj.weight")
+    if w is None or not isinstance(w, torch.Tensor):
+        raise RuntimeError("GNN-only checkpoint missing tensor input_proj.weight (cannot infer input dim).")
+    return int(w.shape[1])
+
+
+def _validate_gnn_only_feature_norm(norm_pack: dict, in_dim: int, src: Path | str) -> None:
+    if "mean" not in norm_pack or "std" not in norm_pack:
+        raise RuntimeError(f"Invalid feature norm pack (missing mean/std): {src}")
+    mean = np.asarray(norm_pack["mean"], dtype=np.float64).reshape(-1)
+    std = np.asarray(norm_pack["std"], dtype=np.float64).reshape(-1)
+    if mean.size != in_dim or std.size != in_dim:
+        raise RuntimeError(
+            f"GNN-only: x_mean/x_std length {mean.size}/{std.size} != model input_proj in_dim={in_dim} ({src})."
+        )
+    if not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError(f"Non-finite feature norm stats in {src}")
+    if np.any(std <= 0):
+        raise RuntimeError(f"Non-positive feature std in {src}")
+
+
+def _load_gnn_only_pe_numpy(
+    node_pe_csv: Path, node_pe_cols: str, node_order: list[str]
+) -> tuple[np.ndarray, list[str]]:
+    import pandas as pd
+
+    if not node_pe_csv.is_file():
+        raise FileNotFoundError(node_pe_csv)
+    pe_df = pd.read_csv(node_pe_csv)
+    if "node" not in pe_df.columns:
+        raise ValueError(f"{node_pe_csv} must contain 'node' column.")
+    if str(node_pe_cols).strip().lower() == "auto":
+        pe_cols = [c for c in pe_df.columns if str(c).lower().startswith("pe_")]
+    else:
+        pe_cols = [c.strip() for c in str(node_pe_cols).split(",") if c.strip()]
+    if not pe_cols:
+        raise ValueError("No PE columns (--gnn-node-pe-cols auto or explicit pe_*) found in PE CSV.")
+    pe_map_lower: dict[str, np.ndarray] = {}
+    for _, r in pe_df[["node", *pe_cols]].iterrows():
+        n = str(r["node"]).strip().lower()
+        pe_map_lower[n] = np.asarray([float(r[c]) for c in pe_cols], dtype=np.float32)
+    out = np.zeros((len(node_order), len(pe_cols)), dtype=np.float32)
+    missing = 0
+    for i, nod in enumerate(node_order):
+        v = pe_map_lower.get(str(nod).strip().lower())
+        if v is None:
+            missing += 1
+            continue
+        out[i, :] = v
+    if missing:
+        print(
+            f"[compare_homo_mv_daily_global_localres][warn] PE missing for {missing}/{len(node_order)} nodes; zero-filled.",
+            flush=True,
+        )
+    return out, pe_cols
+
+
+def _load_mvagg_static_power_tail(
+    mvagg_csv: Path, node_order: list[str], *, tail_dim: int
+) -> np.ndarray:
+    """First sample_id in file: p_pv_kw, p_bess_kw, q_bess_kvar (first tail_dim columns)."""
+    import pandas as pd
+
+    if tail_dim <= 0:
+        return np.zeros((len(node_order), 0), dtype=np.float32)
+    names_all = ["p_pv_kw", "p_bess_kw", "q_bess_kvar"]
+    if tail_dim > len(names_all):
+        raise ValueError(f"tail_dim={tail_dim} > supported {len(names_all)}")
+    names = names_all[:tail_dim]
+    usecols = ["sample_id", "node", *names]
+    df = pd.read_csv(mvagg_csv, usecols=usecols)
+    sid0 = int(sorted({int(x) for x in df["sample_id"].tolist()})[0])
+    sub = df[df["sample_id"] == sid0]
+    lk = {str(r["node"]).strip().lower(): r for _, r in sub.iterrows()}
+    out = np.zeros((len(node_order), tail_dim), dtype=np.float32)
+    for i, nod in enumerate(node_order):
+        row = lk.get(str(nod).strip().lower())
+        if row is None:
+            continue
+        for j, nm in enumerate(names):
+            out[i, j] = float(row[nm])
+    return out
 
 
 def _infer_aux_head_nclasses(sd: dict[str, torch.Tensor], prefix: str) -> list[int]:
@@ -340,6 +429,9 @@ def run_compare_homo_global_localres(
     save_per_node_mae_csv: bool = False,
     debug_features: int = 0,
     plots_only: bool = False,
+    gnn_node_pe_csv: Path | None = None,
+    gnn_node_pe_cols: str = "auto",
+    gnn_static_mvagg_csv: Path | None = None,
 ) -> None:
     device = resolve_inference_device(device)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +495,7 @@ def run_compare_homo_global_localres(
     dropout = 0.0
     gnn_only_y_mean = None
     gnn_only_y_std = None
+    gnn_only_in_dim = 2
 
     if is_gnn_only_ckpt:
         # Checkpoint format from train_gnn_only_compare_complex_voltage.py
@@ -414,11 +507,16 @@ def run_compare_homo_global_localres(
         edge_emb_dim = int(ckpt_dict.get("edge_emb_dim", 0))
         dropout = float(ckpt_dict.get("dropout", 0.0))
 
+        sd_gnn = ckpt_dict.get("model_state_dict")
+        if not isinstance(sd_gnn, dict):
+            raise RuntimeError("GNN-only checkpoint dict must contain model_state_dict.")
+        gnn_only_in_dim = _gnn_only_input_dim_from_state_dict(sd_gnn)
+
         if all(k in ckpt_dict for k in ("x_mean", "x_std", "y_mean", "y_std")):
             norm_pack = {"mean": ckpt_dict["x_mean"], "std": ckpt_dict["x_std"]}
             gnn_only_y_mean = torch.as_tensor(ckpt_dict["y_mean"], dtype=torch.float32).view(1, -1)
             gnn_only_y_std = torch.as_tensor(ckpt_dict["y_std"], dtype=torch.float32).view(1, -1)
-            _validate_feature_norm_pack(norm_pack, ckpt)
+            _validate_gnn_only_feature_norm(norm_pack, gnn_only_in_dim, ckpt)
         else:
             x_mean_p = (ckpt.parent / "x_mean.pt").resolve()
             x_std_p = (ckpt.parent / "x_std.pt").resolve()
@@ -431,7 +529,7 @@ def run_compare_homo_global_localres(
                 "mean": torch.load(x_mean_p, map_location="cpu", weights_only=True),
                 "std": torch.load(x_std_p, map_location="cpu", weights_only=True),
             }
-            _validate_feature_norm_pack(norm_pack, x_mean_p)
+            _validate_gnn_only_feature_norm(norm_pack, gnn_only_in_dim, x_mean_p)
             gnn_only_y_mean = torch.load(y_mean_p, map_location="cpu", weights_only=True).view(1, -1)
             gnn_only_y_std = torch.load(y_std_p, map_location="cpu", weights_only=True).view(1, -1)
     elif is_gine_plus_mlp_ckpt or is_gine_plus_mlp_global_local_ckpt or is_gine_plus_mlp_aux_ckpt:
@@ -528,10 +626,60 @@ def run_compare_homo_global_localres(
     feat_mean = torch.as_tensor(norm_pack["mean"], dtype=torch.float32).view(1, 1, -1)
     feat_std = torch.as_tensor(norm_pack["std"], dtype=torch.float32).clamp_min(1e-8).view(1, 1, -1)
 
+    gnn_pe_feat_np = np.zeros((n_nodes, 0), dtype=np.float32)
+    gnn_static_power_tail_np = np.zeros((n_nodes, 0), dtype=np.float32)
+    gnn_n_power = 2
+    if is_gnn_only_ckpt:
+        ck_n = int(ckpt_dict.get("n_nodes", n_nodes))
+        if ck_n != n_nodes:
+            raise RuntimeError(
+                f"GNN-only checkpoint n_nodes={ck_n} != dataset n_nodes={n_nodes}. "
+                "Use the same heterogeneous MV node CSV / topology as training."
+            )
+        if gnn_only_in_dim > 2:
+            if gnn_node_pe_csv is None:
+                raise RuntimeError(
+                    f"GNN-only checkpoint expects input_proj in_dim={gnn_only_in_dim} (>2). "
+                    "Pass --gnn-node-pe-csv (same PE source as training) and optionally "
+                    "--gnn-static-mvagg-csv for p_pv_kw,p_bess_kw,q_bess_kvar from one reference sample_id."
+                )
+            gnn_pe_feat_np, pe_cols_used = _load_gnn_only_pe_numpy(
+                Path(gnn_node_pe_csv).resolve(), str(gnn_node_pe_cols), node_order
+            )
+            n_pe = int(gnn_pe_feat_np.shape[1])
+            gnn_n_power = int(gnn_only_in_dim - n_pe)
+            if gnn_n_power < 2:
+                raise RuntimeError(
+                    f"in_dim={gnn_only_in_dim} minus n_pe={n_pe} gives n_power={gnn_n_power}<2 (PE column count mismatch?)."
+                )
+            if gnn_n_power > 5:
+                raise NotImplementedError(
+                    f"n_power={gnn_n_power}>5: daily compare only supports P,Q plus up to three PV/BESS columns."
+                )
+            tail_dim = gnn_n_power - 2
+            if tail_dim > 0:
+                if gnn_static_mvagg_csv is not None:
+                    gnn_static_power_tail_np = _load_mvagg_static_power_tail(
+                        Path(gnn_static_mvagg_csv).resolve(), node_order, tail_dim=tail_dim
+                    )
+                else:
+                    print(
+                        f"[compare_homo_mv_daily_global_localres][warn] "
+                        f"Zero-filling {tail_dim} static power cols (p_pv_kw,p_bess_kw,q_bess_kvar). "
+                        "Pass --gnn-static-mvagg-csv for values aligned with training.",
+                        flush=True,
+                    )
+                    gnn_static_power_tail_np = np.zeros((n_nodes, tail_dim), dtype=np.float32)
+            print(
+                f"[compare_homo_mv_daily_global_localres] GNN-only feats: in_dim={gnn_only_in_dim} "
+                f"n_power={gnn_n_power} n_pe={n_pe} pe_cols={pe_cols_used}",
+                flush=True,
+            )
+
     if is_gnn_only_ckpt:
         model = GNNOnlyVoltageModel(
             model_type=model_kind,
-            in_dim=2,
+            in_dim=int(gnn_only_in_dim),
             hidden=hidden,
             layers=n_layers,
             n_nodes=n_nodes,
@@ -767,10 +915,19 @@ def run_compare_homo_global_localres(
                 node_p[mvk] = pa + pb
                 node_q[mvk] = qa + qb
 
-        x = np.zeros((n_nodes, 2), dtype=np.float32)
-        for ni, nk in enumerate(node_order_l):
-            x[ni, 0] = float(node_p.get(nk, 0.0))
-            x[ni, 1] = float(node_q.get(nk, 0.0))
+        if is_gnn_only_ckpt and gnn_only_in_dim > 2:
+            xpow = np.zeros((n_nodes, gnn_n_power), dtype=np.float32)
+            for ni, nk in enumerate(node_order_l):
+                xpow[ni, 0] = float(node_p.get(nk, 0.0))
+                xpow[ni, 1] = float(node_q.get(nk, 0.0))
+            if gnn_static_power_tail_np.shape[1] > 0:
+                xpow[:, 2 : 2 + gnn_static_power_tail_np.shape[1]] = gnn_static_power_tail_np
+            x = np.concatenate([xpow, gnn_pe_feat_np], axis=-1).astype(np.float32)
+        else:
+            x = np.zeros((n_nodes, 2), dtype=np.float32)
+            for ni, nk in enumerate(node_order_l):
+                x[ni, 0] = float(node_p.get(nk, 0.0))
+                x[ni, 1] = float(node_q.get(nk, 0.0))
         feat_build_s += time.perf_counter() - t0
 
         if debug_features > 0 and i < int(debug_features):
@@ -796,8 +953,9 @@ def run_compare_homo_global_localres(
 
         # GNN inference.
         t0 = time.perf_counter()
-        xb = torch.from_numpy(x).view(1, n_nodes, 2)
-        xb = ((xb - feat_mean) / feat_std).squeeze(0).to(device)
+        x_np = np.asarray(x, dtype=np.float32)
+        xb_full = torch.from_numpy(x_np).view(1, n_nodes, -1)
+        xb = ((xb_full - feat_mean) / feat_std).squeeze(0).to(device)
         if debug_features > 0 and i < int(debug_features):
             xb_cpu = xb.detach().cpu()
             print(
@@ -1257,6 +1415,24 @@ def main() -> None:
         action="store_true",
         help="Skip daily_metrics_global_localres.json; write only --plot-node PNGs under monitoring_plots/ (use worst-k=0, no --save-per-node-mae-csv).",
     )
+    p.add_argument(
+        "--gnn-node-pe-csv",
+        type=Path,
+        default=None,
+        help="For GNN-only checkpoints with input_proj in_dim>2: PE CSV (e.g. gnn_node_index_master.csv), same as training.",
+    )
+    p.add_argument(
+        "--gnn-node-pe-cols",
+        type=str,
+        default="auto",
+        help="PE columns: 'auto' selects columns starting with pe_.",
+    )
+    p.add_argument(
+        "--gnn-static-mvagg-csv",
+        type=Path,
+        default=None,
+        help="Optional: gnn_node_features_and_targets_mvagg.csv (any chunk); first sample_id supplies static p_pv_kw,p_bess_kw,q_bess_kvar per node.",
+    )
     args = p.parse_args()
 
     run_compare_homo_global_localres(
@@ -1281,6 +1457,9 @@ def main() -> None:
         save_per_node_mae_csv=bool(args.save_per_node_mae_csv),
         debug_features=int(args.debug_features),
         plots_only=bool(args.plots_only),
+        gnn_node_pe_csv=args.gnn_node_pe_csv.resolve() if args.gnn_node_pe_csv else None,
+        gnn_node_pe_cols=str(args.gnn_node_pe_cols),
+        gnn_static_mvagg_csv=args.gnn_static_mvagg_csv.resolve() if args.gnn_static_mvagg_csv else None,
     )
 
 
