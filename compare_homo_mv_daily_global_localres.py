@@ -634,7 +634,10 @@ def run_compare_homo_global_localres(
         if ck_n != n_nodes:
             raise RuntimeError(
                 f"GNN-only checkpoint n_nodes={ck_n} != dataset n_nodes={n_nodes}. "
-                "Use the same heterogeneous MV node CSV / topology as training."
+                "The default --dataset-dir graph does not match this checkpoint. "
+                "Pass --nodes-csv and --edge-csv pointing to the same run_* folder you trained on "
+                "(e.g. gnn_node_features_and_targets_mvagg.csv + gnn_edges_phase_static.csv), "
+                "or any CSV pair with the same node order and edge count as training."
             )
         if gnn_only_in_dim > 2:
             if gnn_node_pe_csv is None:
@@ -1347,7 +1350,26 @@ def main() -> None:
 
     p = argparse.ArgumentParser(description="Daily compare for homo global+local residual checkpoint.")
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--dataset-dir", type=Path, required=True, help=".../Heterogenous GNN dataset")
+    p.add_argument(
+        "--dataset-dir",
+        type=Path,
+        required=True,
+        help="Folder containing nodes/edges defaults, or any existing dir if you pass --nodes-csv and --edge-csv.",
+    )
+    p.add_argument(
+        "--nodes-csv",
+        type=Path,
+        default=None,
+        help="Override nodes CSV (default: dataset-dir/nodes/hetero_mv_nodes_load_transformer_reg_tap_only.csv). "
+        "For mvagg-trained GNN-only checkpoints, use training gnn_node_features_and_targets_mvagg.csv (3817 nodes).",
+    )
+    p.add_argument(
+        "--edge-csv",
+        type=Path,
+        default=None,
+        help="Override edges CSV (default: dataset-dir/edges/hetero_mv_line_edges_load_only_compacted.csv). "
+        "For mvagg training runs, use gnn_edges_phase_static.csv from the same run_* folder.",
+    )
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--plot-node", action="append", default=[])
     p.add_argument(
@@ -1439,6 +1461,8 @@ def main() -> None:
         checkpoint=args.checkpoint.resolve(),
         dataset_dir=args.dataset_dir.resolve(),
         out_dir=args.out_dir.resolve(),
+        nodes_csv=args.nodes_csv.resolve() if args.nodes_csv else None,
+        edge_csv=args.edge_csv.resolve() if args.edge_csv else None,
         plot_nodes=list(args.plot_node),
         npts=args.npts,
         step_min=args.step_min,
