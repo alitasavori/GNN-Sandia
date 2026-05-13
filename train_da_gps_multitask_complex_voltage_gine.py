@@ -853,6 +853,94 @@ def _cast_batch_float_tensors(batch: Data) -> Data:
     return batch
 
 
+def _metric_key_segment(s: str) -> str:
+    """Safe single-segment key fragment (no spaces)."""
+    import re as _re
+
+    return _re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(s)).strip("_")[:120]
+
+
+def _print_per_head_two_lines(
+    prefix: str,
+    label: str,
+    names: list[str],
+    train_vals: np.ndarray,
+    val_vals: np.ndarray,
+    *,
+    max_tokens_per_line: int = 6,
+) -> None:
+    """Pretty-print name=value pairs, wrapping long lists across lines."""
+    if not names:
+        return
+
+    def _pack(vals: np.ndarray, phase: str) -> None:
+        buf: list[str] = []
+        ntok = 0
+        for i, nm in enumerate(names):
+            piece = f"{nm}={float(vals[i]):.4f}"
+            if ntok >= max_tokens_per_line and buf:
+                print(f"{prefix}  {label} {phase}: " + "  ".join(buf), flush=True)
+                buf = []
+                ntok = 0
+            buf.append(piece)
+            ntok += 1
+        if buf:
+            print(f"{prefix}  {label} {phase}: " + "  ".join(buf), flush=True)
+
+    _pack(train_vals, "train")
+    _pack(val_vals, "val")
+
+
+def _print_test_per_head_block(tag: str, met: dict[str, float], cap_cols: list[str], reg_cols: list[str], meta_cols: list[str]) -> None:
+    print(f"{tag} Test per-head cap_BCE:", flush=True)
+    for nm in cap_cols:
+        k = f"cap_bce__{_metric_key_segment(nm)}"
+        v = met.get(k, float("nan"))
+        print(f"  {nm}={v:.6f}", flush=True)
+    print(f"{tag} Test per-head reg_MSE (nrm / tap pu):", flush=True)
+    for nm in reg_cols:
+        seg = _metric_key_segment(nm)
+        kn = f"reg_mse_nrm__{seg}"
+        kp = f"reg_mse_pu__{seg}"
+        print(f"  {nm}: nrm={met.get(kn, float('nan')):.6f}  tap_pu={met.get(kp, float('nan')):.6f}", flush=True)
+    if meta_cols:
+        print(f"{tag} Test per-head meta_aux_MSE (nrm / raw):", flush=True)
+        for nm in meta_cols:
+            seg = _metric_key_segment(nm)
+            kn = f"meta_aux_mse_nrm__{seg}"
+            kr = f"meta_aux_mse_raw__{seg}"
+            print(f"  {nm}: nrm={met.get(kn, float('nan')):.6f}  raw={met.get(kr, float('nan')):.6f}", flush=True)
+
+
+def _empty_eval_metrics(cap_cols: list[str], reg_cols: list[str], meta_aux_cols: list[str]) -> dict[str, float]:
+    """All-NaN template including per-head keys (for zero-test-samples edge case)."""
+    out: dict[str, float] = {
+        "mae_vmag_pu": float("nan"),
+        "rmse_vmag_pu": float("nan"),
+        "mae_angle_deg": float("nan"),
+        "rmse_angle_deg": float("nan"),
+        "r2_vmag_mean": float("nan"),
+        "r2_vmag_min": float("nan"),
+        "mae_vmag_worst_node": float("nan"),
+        "cap_bce": float("nan"),
+        "reg_mse_normalized": float("nan"),
+        "reg_mse_tap_pu": float("nan"),
+        "pv_mse_normalized": float("nan"),
+        "pv_mse_raw": float("nan"),
+    }
+    for nm in cap_cols:
+        out[f"cap_bce__{_metric_key_segment(nm)}"] = float("nan")
+    for nm in reg_cols:
+        seg = _metric_key_segment(nm)
+        out[f"reg_mse_nrm__{seg}"] = float("nan")
+        out[f"reg_mse_pu__{seg}"] = float("nan")
+    for nm in meta_aux_cols:
+        seg = _metric_key_segment(nm)
+        out[f"meta_aux_mse_nrm__{seg}"] = float("nan")
+        out[f"meta_aux_mse_raw__{seg}"] = float("nan")
+    return out
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -866,6 +954,9 @@ def evaluate(
     *,
     pv_mean: torch.Tensor | None = None,
     pv_std: torch.Tensor | None = None,
+    cap_cols: list[str] | None = None,
+    reg_cols: list[str] | None = None,
+    meta_aux_cols: list[str] | None = None,
 ) -> dict[str, float]:
     model.eval()
     preds, tgts = [], []
@@ -904,6 +995,33 @@ def evaluate(
     rp_denorm = rp * reg_std.to(rp.device) + reg_mean.to(rp.device)
     rt_denorm = rt * reg_std.to(rt.device) + reg_mean.to(rt.device)
     met["reg_mse_tap_pu"] = float(F.mse_loss(rp_denorm, rt_denorm.to(rp_denorm.dtype)).item())
+    cap_list = list(cap_cols or [])
+    reg_list = list(reg_cols or [])
+    meta_list = list(meta_aux_cols or [])
+    for nm in cap_list:
+        met[f"cap_bce__{_metric_key_segment(nm)}"] = float("nan")
+    for nm in reg_list:
+        seg = _metric_key_segment(nm)
+        met[f"reg_mse_nrm__{seg}"] = float("nan")
+        met[f"reg_mse_pu__{seg}"] = float("nan")
+    for nm in meta_list:
+        seg = _metric_key_segment(nm)
+        met[f"meta_aux_mse_nrm__{seg}"] = float("nan")
+        met[f"meta_aux_mse_raw__{seg}"] = float("nan")
+    if cap_list and cap_log.shape[1] == len(cap_list):
+        for j, nm in enumerate(cap_list):
+            met[f"cap_bce__{_metric_key_segment(nm)}"] = float(
+                F.binary_cross_entropy_with_logits(cap_log[:, j], cap_t[:, j]).item()
+            )
+    if reg_list and rp.shape[1] == len(reg_list):
+        rm = reg_mean.to(rp.device)
+        rs = reg_std.to(rp.device)
+        for j, nm in enumerate(reg_list):
+            seg = _metric_key_segment(nm)
+            met[f"reg_mse_nrm__{seg}"] = float(F.mse_loss(rp[:, j], rt[:, j].to(rp.dtype)).item())
+            rpj = rp[:, j] * rs[0, j] + rm[0, j]
+            rtj = rt[:, j] * rs[0, j] + rm[0, j]
+            met[f"reg_mse_pu__{seg}"] = float(F.mse_loss(rpj, rtj.to(rpj.dtype)).item())
     if use_pv and pv_pred_all:
         pp = torch.cat(pv_pred_all, dim=0)
         pt = torch.cat(pv_tgt_all, dim=0)
@@ -911,6 +1029,16 @@ def evaluate(
         pp_den = pp * pv_std.to(pp.device) + pv_mean.to(pp.device)
         pt_den = pt * pv_std.to(pt.device) + pv_mean.to(pt.device)
         met["pv_mse_raw"] = float(F.mse_loss(pp_den, pt_den.to(pp_den.dtype)).item())
+        n_m = int(pp.shape[1])
+        names_m = [meta_list[j] if j < len(meta_list) else f"meta_aux_{j}" for j in range(n_m)]
+        pvm = pv_mean.to(pp.device)
+        pvs = pv_std.to(pp.device)
+        for j, nm in enumerate(names_m[:n_m]):
+            seg = _metric_key_segment(nm)
+            met[f"meta_aux_mse_nrm__{seg}"] = float(F.mse_loss(pp[:, j], pt[:, j].to(pp.dtype)).item())
+            pdj = pp[:, j] * pvs[0, j] + pvm[0, j]
+            tdj = pt[:, j] * pvs[0, j] + pvm[0, j]
+            met[f"meta_aux_mse_raw__{seg}"] = float(F.mse_loss(pdj, tdj.to(pdj.dtype)).item())
     else:
         met["pv_mse_normalized"] = float("nan")
         met["pv_mse_raw"] = float("nan")
@@ -1202,6 +1330,9 @@ def _evaluate_multi_chunks(
             use_amp=use_amp,
             pv_mean=pv_mean,
             pv_std=pv_std,
+            cap_cols=cap_cols,
+            reg_cols=reg_cols,
+            meta_aux_cols=list(pv_aux_cols) if pv_aux_cols else [],
         )
         w = int(len(idx_te))
         if met_acc is None:
@@ -1213,20 +1344,7 @@ def _evaluate_multi_chunks(
         del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl
         gc.collect()
     if met_acc is None or wtot == 0:
-        return {
-            "mae_vmag_pu": float("nan"),
-            "rmse_vmag_pu": float("nan"),
-            "mae_angle_deg": float("nan"),
-            "rmse_angle_deg": float("nan"),
-            "r2_vmag_mean": float("nan"),
-            "r2_vmag_min": float("nan"),
-            "mae_vmag_worst_node": float("nan"),
-            "cap_bce": float("nan"),
-            "reg_mse_normalized": float("nan"),
-            "reg_mse_tap_pu": float("nan"),
-            "pv_mse_normalized": float("nan"),
-            "pv_mse_raw": float("nan"),
-        }
+        return _empty_eval_metrics(cap_cols, reg_cols, list(pv_aux_cols or []))
     return {k: met_acc[k] / float(wtot) for k in met_acc}
 
 
@@ -1572,6 +1690,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         model.train()
         train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
         train_n = 0
+        train_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
+        train_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
+        train_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
+        val_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
+        val_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
+        val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
@@ -1642,6 +1766,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     train_c_sum += float(loss_c.item()) * batch.num_graphs
                     train_r_sum += float(loss_r.item()) * batch.num_graphs
                     train_n += int(batch.num_graphs)
+                    bce_e = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
+                    train_cap_dim += bce_e.sum(dim=0).detach().float().cpu().double()
+                    mse_r = F.mse_loss(r_p, y_reg_b, reduction="none")
+                    train_reg_dim += mse_r.sum(dim=0).detach().float().cpu().double()
+                    if train_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                        y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
+                        mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
+                        train_meta_dim += mse_p.sum(dim=0).detach().float().cpu().double()
             del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_tr
             gc.collect()
             if device.type == "cuda":
@@ -1710,6 +1842,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     val_c_sum += float(lc.item()) * batch.num_graphs
                     val_r_sum += float(lr_.item()) * batch.num_graphs
                     nv += int(batch.num_graphs)
+                    bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
+                    val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
+                    mse_rv = F.mse_loss(r_p, y_reg_b, reduction="none")
+                    val_reg_dim += mse_rv.sum(dim=0).detach().float().cpu().double()
+                    if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                        lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
+                        val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
                     v_flat = v_n.view(batch.num_graphs, -1)
                     pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
                     true_ri = yb.view(batch.num_graphs, n_nodes, 2)
@@ -1740,6 +1879,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         train_r = train_r_sum / max(train_n, 1)
         train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
+        train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
+        train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
+        train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
+        if nv > 0:
+            val_cap_mean = (val_cap_dim / float(nv)).numpy()
+            val_reg_mean = (val_reg_dim / float(nv)).numpy()
+            val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
+        else:
+            val_cap_mean = np.full(n_cap, np.nan)
+            val_reg_mean = np.full(n_reg, np.nan)
+            val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
         if crit < best_val:
@@ -1761,6 +1911,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 f"| best={best_val:.4f}"
             )
             print(_log, flush=True)
+            _print_per_head_two_lines("[da_gps chunk_parent]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
+            _print_per_head_two_lines("[da_gps chunk_parent]", "reg_MSE_nrm", reg_cols, train_reg_mean, val_reg_mean)
+            if n_pv_aux > 0:
+                _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -1860,6 +2014,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
+    _print_test_per_head_block("[da_gps chunk_parent]", met, cap_cols, reg_cols, list(pv_aux_cols) if n_pv_aux > 0 else [])
     print(f"Saved {ckpt}", flush=True)
 
 
@@ -2264,6 +2419,12 @@ def main() -> None:
         model.train()
         train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
         train_n = 0
+        train_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
+        train_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
+        train_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
+        val_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
+        val_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
+        val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
         for batch in dl_tr:
             batch = batch.to(device)
             batch = _cast_batch_float_tensors(batch)
@@ -2298,6 +2459,14 @@ def main() -> None:
                 train_c_sum += float(loss_c.item()) * batch.num_graphs
                 train_r_sum += float(loss_r.item()) * batch.num_graphs
                 train_n += int(batch.num_graphs)
+                bce_e = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
+                train_cap_dim += bce_e.sum(dim=0).detach().float().cpu().double()
+                mse_r = F.mse_loss(r_p, y_reg, reduction="none")
+                train_reg_dim += mse_r.sum(dim=0).detach().float().cpu().double()
+                if train_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                    y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
+                    mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
+                    train_meta_dim += mse_p.sum(dim=0).detach().float().cpu().double()
 
         model.eval()
         val_tot = val_v = 0.0
@@ -2330,6 +2499,13 @@ def main() -> None:
                 val_c_sum += float(lc.item()) * batch.num_graphs
                 val_r_sum += float(lr_.item()) * batch.num_graphs
                 nv += int(batch.num_graphs)
+                bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
+                val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
+                mse_rv = F.mse_loss(r_p, y_reg, reduction="none")
+                val_reg_dim += mse_rv.sum(dim=0).detach().float().cpu().double()
+                if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                    lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
+                    val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
                 v_flat = v_n.view(batch.num_graphs, -1)
                 pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
                 true_ri = yb.view(batch.num_graphs, n_nodes, 2)
@@ -2357,6 +2533,17 @@ def main() -> None:
         train_r = train_r_sum / max(train_n, 1)
         train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
+        train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
+        train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
+        train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
+        if nv > 0:
+            val_cap_mean = (val_cap_dim / float(nv)).numpy()
+            val_reg_mean = (val_reg_dim / float(nv)).numpy()
+            val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
+        else:
+            val_cap_mean = np.full(n_cap, np.nan)
+            val_reg_mean = np.full(n_reg, np.nan)
+            val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
         if crit < best_val:
@@ -2378,6 +2565,10 @@ def main() -> None:
                 f"| best={best_val:.4f}"
             )
             print(_log, flush=True)
+            _print_per_head_two_lines("[da_gps]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
+            _print_per_head_two_lines("[da_gps]", "reg_MSE_nrm", reg_cols, train_reg_mean, val_reg_mean)
+            if n_pv_aux > 0:
+                _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -2410,6 +2601,9 @@ def main() -> None:
         use_amp=use_amp,
         pv_mean=pv_mean_d,
         pv_std=pv_std_d,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        meta_aux_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
     )
     ckpt = out_dir / "da_gps_multitask_best.pt"
     torch.save(
@@ -2458,6 +2652,7 @@ def main() -> None:
         f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
+    _print_test_per_head_block("[da_gps]", met, cap_cols, reg_cols, list(pv_aux_cols) if n_pv_aux > 0 else [])
     print(f"Saved {ckpt}", flush=True)
 
 
