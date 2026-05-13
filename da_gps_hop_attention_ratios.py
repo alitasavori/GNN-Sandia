@@ -2,8 +2,12 @@
 Map DA-GPS ``reg_*_tap_pu`` targets to hop CSV columns (``compute_hop_distance_all_index_nodes.py`` output)
 and compute downstream vs rest attention ratios.
 
-Hop CSV convention: ``0`` = not in that regulator's downstream subtree **or** (only for in-subtree nodes)
-the reference bus at 0 hops — so we use **hop > 0** as "strictly downstream" by default.
+Hop CSV convention:
+- ``0`` = node appears in ``hetero_mv_edge_catalog`` but is not strictly downstream (``hop > 0``) for that
+  regulator — includes reference ``terminal_2`` and buses outside that regulator's downstream subtree.
+- ``-1`` = node does not appear on any edge of the hop topology (``hetero_mv_edge_catalog`` or
+  ``gnn_edges_phase_static`` per ``compute_hop_distance_all_index_nodes.py``);
+  excluded from downstream vs "other" ratio splits (see ``downstream_mask``).
 """
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from compute_hop_distance_all_index_nodes import HOP_NOT_IN_MV_CATALOG
 from train_da_gps_multitask_complex_voltage import TARGET_REG_COLS
 
 # Output columns from compute_hop_distance_all_index_nodes.py (regulator names in CSV)
@@ -66,11 +71,19 @@ def hops_for_manifest_nodes(
 
 
 def downstream_mask(hops: np.ndarray, *, rule: str) -> np.ndarray:
+    """Strictly downstream nodes; never true for ``HOP_NOT_IN_MV_CATALOG`` (-1)."""
+    unk = hops == HOP_NOT_IN_MV_CATALOG
     if rule == "hop_gt_0":
-        return hops > 0
+        return (hops > 0) & ~unk
     if rule == "hop_ge_1":
-        return hops >= 1
+        return (hops >= 1) & ~unk
     raise ValueError(f"Unknown rule {rule!r} (use 'hop_gt_0' or 'hop_ge_1')")
+
+
+def non_downstream_catalog_mask(hops: np.ndarray, *, rule: str) -> np.ndarray:
+    """In-catalog, not strictly downstream — complements ``downstream_mask`` (excludes -1)."""
+    unk = hops == HOP_NOT_IN_MV_CATALOG
+    return ~downstream_mask(hops, rule=rule) & ~unk
 
 
 def node_regulator_hop_dataframe(
@@ -84,7 +97,7 @@ def node_regulator_hop_dataframe(
 
     Index: node names (exact strings from ``node_names``). Columns: short regulator labels
     (``feeder_rega``, ``vreg2_a``, …). Missing hop CSV mapping for a ``reg_target_cols`` entry
-    is skipped. Values are integers from the hop CSV (0 = non-downstream for hop>0 rule).
+    is skipped. Values are integers from the hop CSV (0 = in-catalog but not hop>0; -1 = not in MV catalog).
     """
     cols: dict[str, np.ndarray] = {}
     for reg_col in reg_target_cols:
@@ -141,7 +154,13 @@ def worst_nodes_downstream_regulator_table(
             hop_rows.append(np.full(len(reg_short_cols), np.nan, dtype=np.float64))
             continue
         hrow = hop_mat.loc[key]
-        dmask = downstream_mask(hrow.to_numpy(dtype=np.int32), rule=downstream_rule)
+        hvals = hrow.to_numpy(dtype=np.int32)
+        if np.all(hvals == HOP_NOT_IN_MV_CATALOG):
+            downstream_regs.append("(not in hop topology graph / edges CSV)")
+            n_down.append(0)
+            hop_rows.append(hvals.astype(np.float64))
+            continue
+        dmask = downstream_mask(hvals, rule=downstream_rule)
         names = [reg_short_cols[j] for j in range(len(reg_short_cols)) if dmask[j]]
         downstream_regs.append(", ".join(names))
         n_down.append(len(names))
@@ -203,7 +222,7 @@ def attention_downstream_ratio_table(
             # one line in notebook can print; keep quiet here or use logging
             pass
         dmask = downstream_mask(hops, rule=downstream_rule)
-        omask = ~dmask
+        omask = non_downstream_catalog_mask(hops, rule=downstream_rule)
         if not np.any(dmask) or not np.any(omask):
             continue
         for layer in range(L):
@@ -273,7 +292,7 @@ def attention_downstream_ratio_table_tn(
         tok = n_cap + int(reg_target_cols.index(reg_col))
         hops, miss = hops_for_manifest_nodes(hop_df, node_names, hop_col)
         dmask = downstream_mask(hops, rule=downstream_rule)
-        omask = ~dmask
+        omask = non_downstream_catalog_mask(hops, rule=downstream_rule)
         if not np.any(dmask) or not np.any(omask):
             continue
         for layer in range(L):
@@ -300,9 +319,11 @@ def attention_downstream_ratio_table_tn(
 __all__ = [
     "TARGET_REG_COLS",
     "REG_COL_TO_HOP_COL",
+    "HOP_NOT_IN_MV_CATALOG",
     "load_hop_frame",
     "hops_for_manifest_nodes",
     "downstream_mask",
+    "non_downstream_catalog_mask",
     "node_regulator_hop_dataframe",
     "worst_nodes_downstream_regulator_table",
     "attention_downstream_ratio_table",

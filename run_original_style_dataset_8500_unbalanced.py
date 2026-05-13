@@ -722,6 +722,7 @@ def generate_original_style_dataset_8500_unbalanced(
     bess_num_nodes_max: int = 8,
     bess_q_frac_max: float = 0.44,
     bess_candidate_nodes_override: list[str] | None = None,
+    include_bess: bool = True,
     node_pe_k: int = 0,
     node_pe_seed: int = 42,
     node_pe_zero_eig_tol: float = 1e-8,
@@ -746,12 +747,13 @@ def generate_original_style_dataset_8500_unbalanced(
         raise ValueError(f"Invalid safe voltage band: [{vmin_safe_pu}, {vmax_safe_pu}]")
     if float(sigma_load) < 0.0 or float(sigma_pv) < 0.0:
         raise ValueError("sigma_load and sigma_pv must be non-negative.")
-    if float(bess_total_mva_mean) < 0.0 or float(bess_total_mva_sigma) < 0.0:
-        raise ValueError("bess_total_mva_mean and bess_total_mva_sigma must be non-negative.")
-    if int(bess_num_nodes_min) < 1 or int(bess_num_nodes_max) < int(bess_num_nodes_min):
-        raise ValueError("Invalid BESS three-phase bus-count range.")
-    if not (0.0 <= float(bess_q_frac_max) <= 1.0):
-        raise ValueError("bess_q_frac_max must be within [0, 1].")
+    if include_bess:
+        if float(bess_total_mva_mean) < 0.0 or float(bess_total_mva_sigma) < 0.0:
+            raise ValueError("bess_total_mva_mean and bess_total_mva_sigma must be non-negative.")
+        if int(bess_num_nodes_min) < 1 or int(bess_num_nodes_max) < int(bess_num_nodes_min):
+            raise ValueError("Invalid BESS three-phase bus-count range.")
+        if not (0.0 <= float(bess_q_frac_max) <= 1.0):
+            raise ValueError("bess_q_frac_max must be within [0, 1].")
     if int(node_pe_k) < 0:
         raise ValueError("node_pe_k must be >= 0")
     if float(p_load_mean_kw) <= 0.0 or float(q_load_mean_kvar) <= 0.0:
@@ -766,25 +768,30 @@ def generate_original_style_dataset_8500_unbalanced(
         raise RuntimeError("No nodes left after filtering x*/sx* buses for graph artifacts.")
     node_to_idx_all = {n: i for i, n in enumerate(node_names_all)}
     node_set_all_lower = {str(n).lower() for n in node_names_all}
-    if bess_candidate_nodes_override is None:
-        raise ValueError("bess_candidate_nodes_override must be provided (manual BESS candidate list).")
-    user_nodes_raw = [str(x).strip().lower() for x in bess_candidate_nodes_override if str(x).strip()]
-    user_nodes_dedup = list(dict.fromkeys(user_nodes_raw))
-    bess_candidate_nodes = [n for n in user_nodes_dedup if n in node_set_all_lower]
-    n_bad = int(len(user_nodes_dedup) - len(bess_candidate_nodes))
-    print(f"[diag] BESS candidate nodes (manual list): {len(bess_candidate_nodes)} valid, {n_bad} invalid")
-    if not bess_candidate_nodes:
-        raise ValueError("No valid BESS candidate nodes remain after validation against circuit nodes.")
-    bess_candidate_bus_to_nodes = _candidate_three_phase_buses_from_nodes(bess_candidate_nodes)
-    if not bess_candidate_bus_to_nodes:
-        raise ValueError(
-            "No full three-phase BESS candidate buses found. Provide candidates containing .1/.2/.3 for each bus."
+    if include_bess:
+        if bess_candidate_nodes_override is None:
+            raise ValueError("bess_candidate_nodes_override must be provided (manual BESS candidate list).")
+        user_nodes_raw = [str(x).strip().lower() for x in bess_candidate_nodes_override if str(x).strip()]
+        user_nodes_dedup = list(dict.fromkeys(user_nodes_raw))
+        bess_candidate_nodes = [n for n in user_nodes_dedup if n in node_set_all_lower]
+        n_bad = int(len(user_nodes_dedup) - len(bess_candidate_nodes))
+        print(f"[diag] BESS candidate nodes (manual list): {len(bess_candidate_nodes)} valid, {n_bad} invalid")
+        if not bess_candidate_nodes:
+            raise ValueError("No valid BESS candidate nodes remain after validation against circuit nodes.")
+        bess_candidate_bus_to_nodes = _candidate_three_phase_buses_from_nodes(bess_candidate_nodes)
+        if not bess_candidate_bus_to_nodes:
+            raise ValueError(
+                "No full three-phase BESS candidate buses found. Provide candidates containing .1/.2/.3 for each bus."
+            )
+        dropped_non_3ph = len(set(n.split(".")[0] for n in bess_candidate_nodes)) - len(bess_candidate_bus_to_nodes)
+        print(
+            f"[diag] BESS candidate 3-phase buses: {len(bess_candidate_bus_to_nodes)} "
+            f"(dropped_non_3ph_buses={max(0, int(dropped_non_3ph))})"
         )
-    dropped_non_3ph = len(set(n.split(".")[0] for n in bess_candidate_nodes)) - len(bess_candidate_bus_to_nodes)
-    print(
-        f"[diag] BESS candidate 3-phase buses: {len(bess_candidate_bus_to_nodes)} "
-        f"(dropped_non_3ph_buses={max(0, int(dropped_non_3ph))})"
-    )
+    else:
+        bess_candidate_nodes = []
+        bess_candidate_bus_to_nodes = {}
+        print("[diag] include_bess=False: skipping BESS generators; p_bess_kw / q_bess_kvar will be 0.")
 
     inj.extract_static_phase_edges_to_csv(
         node_names_master=node_names_graph,

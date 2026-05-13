@@ -21,6 +21,7 @@ import csv
 import importlib
 import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -275,6 +276,7 @@ def generate_dataset_8500_daily_aggregate(
     n_scenarios: int = 500,
     k_snapshots_per_scenario: int = 20,
     total_load_scale_range: tuple[float, float] = (0.7, 1.3),
+    total_load_scale_disjoint_ranges: Optional[list[tuple[float, float]]] = None,
     sigma_device: float = 0.03,
     master_seed: int = 20260324,
     vmin_safe_pu: float = 0.85,
@@ -285,15 +287,29 @@ def generate_dataset_8500_daily_aggregate(
     """
     Generate samples by:
       - sampling a scenario-level total load scale from range
+        (or from ``total_load_scale_disjoint_ranges``: pick one interval uniformly,
+        then sample uniformly inside that interval — excludes the "middle" between intervals)
       - selecting time points from daily load profile
       - applying total scale * profile[t] and per-device perturbations
       - solving and recording node features/targets
     """
     if k_snapshots_per_scenario < 1:
         raise ValueError("k_snapshots_per_scenario must be >= 1")
-    lo, hi = float(total_load_scale_range[0]), float(total_load_scale_range[1])
-    if not (0 < lo <= hi):
-        raise ValueError(f"Invalid total_load_scale_range={total_load_scale_range}")
+
+    disjoint: Optional[list[tuple[float, float]]] = None
+    if total_load_scale_disjoint_ranges:
+        disjoint = [(float(a), float(b)) for a, b in total_load_scale_disjoint_ranges]
+        for lo_i, hi_i in disjoint:
+            if not (0 < lo_i <= hi_i):
+                raise ValueError(f"Invalid disjoint interval ({lo_i}, {hi_i}); need 0 < lo <= hi.")
+        lo = min(x for x, _ in disjoint)
+        hi = max(y for _, y in disjoint)
+        print(f"[diag] total_load_scale: DISJOINT uniform ranges {disjoint} (envelope [{lo}, {hi}])", flush=True)
+    else:
+        lo, hi = float(total_load_scale_range[0]), float(total_load_scale_range[1])
+        if not (0 < lo <= hi):
+            raise ValueError(f"Invalid total_load_scale_range={total_load_scale_range}")
+        print(f"[diag] total_load_scale: single uniform range [{lo}, {hi}]", flush=True)
 
     # Initial compile and static artifacts (aligned with notebook Step 9 daily setup)
     _compile_8500_daily_setup()
@@ -393,7 +409,12 @@ def generate_dataset_8500_daily_aggregate(
                 if not dss.Loads.Next():
                     break
 
-            scenario_scale = float(rng_master.uniform(lo, hi))
+            if disjoint:
+                ri = int(rng_master.integers(0, len(disjoint)))
+                a, b = disjoint[ri]
+                scenario_scale = float(rng_master.uniform(a, b))
+            else:
+                scenario_scale = float(rng_master.uniform(lo, hi))
             rng_times = np.random.default_rng(int(rng_master.integers(0, 2**31 - 1)))
             # timestamps selected from load profile
             times = inj.select_times_anchors_equalpop(

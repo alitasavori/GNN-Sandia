@@ -43,28 +43,56 @@ from extract_da_gps_attention import (
 )
 from plot_da_gps_attention_hop_histograms_all import plot_all_regulator_layer_hop_histograms
 
-# --- edit paths ---
+# =============================================================================
+# Knobs — edit here
+# =============================================================================
+# How many cache rows to average (max = cache size).
+#   None → all rows from SAMPLE_IDX_START; int → at most that many consecutive rows.
+N_SAMPLES_AVG = None
+
+SAMPLE_IDX_START = 0
+
+# Worst-bus plots / CSV / heatmap: at most this many buses (clipped to n_nodes).
+TOP_K_WORST_BUSES = 1000
+
+# Log: how many rows of the R²-sorted table (lowest R² first).
+N_ROWS_PRINT_R2_TABLE = 30
+
+TOP_K_PLOT_H_CAP_IN = 42.0
+
+# --- paths ---
 RUN_DIR = REPO_ROOT / r"gnn2_architecture_search\attention checkpoints\da_gps_chunked_l4_mvagg_20260510_134709"
 CACHE_PT = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2\datasets_gnn2_from pc\run_001_scen_0000_0049_seed_20360133__full.pt")
 EDGES_CSV = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2\datasets_gnn2_from pc\gnn_edges_phase_static.csv")
 HOP_CSV = REPO_ROOT / r"datasets_gnn2_from pc\load_hop_distance_to_each_regulator_all_index_nodes.csv"
 OUT_DIR = RUN_DIR / "attention_extract"
-SAMPLE_IDX_START = 0
-N_SAMPLES_AVG = 100
-TOP_K_NODE_PLOT = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DOWNSTREAM_RULE = "hop_gt_0"
-# ------------
+# =============================================================================
 
 print("DEVICE =", DEVICE)
 ckpt = RUN_DIR / "da_gps_multitask_best.pt"
 
 _z = torch.load(CACHE_PT, map_location="cpu", weights_only=False)
 _n_cache = int(_z["x"].shape[0])
-_n_avg = max(1, min(int(N_SAMPLES_AVG), _n_cache))
+if N_SAMPLES_AVG is None:
+    _n_avg = _n_cache
+else:
+    _n_avg = max(1, min(int(N_SAMPLES_AVG), _n_cache))
 _sample_indices = [SAMPLE_IDX_START + k for k in range(_n_avg)]
-if _sample_indices[-1] >= _n_cache:
-    raise IndexError(f"sample range {_sample_indices[0]}..{_sample_indices[-1]} out of cache [0,{_n_cache})")
+if not _sample_indices or _sample_indices[-1] >= _n_cache:
+    raise IndexError(
+        f"sample range {SAMPLE_IDX_START}..{SAMPLE_IDX_START + _n_avg - 1} out of cache [0,{_n_cache})"
+    )
+print(f"cache_pt={CACHE_PT}")
+print(f"  total_samples_in_cache (x batch dim) = {_n_cache}")
+print(
+    f"  n_used_for_average = {_n_avg}  (indices {_sample_indices[0]}..{_sample_indices[-1]} inclusive)"
+)
+print(
+    f"knobs: N_SAMPLES_AVG={N_SAMPLES_AVG!r} → n_used={_n_avg}  |  "
+    f"TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}  |  N_ROWS_PRINT_R2_TABLE={N_ROWS_PRINT_R2_TABLE}"
+)
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 hop_df = load_hop_frame(HOP_CSV)
@@ -146,6 +174,29 @@ print(
     f"worst bus (mean |V| MAE over n={_n_avg}): {node_err_meta['worst_node']}  "
     f"mean_mae_vmag_pu={node_err_meta['worst_mean_mae_vmag_pu']:.6f}"
 )
+_r2s = node_err_df["r2_vmag"].to_numpy(dtype=np.float64)
+_r2ok = _r2s[np.isfinite(_r2s)]
+print(
+    f"|V| R² over nodes (finite {len(_r2ok)}/{node_err_meta['n_nodes']}): "
+    f"mean={node_err_meta.get('r2_vmag_mean', float('nan')):.4f}  "
+    f"median={node_err_meta.get('r2_vmag_median', float('nan')):.4f}  "
+    f"min={node_err_meta.get('r2_vmag_min', float('nan')):.4f}  "
+    f"max={node_err_meta.get('r2_vmag_max', float('nan')):.4f}"
+)
+print(
+    f"worst |V| R² bus (finite): {node_err_meta.get('worst_r2_node', '')!r}  "
+    f"r2_vmag={node_err_meta.get('worst_r2_vmag', float('nan')):.4f}"
+)
+_r2_sorted = (
+    node_err_df.sort_values("r2_vmag", ascending=True, na_position="last").reset_index(drop=True)
+)
+_r2_sorted.insert(0, "rank_r2_table", np.arange(1, len(_r2_sorted) + 1, dtype=np.int32))
+print(
+    "--- lowest R² buses (first {0} rows; rank_r2_table 1 = lowest R²) ---".format(
+        int(N_ROWS_PRINT_R2_TABLE)
+    )
+)
+print(_r2_sorted.head(int(N_ROWS_PRINT_R2_TABLE)).to_string(index=False))
 
 fig_nv, axes_nv = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
 axes_nv[0].hist(node_err_df["mean_mae_vmag_pu"], bins=50, color="steelblue", alpha=0.85, edgecolor="white")
@@ -161,18 +212,75 @@ fig_nv.savefig(_fig_hist, dpi=150)
 plt.show()
 print(f"wrote {_fig_hist}")
 
-worst = node_err_df.head(TOP_K_NODE_PLOT).iloc[::-1]
-fig_top, ax_top = plt.subplots(figsize=(10, max(5.0, 0.22 * TOP_K_NODE_PLOT)), constrained_layout=True)
+fig_r2, ax_r2 = plt.subplots(figsize=(8, 4), constrained_layout=True)
+if len(_r2ok):
+    ax_r2.hist(_r2ok, bins=50, color="seagreen", alpha=0.85, edgecolor="white")
+    ax_r2.axvline(float(np.mean(_r2ok)), color="k", ls="--", lw=1.2, label=f"mean={np.mean(_r2ok):.3f}")
+    ax_r2.legend(loc="upper left", fontsize=8)
+else:
+    ax_r2.text(0.5, 0.5, "no finite r2_vmag", ha="center", va="center", transform=ax_r2.transAxes)
+ax_r2.set_xlabel(r"per-node $R^2$ of $|V|$ over cache rows")
+ax_r2.set_ylabel("count (buses)")
+ax_r2.set_title(
+    f"Distribution of |V| magnitude R² (n_nodes finite={node_err_meta.get('n_nodes_r2_vmag_finite', 0)}, "
+    f"n_samples={_n_avg})"
+)
+_fig_r2 = OUT_DIR / f"voltage_node_r2_vmag_distribution_avg{_n_avg}.png"
+fig_r2.savefig(_fig_r2, dpi=150)
+plt.show()
+print(f"wrote {_fig_r2}")
+
+_sy = node_err_df["std_vmag_true_pu"].to_numpy(dtype=np.float64)
+_r2col = node_err_df["r2_vmag"].to_numpy(dtype=np.float64)
+_mae_col = node_err_df["mean_mae_vmag_pu"].to_numpy(dtype=np.float64)
+_xlog = np.maximum(_sy, 1e-12)
+mask_r2 = np.isfinite(_r2col)
+fig_diag, axes_diag = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
+axd0, axd1 = axes_diag
+axd0.scatter(_xlog[mask_r2], _r2col[mask_r2], s=10, alpha=0.35, c="tab:blue", edgecolors="none")
+axd0.set_xscale("log")
+axd0.set_xlabel(r"std($|V|_{\mathrm{true}}$) (pu) over cache rows [log scale]")
+axd0.set_ylabel(r"$R^2$ of $|V|$ (finite only)")
+axd0.set_title("small std + low R² → touchy metric; large std + low R² → hard / misfit")
+axd0.axhline(0.0, color="k", lw=0.5, alpha=0.4)
+axd0.grid(True, which="both", alpha=0.25)
+axd1.scatter(_xlog, _mae_col, s=10, alpha=0.35, c="tab:orange", edgecolors="none")
+axd1.set_xscale("log")
+axd1.set_xlabel(r"std($|V|_{\mathrm{true}}$) (pu) [log scale]")
+axd1.set_ylabel("mean |V| MAE (pu)")
+axd1.set_title("MAE vs spread: small MAE at tiny std can still give odd R²")
+axd1.grid(True, which="both", alpha=0.25)
+_fig_diag = OUT_DIR / f"voltage_node_std_vmag_vs_r2_mae_avg{_n_avg}.png"
+fig_diag.savefig(_fig_diag, dpi=150)
+plt.show()
+print(f"wrote {_fig_diag}")
+_sy_fin = _sy[mask_r2]
+_r2_fin = _r2col[mask_r2]
+_low_thr = 1e-4
+_touchy = int(np.sum((_sy_fin < _low_thr) & (_r2_fin < 0.5)))
+_hardish = int(np.sum((_sy_fin >= _low_thr) & (_r2_fin < 0.5)))
+print(
+    f"std-vs-R² hint (finite R² only): n(sy<{_low_thr:g} pu & R²<0.5)={_touchy} "
+    f"(metric touchy); n(sy>={_low_thr:g} & R²<0.5)={_hardish} (likely hard / misfit)"
+)
+
+_top_k = min(int(TOP_K_WORST_BUSES), len(node_err_df))
+print(
+    f"worst-bus analysis: TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}, rows_used={_top_k} (n_nodes={len(node_err_df)})"
+)
+_h_bar = min(TOP_K_PLOT_H_CAP_IN, max(5.0, 0.06 * _top_k))
+worst = node_err_df.head(_top_k).iloc[::-1]
+fig_top, ax_top = plt.subplots(figsize=(10, _h_bar), constrained_layout=True)
 ax_top.barh(worst["node"].astype(str), worst["mean_mae_vmag_pu"], color="crimson", alpha=0.85)
 ax_top.set_xlabel("mean |V| MAE (pu)")
-ax_top.set_title(f"Top {TOP_K_NODE_PLOT} worst buses (mean over {_n_avg} samples)")
+ax_top.set_title(f"Top {_top_k} worst buses (mean over {_n_avg} samples)")
 ax_top.grid(True, axis="x", alpha=0.3)
-_fig_top = OUT_DIR / f"voltage_node_worst_{TOP_K_NODE_PLOT}_avg{_n_avg}.png"
+_fig_top = OUT_DIR / f"voltage_node_worst_{_top_k}_avg{_n_avg}.png"
 fig_top.savefig(_fig_top, dpi=150)
 plt.show()
 print(f"wrote {_fig_top}")
 
-worst_raw = node_err_df.head(TOP_K_NODE_PLOT).copy()
+worst_raw = node_err_df.head(_top_k).copy()
 worst_ann, hop_sub_worst = worst_nodes_downstream_regulator_table(
     worst_raw,
     hop_df,
@@ -181,10 +289,11 @@ worst_ann, hop_sub_worst = worst_nodes_downstream_regulator_table(
     reg_col_to_hop_col=REG_COL_TO_HOP_COL,
     downstream_rule=DOWNSTREAM_RULE,
 )
-worst_ann.to_csv(OUT_DIR / f"voltage_worst_{TOP_K_NODE_PLOT}_with_downstream_regs_avg{_n_avg}.csv", index=False)
+worst_ann.to_csv(OUT_DIR / f"voltage_worst_{_top_k}_with_downstream_regs_avg{_n_avg}.csv", index=False)
 M = np.ma.masked_invalid(hop_sub_worst.to_numpy(dtype=float))
+_h_hm = min(48.0, max(5.5, 0.038 * float(M.shape[0])))
 fig_hm, ax_hm = plt.subplots(
-    figsize=(max(10.0, 0.42 * M.shape[1]), max(5.5, 0.2 * M.shape[0])),
+    figsize=(max(10.0, 0.42 * M.shape[1]), _h_hm),
     constrained_layout=True,
 )
 im = ax_hm.imshow(M, aspect="auto", cmap="viridis", interpolation="nearest", vmin=0)
@@ -192,29 +301,30 @@ ax_hm.set_xticks(np.arange(M.shape[1]))
 ax_hm.set_xticklabels(list(hop_sub_worst.columns), rotation=55, ha="right", fontsize=8)
 ax_hm.set_yticks(np.arange(M.shape[0]))
 _labels_y = [f"#{int(r['rank_vmag'])}  {r['node']}" for _, r in worst_raw.iterrows()]
-ax_hm.set_yticklabels(_labels_y, fontsize=7)
+_ylab_fs = 6 if _top_k > 400 else 7
+ax_hm.set_yticklabels(_labels_y, fontsize=_ylab_fs)
 ax_hm.set_xlabel("regulator (hop CSV)")
 ax_hm.set_ylabel("worst buses by mean |V| MAE")
 fig_hm.colorbar(im, ax=ax_hm, label="hop count (0 = not downstream for hop>0 rule)")
 fig_hm.suptitle(
-    f"Hop distance to each regulator — top {TOP_K_NODE_PLOT} worst voltage buses ({DOWNSTREAM_RULE})",
+    f"Hop distance to each regulator — top {_top_k} worst voltage buses ({DOWNSTREAM_RULE})",
     fontsize=10,
 )
-fig_hm.savefig(OUT_DIR / f"voltage_worst_{TOP_K_NODE_PLOT}_hop_heatmap_avg{_n_avg}.png", dpi=150)
+fig_hm.savefig(OUT_DIR / f"voltage_worst_{_top_k}_hop_heatmap_avg{_n_avg}.png", dpi=150)
 plt.show()
-print(f"wrote {OUT_DIR / f'voltage_worst_{TOP_K_NODE_PLOT}_hop_heatmap_avg{_n_avg}.png'}")
+print(f"wrote {OUT_DIR / f'voltage_worst_{_top_k}_hop_heatmap_avg{_n_avg}.png'}")
 
 _ypos = np.arange(len(worst_ann))
-fig_nd, ax_nd = plt.subplots(figsize=(10, max(4.0, 0.18 * TOP_K_NODE_PLOT)), constrained_layout=True)
+fig_nd, ax_nd = plt.subplots(figsize=(10, _h_bar), constrained_layout=True)
 ax_nd.barh(_ypos, worst_ann["n_downstream_regs"].to_numpy(), color="teal", alpha=0.85)
 ax_nd.set_yticks(_ypos)
-ax_nd.set_yticklabels(_labels_y, fontsize=7)
+ax_nd.set_yticklabels(_labels_y, fontsize=_ylab_fs)
 ax_nd.invert_yaxis()
 ax_nd.set_xlabel("number of regulators with hop>0 (strictly downstream)")
 ax_nd.set_title(f"Downstream regulator count ({DOWNSTREAM_RULE})")
-fig_nd.savefig(OUT_DIR / f"voltage_worst_{TOP_K_NODE_PLOT}_n_downstream_bar_avg{_n_avg}.png", dpi=150)
+fig_nd.savefig(OUT_DIR / f"voltage_worst_{_top_k}_n_downstream_bar_avg{_n_avg}.png", dpi=150)
 plt.show()
-print(f"wrote {OUT_DIR / f'voltage_worst_{TOP_K_NODE_PLOT}_n_downstream_bar_avg{_n_avg}.png'}")
+print(f"wrote {OUT_DIR / f'voltage_worst_{_top_k}_n_downstream_bar_avg{_n_avg}.png'}")
 
 # --- attention mean over same indices ---
 mh_acc = None
@@ -314,7 +424,9 @@ def _print_ratio_block(df: pd.DataFrame, label: str) -> None:
 
 
 print("\n========== DA-GPS attention + hop ratios ==========")
-print(f"averaged over n={_n_avg} cache rows (indices {_sample_indices[0]}..{_sample_indices[-1]})")
+print(
+    f"averaged over n={_n_avg} of {_n_cache} cache rows (indices {_sample_indices[0]}..{_sample_indices[-1]})"
+)
 print(f"out_dir={OUT_DIR}")
 print(f"node→token tensors: layers={L}  nodes={N}  tokens={T}")
 print(f"downstream_rule={DOWNSTREAM_RULE!r}")

@@ -17,6 +17,7 @@ from da_gps_hop_attention_ratios import (
     downstream_mask,
     hops_for_manifest_nodes,
     load_hop_frame,
+    non_downstream_catalog_mask,
 )
 
 
@@ -90,7 +91,7 @@ def plot_all_regulator_layer_hop_histograms(
             tok = n_cap + int(reg_target_cols.index(reg_col))
             hvec, _ = hops_for_manifest_nodes(hop_df, list(node_names), hop_col)
             dmask = downstream_mask(hvec, rule=downstream_rule)
-            omask = ~dmask
+            omask = non_downstream_catalog_mask(hvec, rule=downstream_rule)
             lab_short = reg_col.replace("reg_", "").replace("_tap_pu", "")
             for ell in range(L):
                 ax = axes[ell, j]

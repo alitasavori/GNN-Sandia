@@ -30,6 +30,28 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_batch
 
 from train_gnn_only_compare_complex_voltage import _build_complex_targets
+
+
+def _to_dense_batch_mv(
+    x: torch.Tensor,
+    batch: torch.Tensor,
+    *,
+    n_nodes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack batched nodes into ``(B, N, *)`` without ``batch.max()`` (PyG ``to_dense_batch``).
+
+    DA-GPS MV batches use a fixed ``n_nodes`` per graph in standard PyG order; this avoids
+    Dynamo graph breaks from ``Tensor.item()`` inside ``to_dense_batch``.
+    Falls back to ``to_dense_batch`` if the total node count is not ``B * n_nodes``.
+    """
+    n = int(n_nodes)
+    ntot = int(x.size(0))
+    if n > 0 and ntot % n == 0:
+        bsz = ntot // n
+        dense = x.view(bsz, n, -1)
+        mask = torch.ones(bsz, n, dtype=torch.bool, device=x.device)
+        return dense, mask
+    return to_dense_batch(x, batch)
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 TARGET_REG_COLS: tuple[str, ...] = (
@@ -239,6 +261,29 @@ def _multihead_cross_attn(
     return out
 
 
+def _attn_probs_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    n_heads: int,
+    key_padding_mask: torch.Tensor | None,
+    query_padding_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Softmax attention weights (no dropout). Same masking as ``_multihead_cross_attn``.
+    Returns (B, n_heads, L, S) where L = query length, S = key length."""
+    B, L, d = query.shape
+    _, S, _ = key.shape
+    dh = d // n_heads
+    qh = query.view(B, L, n_heads, dh).transpose(1, 2)
+    kh = key.view(B, S, n_heads, dh).transpose(1, 2)
+    scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(float(dh))
+    if key_padding_mask is not None:
+        scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+    if query_padding_mask is not None:
+        scores = scores.masked_fill(~query_padding_mask.unsqueeze(1).unsqueeze(-1), float("-inf"))
+    return torch.softmax(scores, dim=-1)
+
+
 class EdgeAttnMPNN(nn.Module):
     """One hop: gated messages with edge (R, X), residual to linear(self)."""
 
@@ -266,10 +311,12 @@ class DAGPSBlock(nn.Module):
         heads: int,
         edge_dim: int,
         dropout: float,
+        n_nodes: int,
     ):
         super().__init__()
         if hidden % heads != 0:
             raise ValueError("hidden must divide heads")
+        self.n_nodes = int(n_nodes)
         self.hidden = hidden
         self.heads = heads
         self.dropout_p = float(dropout)
@@ -312,7 +359,7 @@ class DAGPSBlock(nn.Module):
         node_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if h_dense is None or node_mask is None:
-            h_dense, node_mask = to_dense_batch(h_in, batch)
+            h_dense, node_mask = _to_dense_batch_mv(h_in, batch, n_nodes=self.n_nodes)
 
         has_padding = int(h_in.size(0)) != int(h_dense.size(0) * h_dense.size(1))
         key_pad = (~node_mask) if has_padding else None
@@ -344,6 +391,36 @@ class DAGPSBlock(nn.Module):
         h_mid = self.norm_h_mid(h_in + z_flat + h_loc)
         h_out = self.norm_out(h_mid + self.ffn_h(h_mid))
         return h_out, T_mid
+
+    def token_to_node_attention_probs(
+        self,
+        T_in: torch.Tensor,
+        h_dense: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """First cross-attn: queries = tokens, keys = nodes.
+        Returns (B, heads, n_tokens, n_nodes) — distribution over nodes per token."""
+        q = self.wq_nt(T_in)
+        k = self.wk_nt(h_dense)
+        return _attn_probs_qk(
+            q, k, n_heads=self.heads, key_padding_mask=key_padding_mask, query_padding_mask=None
+        )
+
+    def node_to_token_attention_probs(
+        self,
+        h_dense: torch.Tensor,
+        T_mid: torch.Tensor,
+        node_mask: torch.Tensor | None,
+        has_padding: bool,
+    ) -> torch.Tensor:
+        """Second cross-attn in the block: queries = nodes, keys = tokens.
+        Returns (B, heads, n_nodes, n_tokens) — distribution over tokens per node."""
+        q2 = self.wq_tn(h_dense)
+        k2 = self.wk_tn(T_mid)
+        qpm = node_mask if has_padding else None
+        return _attn_probs_qk(
+            q2, k2, n_heads=self.heads, key_padding_mask=None, query_padding_mask=qpm
+        )
 
 
 class DAGPSModel(nn.Module):
@@ -401,6 +478,7 @@ class DAGPSModel(nn.Module):
                     heads=heads,
                     edge_dim=eff_edge_dim,
                     dropout=dropout,
+                    n_nodes=int(n_nodes),
                 )
                 for _ in range(int(n_layers))
             ]
@@ -445,11 +523,11 @@ class DAGPSModel(nn.Module):
         if self.edge_emb is not None:
             ea = torch.cat([ea, self.edge_emb(self._edge_ids(ea.size(0), ea.device))], dim=-1)
         batch = data.batch if hasattr(data, "batch") and data.batch is not None else None
-        B = int(data.num_graphs) if hasattr(data, "num_graphs") else 1
+        B = int(data.num_graphs) if hasattr(data, "num_graphs") and data.num_graphs is not None else 1
         h = self.node_in(x)
         T = self.token_latent.unsqueeze(0).repeat(B, 1, 1)
         bptr = batch if batch is not None else torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        h_dense, node_mask = to_dense_batch(h, bptr)
+        h_dense, node_mask = _to_dense_batch_mv(h, bptr, n_nodes=self.n_nodes)
         can_view_dense = int(h.size(0)) == int(h_dense.size(0) * h_dense.size(1))
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
@@ -490,6 +568,114 @@ class DAGPSModel(nn.Module):
         else:
             reg_pred = self.reg_head(T_reg).squeeze(-1)
         return volt, cap_logits, reg_pred
+
+    @torch.no_grad()
+    def forward_node_to_token_attention(
+        self, data: Data
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run forward, collecting both cross-attention softmax weights per GPS block.
+
+        **First cross-attn (token → node):** each global token attends over nodes.
+        For each layer ``l``: ``(B, heads, n_tokens, n_nodes)``.
+
+        **Second cross-attn (node → token):** each node attends over tokens.
+        For each layer ``l``: ``(B, heads, n_nodes, n_tokens)``; token index
+        ``n_cap + j`` is regulator ``j`` (``reg_target_cols[j]``).
+
+        Returns:
+            layer_probs_nt: node→token, list length ``n_layers``
+            layer_probs_tn: token→node, list length ``n_layers``
+            volt, cap_logits, reg_pred: same as ``forward`` (after all blocks).
+        """
+        self.eval()
+        x = data.x
+        ea = data.edge_attr
+        if self.node_emb is not None:
+            x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
+        if self.edge_emb is not None:
+            ea = torch.cat([ea, self.edge_emb(self._edge_ids(ea.size(0), ea.device))], dim=-1)
+        batch = data.batch if hasattr(data, "batch") and data.batch is not None else None
+        B = int(data.num_graphs) if hasattr(data, "num_graphs") and data.num_graphs is not None else 1
+        h = self.node_in(x)
+        T = self.token_latent.unsqueeze(0).repeat(B, 1, 1)
+        bptr = batch if batch is not None else torch.zeros(h.size(0), dtype=torch.long, device=h.device)
+        h_dense, node_mask = _to_dense_batch_mv(h, bptr, n_nodes=self.n_nodes)
+        can_view_dense = int(h.size(0)) == int(h_dense.size(0) * h_dense.size(1))
+        has_padding = int(h.size(0)) != int(h_dense.size(0) * h_dense.size(1))
+        key_pad = (~node_mask) if has_padding else None
+        layer_probs_nt: list[torch.Tensor] = []
+        layer_probs_tn: list[torch.Tensor] = []
+
+        for blk in self.blocks:
+            probs_tn = blk.token_to_node_attention_probs(T, h_dense, key_pad)
+            layer_probs_tn.append(probs_tn.cpu())
+
+            q = blk.wq_nt(T)
+            k = blk.wk_nt(h_dense)
+            v = blk.wv_nt(h_dense)
+            zt = _multihead_cross_attn(
+                q,
+                k,
+                v,
+                n_heads=blk.heads,
+                dropout_p=0.0,
+                training=False,
+                key_padding_mask=key_pad,
+                attn_bias=None,
+                query_padding_mask=None,
+            )
+            zt = blk.wo_nt(zt)
+            T_mid = blk.norm_t1(T + zt)
+            T_mid = blk.norm_t2(T_mid + blk.ffn_t(T_mid))
+
+            probs_nt = blk.node_to_token_attention_probs(h_dense, T_mid, node_mask, has_padding)
+            layer_probs_nt.append(probs_nt.cpu())
+
+            q2 = blk.wq_tn(h_dense)
+            k2 = blk.wk_tn(T_mid)
+            v2 = blk.wv_tn(T_mid)
+            zh = _multihead_cross_attn(
+                q2,
+                k2,
+                v2,
+                n_heads=blk.heads,
+                dropout_p=0.0,
+                training=False,
+                key_padding_mask=None,
+                attn_bias=None,
+                query_padding_mask=node_mask if has_padding else None,
+            )
+            zh = blk.wo_tn(zh)
+            z_flat = zh[node_mask] if has_padding else zh.reshape(-1, zh.size(-1))
+
+            h_loc = blk.mpnn(h, data.edge_index, ea)
+            h_mid = blk.norm_h_mid(h + z_flat + h_loc)
+            h = blk.norm_out(h_mid + blk.ffn_h(h_mid))
+            T = T_mid
+
+            if can_view_dense:
+                h_dense = h.view(h_dense.size(0), h_dense.size(1), h.size(-1))
+            else:
+                h_dense = torch.zeros_like(h_dense)
+                h_dense[node_mask] = h
+
+        if self.per_node_heads:
+            h_per = h.view(B, self.n_nodes, self.hidden)
+            volt = torch.einsum("bnd,ndo->bno", h_per, self.volt_W) + self.volt_b
+            volt = volt.reshape(B * self.n_nodes, 2)
+        else:
+            volt = self.volt_head(h)
+        T_cap = T[:, : self.n_cap, :]
+        if self.per_device_cap_head:
+            cap_logits = (T_cap * self.cap_W.unsqueeze(0)).sum(-1) + self.cap_b.unsqueeze(0)
+        else:
+            cap_logits = self.cap_head(T_cap).squeeze(-1)
+        T_reg = T[:, self.n_cap : self.n_cap + self.n_reg, :]
+        if self.per_device_reg_head:
+            reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
+        else:
+            reg_pred = self.reg_head(T_reg).squeeze(-1)
+        return layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred
 
 
 class DAGPSDataset(Dataset):

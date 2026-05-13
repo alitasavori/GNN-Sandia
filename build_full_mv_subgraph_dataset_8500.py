@@ -3,6 +3,7 @@ Build an MV-only homogenous GNN dataset from an existing full daily-aggregate ex
 
 - Nodes: all phase nodes whose bus kVBase is in [min_kv_base, max_kv_base] (default 2–20 kV,
   which selects 7.2 kV distribution buses on IEEE 8500 and excludes 0.12 kV and 66 kV).
+  By default, special/virtual buses are removed (e.g. OpenDSS-internal star/source/regxfmr nodes).
 - Edges: rows from gnn_edges_phase_static.csv where both endpoints are MV nodes — one row per
   Line/Transformer phase branch (same R_full/X_full as the full export; no load-only compaction).
 - Node P/Q: for the 1,177 mv_node entries in mv_x_sx_node_mapping_8500.csv, set p_load_kw /
@@ -103,17 +104,34 @@ def _mv_phase_nodes(
     *,
     lo_kv: float,
     hi_kv: float,
+    include_special_buses: bool,
 ) -> list[str]:
     df = pd.read_csv(node_index_csv, usecols=["node"])
     out: list[str] = []
     for n in df["node"].astype(str):
         bus = n.split(".")[0].strip().lower()
+        if (not include_special_buses) and _is_special_bus(bus):
+            continue
         kv = bus_kv.get(bus)
         if kv is None:
             continue
         if lo_kv <= kv <= hi_kv:
             out.append(n.strip())
     return sorted(out, key=lambda s: s.lower())
+
+
+def _is_special_bus(bus: str) -> bool:
+    b = str(bus).strip().lower()
+    if not b:
+        return True
+    # OpenDSS-internal / special buses observed in IEEE 8500 exports.
+    if b.startswith("_"):
+        return True
+    if b.startswith("regxfmr_") or "regxfmr_" in b:
+        return True
+    if "hvmv_sub" in b or b == "sourcebus":
+        return True
+    return False
 
 
 def _write_edges_full_mv(
@@ -258,6 +276,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out-dir", type=Path, default=default_ds.parent / "loadtype_8500_dailyagg_full_mv")
     p.add_argument("--min-kv-base", type=float, default=2.0)
     p.add_argument("--max-kv-base", type=float, default=20.0)
+    p.add_argument(
+        "--include-special-buses",
+        action="store_true",
+        help="Include special/virtual OpenDSS buses. Default excludes them.",
+    )
     p.add_argument("--max-samples", type=int, default=None, help="Stop after N samples (test)")
     args = p.parse_args(argv)
 
@@ -293,6 +316,7 @@ def main(argv: list[str] | None = None) -> None:
         bus_kv,
         lo_kv=float(args.min_kv_base),
         hi_kv=float(args.max_kv_base),
+        include_special_buses=bool(args.include_special_buses),
     )
     if not mv_nodes:
         raise SystemExit("No MV phase nodes in kV band; check min/max kV.")
@@ -321,6 +345,7 @@ def main(argv: list[str] | None = None) -> None:
         "n_edges_full_mv_csv": n_e,
         "n_mapping_injection_nodes": len({r["mv_key"] for r in rules}),
         "kv_base_band": [float(args.min_kv_base), float(args.max_kv_base)],
+        "include_special_buses": bool(args.include_special_buses),
         "dss_master": str(args.dss_master.resolve()),
         "sources": {
             "node_index": str(args.node_index.resolve()),

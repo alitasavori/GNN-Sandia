@@ -24,6 +24,14 @@ Usage (repo root):
   python generate_ood_daily_aggregate_dataset_8500.py ^
     --out-subdir datasets_gnn2/loadtype_8500_dailyagg_ood_stress ^
     --sync-static-from datasets_gnn2/loadtype_8500_dailyagg
+
+Stronger OOD (exclude mid load levels): sample scenario scale uniformly in one of
+several disjoint ``lo-hi`` bands, e.g. light + heavy::
+
+  --total-load-scale-disjoint "0.2-0.5;2-3"
+
+When set, this overrides the usual single ``--total-load-scale-lo/hi`` interval
+for *sampling* (each scenario picks one band uniformly, then a scale inside it).
 """
 from __future__ import annotations
 
@@ -31,6 +39,30 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+
+
+def _parse_disjoint_load_scale_ranges(s: str) -> list[tuple[float, float]] | None:
+    """
+    Parse ``'0.2-0.5;2-3'`` -> [(0.2, 0.5), (2.0, 3.0)].
+    Semicolons separate intervals; each interval is ``lo-hi`` (one hyphen, lo < hi).
+    """
+    s = str(s).strip()
+    if not s:
+        return None
+    out: list[tuple[float, float]] = []
+    for part in s.replace(" ", "").split(";"):
+        if not part:
+            continue
+        if "-" not in part:
+            raise ValueError(f"Each interval must look like lo-hi, got {part!r}")
+        lo_s, hi_s = part.split("-", 1)
+        lo, hi = float(lo_s), float(hi_s)
+        if not (0 < lo <= hi):
+            raise ValueError(f"Invalid interval {part!r}: need 0 < lo <= hi.")
+        out.append((lo, hi))
+    if not out:
+        return None
+    return out
 
 
 def _copy_tree_if_missing(src: Path, dst: Path) -> None:
@@ -113,7 +145,15 @@ def main() -> None:
         "--total-load-scale-hi",
         type=float,
         default=1.55,
-        help="OOD: wider high end than typical training (1.3).",
+        help="OOD: wider high end than typical training (1.3). Ignored for sampling if --total-load-scale-disjoint is set.",
+    )
+    p.add_argument(
+        "--total-load-scale-disjoint",
+        type=str,
+        default="",
+        help="Optional disjoint scenario-scale bands: 'lo-hi;lo-hi' e.g. '0.2-0.5;2-3'. "
+        "Each scenario picks one band uniformly, then a scale uniform in that band (excludes the middle). "
+        "When non-empty, overrides --total-load-scale-lo/hi for sampling.",
     )
     p.add_argument(
         "--sigma-device",
@@ -132,20 +172,17 @@ def main() -> None:
     p.add_argument("--vmax-safe-pu", type=float, default=1.15)
     args = p.parse_args()
 
+    try:
+        disjoint_ranges = _parse_disjoint_load_scale_ranges(args.total_load_scale_disjoint)
+    except ValueError as e:
+        print(f"error: --total-load-scale-disjoint: {e}", flush=True)
+        sys.exit(2)
+
     repo = Path(__file__).resolve().parent
     out_root = (repo / args.out_subdir).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
     import run_daily_aggregate_dataset_8500 as gen
-
-    def _resolve_ood_profile_path(profile_arg: str) -> Path:
-        """Match ``_daily_ood`` + ``_resolve_daily_profile_csv`` so we fail fast with a clear path."""
-        p = Path(profile_arg)
-        probe: str | Path = p if p.is_file() else p.name
-        return gen._resolve_daily_profile_csv(probe)
-
-    prof_resolved = _resolve_ood_profile_path(args.daily_profile)
-    print(f"daily profile CSV (resolved): {prof_resolved}", flush=True)
 
     # --- Patch output paths so we never overwrite the default training bundle ---
     gen.OUT_DIR = out_root
@@ -171,16 +208,27 @@ def main() -> None:
     print("=== OOD daily-aggregate generation ===", flush=True)
     print(f"repo: {repo}", flush=True)
     print(f"out_root: {out_root}", flush=True)
-    print(
-        f"regime: total_load_scale=({args.total_load_scale_lo}, {args.total_load_scale_hi}) "
-        f"sigma_device={args.sigma_device} master_seed={args.master_seed} profile={profile_arg!r}",
-        flush=True,
-    )
+    if disjoint_ranges:
+        print(
+            f"regime: total_load_scale DISJOINT {disjoint_ranges} "
+            f"sigma_device={args.sigma_device} master_seed={args.master_seed} profile={profile_arg!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"regime: total_load_scale=({args.total_load_scale_lo}, {args.total_load_scale_hi}) "
+            f"sigma_device={args.sigma_device} master_seed={args.master_seed} profile={profile_arg!r}",
+            flush=True,
+        )
+
+    env_lo = min(lo for lo, hi in disjoint_ranges) if disjoint_ranges else float(args.total_load_scale_lo)
+    env_hi = max(hi for lo, hi in disjoint_ranges) if disjoint_ranges else float(args.total_load_scale_hi)
 
     gen.generate_dataset_8500_daily_aggregate(
         n_scenarios=int(args.n_scenarios),
         k_snapshots_per_scenario=int(args.k_snapshots_per_scenario),
-        total_load_scale_range=(float(args.total_load_scale_lo), float(args.total_load_scale_hi)),
+        total_load_scale_range=(env_lo, env_hi),
+        total_load_scale_disjoint_ranges=disjoint_ranges,
         sigma_device=float(args.sigma_device),
         master_seed=int(args.master_seed),
         vmin_safe_pu=float(args.vmin_safe_pu),
