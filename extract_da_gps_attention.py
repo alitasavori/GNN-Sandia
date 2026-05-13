@@ -34,7 +34,7 @@ def _dagps_model_cls():
     """Fresh ``DAGPSModel`` class (reload train script — notebooks cache old 4-return forward)."""
     import importlib
 
-    import train_da_gps_multitask_complex_voltage as tdg
+    import train_da_gps_multitask_complex_voltage_gine as tdg
 
     importlib.reload(tdg)
     return tdg.DAGPSModel
@@ -87,6 +87,7 @@ def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
         per_node_heads=bool(ckpt.get("per_node_heads", False)),
         per_device_cap_head=bool(ckpt.get("per_device_cap_head", False)),
         per_device_reg_head=bool(ckpt.get("per_device_reg_head", False)),
+        n_pv_aux=int(ckpt.get("n_pv_aux", 0)),
     )
 
 
@@ -183,11 +184,11 @@ def run_attention_extract(
         raise ValueError(
             "forward_node_to_token_attention returned 4 values (stale DA-GPS code in this process). "
             "Restart the Jupyter kernel, or run before extract:\n"
-            "  import importlib, train_da_gps_multitask_complex_voltage as m; importlib.reload(m)"
+            "  import importlib, train_da_gps_multitask_complex_voltage_gine as m; importlib.reload(m)"
         )
-    if len(_attn) != 5:
-        raise ValueError(f"expected 5 return values from forward_node_to_token_attention, got {len(_attn)}")
-    layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred = _attn
+    if len(_attn) != 6:
+        raise ValueError(f"expected 6 return values from forward_node_to_token_attention, got {len(_attn)}")
+    layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred, pv_pred = _attn
 
     cap_cols = list(pack["cap_target_cols"])
     reg_cols = list(pack["reg_target_cols"])
@@ -341,7 +342,7 @@ def eval_aux_per_device_on_cache_indices(
             edge_attr=edge_attr.to(dev),
         )
         data.num_graphs = 1
-        _v, c_log, r_p = model(data)
+        _v, c_log, r_p, _pv = model(data)
         reg_preds.append(r_p.float().cpu())
         cap_logits_l.append(c_log.float().cpu())
 
@@ -406,9 +407,18 @@ def eval_voltage_per_node_errors_on_cache_indices(
 
     - ``mean_mae_vmag_pu``: mean of :math:`| |V|_{pred} - |V|_{true} |`
     - ``mean_mae_angle_deg``: mean of smallest-magnitude angle difference in degrees
-    - ``rmse_vmag_pu``: root mean square of :math:`|V|_{pred} - |V|_{true}` over samples
+    - ``rmse_vmag_pu``: root mean square of :math:`|V|_{pred} - |V|_{true}|` over samples
+    - ``std_vmag_true_pu``: population std of true :math:`|V|` across the same cache rows (pu);
+      near-zero where :math:`|V|` is almost constant.
+    - ``r2_vmag``: R² of :math:`|V|` **across the evaluated cache rows** (one value per bus); finite only
+      where the sample variance of true :math:`|V|` exceeds ``1e-10`` pu² (otherwise ``NaN``).
 
-    Rows are sorted worst-first by ``mean_mae_vmag_pu`` (``rank_vmag`` = 1 is worst bus).
+    - ``rank_vmag``: 1 = largest mean |V| MAE (table sorted by this, worst MAE first).
+    - ``rank_r2_worst``: 1 = lowest finite ``r2_vmag`` (worst R²); NaN ``r2_vmag`` ranked last.
+
+    Returned rows are ordered by ``mean_mae_vmag_pu`` (worst MAE first). For a view sorted by
+    worst R² first, sort by ``r2_vmag`` ascending (``na_position='last'``); the attention
+    notebook prints that table (no separate CSV).
 
     Note: loads the model and runs one forward per sample (same cost order as aux eval);
     call once and cache if you also run ``eval_aux_per_device_on_cache_indices`` separately.
@@ -461,6 +471,8 @@ def eval_voltage_per_node_errors_on_cache_indices(
     sum_mae_v = torch.zeros(n_nodes, dtype=torch.float64)
     sum_mae_a = torch.zeros(n_nodes, dtype=torch.float64)
     sum_sq_v = torch.zeros(n_nodes, dtype=torch.float64)
+    sum_true_m = torch.zeros(n_nodes, dtype=torch.float64)
+    sum_true_m2 = torch.zeros(n_nodes, dtype=torch.float64)
     n_s = 0
     for si in sample_indices:
         si = int(si)
@@ -472,7 +484,7 @@ def eval_voltage_per_node_errors_on_cache_indices(
             edge_attr=edge_attr.to(dev),
         )
         data.num_graphs = 1
-        volt_n, _, _ = model(data)
+        volt_n, _, _, _ = model(data)
         v_flat = volt_n.view(1, -1)
         pred_flat = v_flat * y_std_d + y_mean_d
         pred = pred_flat.view(n_nodes, 2)
@@ -487,6 +499,9 @@ def eval_voltage_per_node_errors_on_cache_indices(
         d_ang = (d_ang + math.pi) % (2.0 * math.pi) - math.pi
         ang_err_deg = torch.rad2deg(d_ang).abs()
         vmag_err = pred_mag - true_mag
+        tm = true_mag.double().cpu()
+        sum_true_m += tm
+        sum_true_m2 += tm * tm
         sum_mae_v += vmag_err.abs().double().cpu()
         sum_mae_a += ang_err_deg.double().cpu()
         sum_sq_v += (vmag_err * vmag_err).double().cpu()
@@ -495,6 +510,14 @@ def eval_voltage_per_node_errors_on_cache_indices(
     mean_mae_v = (sum_mae_v / float(n_s)).numpy()
     mean_mae_a = (sum_mae_a / float(n_s)).numpy()
     rmse_v = torch.sqrt(sum_sq_v / float(n_s)).numpy()
+    mean_t = sum_true_m / float(n_s)
+    var_t = sum_true_m2 / float(n_s) - mean_t * mean_t
+    mse_v = (sum_sq_v / float(n_s)).numpy()
+    var_np = var_t.numpy()
+    std_vmag = np.sqrt(np.maximum(var_np, 0.0))
+    r2_v = np.full(n_nodes, np.nan, dtype=np.float64)
+    mask = var_np > 1e-10
+    r2_v[mask] = 1.0 - mse_v[mask] / var_np[mask]
 
     rows = [
         {
@@ -502,12 +525,27 @@ def eval_voltage_per_node_errors_on_cache_indices(
             "mean_mae_vmag_pu": float(mean_mae_v[i]),
             "mean_mae_angle_deg": float(mean_mae_a[i]),
             "rmse_vmag_pu": float(rmse_v[i]),
+            "std_vmag_true_pu": float(std_vmag[i]),
+            "r2_vmag": float(r2_v[i]) if np.isfinite(r2_v[i]) else float("nan"),
         }
         for i in range(n_nodes)
     ]
     df = pd.DataFrame(rows)
     df = df.sort_values("mean_mae_vmag_pu", ascending=False).reset_index(drop=True)
     df.insert(0, "rank_vmag", np.arange(1, len(df) + 1, dtype=np.int32))
+    # rank 1 = lowest finite R² (worst fit); NaN R² (near-constant |V| across samples) ranked last
+    df["rank_r2_worst"] = (
+        df["r2_vmag"].rank(method="min", ascending=True, na_option="bottom").astype(np.int64)
+    )
+    r2_fin = r2_v[np.isfinite(r2_v)]
+    _finite_r2 = df[np.isfinite(df["r2_vmag"])]
+    if len(_finite_r2):
+        _iwr = int(_finite_r2["r2_vmag"].idxmin())
+        worst_r2_node = str(df.loc[_iwr, "node"])
+        worst_r2_vmag = float(df.loc[_iwr, "r2_vmag"])
+    else:
+        worst_r2_node = ""
+        worst_r2_vmag = float("nan")
     meta = {
         "n_nodes": int(n_nodes),
         "n_samples": int(n_s),
@@ -515,6 +553,13 @@ def eval_voltage_per_node_errors_on_cache_indices(
         "cache_pt": str(cache_pt),
         "worst_node": str(df.iloc[0]["node"]) if len(df) else "",
         "worst_mean_mae_vmag_pu": float(df.iloc[0]["mean_mae_vmag_pu"]) if len(df) else float("nan"),
+        "r2_vmag_mean": float(np.mean(r2_fin)) if len(r2_fin) else float("nan"),
+        "r2_vmag_median": float(np.median(r2_fin)) if len(r2_fin) else float("nan"),
+        "r2_vmag_min": float(np.min(r2_fin)) if len(r2_fin) else float("nan"),
+        "r2_vmag_max": float(np.max(r2_fin)) if len(r2_fin) else float("nan"),
+        "n_nodes_r2_vmag_finite": int(len(r2_fin)),
+        "worst_r2_node": worst_r2_node,
+        "worst_r2_vmag": worst_r2_vmag,
         "node_names": list(node_names),
         "reg_target_cols": list(pack["reg_target_cols"]),
     }

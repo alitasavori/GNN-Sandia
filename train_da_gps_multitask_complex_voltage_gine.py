@@ -459,6 +459,7 @@ class DAGPSModel(nn.Module):
         per_node_heads: bool = False,
         per_device_cap_head: bool = False,
         per_device_reg_head: bool = False,
+        n_pv_aux: int = 0,
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
@@ -468,6 +469,9 @@ class DAGPSModel(nn.Module):
         self.n_cap = int(n_cap)
         self.n_reg = int(n_reg)
         self.n_system = int(n_system)
+        self.n_pv_aux = int(n_pv_aux)
+        if self.n_pv_aux > 0 and self.n_pv_aux > self.n_system:
+            raise ValueError(f"n_pv_aux={self.n_pv_aux} exceeds n_system={self.n_system}")
         self.node_in_dim = int(node_in_dim)
         self.node_emb_dim = max(0, int(node_emb_dim))
         self.edge_emb_dim = max(0, int(edge_emb_dim))
@@ -524,13 +528,20 @@ class DAGPSModel(nn.Module):
             self.reg_W = None
             self.reg_b = None
 
+        if self.n_pv_aux > 0:
+            self.pv_W = nn.Parameter(torch.randn(self.n_pv_aux, self.hidden) * 0.02)
+            self.pv_b = nn.Parameter(torch.zeros(self.n_pv_aux))
+        else:
+            self.pv_W = None
+            self.pv_b = None
+
     def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
 
     def _edge_ids(self, e_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.num_edges, device=device, dtype=torch.long).repeat(e_total // self.num_edges)
 
-    def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = data.x
         ea = data.edge_attr
         if self.node_emb is not None:
@@ -582,12 +593,17 @@ class DAGPSModel(nn.Module):
             reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
         else:
             reg_pred = self.reg_head(T_reg).squeeze(-1)
-        return volt, cap_logits, reg_pred
+        if self.n_pv_aux > 0 and self.pv_W is not None:
+            T_pv = T[:, self.n_cap + self.n_reg : self.n_cap + self.n_reg + self.n_pv_aux, :]
+            pv_pred = (T_pv * self.pv_W.unsqueeze(0)).sum(-1) + self.pv_b.unsqueeze(0)
+        else:
+            pv_pred = reg_pred.new_zeros((reg_pred.size(0), 0))
+        return volt, cap_logits, reg_pred, pv_pred
 
     @torch.no_grad()
     def forward_node_to_token_attention(
         self, data: Data
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run forward, collecting both cross-attention softmax weights per GPS block.
 
         **First cross-attn (token → node):** each global token attends over nodes.
@@ -600,7 +616,7 @@ class DAGPSModel(nn.Module):
         Returns:
             layer_probs_nt: node→token, list length ``n_layers``
             layer_probs_tn: token→node, list length ``n_layers``
-            volt, cap_logits, reg_pred: same as ``forward`` (after all blocks).
+            volt, cap_logits, reg_pred, pv_pred: same as ``forward`` (after all blocks).
         """
         self.eval()
         x = data.x
@@ -690,7 +706,12 @@ class DAGPSModel(nn.Module):
             reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
         else:
             reg_pred = self.reg_head(T_reg).squeeze(-1)
-        return layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred
+        if self.n_pv_aux > 0 and self.pv_W is not None:
+            T_pv = T[:, self.n_cap + self.n_reg : self.n_cap + self.n_reg + self.n_pv_aux, :]
+            pv_pred = (T_pv * self.pv_W.unsqueeze(0)).sum(-1) + self.pv_b.unsqueeze(0)
+        else:
+            pv_pred = reg_pred.new_zeros((reg_pred.size(0), 0))
+        return layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred, pv_pred
 
 
 class DAGPSDataset(Dataset):
@@ -702,11 +723,13 @@ class DAGPSDataset(Dataset):
         y_reg: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        y_pv: torch.Tensor | None = None,
     ):
         self.x = x
         self.y_ri = y_ri
         self.y_cap = y_cap
         self.y_reg = y_reg
+        self.y_pv = y_pv
         self.edge_index = edge_index
         self.edge_attr = edge_attr
 
@@ -714,7 +737,7 @@ class DAGPSDataset(Dataset):
         return int(self.x.shape[0])
 
     def __getitem__(self, i: int) -> Data:
-        return Data(
+        d = Data(
             x=self.x[i],
             y=self.y_ri[i],
             edge_index=self.edge_index,
@@ -722,6 +745,9 @@ class DAGPSDataset(Dataset):
             y_cap=self.y_cap[i],
             y_reg=self.y_reg[i],
         )
+        if self.y_pv is not None:
+            d.y_pv = self.y_pv[i]
+        return d
 
 
 def _load_meta_aux(
@@ -753,6 +779,33 @@ def _load_meta_aux(
     reg_raw = df[list(reg_cols)].to_numpy(dtype=np.float64)[order]
     y_cap = (cap_raw > 0.5).astype(np.float32)
     return torch.from_numpy(y_cap), torch.from_numpy(reg_raw.astype(np.float32))
+
+
+def _load_meta_pv(meta_csv: Path, sample_ids: list[int], pv_cols: list[str]) -> torch.Tensor:
+    """Numeric columns from ``gnn_sample_meta`` (float targets), rows aligned to ``sample_ids`` order."""
+    import pandas as pd
+
+    if not pv_cols:
+        raise ValueError("pv_cols must be non-empty")
+    df = pd.read_csv(meta_csv)
+    lower_to_orig = {str(c).lower(): c for c in df.columns}
+    if "sample_id" not in lower_to_orig:
+        raise KeyError(f"sample_id missing in {meta_csv}")
+    sid_col = lower_to_orig["sample_id"]
+    use_orig: list[str] = []
+    for c in pv_cols:
+        cl = str(c).lower()
+        if cl not in lower_to_orig:
+            raise KeyError(f"Column {c!r} not in {meta_csv} (available include: {sorted(lower_to_orig.keys())[:30]}...)")
+        use_orig.append(lower_to_orig[cl])
+    df = df[[sid_col, *use_orig]]
+    lk = {_norm_sid(k): j for j, k in enumerate(df[sid_col].tolist())}
+    miss = [sid for sid in sample_ids if _norm_sid(sid) not in lk]
+    if miss:
+        raise KeyError(f"{len(miss)} sample_id values missing from {meta_csv} for PV aux (showing up to 5): {miss[:5]}")
+    order = [lk[_norm_sid(sid)] for sid in sample_ids]
+    raw = df[use_orig].to_numpy(dtype=np.float64)[order]
+    return torch.from_numpy(raw.astype(np.float32))
 
 
 def _metrics_voltage(pred_ri: torch.Tensor, true_ri: torch.Tensor) -> dict[str, float]:
@@ -795,6 +848,8 @@ def _cast_batch_float_tensors(batch: Data) -> Data:
         batch.y_cap = batch.y_cap.float()
     if hasattr(batch, "y_reg") and batch.y_reg is not None:
         batch.y_reg = batch.y_reg.float()
+    if hasattr(batch, "y_pv") and batch.y_pv is not None:
+        batch.y_pv = batch.y_pv.float()
     return batch
 
 
@@ -808,11 +863,16 @@ def evaluate(
     reg_mean: torch.Tensor,
     reg_std: torch.Tensor,
     use_amp: bool = False,
+    *,
+    pv_mean: torch.Tensor | None = None,
+    pv_std: torch.Tensor | None = None,
 ) -> dict[str, float]:
     model.eval()
     preds, tgts = [], []
     cap_logits_all, cap_tgt_all = [], []
     reg_pred_all, reg_tgt_all = [], []
+    pv_pred_all, pv_tgt_all = [], []
+    use_pv = pv_mean is not None and pv_std is not None
     for batch in dl:
         batch = batch.to(device)
         batch = _cast_batch_float_tensors(batch)
@@ -820,7 +880,7 @@ def evaluate(
         y_cap = batch.y_cap.view(batch.num_graphs, -1)
         y_reg = batch.y_reg.view(batch.num_graphs, -1)
         with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-            v_n, c_log, r_p = model(batch)
+            v_n, c_log, r_p, pv_p = model(batch)
         v_n_flat = v_n.view(batch.num_graphs, -1)
         preds.append((v_n_flat * y_std.to(device) + y_mean.to(device)).cpu())
         tgts.append(yb.cpu())
@@ -828,6 +888,10 @@ def evaluate(
         cap_tgt_all.append(y_cap.cpu())
         reg_pred_all.append(r_p.cpu())
         reg_tgt_all.append(y_reg.cpu())
+        if use_pv and hasattr(batch, "y_pv") and batch.y_pv is not None and pv_p.size(-1) > 0:
+            y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
+            pv_pred_all.append(pv_p.cpu())
+            pv_tgt_all.append(y_pv_b.cpu())
     pred = torch.cat(preds, dim=0)
     tgt = torch.cat(tgts, dim=0)
     met = _metrics_voltage(pred, tgt)
@@ -840,6 +904,16 @@ def evaluate(
     rp_denorm = rp * reg_std.to(rp.device) + reg_mean.to(rp.device)
     rt_denorm = rt * reg_std.to(rt.device) + reg_mean.to(rt.device)
     met["reg_mse_tap_pu"] = float(F.mse_loss(rp_denorm, rt_denorm.to(rp_denorm.dtype)).item())
+    if use_pv and pv_pred_all:
+        pp = torch.cat(pv_pred_all, dim=0)
+        pt = torch.cat(pv_tgt_all, dim=0)
+        met["pv_mse_normalized"] = float(F.mse_loss(pp, pt.to(pp.dtype)).item())
+        pp_den = pp * pv_std.to(pp.device) + pv_mean.to(pp.device)
+        pt_den = pt * pv_std.to(pt.device) + pv_mean.to(pt.device)
+        met["pv_mse_raw"] = float(F.mse_loss(pp_den, pt_den.to(pp_den.dtype)).item())
+    else:
+        met["pv_mse_normalized"] = float("nan")
+        met["pv_mse_raw"] = float("nan")
     return met
 
 
@@ -870,12 +944,41 @@ def _select_sample_ids_from_meta(meta_csv: Path, sample_frac: float, seed: int, 
     return [int(sids[i]) for i in pick_sorted]
 
 
-def _chunk_cache_path(cache_dir: Path, chunk_name: str, sample_frac: float, seed: int, chunk_idx: int) -> Path:
+def _chunk_cache_path(
+    cache_dir: Path,
+    chunk_name: str,
+    sample_frac: float,
+    seed: int,
+    chunk_idx: int,
+    *,
+    feat_slug: str = "",
+    meta_aux_slug: str = "",
+) -> Path:
     if float(sample_frac) >= 1.0:
         tag = "full"
     else:
         tag = f"sf{float(sample_frac):.6f}_s{int(seed)}_c{int(chunk_idx)}"
-    return cache_dir / f"{chunk_name}__{tag}.pt"
+    base = f"{chunk_name}__{tag}"
+    if str(feat_slug).strip():
+        base = f"{base}__{str(feat_slug).strip()}"
+    if str(meta_aux_slug).strip():
+        base = f"{base}__maux{str(meta_aux_slug).strip()}"
+    return cache_dir / f"{base}.pt"
+
+
+def _meta_aux_cols_from_args(args: argparse.Namespace) -> list[str]:
+    """Prefer --aux_meta_cols; fall back to deprecated --aux_pv_meta_cols."""
+    raw = str(getattr(args, "aux_meta_cols", "") or "").strip()
+    if raw:
+        return [c.strip().lower() for c in raw.split(",") if c.strip()]
+    raw = str(getattr(args, "aux_pv_meta_cols", "") or "").strip()
+    return [c.strip().lower() for c in raw.split(",") if c.strip()]
+
+
+def _meta_aux_cache_slug(meta_aux_cols: list[str]) -> str:
+    if not meta_aux_cols:
+        return ""
+    return hashlib.md5(",".join(meta_aux_cols).encode("utf-8")).hexdigest()[:8]
 
 
 def _ensure_chunk_tensor_cache(
@@ -892,9 +995,36 @@ def _ensure_chunk_tensor_cache(
     cache_pt: Path,
     bootstrap_gnn_cache_pt: Path | None,
     ref_ntl: dict[str, int] | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], dict[str, int]]:
+    pv_aux_cols: list[str] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], dict[str, int]]:
     np_ = chunk_dir / nodes_name
     mp_ = chunk_dir / meta_name
+    pv_cols = [str(c).strip().lower() for c in (pv_aux_cols or []) if str(c).strip()]
+
+    def _maybe_attach_y_pv(z: dict, sids: list[int]) -> torch.Tensor | None:
+        if not pv_cols:
+            return None
+        k = len(pv_cols)
+        stored = z.get("meta_aux_cols")
+        stored_l = [str(x).lower() for x in stored] if stored is not None else None
+        existing = z.get("y_pv")
+        if existing is not None:
+            ex = existing.to(dtype=torch.float32)
+            if stored_l == pv_cols and ex.dim() == 2 and ex.shape[1] == k:
+                return ex
+            print(
+                f"chunk cache y_pv out of date (cols or shape); recomputing meta aux: {cache_pt}",
+                flush=True,
+            )
+            z.pop("y_pv", None)
+            z.pop("meta_aux_cols", None)
+        y_pv = _load_meta_pv(mp_, sids, pv_cols)
+        z["y_pv"] = y_pv
+        z["meta_aux_cols"] = list(pv_cols)
+        torch.save(z, cache_pt)
+        print(f"Added meta-aux columns to chunk cache: {cache_pt}", flush=True)
+        return y_pv.to(dtype=torch.float32)
+
     if cache_pt.is_file():
         z = torch.load(cache_pt, map_location="cpu", weights_only=False)
         ntl = z["node_to_local"]
@@ -909,7 +1039,12 @@ def _ensure_chunk_tensor_cache(
         y_ri = z["y_ri"].to(dtype=torch.float32)
         y_cap = z["y_cap"].to(dtype=torch.float32)
         y_reg = z["y_reg"].to(dtype=torch.float32)
-        return x, y_ri, y_cap, y_reg, sids, ntl
+        y_pv = None
+        if pv_cols:
+            y_pv = _maybe_attach_y_pv(z, sids)
+            if y_pv is not None:
+                y_pv = y_pv.to(dtype=torch.float32)
+        return x, y_ri, y_cap, y_reg, y_pv, sids, ntl
 
     if bootstrap_gnn_cache_pt is not None and bootstrap_gnn_cache_pt.is_file():
         z = torch.load(bootstrap_gnn_cache_pt, map_location="cpu", weights_only=False)
@@ -939,20 +1074,22 @@ def _ensure_chunk_tensor_cache(
             y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
             y_cap = y_cap.to(dtype=torch.float32)
             y_reg = y_reg.to(dtype=torch.float32)
+            y_pv = _load_meta_pv(mp_, sample_ids, pv_cols) if pv_cols else None
             cache_pt.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "x": x,
-                    "y_ri": y_ri,
-                    "y_cap": y_cap,
-                    "y_reg": y_reg,
-                    "sample_ids": sample_ids,
-                    "node_to_local": node_to_local,
-                },
-                cache_pt,
-            )
+            row = {
+                "x": x,
+                "y_ri": y_ri,
+                "y_cap": y_cap,
+                "y_reg": y_reg,
+                "sample_ids": sample_ids,
+                "node_to_local": node_to_local,
+            }
+            if y_pv is not None:
+                row["y_pv"] = y_pv
+                row["meta_aux_cols"] = list(pv_cols)
+            torch.save(row, cache_pt)
             print(f"Bootstrapped DA cache from GNN cache: {bootstrap_gnn_cache_pt} -> {cache_pt}", flush=True)
-            return x, y_ri, y_cap, y_reg, sample_ids, node_to_local
+            return x, y_ri, y_cap, y_reg, y_pv, sample_ids, node_to_local
 
     if not np_.is_file() or not mp_.is_file():
         raise FileNotFoundError(f"{np_} / {mp_}")
@@ -970,20 +1107,22 @@ def _ensure_chunk_tensor_cache(
     y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
     y_cap = y_cap.to(dtype=torch.float32)
     y_reg = y_reg.to(dtype=torch.float32)
+    y_pv = _load_meta_pv(mp_, sample_ids, pv_cols) if pv_cols else None
     cache_pt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "x": x,
-            "y_ri": y_ri,
-            "y_cap": y_cap,
-            "y_reg": y_reg,
-            "sample_ids": sample_ids,
-            "node_to_local": node_to_local,
-        },
-        cache_pt,
-    )
+    row = {
+        "x": x,
+        "y_ri": y_ri,
+        "y_cap": y_cap,
+        "y_reg": y_reg,
+        "sample_ids": sample_ids,
+        "node_to_local": node_to_local,
+    }
+    if y_pv is not None:
+        row["y_pv"] = y_pv
+        row["meta_aux_cols"] = list(pv_cols)
+    torch.save(row, cache_pt)
     print(f"Wrote chunk tensor cache: {cache_pt}", flush=True)
-    return x, y_ri, y_cap, y_reg, sample_ids, node_to_local
+    return x, y_ri, y_cap, y_reg, y_pv, sample_ids, node_to_local
 
 
 def _evaluate_multi_chunks(
@@ -991,6 +1130,7 @@ def _evaluate_multi_chunks(
     chunk_dirs: list[Path],
     idx_lists: list[np.ndarray],
     cache_pts: list[Path],
+    bootstrap_cache_pts: list[Path | None],
     selected_ids_list: list[list[int] | None],
     *,
     nodes_name: str,
@@ -1001,7 +1141,6 @@ def _evaluate_multi_chunks(
     cap_cols: list[str],
     reg_cols: list[str],
     cache_dir: Path,
-    bootstrap_gnn_cache_dir: Path | None,
     ref_ntl: dict[str, int],
     edge_index: torch.Tensor,
     edge_attr: torch.Tensor,
@@ -1011,15 +1150,20 @@ def _evaluate_multi_chunks(
     y_std: torch.Tensor,
     reg_mean: torch.Tensor,
     reg_std: torch.Tensor,
+    pv_mean: torch.Tensor | None,
+    pv_std: torch.Tensor | None,
+    pv_aux_cols: list[str] | None,
     device: torch.device,
     use_amp: bool,
 ) -> dict[str, float]:
     met_acc: dict[str, float] | None = None
     wtot = 0
-    for ch, idx_te, cpt, sel_ids in zip(chunk_dirs, idx_lists, cache_pts, selected_ids_list):
+    for ch, idx_te, cpt, boot_pt, sel_ids in zip(
+        chunk_dirs, idx_lists, cache_pts, bootstrap_cache_pts, selected_ids_list
+    ):
         if len(idx_te) == 0:
             continue
-        x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+        x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
             ch,
             nodes_name=nodes_name,
             meta_name=meta_name,
@@ -1030,12 +1174,16 @@ def _evaluate_multi_chunks(
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             cache_pt=cpt,
-            bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
+            bootstrap_gnn_cache_pt=boot_pt,
             ref_ntl=ref_ntl,
+            pv_aux_cols=pv_aux_cols,
         )
         y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
         x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
-        ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+        y_pv_n = None
+        if y_pv is not None and pv_mean is not None and pv_std is not None:
+            y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+        ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
         dl = DataLoader(
             Subset(ds, idx_te.tolist()),
             batch_size=min(64, max(1, len(idx_te))),
@@ -1043,7 +1191,18 @@ def _evaluate_multi_chunks(
             num_workers=0,
             pin_memory=device.type == "cuda",
         )
-        met = evaluate(model, dl, device, y_mean, y_std, reg_mean, reg_std, use_amp=use_amp)
+        met = evaluate(
+            model,
+            dl,
+            device,
+            y_mean,
+            y_std,
+            reg_mean,
+            reg_std,
+            use_amp=use_amp,
+            pv_mean=pv_mean,
+            pv_std=pv_std,
+        )
         w = int(len(idx_te))
         if met_acc is None:
             met_acc = {k: met[k] * w for k in met}
@@ -1051,7 +1210,7 @@ def _evaluate_multi_chunks(
             for k in met:
                 met_acc[k] += met[k] * w
         wtot += w
-        del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl
+        del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl
         gc.collect()
     if met_acc is None or wtot == 0:
         return {
@@ -1065,8 +1224,42 @@ def _evaluate_multi_chunks(
             "cap_bce": float("nan"),
             "reg_mse_normalized": float("nan"),
             "reg_mse_tap_pu": float("nan"),
+            "pv_mse_normalized": float("nan"),
+            "pv_mse_raw": float("nan"),
         }
     return {k: met_acc[k] / float(wtot) for k in met_acc}
+
+
+def _save_periodic_training_checkpoint(
+    path: Path,
+    base_model: nn.Module,
+    opt: torch.optim.Optimizer,
+    sch: object,
+    scaler: object | None,
+    *,
+    epoch: int,
+    bad: int,
+    best_val: float,
+    best_state: dict[str, torch.Tensor] | None,
+) -> None:
+    """Atomic write of resumable training state (current + best-so-far weights)."""
+    payload: dict[str, object] = {
+        "epoch": int(epoch),
+        "bad": int(bad),
+        "best_val": float(best_val),
+        "model_state_dict": {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()},
+        "optimizer_state_dict": opt.state_dict(),
+        "scheduler_state_dict": sch.state_dict(),
+        "best_model_state_dict": (
+            {k: v.detach().cpu().clone() for k, v in best_state.items()} if best_state is not None else None
+        ),
+    }
+    if scaler is not None:
+        payload["scaler_state_dict"] = scaler.state_dict()  # type: ignore[union-attr]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
 
 
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
@@ -1090,6 +1283,29 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     edge_name = Path(args.edge_catalog_csv).name
     meta_name = Path(args.meta_csv).name
     node_feature_cols = _parse_csv_cols(args.node_feature_cols)
+    if bool(args.exclude_bess_features):
+        _bess = ("p_bess_kw", "q_bess_kvar")
+        node_feature_cols = [c for c in node_feature_cols if c not in _bess]
+        print("exclude_bess_features: using node_feature_cols=", node_feature_cols, flush=True)
+    feat_slug = "nobess" if bool(args.exclude_bess_features) else ""
+    _raw_meta = str(getattr(args, "aux_meta_cols", "") or "").strip()
+    _raw_pv = str(getattr(args, "aux_pv_meta_cols", "") or "").strip()
+    if _raw_meta and _raw_pv:
+        print(
+            "NOTE: both --aux_meta_cols and --aux_pv_meta_cols are set; using --aux_meta_cols only.",
+            flush=True,
+        )
+    pv_aux_cols = _meta_aux_cols_from_args(args)
+    _bad = {"sample_id"} & set(pv_aux_cols)
+    if _bad:
+        raise ValueError(f"--aux_meta_cols must not include reserved column name(s): {_bad}")
+    n_pv_aux = len(pv_aux_cols)
+    maux_slug = _meta_aux_cache_slug(pv_aux_cols)
+    if n_pv_aux > int(args.n_system_tokens):
+        raise ValueError(
+            f"--n_system_tokens ({args.n_system_tokens}) must be >= number of meta-aux columns ({n_pv_aux}). "
+            "Each listed column supervises one system token in order (after cap and reg tokens)."
+        )
     node_pe_csv = Path(args.node_pe_csv).resolve() if str(args.node_pe_csv).strip() else None
     node_pe_cols = str(args.node_pe_cols)
 
@@ -1124,6 +1340,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     n_reg = len(reg_cols)
     n_sys = int(args.n_system_tokens)
     g_tot = n_cap + n_reg + n_sys
+    if n_pv_aux > 0:
+        print(
+            f"Meta aux (sample_meta): {n_pv_aux} column(s); chunk DA caches use suffix __maux{maux_slug} (per chunk name).",
+            flush=True,
+        )
+        for j, cname in enumerate(pv_aux_cols):
+            tok_i = n_cap + n_reg + j
+            print(f"  global token index {tok_i} (system slot {j}): column {cname!r}", flush=True)
 
     ref_digest = _file_digest(chunk_dirs[0] / edge_name)
     for ch in chunk_dirs[1:]:
@@ -1142,6 +1366,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     idx_test_list: list[np.ndarray] = []
     selected_ids_list: list[list[int] | None] = []
     cache_pts: list[Path] = []
+    bootstrap_cache_pts: list[Path | None] = []
 
     sum_x: torch.Tensor | None = None
     sum_x2: torch.Tensor | None = None
@@ -1152,6 +1377,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     sum_reg: torch.Tensor | None = None
     sum_reg2: torch.Tensor | None = None
     cnt_reg = 0
+    sum_pv: torch.Tensor | None = None
+    sum_pv2: torch.Tensor | None = None
+    cnt_pv = 0
 
     ref_ntl: dict[str, int] | None = None
     edge_index: torch.Tensor | None = None
@@ -1163,9 +1391,19 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         meta_path = ch / meta_name
         sel_ids = _select_sample_ids_from_meta(meta_path, float(args.sample_frac), int(args.seed), ci)
         selected_ids_list.append(sel_ids)
-        cpt = _chunk_cache_path(cache_dir, ch.name, float(args.sample_frac), int(args.seed), ci)
-        cache_pts.append(cpt)
-        x, y_ri, y_cap, y_reg, _sids, ntl = _ensure_chunk_tensor_cache(
+        da_pt = _chunk_cache_path(
+            cache_dir, ch.name, float(args.sample_frac), int(args.seed), ci, feat_slug=feat_slug, meta_aux_slug=maux_slug
+        )
+        cache_pts.append(da_pt)
+        if bootstrap_gnn_cache_dir is not None:
+            boot_name = _chunk_cache_path(
+                cache_dir, ch.name, float(args.sample_frac), int(args.seed), ci, feat_slug=feat_slug, meta_aux_slug=""
+            ).name
+            bootstrap_cache_pts.append(bootstrap_gnn_cache_dir / boot_name)
+        else:
+            bootstrap_cache_pts.append(None)
+        boot_pt = bootstrap_cache_pts[-1]
+        x, y_ri, y_cap, y_reg, y_pv, _sids, ntl = _ensure_chunk_tensor_cache(
             ch,
             nodes_name=nodes_name,
             meta_name=meta_name,
@@ -1175,9 +1413,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             selected_sample_ids=sel_ids,
             cap_cols=cap_cols,
             reg_cols=reg_cols,
-            cache_pt=cpt,
-            bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
+            cache_pt=da_pt,
+            bootstrap_gnn_cache_pt=boot_pt,
             ref_ntl=ref_ntl,
+            pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
         )
         if ci == 0:
             ref_ntl = ntl
@@ -1191,6 +1430,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             sum_y2 = torch.zeros(n_nodes * 2, dtype=torch.float64)
             sum_reg = torch.zeros(n_reg, dtype=torch.float64)
             sum_reg2 = torch.zeros(n_reg, dtype=torch.float64)
+            if n_pv_aux > 0:
+                sum_pv = torch.zeros(n_pv_aux, dtype=torch.float64)
+                sum_pv2 = torch.zeros(n_pv_aux, dtype=torch.float64)
         assert sum_x is not None and sum_x2 is not None and sum_y is not None and sum_reg is not None and edge_index is not None
 
         n = int(x.shape[0])
@@ -1221,7 +1463,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         sum_reg2 += (rt * rt).sum(dim=0)
         cnt_reg += len(itr)
 
-        del x, y_ri, y_cap, y_reg
+        if n_pv_aux > 0 and y_pv is not None and sum_pv is not None and sum_pv2 is not None:
+            ypv = y_pv[itr].to(dtype=torch.float64)
+            sum_pv += ypv.sum(dim=0)
+            sum_pv2 += (ypv * ypv).sum(dim=0)
+            cnt_pv += len(itr)
+
+        del x, y_ri, y_cap, y_reg, y_pv
         gc.collect()
 
     assert ref_ntl is not None and edge_index is not None and edge_attr is not None
@@ -1239,6 +1487,20 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     reg_mean = (sum_reg / float(cnt_reg)).view(1, -1).float()
     reg_var = sum_reg2 / float(cnt_reg) - (sum_reg / float(cnt_reg)) ** 2
     reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
+
+    if n_pv_aux > 0:
+        if sum_pv is None or cnt_pv < 1:
+            raise RuntimeError(
+                "Meta aux enabled but no train statistics accumulated for meta columns (missing y_pv in caches?)."
+            )
+        pv_mean = (sum_pv / float(cnt_pv)).view(1, -1).float()
+        pv_var = sum_pv2 / float(cnt_pv) - (sum_pv / float(cnt_pv)) ** 2
+        pv_std = torch.sqrt(pv_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
+        torch.save(pv_mean, out_dir / "pv_mean.pt")
+        torch.save(pv_std, out_dir / "pv_std.pt")
+    else:
+        pv_mean = None
+        pv_std = None
 
     torch.save(x_mean, out_dir / "x_mean.pt")
     torch.save(x_std, out_dir / "x_std.pt")
@@ -1269,6 +1531,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         per_node_heads=bool(args.per_node_heads),
         per_device_cap_head=bool(args.per_device_cap_head),
         per_device_reg_head=bool(args.per_device_reg_head),
+        n_pv_aux=int(n_pv_aux),
     ).to(device)
     model = base_model
     if device.type == "cuda" and not args.no_compile:
@@ -1287,6 +1550,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     y_std_d = y_std.to(device).float()
     reg_mean_d = reg_mean.to(device).float()
     reg_std_d = reg_std.to(device).float()
+    pv_mean_d = pv_mean.to(device).float() if pv_mean is not None else None
+    pv_std_d = pv_std.to(device).float() if pv_std is not None else None
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
@@ -1305,14 +1570,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = 0.0
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
         train_n = 0
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
             ch = chunk_dirs[ci_i]
             cpt = cache_pts[ci_i]
-            x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+            boot_pt = bootstrap_cache_pts[ci_i]
+            x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
                 ch,
                 nodes_name=nodes_name,
                 meta_name=meta_name,
@@ -1323,12 +1589,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 cap_cols=cap_cols,
                 reg_cols=reg_cols,
                 cache_pt=cpt,
-                bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
+                bootstrap_gnn_cache_pt=boot_pt,
                 ref_ntl=ref_ntl,
+                pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
             )
             y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
             x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
-            ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+            y_pv_n = None
+            if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
+                y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+            ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
             dl_tr = DataLoader(
                 Subset(ds, idx_train_list[ci_i].tolist()),
                 batch_size=args.batch_size,
@@ -1346,11 +1616,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 yb_n = (yb - y_mean_d) / y_std_d
                 opt.zero_grad(set_to_none=True)
                 with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                    v_n, c_log, r_p = model(batch)
+                    v_n, c_log, r_p, pv_p = model(batch)
                     loss_v = mse(v_n.view_as(yb_n), yb_n)
                     loss_c = bce(c_log, y_cap_b)
                     loss_r = mse(r_p, y_reg_b)
                     loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                    if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                        y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
+                        loss_pv = mse(pv_p, y_pv_b)
+                        loss = loss + float(args.lambda_pv) * loss_pv
+                        train_pv_sum += float(loss_pv.item()) * batch.num_graphs
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt)
@@ -1367,14 +1642,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     train_c_sum += float(loss_c.item()) * batch.num_graphs
                     train_r_sum += float(loss_r.item()) * batch.num_graphs
                     train_n += int(batch.num_graphs)
-            del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl_tr
+            del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_tr
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         model.eval()
         val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = 0.0
+        val_c_sum = val_r_sum = val_pv_sum = 0.0
         nv = 0
         val_sum_true = torch.zeros(n_nodes, device=device)
         val_sum_true2 = torch.zeros(n_nodes, device=device)
@@ -1383,7 +1658,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         with torch.no_grad():
             for ci, ch in enumerate(chunk_dirs):
                 cpt = cache_pts[ci]
-                x, y_ri, y_cap, y_reg, _sids, _ntl = _ensure_chunk_tensor_cache(
+                boot_pt = bootstrap_cache_pts[ci]
+                x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
                     ch,
                     nodes_name=nodes_name,
                     meta_name=meta_name,
@@ -1394,12 +1670,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     cap_cols=cap_cols,
                     reg_cols=reg_cols,
                     cache_pt=cpt,
-                    bootstrap_gnn_cache_pt=(bootstrap_gnn_cache_dir / cpt.name) if bootstrap_gnn_cache_dir is not None else None,
+                    bootstrap_gnn_cache_pt=boot_pt,
                     ref_ntl=ref_ntl,
+                    pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
                 )
                 y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
                 x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
-                ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+                y_pv_n = None
+                if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
+                    y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+                ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
                 dl_va = DataLoader(
                     Subset(ds, idx_val_list[ci].tolist()),
                     batch_size=args.batch_size,
@@ -1416,11 +1696,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
                     yb_n = (yb - y_mean_d) / y_std_d
                     with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                        v_n, c_log, r_p = model(batch)
+                        v_n, c_log, r_p, pv_p = model(batch)
                         lv = mse(v_n.view_as(yb_n), yb_n)
                         lc = bce(c_log, y_cap_b)
                         lr_ = mse(r_p, y_reg_b)
                         lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                        if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                            lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                            lt = lt + float(args.lambda_pv) * lpv
+                            val_pv_sum += float(lpv.item()) * batch.num_graphs
                     val_tot += float(lt.item()) * batch.num_graphs
                     val_v += float(lv.item()) * batch.num_graphs
                     val_c_sum += float(lc.item()) * batch.num_graphs
@@ -1436,13 +1720,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     val_sum_true2 += (true_mag * true_mag).sum(dim=0)
                     val_sum_se += (err * err).sum(dim=0)
                     val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
-                del x, y_ri, y_cap, y_reg, y_reg_n, x_n, ds, dl_va
+                del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
                 gc.collect()
 
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
         val_c = val_c_sum / max(nv, 1)
         val_r = val_r_sum / max(nv, 1)
+        val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
         true_mean = val_sum_true / max(nv, 1)
         var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
         mse_node = val_sum_se / max(nv, 1)
@@ -1453,6 +1738,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         train_v = train_v_sum / max(train_n, 1)
         train_c = train_c_sum / max(train_n, 1)
         train_r = train_r_sum / max(train_n, 1)
+        train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
@@ -1463,16 +1749,33 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         else:
             bad += 1
         if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            print(
+            _log = (
                 f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
-                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f} "
-                f"| val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}",
-                flush=True,
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
             )
+            if n_pv_aux > 0:
+                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            _log += (
+                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
+                f"| best={best_val:.4f}"
+            )
+            print(_log, flush=True)
+        _ce = int(args.checkpoint_every)
+        if _ce > 0 and ep % _ce == 0:
+            _ck = out_dir / "training_last.pt"
+            _save_periodic_training_checkpoint(
+                _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+            )
+            print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
             print(f"[da_gps chunk_parent] early stop at epoch {ep}", flush=True)
+            if int(args.checkpoint_every) > 0:
+                _ck = out_dir / "training_last.pt"
+                _save_periodic_training_checkpoint(
+                    _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                )
+                print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
 
     train_seconds = time.perf_counter() - t0
@@ -1484,6 +1787,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         chunk_dirs,
         idx_test_list,
         cache_pts,
+        bootstrap_cache_pts,
         selected_ids_list,
         nodes_name=nodes_name,
         meta_name=meta_name,
@@ -1493,7 +1797,6 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         cap_cols=cap_cols,
         reg_cols=reg_cols,
         cache_dir=cache_dir,
-        bootstrap_gnn_cache_dir=bootstrap_gnn_cache_dir,
         ref_ntl=ref_ntl,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -1503,6 +1806,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         y_std=y_std,
         reg_mean=reg_mean,
         reg_std=reg_std,
+        pv_mean=pv_mean,
+        pv_std=pv_std,
+        pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
         device=device,
         use_amp=use_amp,
     )
@@ -1523,6 +1829,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             "per_node_heads": bool(args.per_node_heads),
             "per_device_cap_head": bool(args.per_device_cap_head),
             "per_device_reg_head": bool(args.per_device_reg_head),
+            "n_pv_aux": int(n_pv_aux),
+            "pv_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
+            "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
             "chunk_parent": str(chunk_parent),
@@ -1543,9 +1852,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "checkpoint": str(ckpt.resolve()),
     }
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    _pv_n = met.get("pv_mse_normalized", float("nan"))
+    _pv_raw = met.get("pv_mse_raw", float("nan"))
+    _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
     print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  time={train_seconds:.1f}s",
+        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
     print(f"Saved {ckpt}", flush=True)
@@ -1634,6 +1946,12 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint each GPS block in training to save activation memory (~30%% slower).",
     )
     p.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help="Every N epochs save out_dir/training_last.pt (model+optimizer+scheduler+epoch); 0 disables.",
+    )
+    p.add_argument(
         "--per_node_heads",
         action="store_true",
         help="Use independent per-node voltage decoder instead of shared MLP head.",
@@ -1662,6 +1980,31 @@ def parse_args() -> argparse.Namespace:
         default="run_*",
         help="Only used with --chunk_parent: fnmatch pattern for subdirectory names (e.g. run_*).",
     )
+    p.add_argument(
+        "--exclude_bess_features",
+        action="store_true",
+        help="Remove p_bess_kw and q_bess_kvar from --node_feature_cols if present (chunk mode uses cache filename __nobess).",
+    )
+    p.add_argument(
+        "--aux_meta_cols",
+        type=str,
+        default="",
+        help="Comma-separated numeric columns from gnn_sample_meta: column i supervises global system token "
+        "index (n_cap+n_reg+i) with normalized MSE. Use any meta names you want (not only PV). "
+        "Overrides --aux_pv_meta_cols when non-empty. Empty disables.",
+    )
+    p.add_argument(
+        "--aux_pv_meta_cols",
+        type=str,
+        default="",
+        help="Deprecated alias for --aux_meta_cols (used only when --aux_meta_cols is empty).",
+    )
+    p.add_argument(
+        "--lambda_pv",
+        type=float,
+        default=0.1,
+        help="Loss weight for meta-aux MSE (all --aux_meta_cols targets; normalized like regulators).",
+    )
     return p.parse_args()
 
 
@@ -1682,6 +2025,25 @@ def main() -> None:
     edges_path = Path(args.edge_catalog_csv) if Path(args.edge_catalog_csv).is_absolute() else (data_root / args.edge_catalog_csv).resolve()
     meta_path = Path(args.meta_csv) if Path(args.meta_csv).is_absolute() else (data_root / args.meta_csv).resolve()
     node_feature_cols = _parse_csv_cols(args.node_feature_cols)
+    if bool(args.exclude_bess_features):
+        node_feature_cols = [c for c in node_feature_cols if c not in ("p_bess_kw", "q_bess_kvar")]
+        print("exclude_bess_features: using node_feature_cols=", node_feature_cols, flush=True)
+    _raw_meta = str(getattr(args, "aux_meta_cols", "") or "").strip()
+    _raw_pv = str(getattr(args, "aux_pv_meta_cols", "") or "").strip()
+    if _raw_meta and _raw_pv:
+        print(
+            "NOTE: both --aux_meta_cols and --aux_pv_meta_cols are set; using --aux_meta_cols only.",
+            flush=True,
+        )
+    pv_aux_cols = _meta_aux_cols_from_args(args)
+    _bad = {"sample_id"} & set(pv_aux_cols)
+    if _bad:
+        raise ValueError(f"--aux_meta_cols must not include reserved column name(s): {_bad}")
+    n_pv_aux = len(pv_aux_cols)
+    if n_pv_aux > int(args.n_system_tokens):
+        raise ValueError(
+            f"--n_system_tokens ({args.n_system_tokens}) must be >= number of meta-aux columns ({n_pv_aux})."
+        )
     node_pe_csv = Path(args.node_pe_csv).resolve() if str(args.node_pe_csv).strip() else None
     node_pe_cols = str(args.node_pe_cols)
 
@@ -1700,6 +2062,11 @@ def main() -> None:
     n_reg = len(reg_cols)
     n_sys = int(args.n_system_tokens)
     g_tot = n_cap + n_reg + n_sys
+    if n_pv_aux > 0:
+        print(f"Meta aux (sample_meta): {n_pv_aux} column(s): {pv_aux_cols}", flush=True)
+        for j, cname in enumerate(pv_aux_cols):
+            tok_i = n_cap + n_reg + j
+            print(f"  global token index {tok_i} (system slot {j}): column {cname!r}", flush=True)
 
     cache_path = Path(args.cache_tensor).resolve() if args.cache_tensor else None
     node_to_local = None
@@ -1745,9 +2112,15 @@ def main() -> None:
 
     if y_ri is None:
         y_ri = _build_complex_targets(nodes_path, sample_ids, node_to_local)
-    y_cap, y_reg = _load_meta_aux(meta_path, sample_ids, cap_cols, reg_cols)
+    sid_list = (
+        [int(x) for x in sample_ids.tolist()]
+        if isinstance(sample_ids, torch.Tensor)
+        else [int(_norm_sid(s)) for s in sample_ids]
+    )
+    y_cap, y_reg = _load_meta_aux(meta_path, sid_list, cap_cols, reg_cols)
     y_cap = y_cap.to(dtype=torch.float32)
     y_reg = y_reg.to(dtype=torch.float32)
+    y_pv = _load_meta_pv(meta_path, sid_list, pv_aux_cols) if n_pv_aux > 0 else None
 
     if args.sample_frac < 1.0:
         k = max(1, int(round(len(sample_ids) * args.sample_frac)))
@@ -1755,6 +2128,8 @@ def main() -> None:
         y_ri = y_ri[:k]
         y_cap = y_cap[:k]
         y_reg = y_reg[:k]
+        if y_pv is not None:
+            y_pv = y_pv[:k]
         sample_ids = sample_ids[:k]
         print(f"sample_frac={args.sample_frac} => {k} samples", flush=True)
 
@@ -1783,6 +2158,17 @@ def main() -> None:
     reg_std = y_reg[idx_train].std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6).float()
     y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
 
+    if n_pv_aux > 0 and y_pv is not None:
+        pv_mean = y_pv[idx_train].mean(dim=0, keepdim=True)
+        pv_std = y_pv[idx_train].std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6).float()
+        y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+        torch.save(pv_mean, out_dir / "pv_mean.pt")
+        torch.save(pv_std, out_dir / "pv_std.pt")
+    else:
+        pv_mean = None
+        pv_std = None
+        y_pv_n = None
+
     torch.save(x_mean, out_dir / "x_mean.pt")
     torch.save(x_std, out_dir / "x_std.pt")
     torch.save(y_mean, out_dir / "y_mean.pt")
@@ -1791,7 +2177,7 @@ def main() -> None:
     torch.save(reg_std, out_dir / "reg_std.pt")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr)
+    ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
     pin = device.type == "cuda"
     nw = int(args.num_workers)
     dl_tr = DataLoader(
@@ -1837,6 +2223,7 @@ def main() -> None:
         per_node_heads=bool(args.per_node_heads),
         per_device_cap_head=bool(args.per_device_cap_head),
         per_device_reg_head=bool(args.per_device_reg_head),
+        n_pv_aux=int(n_pv_aux),
     ).to(device)
     model = base_model
     if device.type == "cuda" and not args.no_compile:
@@ -1855,6 +2242,8 @@ def main() -> None:
     y_std_d = y_std.to(device).float()
     reg_mean_d = reg_mean.to(device).float()
     reg_std_d = reg_std.to(device).float()
+    pv_mean_d = pv_mean.to(device).float() if pv_mean is not None else None
+    pv_std_d = pv_std.to(device).float() if pv_std is not None else None
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
@@ -1873,7 +2262,7 @@ def main() -> None:
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = 0.0
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
         train_n = 0
         for batch in dl_tr:
             batch = batch.to(device)
@@ -1884,11 +2273,15 @@ def main() -> None:
             yb_n = (yb - y_mean_d) / y_std_d
             opt.zero_grad(set_to_none=True)
             with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                v_n, c_log, r_p = model(batch)
+                v_n, c_log, r_p, pv_p = model(batch)
                 loss_v = mse(v_n.view_as(yb_n), yb_n)
                 loss_c = bce(c_log, y_cap)
                 loss_r = mse(r_p, y_reg)
                 loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                    loss_pv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                    loss = loss + float(args.lambda_pv) * loss_pv
+                    train_pv_sum += float(loss_pv.item()) * batch.num_graphs
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -1908,7 +2301,7 @@ def main() -> None:
 
         model.eval()
         val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = 0.0
+        val_c_sum = val_r_sum = val_pv_sum = 0.0
         nv = 0
         val_sum_true = torch.zeros(n_nodes, device=device)
         val_sum_true2 = torch.zeros(n_nodes, device=device)
@@ -1923,11 +2316,15 @@ def main() -> None:
                 y_reg = batch.y_reg.view(batch.num_graphs, -1)
                 yb_n = (yb - y_mean_d) / y_std_d
                 with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                    v_n, c_log, r_p = model(batch)
+                    v_n, c_log, r_p, pv_p = model(batch)
                     lv = mse(v_n.view_as(yb_n), yb_n)
                     lc = bce(c_log, y_cap)
                     lr_ = mse(r_p, y_reg)
                     lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                    if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                        lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                        lt = lt + float(args.lambda_pv) * lpv
+                        val_pv_sum += float(lpv.item()) * batch.num_graphs
                 val_tot += float(lt.item()) * batch.num_graphs
                 val_v += float(lv.item()) * batch.num_graphs
                 val_c_sum += float(lc.item()) * batch.num_graphs
@@ -1947,6 +2344,7 @@ def main() -> None:
         val_v /= max(nv, 1)
         val_c = val_c_sum / max(nv, 1)
         val_r = val_r_sum / max(nv, 1)
+        val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
         true_mean = val_sum_true / max(nv, 1)
         var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
         mse_node = val_sum_se / max(nv, 1)
@@ -1957,6 +2355,7 @@ def main() -> None:
         train_v = train_v_sum / max(train_n, 1)
         train_c = train_c_sum / max(train_n, 1)
         train_r = train_r_sum / max(train_n, 1)
+        train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
@@ -1967,23 +2366,51 @@ def main() -> None:
         else:
             bad += 1
         if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            print(
+            _log = (
                 f"[da_gps] epoch {ep:4d}/{args.epochs} "
-                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f} "
-                f"| val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}",
-                flush=True,
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
             )
+            if n_pv_aux > 0:
+                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            _log += (
+                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
+                f"| best={best_val:.4f}"
+            )
+            print(_log, flush=True)
+        _ce = int(args.checkpoint_every)
+        if _ce > 0 and ep % _ce == 0:
+            _ck = out_dir / "training_last.pt"
+            _save_periodic_training_checkpoint(
+                _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+            )
+            print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
             print(f"[da_gps] early stop at epoch {ep}", flush=True)
+            if int(args.checkpoint_every) > 0:
+                _ck = out_dir / "training_last.pt"
+                _save_periodic_training_checkpoint(
+                    _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                )
+                print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
 
     train_seconds = time.perf_counter() - t0
     if best_state is not None:
         base_model.load_state_dict(best_state)
 
-    met = evaluate(model, dl_te, device, y_mean_d, y_std_d, reg_mean_d, reg_std_d, use_amp=use_amp)
+    met = evaluate(
+        model,
+        dl_te,
+        device,
+        y_mean_d,
+        y_std_d,
+        reg_mean_d,
+        reg_std_d,
+        use_amp=use_amp,
+        pv_mean=pv_mean_d,
+        pv_std=pv_std_d,
+    )
     ckpt = out_dir / "da_gps_multitask_best.pt"
     torch.save(
         {
@@ -2000,6 +2427,9 @@ def main() -> None:
             "per_node_heads": bool(args.per_node_heads),
             "per_device_cap_head": bool(args.per_device_cap_head),
             "per_device_reg_head": bool(args.per_device_reg_head),
+            "n_pv_aux": int(n_pv_aux),
+            "pv_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
+            "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
         },
@@ -2020,9 +2450,12 @@ def main() -> None:
         "checkpoint": str(ckpt.resolve()),
     }
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    _pv_n = met.get("pv_mse_normalized", float("nan"))
+    _pv_raw = met.get("pv_mse_raw", float("nan"))
+    _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
     print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  time={train_seconds:.1f}s",
+        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
     print(f"Saved {ckpt}", flush=True)
