@@ -1619,24 +1619,90 @@ def _evaluate_multi_chunks(
     return {k: met_acc[k] / float(wtot) for k in met_acc}
 
 
+def _da_gps_ckpt_meta(
+    *,
+    n_nodes: int,
+    hidden: int,
+    layers: int,
+    heads: int,
+    n_cap: int,
+    n_reg: int,
+    n_system_tokens: int,
+    node_emb_dim: int,
+    edge_emb_dim: int,
+    per_node_heads: bool,
+    per_device_cap_head: bool,
+    per_device_reg_head: bool,
+    n_pv_aux: int,
+    pv_target_cols: list[str],
+    meta_aux_target_cols: list[str],
+    cap_target_cols: list[str],
+    reg_target_cols: list[str],
+    reg_loss: str,
+    reg_nclasses: list[int] | None = None,
+    chunk_parent: str | None = None,
+    chunk_folders: list[str] | None = None,
+) -> dict[str, object]:
+    """Architecture / target metadata shared by ``da_gps_multitask_best.pt`` and ``training_last.pt``."""
+    meta: dict[str, object] = {
+        "n_nodes": int(n_nodes),
+        "hidden": int(hidden),
+        "layers": int(layers),
+        "heads": int(heads),
+        "n_cap": int(n_cap),
+        "n_reg": int(n_reg),
+        "n_system_tokens": int(n_system_tokens),
+        "node_emb_dim": int(node_emb_dim),
+        "edge_emb_dim": int(edge_emb_dim),
+        "per_node_heads": bool(per_node_heads),
+        "per_device_cap_head": bool(per_device_cap_head),
+        "per_device_reg_head": bool(per_device_reg_head),
+        "n_pv_aux": int(n_pv_aux),
+        "pv_target_cols": list(pv_target_cols),
+        "meta_aux_target_cols": list(meta_aux_target_cols),
+        "cap_target_cols": list(cap_target_cols),
+        "reg_target_cols": list(reg_target_cols),
+        "reg_loss": str(reg_loss),
+        "reg_nclasses": list(reg_nclasses) if reg_nclasses is not None else [],
+    }
+    if chunk_parent is not None:
+        meta["chunk_parent"] = str(chunk_parent)
+    if chunk_folders is not None:
+        meta["chunk_folders"] = [str(p) for p in chunk_folders]
+    return meta
+
+
+def _da_gps_checkpoint_payload(
+    base_model: nn.Module,
+    ckpt_meta: dict[str, object],
+) -> dict[str, object]:
+    """Full inference bundle: ``model_state_dict`` plus all keys in ``da_gps_multitask_best.pt``."""
+    return {
+        "model_state_dict": {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()},
+        **dict(ckpt_meta),
+    }
+
+
 def _save_periodic_training_checkpoint(
     path: Path,
     base_model: nn.Module,
     opt: torch.optim.Optimizer,
     sch: object,
     scaler: object | None,
+    ckpt_meta: dict[str, object],
     *,
     epoch: int,
     bad: int,
     best_val: float,
     best_state: dict[str, torch.Tensor] | None,
 ) -> None:
-    """Atomic write of resumable training state (current + best-so-far weights)."""
+    """Atomic write: same architecture metadata as ``da_gps_multitask_best.pt`` plus resume fields."""
     payload: dict[str, object] = {
+        **_da_gps_checkpoint_payload(base_model, ckpt_meta),
+        "checkpoint_type": "training_last",
         "epoch": int(epoch),
         "bad": int(bad),
         "best_val": float(best_val),
-        "model_state_dict": {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()},
         "optimizer_state_dict": opt.state_dict(),
         "scheduler_state_dict": sch.state_dict(),
         "best_model_state_dict": (
@@ -1968,6 +2034,29 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         n_pv_aux=int(n_pv_aux),
         reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
     ).to(device)
+    ckpt_meta = _da_gps_ckpt_meta(
+        n_nodes=n_nodes,
+        hidden=int(args.hidden),
+        layers=int(args.layers),
+        heads=int(args.heads),
+        n_cap=n_cap,
+        n_reg=n_reg,
+        n_system_tokens=n_sys,
+        node_emb_dim=int(args.node_emb_dim),
+        edge_emb_dim=int(args.edge_emb_dim),
+        per_node_heads=bool(args.per_node_heads),
+        per_device_cap_head=bool(args.per_device_cap_head),
+        per_device_reg_head=bool(args.per_device_reg_head),
+        n_pv_aux=int(n_pv_aux),
+        pv_target_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
+        meta_aux_target_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
+        cap_target_cols=cap_cols,
+        reg_target_cols=reg_cols,
+        reg_loss=reg_loss,
+        reg_nclasses=list(reg_nclasses) if reg_loss == "ce" else None,
+        chunk_parent=str(chunk_parent),
+        chunk_folders=[str(p) for p in chunk_dirs],
+    )
     model = base_model
     if device.type == "cuda" and not args.no_compile:
         try:
@@ -2277,7 +2366,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
             _save_periodic_training_checkpoint(
-                _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                _ck,
+                base_model,
+                opt,
+                sch,
+                scaler,
+                ckpt_meta,
+                epoch=ep,
+                bad=bad,
+                best_val=best_val,
+                best_state=best_state,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
@@ -2285,7 +2383,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
                 _save_periodic_training_checkpoint(
-                    _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                    _ck,
+                    base_model,
+                    opt,
+                    sch,
+                    scaler,
+                    ckpt_meta,
+                    epoch=ep,
+                    bad=bad,
+                    best_val=best_val,
+                    best_state=best_state,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
@@ -2331,33 +2438,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
-    torch.save(
-        {
-            "model_state_dict": base_model.state_dict(),
-            "n_nodes": n_nodes,
-            "hidden": int(args.hidden),
-            "layers": int(args.layers),
-            "heads": int(args.heads),
-            "n_cap": n_cap,
-            "n_reg": n_reg,
-            "n_system_tokens": n_sys,
-            "node_emb_dim": int(args.node_emb_dim),
-            "edge_emb_dim": int(args.edge_emb_dim),
-            "per_node_heads": bool(args.per_node_heads),
-            "per_device_cap_head": bool(args.per_device_cap_head),
-            "per_device_reg_head": bool(args.per_device_reg_head),
-            "n_pv_aux": int(n_pv_aux),
-            "pv_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
-            "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
-            "cap_target_cols": cap_cols,
-            "reg_target_cols": reg_cols,
-            "reg_loss": reg_loss,
-            "reg_nclasses": list(reg_nclasses) if reg_loss == "ce" else [],
-            "chunk_parent": str(chunk_parent),
-            "chunk_folders": [str(p) for p in chunk_dirs],
-        },
-        ckpt,
-    )
+    torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
     report = {
         "task": "DA-GPS multitask chunk_parent",
         "chunk_parent": str(chunk_parent),
@@ -2481,7 +2562,8 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint_every",
         type=int,
         default=0,
-        help="Every N epochs save out_dir/training_last.pt (model+optimizer+scheduler+epoch); 0 disables.",
+        help="Every N epochs save out_dir/training_last.pt (same arch metadata as da_gps_multitask_best.pt "
+        "+ optimizer/scheduler/epoch); 0 disables.",
     )
     p.add_argument(
         "--per_node_heads",
@@ -2759,6 +2841,26 @@ def main() -> None:
         per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
     ).to(device)
+    ckpt_meta = _da_gps_ckpt_meta(
+        n_nodes=n_nodes,
+        hidden=int(args.hidden),
+        layers=int(args.layers),
+        heads=int(args.heads),
+        n_cap=n_cap,
+        n_reg=n_reg,
+        n_system_tokens=n_sys,
+        node_emb_dim=int(args.node_emb_dim),
+        edge_emb_dim=int(args.edge_emb_dim),
+        per_node_heads=bool(args.per_node_heads),
+        per_device_cap_head=bool(args.per_device_cap_head),
+        per_device_reg_head=bool(args.per_device_reg_head),
+        n_pv_aux=int(n_pv_aux),
+        pv_target_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
+        meta_aux_target_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
+        cap_target_cols=cap_cols,
+        reg_target_cols=reg_cols,
+        reg_loss=reg_loss,
+    )
     model = base_model
     if device.type == "cuda" and not args.no_compile:
         try:
@@ -2953,7 +3055,16 @@ def main() -> None:
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
             _save_periodic_training_checkpoint(
-                _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                _ck,
+                base_model,
+                opt,
+                sch,
+                scaler,
+                ckpt_meta,
+                epoch=ep,
+                bad=bad,
+                best_val=best_val,
+                best_state=best_state,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
@@ -2961,7 +3072,16 @@ def main() -> None:
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
                 _save_periodic_training_checkpoint(
-                    _ck, base_model, opt, sch, scaler, epoch=ep, bad=bad, best_val=best_val, best_state=best_state
+                    _ck,
+                    base_model,
+                    opt,
+                    sch,
+                    scaler,
+                    ckpt_meta,
+                    epoch=ep,
+                    bad=bad,
+                    best_val=best_val,
+                    best_state=best_state,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
@@ -2986,30 +3106,7 @@ def main() -> None:
         meta_aux_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
     )
     ckpt = out_dir / "da_gps_multitask_best.pt"
-    torch.save(
-        {
-            "model_state_dict": base_model.state_dict(),
-            "n_nodes": n_nodes,
-            "hidden": int(args.hidden),
-            "layers": int(args.layers),
-            "heads": int(args.heads),
-            "n_cap": n_cap,
-            "n_reg": n_reg,
-            "n_system_tokens": n_sys,
-            "node_emb_dim": int(args.node_emb_dim),
-            "edge_emb_dim": int(args.edge_emb_dim),
-            "per_node_heads": bool(args.per_node_heads),
-            "per_device_cap_head": bool(args.per_device_cap_head),
-            "per_device_reg_head": bool(args.per_device_reg_head),
-            "n_pv_aux": int(n_pv_aux),
-            "pv_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
-            "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
-            "cap_target_cols": cap_cols,
-            "reg_target_cols": reg_cols,
-            "reg_loss": reg_loss,
-        },
-        ckpt,
-    )
+    torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
     report = {
         "task": "DA-GPS multitask full MV",
         "nodes_csv": str(nodes_path),

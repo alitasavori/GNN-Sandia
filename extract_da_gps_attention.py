@@ -331,9 +331,7 @@ def augment_da_gps_pack_for_eval(
     *,
     node_in_dim_hint: int | None = None,
 ) -> None:
-    """Periodic ``training_last.pt`` checkpoints omit architecture metadata.
-
-    If ``reg_target_cols`` / ``cap_target_cols`` (etc.) are missing, merge non-weight keys from
+    """If ``reg_target_cols`` / ``cap_target_cols`` (etc.) are missing, merge non-weight keys from
     ``run_dir/da_gps_multitask_best.pt`` when present; otherwise infer from ``state_dict`` and
     ``train_da_gps_multitask_complex_voltage_gine`` / ``train_da_gps_multitask_complex_voltage`` defaults
     (and optional ``da_gps_report.json``), chosen from checkpoint **weights** (GINE vs legacy EdgeAttn).
