@@ -1,5 +1,45 @@
 # Full notebook cell: aux + reg bars + per-bus voltage rank + attention / hop / hist.
+# Also prints **per meta-aux / system token** the top graph nodes by cross-attention (mean over GPS layers,
+# heads in extract, cache samples): **node→token** (nodes attending *to* each aux) and **token→node**
+# (which nodes each aux token attends to). Writes ``aux_sys_node_to_token_mean_layers_avg*.csv`` and
+# ``aux_sys_token_to_node_mean_layers_avg*.csv``.
 # Source of truth: this file (copy entire file into one Jupyter cell, or %run it).
+#
+# --- Two training styles (same script) ---
+# 1) **GINE / meta-aux / ``--exclude_bess_features``** — cache often
+#    ``run_*__full__nobess__maux<md5>.pt``; ``x`` has fewer columns; ``augment_da_gps_pack_for_eval`` in
+#    ``extract_da_gps_attention.py`` fills missing periodic-ckpt metadata from ``da_gps_multitask_best.pt``
+#    or from the state dict.
+# 2) **BESS in node features** (no ``__nobess`` slug) — cache ``run_*__full.pt`` or ``run_*__full__maux<md5>.pt``;
+#    ``x`` is wider (``p_bess_kw``, ``q_bess_kvar``); same eval code; set ``RUN_DIR`` / ``CACHE_PT`` / ``CKPT_PATH``
+#    to that run. Use ``NOTEBOOK_PRESET`` (see below) or full paths in ``__NOTEBOOK_KNOBS__``.
+#    If ``gnn_edges_phase_static.csv`` is **not** under ``run_*\``, set ``"EDGES_CSV": Path(r"...")`` in knobs
+#    (same for ``HOP_CSV`` if needed). The script auto-falls back to ``datasets_gnn2_from pc\gnn_edges_phase_static.csv``
+#    when the chunk-subdir path is missing. Preset ``bess_l3_chunk`` sets ``CACHE_RESOLVER_REJECT_SUBSTR`` so
+#    ``__nobess__`` tensor caches are not auto-picked against a with-BESS ``RUN_DIR`` (set ``CACHE_PT`` explicitly
+#    if no BESS-aligned sibling ``.pt`` exists yet).
+#
+# **Presets:** set ``NOTEBOOK_PRESET = "bess_l3_chunk"`` before ``exec``, or add
+# ``"NOTEBOOK_PRESET": "bess_l3_chunk"`` to ``__NOTEBOOK_KNOBS__`` (applied before other knob keys).
+# Edit ``RUN_DIR`` inside ``NOTEBOOK_PRESETS["bess_l3_chunk"]`` once, or override paths in knobs.
+#
+# Example — **BESS** (after editing ``RUN_DIR`` in ``NOTEBOOK_PRESETS`` or overriding here)::
+#
+#   from pathlib import Path
+#   __NOTEBOOK_KNOBS__ = {
+#       "NOTEBOOK_PRESET": "bess_l3_chunk",
+#       "RUN_DIR": Path(r"C:\...\your_DA_GPS_out_with_x_mean"),
+#       "CKPT_PATH": Path(r"C:\...\training_last.pt"),
+#       "EDGES_CSV": Path(r"C:\...\gnn_edges_phase_static.csv"),
+#       "HOP_CSV": Path(r"C:\...\load_hop_distance_to_each_regulator_all_index_nodes.csv"),
+#       "N_SAMPLES_AVG": 1000,
+#   }
+#   _p = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2\notebook_cell_attention_aux_voltage_nodes.py")
+#   exec(compile(_p.read_text(encoding="utf-8"), str(_p), "exec"), globals())
+#
+# Example — **GINE / nobess / meta-aux** (defaults in file; optional preset name for clarity)::
+#
+#   __NOTEBOOK_KNOBS__ = {"NOTEBOOK_PRESET": "gine_metaaux_default", "N_SAMPLES_AVG": 1000}
 
 import json
 import os
@@ -38,6 +78,165 @@ from extract_da_gps_attention import (
 )
 from plot_da_gps_attention_hop_histograms_all import plot_all_regulator_layer_hop_histograms
 
+
+def _regulator_cross_attn_node_tables(
+    mh: np.ndarray,
+    mhtn: np.ndarray,
+    *,
+    n_cap: int,
+    reg_cols: list[str],
+    node_names: list[str],
+    top_k_global: int,
+    top_k_per_reg: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    """Rank buses by regulator-related cross-attention (mean over heads, max over layers).
+
+    - **First cross-attn (token→node):** ``mhtn[l, reg_token, n]`` — regulator token attends to node.
+    - **Second cross-attn (node→token):** ``mh[l, n, reg_token]`` — node attends to regulator token.
+
+    For each node, pool over all regulator tokens and GPS layers, then take
+    ``max(max_nt, max_tn)`` so a bus is highlighted if it is strong in **either** direction.
+    """
+    _L, N, _T = mh.shape
+    R = len(reg_cols)
+    rt0 = int(n_cap)
+    w_nt = mh[:, :, rt0 : rt0 + R]
+    w_tn = mhtn[:, rt0 : rt0 + R, :]
+    max_nt = np.max(w_nt, axis=(0, 2))
+    max_tn = np.max(w_tn, axis=(0, 1))
+    comb = np.maximum(max_nt, max_tn)
+    attn_map = {str(node_names[i]): float(comb[i]) for i in range(N)}
+
+    order = np.argsort(-comb)
+    topk = min(int(top_k_global), N)
+    rows_g: list[dict] = []
+    for rank, ni in enumerate(order[:topk], start=1):
+        ni = int(ni)
+        rows_g.append(
+            {
+                "rank_attn_reg_pool": rank,
+                "node": str(node_names[ni]),
+                "max_node_to_token_over_regs_layers": float(max_nt[ni]),
+                "max_token_to_node_over_regs_layers": float(max_tn[ni]),
+                "max_either_dir": float(comb[ni]),
+            }
+        )
+    df_g = pd.DataFrame(rows_g)
+
+    rows_l: list[dict] = []
+    for j, rname in enumerate(reg_cols):
+        nt_j = np.max(w_nt[:, :, j], axis=0)
+        tn_j = np.max(w_tn[:, j, :], axis=0)
+        cj = np.maximum(nt_j, tn_j)
+        ordj = np.argsort(-cj)
+        tk = min(int(top_k_per_reg), N)
+        for rank, ni in enumerate(ordj[:tk], start=1):
+            ni = int(ni)
+            rows_l.append(
+                {
+                    "reg_col": str(rname),
+                    "rank_within_reg": rank,
+                    "node": str(node_names[ni]),
+                    "max_node_to_token": float(nt_j[ni]),
+                    "max_token_to_node": float(tn_j[ni]),
+                    "max_either_dir": float(cj[ni]),
+                }
+            )
+    df_l = pd.DataFrame(rows_l)
+    return df_g, df_l, attn_map
+
+
+def _meta_aux_token_node_rankings_mean_layers(
+    attn: np.ndarray,
+    *,
+    cross_attn: str,
+    token_names: list[str],
+    node_names: list[str],
+    n_cap: int,
+    n_reg: int,
+    top_k_per_token: int,
+    meta_aux_target_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Rank graph nodes per **meta-aux / system** token (indices after cap+reg), mean over GPS layers.
+
+    ``cross_attn``:
+
+    - ``node_to_token``: ``attn`` is ``mh`` (L, N, T); top nodes that **attend to** each aux token.
+    - ``token_to_node``: ``attn`` is ``mhtn`` (L, T, N); top nodes each aux token **attends to**.
+
+    ``attn`` is head-meaned in ``run_attention_extract`` and sample-averaged in this notebook.
+    """
+    attn = np.asarray(attn, dtype=np.float64)
+    if attn.ndim != 3:
+        return pd.DataFrame()
+    L = int(attn.shape[0])
+    if cross_attn == "node_to_token":
+        _L, N, T = attn.shape
+    elif cross_attn == "token_to_node":
+        _L, T, N = attn.shape
+    else:
+        raise ValueError(f"cross_attn must be 'node_to_token' or 'token_to_node', got {cross_attn!r}")
+    t0 = int(n_cap) + int(n_reg)
+    if t0 >= T:
+        return pd.DataFrame()
+    meta = list(meta_aux_target_cols or [])
+    names_t = [str(token_names[i]) if i < len(token_names) else f"tok_{i}" for i in range(T)]
+    names_n = [str(node_names[i]) if i < len(node_names) else f"node_{i}" for i in range(N)]
+    n_sys = T - t0
+    tk = max(1, min(int(top_k_per_token), N))
+    w_mean = np.mean(attn, axis=0)
+    rows: list[dict] = []
+    for j, ti in enumerate(range(t0, T)):
+        ti = int(ti)
+        meta_label = meta[j] if j < len(meta) else ""
+        tok = names_t[ti]
+        label = str(meta_label) if meta_label and len(meta) == n_sys else tok
+        if cross_attn == "node_to_token":
+            vec = w_mean[:, ti]
+        else:
+            vec = w_mean[ti, :]
+        order = np.argsort(-vec)[:tk]
+        for rank, ni in enumerate(order, start=1):
+            ni = int(ni)
+            rows.append(
+                {
+                    "n_gps_layers": L,
+                    "layer_aggregate": "mean",
+                    "cross_attn": cross_attn,
+                    "token_index": int(ti),
+                    "token_name": tok,
+                    "meta_aux_head": str(meta_label) if meta_label else "",
+                    "token_label": label,
+                    "rank_node": int(rank),
+                    "node": names_n[ni],
+                    "attn_mass": float(vec[ni]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _system_token_to_node_rankings_mean_layers(
+    mhtn: np.ndarray,
+    *,
+    token_names: list[str],
+    node_names: list[str],
+    n_cap: int,
+    n_reg: int,
+    top_k_per_token: int,
+    meta_aux_target_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    return _meta_aux_token_node_rankings_mean_layers(
+        mhtn,
+        cross_attn="token_to_node",
+        token_names=token_names,
+        node_names=node_names,
+        n_cap=n_cap,
+        n_reg=n_reg,
+        top_k_per_token=top_k_per_token,
+        meta_aux_target_cols=meta_aux_target_cols,
+    )
+
+
 # =============================================================================
 # Knobs — edit here
 # =============================================================================
@@ -52,47 +251,271 @@ SAMPLE_IDX_START = 0  # starting cache row index when slicing samples
 # (clipped to n_nodes in the graph).
 TOP_K_WORST_BUSES = 1000
 
+# Regulator-related cross-attention: how many nodes to list globally and per regulator token.
+TOP_K_ATTENTION_NODES = 200
+TOP_K_ATTENTION_NODES_PER_REG = 50
+# Meta-aux / system tokens (``sys_*`` after cap+reg): top nodes per aux for node→token and token→node;
+# mean over all GPS layers (and heads in extract, cache samples in this cell).
+TOP_K_ATTENTION_NODES_PER_AUX_TOKEN = 10
+
 # Notebook: how many rows to print / display for the R²-sorted table (lowest R² first).
 N_ROWS_PRINT_R2_TABLE = 30
 
 # Max matplotlib figure height (inches) for worst-bus bar charts when TOP_K is large.
 TOP_K_PLOT_H_CAP_IN = 42.0
 
-# --- paths ---
-RUN_DIR = REPO_ROOT / r"gnn2_architecture_search\attention checkpoints\da_gps_chunked_l4_mvagg_20260510_134709"
-CACHE_PT = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2\datasets_gnn2_from pc\run_001_scen_0000_0049_seed_20360133__full.pt")
-EDGES_CSV = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2\datasets_gnn2_from pc\gnn_edges_phase_static.csv")
-HOP_CSV = REPO_ROOT / r"datasets_gnn2_from pc\load_hop_distance_to_each_regulator_all_index_nodes.csv"
-OUT_DIR = RUN_DIR / "attention_extract"
+# Shared chunk topology (DA cache ``.pt`` often sits next to ``datasets_gnn2_from pc``; edges may be
+# **flat** ``…\gnn_edges_phase_static.csv`` or under ``…\run_*\gnn_edges_phase_static.csv`` — see auto-pick below).
+_DATASET_PC = REPO_ROOT / r"datasets_gnn2_from pc"
+_CHUNK_RUN = _DATASET_PC / "run_001_scen_0000_0049_seed_20360143"
+_CHUNK_EDGES_CSV = _CHUNK_RUN / "gnn_edges_phase_static.csv"
+_EDGES_FLAT_CSV = _DATASET_PC / "gnn_edges_phase_static.csv"
+_CACHE_STEM = _CHUNK_RUN.name
+CACHE_PT = _CHUNK_RUN.parent / f"{_CACHE_STEM}__full.pt"
+EDGES_CSV = _CHUNK_EDGES_CSV
+
+# --- paths (defaults: GINE meta-aux run + same chunk topology as training; edit CACHE_PT if needed) ---
+RUN_DIR = REPO_ROOT / r"gnn2_architecture_search\da_gps_chunked_l4_mvagg_gine_metaaux_20260513_140037"
+# DA multitask cache .pt for one chunk (must match checkpoint n_nodes / edges topology).
+# Use the same ``run_*`` chunk as training (here: seed 20360143 from your Colab NODE_PE_CSV).
+_HOP_FLAT = _DATASET_PC / "load_hop_distance_to_each_regulator_all_index_nodes.csv"
+HOP_CSV = _HOP_FLAT
+# ``RUN_DIR``: training output folder that holds ``x_mean.pt``, ``reg_mean.pt``, etc. (not necessarily the
+# same folder as a copied checkpoint under ``attention checkpoints\``).
+# ``OUT_DIR``: where this notebook writes CSV/PNG/NPZ. Default targets your ``attention checkpoints\…_epoch20``
+# tree while ``RUN_DIR`` (above) stays the original training folder for ``*.pt`` norms. If you change ``RUN_DIR``
+# to another experiment, set ``OUT_DIR`` in ``__NOTEBOOK_KNOBS__`` as well.
+OUT_DIR = (
+    REPO_ROOT
+    / r"gnn2_architecture_search\attention checkpoints\da_gps_chunked_l4_mvagg_gine_metaaux_20260513_140037_epoch20"
+    / "attention_extract"
+)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DOWNSTREAM_RULE = "hop_gt_0"
+# Optional: set to a specific ``.pt`` file. If None, uses ``da_gps_multitask_best.pt`` when present,
+# otherwise ``training_last.pt`` (from ``--checkpoint_every`` saves during training).
+CKPT_PATH = None
+# When ``CACHE_PT`` is missing, ``_resolve_da_cache_pt`` globs siblings. For BESS-in-``x`` runs, set this to
+# ``("__nobess__",)`` so ``__full__nobess__...`` caches are never auto-picked (avoids silent x_dim mismatch).
+CACHE_RESOLVER_REJECT_SUBSTR: tuple[str, ...] = ()
 # import matplotlib
 # matplotlib.use("Agg")
 # =============================================================================
 # Optional: before exec(this file), set __NOTEBOOK_KNOBS__ = {"N_SAMPLES_AVG": 50, ...}
 # in the parent cell to override any of the keys below (omit keys you keep from file).
+#
+# Presets: merged before ``__NOTEBOOK_KNOBS__`` (knobs override). Empty dict = no-op.
+NOTEBOOK_PRESETS: dict[str, dict[str, object]] = {
+    "gine_metaaux_default": {"CACHE_RESOLVER_REJECT_SUBSTR": ()},
+    "bess_l3_chunk": {
+        # --- replace ``_BESS_RUN`` with your real DA-GPS output dir (must contain x_mean.pt + ckpt) ---
+        "RUN_DIR": REPO_ROOT
+        / r"gnn2_architecture_search\REPLACE_WITH_YOUR_DA_GPS_BESS_RUN_DIR",
+        # BESS cache: usually ``...__full.pt`` or ``...__full__maux<8hex>.pt`` (no ``__nobess`` when BESS kept).
+        "CACHE_PT": _CHUNK_RUN.parent / f"{_CACHE_STEM}__full.pt",
+        "CACHE_RESOLVER_REJECT_SUBSTR": ("__nobess__",),
+        "OUT_DIR": REPO_ROOT
+        / r"gnn2_architecture_search\attention checkpoints\da_gps_bess_l3_attention_extract\attention_extract",
+        "CKPT_PATH": None,
+    },
+}
+
 _KNOB_KEYS = (
     "N_SAMPLES_AVG",
     "SAMPLE_IDX_START",
     "TOP_K_WORST_BUSES",
+    "TOP_K_ATTENTION_NODES",
+    "TOP_K_ATTENTION_NODES_PER_REG",
+    "TOP_K_ATTENTION_NODES_PER_AUX_TOKEN",
     "N_ROWS_PRINT_R2_TABLE",
     "TOP_K_PLOT_H_CAP_IN",
     "RUN_DIR",
     "CACHE_PT",
+    "CACHE_RESOLVER_REJECT_SUBSTR",
     "EDGES_CSV",
     "HOP_CSV",
     "OUT_DIR",
     "DEVICE",
     "DOWNSTREAM_RULE",
+    "CKPT_PATH",
 )
-_nbk = globals().get("__NOTEBOOK_KNOBS__")
-if isinstance(_nbk, dict):
+
+_nbk_raw = globals().get("__NOTEBOOK_KNOBS__")
+_nbk: dict = dict(_nbk_raw) if isinstance(_nbk_raw, dict) else {}
+_preset_name = str(_nbk.pop("NOTEBOOK_PRESET", "") or "").strip()
+if not _preset_name:
+    _preset_name = str(globals().get("NOTEBOOK_PRESET", "") or "").strip()
+if _preset_name:
+    if _preset_name not in NOTEBOOK_PRESETS:
+        raise KeyError(
+            f"Unknown NOTEBOOK_PRESET={_preset_name!r}. "
+            f"Valid: {sorted(NOTEBOOK_PRESETS.keys())!r}"
+        )
+    _pd = NOTEBOOK_PRESETS[_preset_name]
+    if _pd:
+        for _pk, _pv in _pd.items():
+            if _pk in _KNOB_KEYS:
+                globals()[_pk] = _pv
+        print(f"applied NOTEBOOK_PRESET={_preset_name!r} ({len(_pd)} keys)", flush=True)
+    else:
+        print(f"NOTEBOOK_PRESET={_preset_name!r} (empty overlay; file defaults unchanged)", flush=True)
+
+if isinstance(_nbk_raw, dict):
     for _k in _KNOB_KEYS:
         if _k in _nbk:
             globals()[_k] = _nbk[_k]
+else:
+    print(
+        "note: __NOTEBOOK_KNOBS__ not set or not a dict — using file defaults for paths.",
+        flush=True,
+    )
 
+print("RUN_DIR =", Path(RUN_DIR).resolve(), flush=True)
+print("OUT_DIR =", Path(OUT_DIR).resolve(), flush=True)
 print("DEVICE =", DEVICE)
-ckpt = RUN_DIR / "da_gps_multitask_best.pt"
+
+# --- resolve edges / hop CSV (override with __NOTEBOOK_KNOBS__["EDGES_CSV"] / ["HOP_CSV"] if needed) ---
+_edges_set = Path(EDGES_CSV)
+if not _edges_set.is_file():
+    if _EDGES_FLAT_CSV.is_file():
+        EDGES_CSV = _EDGES_FLAT_CSV
+        print(f"EDGES_CSV: using flat file (chunk subdir missing): {EDGES_CSV.resolve()}", flush=True)
+    elif _CHUNK_EDGES_CSV.is_file():
+        EDGES_CSV = _CHUNK_EDGES_CSV
+        print(f"EDGES_CSV: using chunk subdir: {EDGES_CSV.resolve()}", flush=True)
+    else:
+        raise FileNotFoundError(
+            f"EDGES_CSV not found at {_edges_set}\n"
+            f"  Tried flat: {_EDGES_FLAT_CSV}\n"
+            f"  Tried chunk: {_CHUNK_EDGES_CSV}\n"
+            f"Set __NOTEBOOK_KNOBS__['EDGES_CSV'] = Path(r\"...\\gnn_edges_phase_static.csv\") to your real file."
+        )
+else:
+    EDGES_CSV = _edges_set.resolve()
+    print(f"EDGES_CSV = {EDGES_CSV}", flush=True)
+
+_hop_set = Path(HOP_CSV)
+if _hop_set.is_file():
+    HOP_CSV = _hop_set.resolve()
+elif _HOP_FLAT.is_file():
+    HOP_CSV = _HOP_FLAT.resolve()
+    print(f"HOP_CSV: explicit path missing; using: {HOP_CSV}", flush=True)
+else:
+    raise FileNotFoundError(
+        f"HOP_CSV not found at {_hop_set}. Tried fallback {_HOP_FLAT}. "
+        f"Set __NOTEBOOK_KNOBS__['HOP_CSV'] = Path(r\"...\") to your hop CSV."
+    )
+print(f"HOP_CSV = {HOP_CSV}", flush=True)
+
+
+def _resolve_da_gps_ckpt(run_dir: Path, explicit) -> Path:
+    if explicit is not None:
+        p = Path(explicit).expanduser().resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"CKPT_PATH not found: {p}")
+        return p
+    rd = Path(run_dir).resolve()
+    best = rd / "da_gps_multitask_best.pt"
+    last = rd / "training_last.pt"
+    if best.is_file():
+        return best
+    if last.is_file():
+        return last
+    raise FileNotFoundError(
+        f"No checkpoint in {rd}: expected {best.name} or {last.name} "
+        "(or pass __NOTEBOOK_KNOBS__['CKPT_PATH'] = Path(...))."
+    )
+
+
+ckpt = _resolve_da_gps_ckpt(RUN_DIR, CKPT_PATH)
+print("ckpt =", ckpt)
+
+
+def _resolve_da_cache_pt(cache_pt: Path | str, run_dir: Path | str | None = None) -> Path:
+    """Use ``CACHE_PT`` if it exists; else try sibling names from chunk DA-GPS training.
+
+    Training may write ``<stem>__full__nobess__maux<md5>.pt`` (``--exclude_bess_features``) or
+    ``<stem>__full__maux<md5>.pt`` / bare ``<stem>.pt`` when BESS columns stay in ``x``.
+
+    When both exist, **BESS / maux-only** names (``__full__maux*.pt`` without ``__nobess__``) are tried **before**
+    ``__nobess__`` variants so a missing bare ``__full.pt`` does not silently pick the wrong feature set.
+
+    If ``CACHE_RESOLVER_REJECT_SUBSTR`` is set (e.g. ``(\"__nobess__\",)`` for preset ``bess_l3_chunk``), sibling
+    paths whose **filename** contains any of those substrings are skipped. If that removes all candidates, a
+    ``FileNotFoundError`` lists what was found so you can copy the correct ``.pt`` or set ``CACHE_PT`` explicitly.
+    """
+    p = Path(cache_pt).expanduser().resolve()
+    if p.is_file():
+        return p
+    par = p.parent
+    stem = p.stem
+    rej = globals().get("CACHE_RESOLVER_REJECT_SUBSTR") or ()
+    if isinstance(rej, str):
+        rej_t = (rej,) if rej.strip() else ()
+    elif isinstance(rej, (list, tuple)):
+        rej_t = tuple(str(x) for x in rej if str(x).strip())
+    else:
+        rej_t = ()
+
+    def _allowed(c: Path) -> bool:
+        name = c.name
+        return not any(s in name for s in rej_t)
+
+    raw_all: list[Path] = []
+    for pat in (
+        f"{stem}__maux*.pt",
+        f"{stem}__nobess__maux*.pt",
+        f"{stem}__nobess.pt",
+    ):
+        raw_all.extend(sorted(par.glob(pat)))
+    hits = [c for c in raw_all if _allowed(c)]
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for c in hits:
+        k = str(c.resolve())
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    if len(uniq) == 1:
+        print(f"CACHE_PT not at {p}; using resolved: {uniq[0]}", flush=True)
+        return uniq[0].resolve()
+    if len(uniq) > 1:
+        msg = "\n  ".join(str(x) for x in uniq[:15])
+        raise FileNotFoundError(
+            f"CACHE_PT missing: {p}\nMultiple sibling caches; set CACHE_PT explicitly to one of:\n  {msg}"
+        )
+    if raw_all and rej_t:
+        raw_u: list[Path] = []
+        seen2: set[str] = set()
+        for c in raw_all:
+            k2 = str(c.resolve())
+            if k2 not in seen2:
+                seen2.add(k2)
+                raw_u.append(c)
+        msg_r = "\n  ".join(str(x) for x in raw_u[:20])
+        raise FileNotFoundError(
+            f"CACHE_PT missing: {p}\n"
+            f"Found {len(raw_u)} sibling tensor cache(s), but all filenames match CACHE_RESOLVER_REJECT_SUBSTR={rej_t!r} "
+            f"(skipped). For with-BESS ``RUN_DIR``, copy or build a cache **without** ``__nobess__`` in the name "
+            f"(e.g. ``{stem}__full.pt`` or ``{stem}__full__maux....pt``), or set ``CACHE_PT`` / "
+            f"``CACHE_RESOLVER_REJECT_SUBSTR`` explicitly.\n"
+            f"Skipped candidates:\n  {msg_r}"
+        )
+    hint = ""
+    if run_dir is not None:
+        rp = Path(run_dir) / "da_gps_report.json"
+        if rp.is_file():
+            hint = f"\nSee {rp} for aux_meta_cols / exclude_bess (cache basename includes __nobess / __maux...)."
+    raise FileNotFoundError(
+        f"CACHE_PT not found: {p}{hint}\n"
+        f"Searched under {par} for patterns from stem {stem!r} "
+        f"(``__full__maux*.pt`` without ``__nobess__`` first, then ``__nobess__`` variants). "
+        f"Copy the chunk ``.pt`` from your Colab ``--cache_dir`` next to the chunk CSVs, or point ``CACHE_PT`` "
+        f"at the real file. For BESS-in-``x`` training, avoid ``__nobess__`` caches unless that is what you trained."
+    )
+
+
+CACHE_PT = _resolve_da_cache_pt(CACHE_PT, RUN_DIR)
 
 _z = torch.load(CACHE_PT, map_location="cpu", weights_only=False)
 _n_cache = int(_z["x"].shape[0])
@@ -112,14 +535,22 @@ print(
 )
 print(
     f"knobs: N_SAMPLES_AVG={N_SAMPLES_AVG!r} → n_used={_n_avg}  |  "
-    f"TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}  |  N_ROWS_PRINT_R2_TABLE={N_ROWS_PRINT_R2_TABLE}"
+    f"TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}  |  N_ROWS_PRINT_R2_TABLE={N_ROWS_PRINT_R2_TABLE}  |  "
+    f"TOP_K_ATTENTION_NODES_PER_AUX_TOKEN={TOP_K_ATTENTION_NODES_PER_AUX_TOKEN}"
 )
+if _n_avg > 150:
+    print(
+        f"WARNING: attention section below runs ``run_attention_extract`` {_n_avg} times (full model + "
+        f"edges each time). Expect a long run or use e.g. N_SAMPLES_AVG=50 for development; "
+        f"KeyboardInterrupt is normal if you hit Stop.",
+        flush=True,
+    )
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 hop_df = load_hop_frame(HOP_CSV)
 
 # ----- same cache rows: per-regulator MAE/MSE/RMS in tap pu + per-cap BCE & accuracy -----
-reg_df, cap_df, aux_meta = eval_aux_per_device_on_cache_indices(
+reg_df, cap_df, aux_meta, meta_aux_df = eval_aux_per_device_on_cache_indices(
     ckpt,
     RUN_DIR,
     CACHE_PT,
@@ -133,14 +564,26 @@ cap_df.to_csv(OUT_DIR / f"aux_cap_per_device_avg{_n_avg}.csv", index=False)
 (OUT_DIR / f"aux_metrics_meta_avg{_n_avg}.json").write_text(
     json.dumps(aux_meta, indent=2), encoding="utf-8"
 )
+if len(meta_aux_df):
+    _mcsv = OUT_DIR / f"aux_meta_per_col_avg{_n_avg}.csv"
+    meta_aux_df.to_csv(_mcsv, index=False)
+    print(f"wrote {_mcsv}")
 print(f"wrote {OUT_DIR / f'aux_reg_per_device_avg{_n_avg}.csv'}")
 print(f"wrote {OUT_DIR / f'aux_cap_per_device_avg{_n_avg}.csv'}")
 print(f"wrote {OUT_DIR / f'aux_metrics_meta_avg{_n_avg}.json'}")
 print(f"aggregate reg_mse_tap_pu_all={aux_meta['reg_mse_tap_pu_all']:.8f}  cap_bce_all={aux_meta['cap_bce_all']:.6f}")
-print("\n--- per-regulator (tap pu) ---")
+if "pv_mse_raw_all" in aux_meta:
+    print(
+        f"meta_aux: pv_mse_nrm_all={aux_meta.get('pv_mse_nrm_all', float('nan')):.6f}  "
+        f"pv_mse_raw_all={aux_meta['pv_mse_raw_all']:.6f}"
+    )
+print("\n--- per-regulator (tap pu) + hit-rate style accuracy ---")
 print(reg_df.to_string(index=False))
-print("\n--- per-cap ---")
+print("\n--- per-cap (BCE + threshold accuracy) ---")
 print(cap_df.to_string(index=False))
+if len(meta_aux_df):
+    print("\n--- per-meta-aux column (raw + normalized errors; R² across evaluated cache rows) ---")
+    print(meta_aux_df.to_string(index=False))
 
 
 def _short_reg_col(name: str) -> str:
@@ -194,6 +637,17 @@ node_err_df.to_csv(_node_csv, index=False)
     json.dumps(node_err_meta, indent=2), encoding="utf-8"
 )
 print(f"wrote {_node_csv}")
+print(
+    f"voltage pooled over all nodes×cache rows (n={node_err_meta.get('n_points_vmag_finite_overlap', 0)}): "
+    f"|V| MAE={node_err_meta.get('mae_global_vmag_pu', float('nan')):.6f} pu  "
+    f"RMSE={node_err_meta.get('rmse_global_vmag_pu', float('nan')):.6f} pu  "
+    f"R²={node_err_meta.get('r2_global_vmag_pu', float('nan')):.6f}"
+)
+print(
+    f"angle pooled (circular MAE, naive linear R² vs true angle in deg): "
+    f"MAE={node_err_meta.get('mae_global_angle_deg', float('nan')):.4f} deg  "
+    f"R²={node_err_meta.get('r2_global_vang_deg_naive', float('nan')):.6f}"
+)
 print(
     f"worst bus (mean |V| MAE over n={_n_avg}): {node_err_meta['worst_node']}  "
     f"mean_mae_vmag_pu={node_err_meta['worst_mean_mae_vmag_pu']:.6f}"
@@ -314,6 +768,8 @@ worst_ann, hop_sub_worst = worst_nodes_downstream_regulator_table(
 _csv_w = OUT_DIR / f"voltage_worst_{_top_k}_with_downstream_regs_avg{_n_avg}.csv"
 worst_ann.to_csv(_csv_w, index=False)
 print(f"wrote {_csv_w}")
+worst_ann2 = worst_ann.copy()
+worst_ann2["max_reg_cross_attn_either"] = float("nan")
 
 M = np.ma.masked_invalid(hop_sub_worst.to_numpy(dtype=float))
 _h_hm = min(48.0, max(5.5, 0.038 * float(M.shape[0])))
@@ -436,6 +892,96 @@ ratios_tn.to_csv(out_csv_tn, index=False)
 reg_cols = list(res["manifest"]["reg_target_cols"])
 n_cap = int(res["n_cap"])
 
+node_names_attn = list(res["manifest"]["node_names"])
+_df_g, _df_per_reg, _attn_map = _regulator_cross_attn_node_tables(
+    np.asarray(mh, dtype=np.float64),
+    np.asarray(mhtn, dtype=np.float64),
+    n_cap=n_cap,
+    reg_cols=reg_cols,
+    node_names=node_names_attn,
+    top_k_global=int(TOP_K_ATTENTION_NODES),
+    top_k_per_reg=int(TOP_K_ATTENTION_NODES_PER_REG),
+)
+_csv_g = OUT_DIR / f"reg_cross_attn_node_rank_global_avg{_n_avg}.csv"
+_csv_pr = OUT_DIR / f"reg_cross_attn_top_nodes_per_regulator_avg{_n_avg}.csv"
+_df_g.to_csv(_csv_g, index=False)
+_df_per_reg.to_csv(_csv_pr, index=False)
+print(f"wrote {_csv_g}")
+print(f"wrote {_csv_pr}")
+worst_ann2 = worst_ann.copy()
+worst_ann2["max_reg_cross_attn_either"] = worst_ann2["node"].astype(str).map(_attn_map)
+_csv_w2 = OUT_DIR / f"voltage_worst_{_top_k}_with_downstream_regs_and_cross_attn_avg{_n_avg}.csv"
+worst_ann2.to_csv(_csv_w2, index=False)
+print(f"wrote {_csv_w2}")
+print(
+    "\n--- Regulator cross-attn (max over layers & reg tokens): "
+    "node→token vs token→node, pooled by max either ---"
+)
+print(_df_g.head(15).to_string(index=False))
+
+try:
+    _bund_meta = torch.load(ckpt, map_location="cpu", weights_only=False)
+    _meta_aux_cols = list(_bund_meta.get("meta_aux_target_cols") or _bund_meta.get("pv_target_cols") or [])
+except Exception:
+    _meta_aux_cols = []
+
+def _print_meta_aux_attn_block(df: pd.DataFrame, *, title: str, csv_path: Path) -> None:
+    if not len(df):
+        return
+    df.to_csv(csv_path, index=False)
+    print(f"wrote {csv_path}")
+    print(title)
+    print(
+        "(``attn_mass`` = mean over **all GPS layers** × **heads** (extract) × **cache rows** in this run; "
+        "``token_index`` = cap + reg + sys slot; ``sys_j`` ↔ ``meta_aux_target_cols[j]`` when lengths match.)"
+    )
+    for _tok, _sub in df.groupby("token_label", sort=False):
+        print(f"\n  meta_aux={_tok!r}")
+        print(_sub.drop(columns=["token_label"]).to_string(index=False))
+
+
+_df_aux_nt = _meta_aux_token_node_rankings_mean_layers(
+    np.asarray(mh, dtype=np.float64),
+    cross_attn="node_to_token",
+    token_names=list(res["manifest"]["token_names"]),
+    node_names=node_names_attn,
+    n_cap=n_cap,
+    n_reg=len(reg_cols),
+    top_k_per_token=int(TOP_K_ATTENTION_NODES_PER_AUX_TOKEN),
+    meta_aux_target_cols=_meta_aux_cols,
+)
+_df_aux_tn = _system_token_to_node_rankings_mean_layers(
+    np.asarray(mhtn, dtype=np.float64),
+    token_names=list(res["manifest"]["token_names"]),
+    node_names=node_names_attn,
+    n_cap=n_cap,
+    n_reg=len(reg_cols),
+    top_k_per_token=int(TOP_K_ATTENTION_NODES_PER_AUX_TOKEN),
+    meta_aux_target_cols=_meta_aux_cols,
+)
+if len(_df_aux_nt) or len(_df_aux_tn):
+    _print_meta_aux_attn_block(
+        _df_aux_nt,
+        title=(
+            f"\n--- Node→token (2nd cross-attn): top {TOP_K_ATTENTION_NODES_PER_AUX_TOKEN} **nodes** "
+            f"attending **to** each meta-aux token (mean over layers) ---"
+        ),
+        csv_path=OUT_DIR / f"aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv",
+    )
+    _print_meta_aux_attn_block(
+        _df_aux_tn,
+        title=(
+            f"\n--- Token→node (1st cross-attn): top {TOP_K_ATTENTION_NODES_PER_AUX_TOKEN} **nodes** "
+            f"each meta-aux token attends **to** (mean over layers) ---"
+        ),
+        csv_path=OUT_DIR / f"aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv",
+    )
+else:
+    print(
+        "\n(no meta-aux / system tokens: token count equals cap+reg only — skip aux cross-attn rankings)",
+        flush=True,
+    )
+
 
 def _print_ratio_block(df: pd.DataFrame, label: str) -> None:
     print(f"\n--- {label} ---")
@@ -549,8 +1095,16 @@ try:
 
     print("\n--- lowest R² buses (sorted, first {0}) ---".format(int(N_ROWS_PRINT_R2_TABLE)))
     display(_r2_sorted.head(int(N_ROWS_PRINT_R2_TABLE)))
-    print("\n--- worst buses + downstream regs (head) ---")
-    display(worst_ann.head(15))
+    print("\n--- worst buses + downstream regs + cross-attn column (head) ---")
+    display(worst_ann2.head(15))
+    print("\n--- meta aux per column (if trained) ---")
+    if len(meta_aux_df):
+        display(meta_aux_df)
+    print("\n--- top buses by regulator cross-attn pool (head) ---")
+    display(_df_g.head(20))
+    print("\n--- system/aux tokens: token→node top nodes, **mean over layers+heads**, mean over samples (head) ---")
+    if len(_df_aux_tn):
+        display(_df_aux_tn)
     print("\n--- worst buses voltage only (head) ---")
     display(node_err_df.head(20))
     print("\n--- node→token ratios (head) ---")
@@ -559,7 +1113,13 @@ try:
     display(ratios_tn.head(24))
 except Exception:
     print(_r2_sorted.head(int(N_ROWS_PRINT_R2_TABLE)).to_string())
-    print(worst_ann.head(15).to_string())
+    print(worst_ann2.head(15).to_string())
+    if len(meta_aux_df):
+        print(meta_aux_df.to_string(index=False))
+    print(_df_g.head(20).to_string(index=False))
+    if len(_df_aux_tn):
+        print("\n--- system/aux tokens: token→node, mean layers+heads, mean samples (full table) ---")
+        print(_df_aux_tn.to_string(index=False))
     print(node_err_df.head(20).to_string())
     print(ratios.head(24).to_string())
     print(ratios_tn.head(24).to_string())

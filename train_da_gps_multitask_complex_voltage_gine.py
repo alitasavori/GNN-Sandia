@@ -1,7 +1,7 @@
 """
 DA-GPS v2 (GINE local message passing): Perceiver-style latent tokens + cross-attention
 + standard GINEConv on the graph (replaces EdgeAttnMPNN),
-multitask voltage + cap (BCE) + regulator (MSE on z-scored taps).
+multitask voltage + cap (BCE) + regulator (MSE or MAE on z-scored taps via ``--reg_loss``).
 
 v2 alignment:
 - Node inputs: dynamic columns from nodes CSV (default load P/Q) plus optional shared PE columns from a single master CSV.
@@ -90,6 +90,157 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _parse_reg_loss(spec: str) -> str:
+    """``mse`` / ``mae`` on z-scored taps, or ``ce`` / ``cce`` (categorical cross-entropy on tap classes)."""
+    s = str(spec).strip().lower()
+    if s in ("mse", "l2"):
+        return "mse"
+    if s in ("mae", "l1"):
+        return "mae"
+    if s in ("ce", "cce", "cross_entropy", "cross-entropy", "nll"):
+        return "ce"
+    raise ValueError(f"--reg_loss must be 'mse', 'mae', or 'ce', got {spec!r}")
+
+
+def _reg_loss_slug(reg_loss: str) -> str:
+    if reg_loss == "ce":
+        return "regce"
+    if reg_loss == "mae":
+        return "regmae"
+    return ""
+
+
+def _build_reg_class_tables(reg_cols: list[str], reg_raw: np.ndarray) -> list[dict]:
+    """One discrete tap class set per regulator column (rounded unique tap_pu values)."""
+    if reg_raw.ndim != 2 or reg_raw.shape[1] != len(reg_cols):
+        raise ValueError(f"reg_raw shape {reg_raw.shape} vs n_reg={len(reg_cols)}")
+    tables: list[dict] = []
+    for j, col in enumerate(reg_cols):
+        yq = np.round(reg_raw[:, j].astype(np.float64), 6)
+        classes = np.unique(yq)
+        classes = np.sort(classes)
+        cls_to_i = {float(c): int(i) for i, c in enumerate(classes.tolist())}
+        tables.append(
+            {
+                "col": str(col),
+                "classes": [float(c) for c in classes.tolist()],
+                "n_classes": int(len(classes)),
+                "class_to_index": {str(float(k)): int(v) for k, v in cls_to_i.items()},
+            }
+        )
+    return tables
+
+
+def _encode_reg_class_indices(reg_raw: np.ndarray, reg_class_tables: list[dict]) -> np.ndarray:
+    out = np.zeros((reg_raw.shape[0], len(reg_class_tables)), dtype=np.int64)
+    for j, tab in enumerate(reg_class_tables):
+        cls_to_i = {float(c): i for i, c in enumerate(tab["classes"])}
+        yq = np.round(reg_raw[:, j].astype(np.float64), 6)
+        try:
+            out[:, j] = np.array([cls_to_i[float(v)] for v in yq.tolist()], dtype=np.int64)
+        except KeyError as ex:
+            raise KeyError(
+                f"Unseen tap value for {tab['col']!r} (not in training class list). "
+                f"Rebuild caches with --reg_loss ce after all chunks are visible."
+            ) from ex
+    return out
+
+
+def _collect_reg_raw_all_chunks(
+    chunk_dirs: list[Path],
+    meta_name: str,
+    reg_cols: list[str],
+    selected_ids_list: list[list[int] | None],
+) -> np.ndarray:
+    import pandas as pd
+
+    parts: list[np.ndarray] = []
+    usecols = ["sample_id", *reg_cols]
+    for ch, sel in zip(chunk_dirs, selected_ids_list):
+        df = pd.read_csv(ch / meta_name, usecols=usecols)
+        ren = {}
+        for c in df.columns:
+            cs = str(c)
+            if cs.startswith("reg_") and cs.lower() != cs:
+                ren[c] = cs.lower()
+        if ren:
+            df = df.rename(columns=ren)
+        if sel is not None:
+            want = {_norm_sid(s) for s in sel}
+            df = df[df["sample_id"].map(_norm_sid).isin(want)]
+        parts.append(df[list(reg_cols)].to_numpy(dtype=np.float64))
+    if not parts:
+        raise RuntimeError("No regulator tap rows collected from chunk meta CSVs.")
+    return np.concatenate(parts, axis=0)
+
+
+def _classes_to_tensor(reg_class_tables: list[dict]) -> torch.Tensor:
+    """Pad class tap values to (n_reg, max_classes); unused entries are NaN."""
+    n_reg = len(reg_class_tables)
+    max_c = max(int(t["n_classes"]) for t in reg_class_tables) if n_reg else 0
+    out = torch.full((n_reg, max_c), float("nan"), dtype=torch.float32)
+    for j, tab in enumerate(reg_class_tables):
+        for i, c in enumerate(tab["classes"]):
+            out[j, i] = float(c)
+    return out
+
+
+def _reg_indices_to_tap_pu(
+    pred_idx: torch.Tensor, tgt_idx: torch.Tensor, class_values: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map class indices to tap pu using ``class_values[j, k]``."""
+    dev = pred_idx.device
+    cv = class_values.to(device=dev, dtype=torch.float32)
+    n_reg = int(cv.shape[0])
+    pred_tap = torch.empty(pred_idx.shape, device=dev, dtype=torch.float32)
+    tgt_tap = torch.empty_like(pred_tap)
+    for j in range(n_reg):
+        pred_tap[:, j] = cv[j].index_select(0, pred_idx[:, j].long().clamp(min=0))
+        tgt_tap[:, j] = cv[j].index_select(0, tgt_idx[:, j].long().clamp(min=0))
+    return pred_tap, tgt_tap
+
+
+def _reg_loss_scalar(
+    pred: torch.Tensor | None,
+    target: torch.Tensor,
+    reg_loss: str,
+    *,
+    reg_logits: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if reg_loss == "ce":
+        if not reg_logits:
+            raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
+        losses = [F.cross_entropy(reg_logits[j], target[:, j].long()) for j in range(len(reg_logits))]
+        return torch.stack(losses).mean()
+    assert pred is not None
+    if reg_loss == "mae":
+        return F.l1_loss(pred, target)
+    return F.mse_loss(pred, target)
+
+
+def _reg_loss_elementwise(
+    pred: torch.Tensor | None,
+    target: torch.Tensor,
+    reg_loss: str,
+    *,
+    reg_logits: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if reg_loss == "ce":
+        if not reg_logits:
+            raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
+        return torch.stack(
+            [
+                F.cross_entropy(reg_logits[j], target[:, j].long(), reduction="none")
+                for j in range(len(reg_logits))
+            ],
+            dim=1,
+        )
+    assert pred is not None
+    if reg_loss == "mae":
+        return (pred - target).abs()
+    return (pred - target) ** 2
 
 
 def _norm_sid(s: object) -> int:
@@ -460,6 +611,7 @@ class DAGPSModel(nn.Module):
         per_device_cap_head: bool = False,
         per_device_reg_head: bool = False,
         n_pv_aux: int = 0,
+        reg_nclasses: list[int] | None = None,
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
@@ -479,6 +631,13 @@ class DAGPSModel(nn.Module):
         self.per_node_heads = bool(per_node_heads)
         self.per_device_cap_head = bool(per_device_cap_head)
         self.per_device_reg_head = bool(per_device_reg_head)
+        self.reg_nclasses = [int(c) for c in (reg_nclasses or [])]
+        self.reg_classification = (
+            len(self.reg_nclasses) == self.n_reg
+            and self.n_reg > 0
+            and all(int(c) >= 2 for c in self.reg_nclasses)
+        )
+        self._last_reg_logits: list[torch.Tensor] | None = None
         self.g_tokens = int(n_cap + n_reg + n_system)
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
@@ -519,14 +678,23 @@ class DAGPSModel(nn.Module):
             self.cap_W = None
             self.cap_b = None
 
-        if self.per_device_reg_head:
+        if self.reg_classification:
+            if not self.per_device_reg_head:
+                raise ValueError("reg_loss=ce requires --per_device_reg_head (one classifier per regulator).")
+            self.reg_ce_heads = nn.ModuleList([nn.Linear(hidden, int(c)) for c in self.reg_nclasses])
+            self.reg_W = None
+            self.reg_b = None
+            self.reg_head = None
+        elif self.per_device_reg_head:
             self.reg_W = nn.Parameter(torch.randn(self.n_reg, self.hidden) * 0.02)
             self.reg_b = nn.Parameter(torch.zeros(self.n_reg))
             self.reg_head = None
+            self.reg_ce_heads = None
         else:
             self.reg_head = nn.Linear(hidden, 1, bias=False)
             self.reg_W = None
             self.reg_b = None
+            self.reg_ce_heads = None
 
         if self.n_pv_aux > 0:
             self.pv_W = nn.Parameter(torch.randn(self.n_pv_aux, self.hidden) * 0.02)
@@ -540,6 +708,19 @@ class DAGPSModel(nn.Module):
 
     def _edge_ids(self, e_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.num_edges, device=device, dtype=torch.long).repeat(e_total // self.num_edges)
+
+    def _predict_reg(self, T_reg: torch.Tensor) -> torch.Tensor:
+        if self.reg_classification:
+            assert self.reg_ce_heads is not None
+            logits = [head(T_reg[:, j, :]) for j, head in enumerate(self.reg_ce_heads)]
+            self._last_reg_logits = logits
+            return torch.stack([lg.argmax(dim=-1) for lg in logits], dim=1).to(torch.float32)
+        self._last_reg_logits = None
+        if self.per_device_reg_head:
+            assert self.reg_W is not None and self.reg_b is not None
+            return (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
+        assert self.reg_head is not None
+        return self.reg_head(T_reg).squeeze(-1)
 
     def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = data.x
@@ -589,10 +770,7 @@ class DAGPSModel(nn.Module):
             cap_logits = self.cap_head(T_cap).squeeze(-1)
 
         T_reg = T[:, self.n_cap : self.n_cap + self.n_reg, :]
-        if self.per_device_reg_head:
-            reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
-        else:
-            reg_pred = self.reg_head(T_reg).squeeze(-1)
+        reg_pred = self._predict_reg(T_reg)
         if self.n_pv_aux > 0 and self.pv_W is not None:
             T_pv = T[:, self.n_cap + self.n_reg : self.n_cap + self.n_reg + self.n_pv_aux, :]
             pv_pred = (T_pv * self.pv_W.unsqueeze(0)).sum(-1) + self.pv_b.unsqueeze(0)
@@ -702,10 +880,7 @@ class DAGPSModel(nn.Module):
         else:
             cap_logits = self.cap_head(T_cap).squeeze(-1)
         T_reg = T[:, self.n_cap : self.n_cap + self.n_reg, :]
-        if self.per_device_reg_head:
-            reg_pred = (T_reg * self.reg_W.unsqueeze(0)).sum(-1) + self.reg_b.unsqueeze(0)
-        else:
-            reg_pred = self.reg_head(T_reg).squeeze(-1)
+        reg_pred = self._predict_reg(T_reg)
         if self.n_pv_aux > 0 and self.pv_W is not None:
             T_pv = T[:, self.n_cap + self.n_reg : self.n_cap + self.n_reg + self.n_pv_aux, :]
             pv_pred = (T_pv * self.pv_W.unsqueeze(0)).sum(-1) + self.pv_b.unsqueeze(0)
@@ -755,6 +930,8 @@ def _load_meta_aux(
     sample_ids: list[int],
     cap_cols: list[str],
     reg_cols: list[str],
+    *,
+    reg_class_tables: list[dict] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import pandas as pd
 
@@ -778,6 +955,9 @@ def _load_meta_aux(
     cap_raw = df[list(cap_cols)].to_numpy(dtype=np.float64)[order]
     reg_raw = df[list(reg_cols)].to_numpy(dtype=np.float64)[order]
     y_cap = (cap_raw > 0.5).astype(np.float32)
+    if reg_class_tables is not None:
+        y_reg_idx = _encode_reg_class_indices(reg_raw, reg_class_tables)
+        return torch.from_numpy(y_cap), torch.from_numpy(y_reg_idx)
     return torch.from_numpy(y_cap), torch.from_numpy(reg_raw.astype(np.float32))
 
 
@@ -847,7 +1027,10 @@ def _cast_batch_float_tensors(batch: Data) -> Data:
     if hasattr(batch, "y_cap") and batch.y_cap is not None:
         batch.y_cap = batch.y_cap.float()
     if hasattr(batch, "y_reg") and batch.y_reg is not None:
-        batch.y_reg = batch.y_reg.float()
+        if batch.y_reg.dtype in (torch.int64, torch.int32, torch.long):
+            batch.y_reg = batch.y_reg.long()
+        else:
+            batch.y_reg = batch.y_reg.float()
     if hasattr(batch, "y_pv") and batch.y_pv is not None:
         batch.y_pv = batch.y_pv.float()
     return batch
@@ -897,12 +1080,18 @@ def _print_test_per_head_block(tag: str, met: dict[str, float], cap_cols: list[s
         k = f"cap_bce__{_metric_key_segment(nm)}"
         v = met.get(k, float("nan"))
         print(f"  {nm}={v:.6f}", flush=True)
-    print(f"{tag} Test per-head reg_MSE (nrm / tap pu):", flush=True)
+    print(f"{tag} Test per-head reg_MSE / reg_MAE (nrm / tap pu):", flush=True)
     for nm in reg_cols:
         seg = _metric_key_segment(nm)
         kn = f"reg_mse_nrm__{seg}"
         kp = f"reg_mse_pu__{seg}"
-        print(f"  {nm}: nrm={met.get(kn, float('nan')):.6f}  tap_pu={met.get(kp, float('nan')):.6f}", flush=True)
+        kan = f"reg_mae_nrm__{seg}"
+        kap = f"reg_mae_pu__{seg}"
+        print(
+            f"  {nm}: MSE nrm={met.get(kn, float('nan')):.6f} pu={met.get(kp, float('nan')):.6f}  "
+            f"MAE nrm={met.get(kan, float('nan')):.6f} pu={met.get(kap, float('nan')):.6f}",
+            flush=True,
+        )
     if meta_cols:
         print(f"{tag} Test per-head meta_aux_MSE (nrm / raw):", flush=True)
         for nm in meta_cols:
@@ -924,7 +1113,9 @@ def _empty_eval_metrics(cap_cols: list[str], reg_cols: list[str], meta_aux_cols:
         "mae_vmag_worst_node": float("nan"),
         "cap_bce": float("nan"),
         "reg_mse_normalized": float("nan"),
+        "reg_mae_normalized": float("nan"),
         "reg_mse_tap_pu": float("nan"),
+        "reg_mae_tap_pu": float("nan"),
         "pv_mse_normalized": float("nan"),
         "pv_mse_raw": float("nan"),
     }
@@ -934,6 +1125,8 @@ def _empty_eval_metrics(cap_cols: list[str], reg_cols: list[str], meta_aux_cols:
         seg = _metric_key_segment(nm)
         out[f"reg_mse_nrm__{seg}"] = float("nan")
         out[f"reg_mse_pu__{seg}"] = float("nan")
+        out[f"reg_mae_nrm__{seg}"] = float("nan")
+        out[f"reg_mae_pu__{seg}"] = float("nan")
     for nm in meta_aux_cols:
         seg = _metric_key_segment(nm)
         out[f"meta_aux_mse_nrm__{seg}"] = float("nan")
@@ -957,12 +1150,19 @@ def evaluate(
     cap_cols: list[str] | None = None,
     reg_cols: list[str] | None = None,
     meta_aux_cols: list[str] | None = None,
+    reg_loss: str = "mse",
+    reg_class_values: torch.Tensor | None = None,
+    base_model: nn.Module | None = None,
 ) -> dict[str, float]:
     model.eval()
+    core = base_model if base_model is not None else model
     preds, tgts = [], []
     cap_logits_all, cap_tgt_all = [], []
     reg_pred_all, reg_tgt_all = [], []
     pv_pred_all, pv_tgt_all = [], []
+    reg_ce_losses: list[torch.Tensor] = []
+    reg_acc_hits = 0
+    reg_acc_n = 0
     use_pv = pv_mean is not None and pv_std is not None
     for batch in dl:
         batch = batch.to(device)
@@ -979,6 +1179,17 @@ def evaluate(
         cap_tgt_all.append(y_cap.cpu())
         reg_pred_all.append(r_p.cpu())
         reg_tgt_all.append(y_reg.cpu())
+        if reg_loss == "ce" and getattr(core, "_last_reg_logits", None):
+            logits = core._last_reg_logits
+            tgt_l = y_reg.long()
+            reg_ce_losses.append(
+                torch.stack(
+                    [F.cross_entropy(logits[j], tgt_l[:, j]) for j in range(len(logits))],
+                    dim=0,
+                ).mean()
+            )
+            reg_acc_hits += int((r_p.long() == tgt_l).sum().item())
+            reg_acc_n += int(tgt_l.numel())
         if use_pv and hasattr(batch, "y_pv") and batch.y_pv is not None and pv_p.size(-1) > 0:
             y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
             pv_pred_all.append(pv_p.cpu())
@@ -991,10 +1202,26 @@ def evaluate(
     met["cap_bce"] = float(F.binary_cross_entropy_with_logits(cap_log, cap_t).item())
     rp = torch.cat(reg_pred_all, dim=0)
     rt = torch.cat(reg_tgt_all, dim=0)
-    met["reg_mse_normalized"] = float(F.mse_loss(rp, rt.to(rp.dtype)).item())
-    rp_denorm = rp * reg_std.to(rp.device) + reg_mean.to(rp.device)
-    rt_denorm = rt * reg_std.to(rt.device) + reg_mean.to(rt.device)
-    met["reg_mse_tap_pu"] = float(F.mse_loss(rp_denorm, rt_denorm.to(rp_denorm.dtype)).item())
+    if reg_loss == "ce" and reg_class_values is not None:
+        met["reg_ce_loss"] = float(torch.stack(reg_ce_losses).mean().item()) if reg_ce_losses else float("nan")
+        met["reg_accuracy"] = float(reg_acc_hits / max(reg_acc_n, 1))
+        pred_tap, true_tap = _reg_indices_to_tap_pu(
+            rp.long(), rt.long(), reg_class_values.to(device=rp.device)
+        )
+        met["reg_mse_normalized"] = float(F.mse_loss(rp, rt.to(rp.dtype)).item())
+        met["reg_mae_normalized"] = float(F.l1_loss(rp, rt.to(rp.dtype)).item())
+        met["reg_mse_tap_pu"] = float(F.mse_loss(pred_tap, true_tap).item())
+        met["reg_mae_tap_pu"] = float(F.l1_loss(pred_tap, true_tap).item())
+        rp_denorm, rt_denorm = pred_tap, true_tap
+    else:
+        met["reg_ce_loss"] = float("nan")
+        met["reg_accuracy"] = float("nan")
+        met["reg_mse_normalized"] = float(F.mse_loss(rp, rt.to(rp.dtype)).item())
+        met["reg_mae_normalized"] = float(F.l1_loss(rp, rt.to(rp.dtype)).item())
+        rp_denorm = rp * reg_std.to(rp.device) + reg_mean.to(rp.device)
+        rt_denorm = rt * reg_std.to(rt.device) + reg_mean.to(rt.device)
+        met["reg_mse_tap_pu"] = float(F.mse_loss(rp_denorm, rt_denorm.to(rp_denorm.dtype)).item())
+        met["reg_mae_tap_pu"] = float(F.l1_loss(rp_denorm, rt_denorm.to(rp_denorm.dtype)).item())
     cap_list = list(cap_cols or [])
     reg_list = list(reg_cols or [])
     meta_list = list(meta_aux_cols or [])
@@ -1004,6 +1231,8 @@ def evaluate(
         seg = _metric_key_segment(nm)
         met[f"reg_mse_nrm__{seg}"] = float("nan")
         met[f"reg_mse_pu__{seg}"] = float("nan")
+        met[f"reg_mae_nrm__{seg}"] = float("nan")
+        met[f"reg_mae_pu__{seg}"] = float("nan")
     for nm in meta_list:
         seg = _metric_key_segment(nm)
         met[f"meta_aux_mse_nrm__{seg}"] = float("nan")
@@ -1019,9 +1248,11 @@ def evaluate(
         for j, nm in enumerate(reg_list):
             seg = _metric_key_segment(nm)
             met[f"reg_mse_nrm__{seg}"] = float(F.mse_loss(rp[:, j], rt[:, j].to(rp.dtype)).item())
+            met[f"reg_mae_nrm__{seg}"] = float(F.l1_loss(rp[:, j], rt[:, j].to(rp.dtype)).item())
             rpj = rp[:, j] * rs[0, j] + rm[0, j]
             rtj = rt[:, j] * rs[0, j] + rm[0, j]
             met[f"reg_mse_pu__{seg}"] = float(F.mse_loss(rpj, rtj.to(rpj.dtype)).item())
+            met[f"reg_mae_pu__{seg}"] = float(F.l1_loss(rpj, rtj.to(rpj.dtype)).item())
     if use_pv and pv_pred_all:
         pp = torch.cat(pv_pred_all, dim=0)
         pt = torch.cat(pv_tgt_all, dim=0)
@@ -1081,6 +1312,7 @@ def _chunk_cache_path(
     *,
     feat_slug: str = "",
     meta_aux_slug: str = "",
+    reg_slug: str = "",
 ) -> Path:
     if float(sample_frac) >= 1.0:
         tag = "full"
@@ -1089,6 +1321,8 @@ def _chunk_cache_path(
     base = f"{chunk_name}__{tag}"
     if str(feat_slug).strip():
         base = f"{base}__{str(feat_slug).strip()}"
+    if str(reg_slug).strip():
+        base = f"{base}__{str(reg_slug).strip()}"
     if str(meta_aux_slug).strip():
         base = f"{base}__maux{str(meta_aux_slug).strip()}"
     return cache_dir / f"{base}.pt"
@@ -1124,6 +1358,8 @@ def _ensure_chunk_tensor_cache(
     bootstrap_gnn_cache_pt: Path | None,
     ref_ntl: dict[str, int] | None,
     pv_aux_cols: list[str] | None = None,
+    reg_class_tables: list[dict] | None = None,
+    reg_target_mode: str = "regression",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], dict[str, int]]:
     np_ = chunk_dir / nodes_name
     mp_ = chunk_dir / meta_name
@@ -1153,26 +1389,38 @@ def _ensure_chunk_tensor_cache(
         print(f"Added meta-aux columns to chunk cache: {cache_pt}", flush=True)
         return y_pv.to(dtype=torch.float32)
 
+    want_reg_mode = str(reg_target_mode).strip().lower()
+
     if cache_pt.is_file():
         z = torch.load(cache_pt, map_location="cpu", weights_only=False)
-        ntl = z["node_to_local"]
-        if ref_ntl is not None and ntl != ref_ntl:
-            raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
-        sids = z["sample_ids"]
-        if isinstance(sids, torch.Tensor):
-            sids = [int(x) for x in sids.tolist()]
+        if str(z.get("reg_target_mode", "regression")).lower() != want_reg_mode:
+            print(
+                f"chunk cache reg_target_mode={z.get('reg_target_mode')!r} != {want_reg_mode!r}; "
+                f"rebuilding: {cache_pt}",
+                flush=True,
+            )
         else:
-            sids = list(sids)
-        x = z["x"].to(dtype=torch.float32)
-        y_ri = z["y_ri"].to(dtype=torch.float32)
-        y_cap = z["y_cap"].to(dtype=torch.float32)
-        y_reg = z["y_reg"].to(dtype=torch.float32)
-        y_pv = None
-        if pv_cols:
-            y_pv = _maybe_attach_y_pv(z, sids)
-            if y_pv is not None:
-                y_pv = y_pv.to(dtype=torch.float32)
-        return x, y_ri, y_cap, y_reg, y_pv, sids, ntl
+            ntl = z["node_to_local"]
+            if ref_ntl is not None and ntl != ref_ntl:
+                raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+            sids = z["sample_ids"]
+            if isinstance(sids, torch.Tensor):
+                sids = [int(x) for x in sids.tolist()]
+            else:
+                sids = list(sids)
+            x = z["x"].to(dtype=torch.float32)
+            y_ri = z["y_ri"].to(dtype=torch.float32)
+            y_cap = z["y_cap"].to(dtype=torch.float32)
+            if want_reg_mode == "class":
+                y_reg = z["y_reg"].to(dtype=torch.long)
+            else:
+                y_reg = z["y_reg"].to(dtype=torch.float32)
+            y_pv = None
+            if pv_cols:
+                y_pv = _maybe_attach_y_pv(z, sids)
+                if y_pv is not None:
+                    y_pv = y_pv.to(dtype=torch.float32)
+            return x, y_ri, y_cap, y_reg, y_pv, sids, ntl
 
     if bootstrap_gnn_cache_pt is not None and bootstrap_gnn_cache_pt.is_file():
         z = torch.load(bootstrap_gnn_cache_pt, map_location="cpu", weights_only=False)
@@ -1199,9 +1447,14 @@ def _ensure_chunk_tensor_cache(
                 sample_ids = [sample_ids[i] for i in keep_idx]
             if not mp_.is_file():
                 raise FileNotFoundError(mp_)
-            y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
+            y_cap, y_reg = _load_meta_aux(
+                mp_, sample_ids, cap_cols, reg_cols, reg_class_tables=reg_class_tables
+            )
             y_cap = y_cap.to(dtype=torch.float32)
-            y_reg = y_reg.to(dtype=torch.float32)
+            if want_reg_mode == "class":
+                y_reg = y_reg.to(dtype=torch.long)
+            else:
+                y_reg = y_reg.to(dtype=torch.float32)
             y_pv = _load_meta_pv(mp_, sample_ids, pv_cols) if pv_cols else None
             cache_pt.parent.mkdir(parents=True, exist_ok=True)
             row = {
@@ -1211,6 +1464,7 @@ def _ensure_chunk_tensor_cache(
                 "y_reg": y_reg,
                 "sample_ids": sample_ids,
                 "node_to_local": node_to_local,
+                "reg_target_mode": want_reg_mode,
             }
             if y_pv is not None:
                 row["y_pv"] = y_pv
@@ -1232,9 +1486,12 @@ def _ensure_chunk_tensor_cache(
     y_ri = y_ri.to(dtype=torch.float32)
     if ref_ntl is not None and node_to_local != ref_ntl:
         raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
-    y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols)
+    y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols, reg_class_tables=reg_class_tables)
     y_cap = y_cap.to(dtype=torch.float32)
-    y_reg = y_reg.to(dtype=torch.float32)
+    if want_reg_mode == "class":
+        y_reg = y_reg.to(dtype=torch.long)
+    else:
+        y_reg = y_reg.to(dtype=torch.float32)
     y_pv = _load_meta_pv(mp_, sample_ids, pv_cols) if pv_cols else None
     cache_pt.parent.mkdir(parents=True, exist_ok=True)
     row = {
@@ -1244,6 +1501,7 @@ def _ensure_chunk_tensor_cache(
         "y_reg": y_reg,
         "sample_ids": sample_ids,
         "node_to_local": node_to_local,
+        "reg_target_mode": want_reg_mode,
     }
     if y_pv is not None:
         row["y_pv"] = y_pv
@@ -1283,6 +1541,11 @@ def _evaluate_multi_chunks(
     pv_aux_cols: list[str] | None,
     device: torch.device,
     use_amp: bool,
+    reg_loss: str = "mse",
+    reg_class_tables: list[dict] | None = None,
+    reg_target_mode: str = "regression",
+    reg_class_values: torch.Tensor | None = None,
+    base_model: nn.Module | None = None,
 ) -> dict[str, float]:
     met_acc: dict[str, float] | None = None
     wtot = 0
@@ -1305,8 +1568,13 @@ def _evaluate_multi_chunks(
             bootstrap_gnn_cache_pt=boot_pt,
             ref_ntl=ref_ntl,
             pv_aux_cols=pv_aux_cols,
+            reg_class_tables=reg_class_tables,
+            reg_target_mode=reg_target_mode,
         )
-        y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+        if reg_loss == "ce":
+            y_reg_n = y_reg.to(dtype=torch.long)
+        else:
+            y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
         x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
         y_pv_n = None
         if y_pv is not None and pv_mean is not None and pv_std is not None:
@@ -1333,6 +1601,9 @@ def _evaluate_multi_chunks(
             cap_cols=cap_cols,
             reg_cols=reg_cols,
             meta_aux_cols=list(pv_aux_cols) if pv_aux_cols else [],
+            reg_loss=reg_loss,
+            reg_class_values=reg_class_values,
+            base_model=base_model,
         )
         w = int(len(idx_te))
         if met_acc is None:
@@ -1384,6 +1655,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
+    reg_loss = _parse_reg_loss(args.reg_loss)
+    reg_target_mode = "class" if reg_loss == "ce" else "regression"
+    if reg_loss == "ce" and not bool(args.per_device_reg_head):
+        raise ValueError("--reg_loss ce requires --per_device_reg_head (one softmax head per regulator).")
+    reg_slug = _reg_loss_slug(reg_loss)
+    print(
+        f"regulator tap training loss: {reg_loss} "
+        f"({'discrete tap classes + cross-entropy' if reg_loss == 'ce' else 'z-scored continuous taps'})",
+        flush=True,
+    )
 
     chunk_parent = Path(args.chunk_parent).resolve()
     if not chunk_parent.is_dir():
@@ -1479,6 +1760,24 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     for d in chunk_dirs:
         print(f"  - {d.name}", flush=True)
 
+    reg_class_tables: list[dict] | None = None
+    reg_nclasses: list[int] = []
+    if reg_loss == "ce":
+        _sel_for_classes: list[list[int] | None] = []
+        for ci, ch in enumerate(chunk_dirs):
+            _sel_for_classes.append(
+                _select_sample_ids_from_meta(ch / meta_name, float(args.sample_frac), int(args.seed), ci)
+            )
+        reg_raw_all = _collect_reg_raw_all_chunks(chunk_dirs, meta_name, reg_cols, _sel_for_classes)
+        reg_class_tables = _build_reg_class_tables(reg_cols, reg_raw_all)
+        reg_nclasses = [int(t["n_classes"]) for t in reg_class_tables]
+        (out_dir / "reg_class_tables.json").write_text(
+            json.dumps(reg_class_tables, indent=2), encoding="utf-8"
+        )
+        print("reg_loss=ce: per-regulator tap classes (rounded unique tap_pu):", flush=True)
+        for tab in reg_class_tables:
+            print(f"  {tab['col']}: n_classes={tab['n_classes']}", flush=True)
+
     idx_train_list: list[np.ndarray] = []
     idx_val_list: list[np.ndarray] = []
     idx_test_list: list[np.ndarray] = []
@@ -1510,7 +1809,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         sel_ids = _select_sample_ids_from_meta(meta_path, float(args.sample_frac), int(args.seed), ci)
         selected_ids_list.append(sel_ids)
         da_pt = _chunk_cache_path(
-            cache_dir, ch.name, float(args.sample_frac), int(args.seed), ci, feat_slug=feat_slug, meta_aux_slug=maux_slug
+            cache_dir,
+            ch.name,
+            float(args.sample_frac),
+            int(args.seed),
+            ci,
+            feat_slug=feat_slug,
+            meta_aux_slug=maux_slug,
+            reg_slug=reg_slug,
         )
         cache_pts.append(da_pt)
         if bootstrap_gnn_cache_dir is not None:
@@ -1535,6 +1841,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             bootstrap_gnn_cache_pt=boot_pt,
             ref_ntl=ref_ntl,
             pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+            reg_class_tables=reg_class_tables,
+            reg_target_mode=reg_target_mode,
         )
         if ci == 0:
             ref_ntl = ntl
@@ -1576,10 +1884,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         sum_y2 += (yt * yt).sum(dim=0)
         cnt_y += len(itr)
 
-        rt = y_reg[itr].to(dtype=torch.float64)
-        sum_reg += rt.sum(dim=0)
-        sum_reg2 += (rt * rt).sum(dim=0)
-        cnt_reg += len(itr)
+        if reg_loss != "ce":
+            rt = y_reg[itr].to(dtype=torch.float64)
+            sum_reg += rt.sum(dim=0)
+            sum_reg2 += (rt * rt).sum(dim=0)
+            cnt_reg += len(itr)
 
         if n_pv_aux > 0 and y_pv is not None and sum_pv is not None and sum_pv2 is not None:
             ypv = y_pv[itr].to(dtype=torch.float64)
@@ -1602,9 +1911,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     y_var = sum_y2 / float(cnt_y) - (sum_y / float(cnt_y)) ** 2
     y_std = torch.sqrt(y_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
 
-    reg_mean = (sum_reg / float(cnt_reg)).view(1, -1).float()
-    reg_var = sum_reg2 / float(cnt_reg) - (sum_reg / float(cnt_reg)) ** 2
-    reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
+    if reg_loss == "ce":
+        reg_mean = torch.zeros(1, n_reg, dtype=torch.float32)
+        reg_std = torch.ones(1, n_reg, dtype=torch.float32)
+    else:
+        reg_mean = (sum_reg / float(cnt_reg)).view(1, -1).float()
+        reg_var = sum_reg2 / float(cnt_reg) - (sum_reg / float(cnt_reg)) ** 2
+        reg_std = torch.sqrt(reg_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
+    reg_class_values = _classes_to_tensor(reg_class_tables) if reg_class_tables else None
 
     if n_pv_aux > 0:
         if sum_pv is None or cnt_pv < 1:
@@ -1626,6 +1940,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     torch.save(y_std, out_dir / "y_std.pt")
     torch.save(reg_mean, out_dir / "reg_mean.pt")
     torch.save(reg_std, out_dir / "reg_std.pt")
+    if reg_class_values is not None:
+        torch.save(reg_class_values, out_dir / "reg_class_values.pt")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.type == "cuda"
@@ -1650,6 +1966,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         per_device_cap_head=bool(args.per_device_cap_head),
         per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
+        reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
     ).to(device)
     model = base_model
     if device.type == "cuda" and not args.no_compile:
@@ -1663,6 +1980,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=8)
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
+    reg_class_values_d = reg_class_values.to(device) if reg_class_values is not None else None
 
     y_mean_d = y_mean.to(device).float()
     y_std_d = y_std.to(device).float()
@@ -1716,8 +2034,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 bootstrap_gnn_cache_pt=boot_pt,
                 ref_ntl=ref_ntl,
                 pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+                reg_class_tables=reg_class_tables,
+                reg_target_mode=reg_target_mode,
             )
-            y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+            if reg_loss == "ce":
+                y_reg_n = y_reg.to(dtype=torch.long)
+            else:
+                y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
             x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
             y_pv_n = None
             if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
@@ -1743,7 +2066,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     v_n, c_log, r_p, pv_p = model(batch)
                     loss_v = mse(v_n.view_as(yb_n), yb_n)
                     loss_c = bce(c_log, y_cap_b)
-                    loss_r = mse(r_p, y_reg_b)
+                    reg_logits = base_model._last_reg_logits if reg_loss == "ce" else None
+                    loss_r = _reg_loss_scalar(
+                        r_p if reg_loss != "ce" else None,
+                        y_reg_b,
+                        reg_loss,
+                        reg_logits=reg_logits,
+                    )
                     loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
@@ -1768,8 +2097,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     train_n += int(batch.num_graphs)
                     bce_e = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
                     train_cap_dim += bce_e.sum(dim=0).detach().float().cpu().double()
-                    mse_r = F.mse_loss(r_p, y_reg_b, reduction="none")
-                    train_reg_dim += mse_r.sum(dim=0).detach().float().cpu().double()
+                    reg_e = _reg_loss_elementwise(
+                        r_p if reg_loss != "ce" else None,
+                        y_reg_b,
+                        reg_loss,
+                        reg_logits=reg_logits,
+                    )
+                    train_reg_dim += reg_e.sum(dim=0).detach().float().cpu().double()
                     if train_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                         mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
@@ -1805,8 +2139,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     bootstrap_gnn_cache_pt=boot_pt,
                     ref_ntl=ref_ntl,
                     pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+                    reg_class_tables=reg_class_tables,
+                    reg_target_mode=reg_target_mode,
                 )
-                y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+                if reg_loss == "ce":
+                    y_reg_n = y_reg.to(dtype=torch.long)
+                else:
+                    y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
                 x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
                 y_pv_n = None
                 if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
@@ -1831,7 +2170,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         v_n, c_log, r_p, pv_p = model(batch)
                         lv = mse(v_n.view_as(yb_n), yb_n)
                         lc = bce(c_log, y_cap_b)
-                        lr_ = mse(r_p, y_reg_b)
+                        reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
+                        lr_ = _reg_loss_scalar(
+                            r_p if reg_loss != "ce" else None,
+                            y_reg_b,
+                            reg_loss,
+                            reg_logits=reg_logits_v,
+                        )
                         lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                         if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                             lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
@@ -1844,8 +2189,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     nv += int(batch.num_graphs)
                     bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
                     val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
-                    mse_rv = F.mse_loss(r_p, y_reg_b, reduction="none")
-                    val_reg_dim += mse_rv.sum(dim=0).detach().float().cpu().double()
+                    reg_ev = _reg_loss_elementwise(
+                        r_p if reg_loss != "ce" else None,
+                        y_reg_b,
+                        reg_loss,
+                        reg_logits=reg_logits_v,
+                    )
+                    val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
                     if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
                         val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
@@ -1912,7 +2262,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             print(_log, flush=True)
             _print_per_head_two_lines("[da_gps chunk_parent]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
-            _print_per_head_two_lines("[da_gps chunk_parent]", "reg_MSE_nrm", reg_cols, train_reg_mean, val_reg_mean)
+            if reg_loss == "ce":
+                _reg_head_label = "reg_CE"
+            elif reg_loss == "mae":
+                _reg_head_label = "reg_MAE_nrm"
+            else:
+                _reg_head_label = "reg_MSE_nrm"
+            _print_per_head_two_lines(
+                "[da_gps chunk_parent]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean
+            )
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
         _ce = int(args.checkpoint_every)
@@ -1965,6 +2323,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
         device=device,
         use_amp=use_amp,
+        reg_loss=reg_loss,
+        reg_class_tables=reg_class_tables,
+        reg_target_mode=reg_target_mode,
+        reg_class_values=reg_class_values,
+        base_model=base_model,
     )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
@@ -1988,6 +2351,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
+            "reg_loss": reg_loss,
+            "reg_nclasses": list(reg_nclasses) if reg_loss == "ce" else [],
             "chunk_parent": str(chunk_parent),
             "chunk_folders": [str(p) for p in chunk_dirs],
         },
@@ -2009,9 +2374,14 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     _pv_n = met.get("pv_mse_normalized", float("nan"))
     _pv_raw = met.get("pv_mse_raw", float("nan"))
     _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
+    _reg_tail = (
+        f"  reg_CE={met.get('reg_ce_loss', float('nan')):.6f}  reg_acc={met.get('reg_accuracy', float('nan')):.4f}"
+        if reg_loss == "ce"
+        else f"  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  reg_MAE(pu)={met.get('reg_mae_tap_pu', float('nan')):.6f}"
+    )
     print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
+        f"cap_BCE={met['cap_bce']:.6f}{_reg_tail}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
     _print_test_per_head_block("[da_gps chunk_parent]", met, cap_cols, reg_cols, list(pv_aux_cols) if n_pv_aux > 0 else [])
@@ -2057,6 +2427,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--lambda_cap", type=float, default=0.1)
     p.add_argument("--lambda_reg", type=float, default=0.1)
+    p.add_argument(
+        "--reg_loss",
+        type=str,
+        default="mse",
+        help="Regulator tap loss: mse or mae on z-scored tap_pu; ce (cce) = cross-entropy on discrete tap "
+        "classes (rounded unique tap_pu per reg column, requires --per_device_reg_head). Caps use BCE.",
+    )
     p.add_argument("--patience", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--train_frac", type=float, default=0.8)
@@ -2172,6 +2549,8 @@ def main() -> None:
 
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
+    reg_loss = _parse_reg_loss(args.reg_loss)
+    print(f"regulator tap training loss: {reg_loss} (z-scored tap targets)", flush=True)
 
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
@@ -2437,7 +2816,7 @@ def main() -> None:
                 v_n, c_log, r_p, pv_p = model(batch)
                 loss_v = mse(v_n.view_as(yb_n), yb_n)
                 loss_c = bce(c_log, y_cap)
-                loss_r = mse(r_p, y_reg)
+                loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
                 loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     loss_pv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
@@ -2461,8 +2840,8 @@ def main() -> None:
                 train_n += int(batch.num_graphs)
                 bce_e = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
                 train_cap_dim += bce_e.sum(dim=0).detach().float().cpu().double()
-                mse_r = F.mse_loss(r_p, y_reg, reduction="none")
-                train_reg_dim += mse_r.sum(dim=0).detach().float().cpu().double()
+                reg_e = _reg_loss_elementwise(r_p, y_reg, reg_loss)
+                train_reg_dim += reg_e.sum(dim=0).detach().float().cpu().double()
                 if train_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                     mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
@@ -2488,7 +2867,7 @@ def main() -> None:
                     v_n, c_log, r_p, pv_p = model(batch)
                     lv = mse(v_n.view_as(yb_n), yb_n)
                     lc = bce(c_log, y_cap)
-                    lr_ = mse(r_p, y_reg)
+                    lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
                     lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
@@ -2501,8 +2880,8 @@ def main() -> None:
                 nv += int(batch.num_graphs)
                 bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
                 val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
-                mse_rv = F.mse_loss(r_p, y_reg, reduction="none")
-                val_reg_dim += mse_rv.sum(dim=0).detach().float().cpu().double()
+                reg_ev = _reg_loss_elementwise(r_p, y_reg, reg_loss)
+                val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
                 if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
                     val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
@@ -2566,7 +2945,8 @@ def main() -> None:
             )
             print(_log, flush=True)
             _print_per_head_two_lines("[da_gps]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
-            _print_per_head_two_lines("[da_gps]", "reg_MSE_nrm", reg_cols, train_reg_mean, val_reg_mean)
+            _reg_head_label = "reg_MAE_nrm" if reg_loss == "mae" else "reg_MSE_nrm"
+            _print_per_head_two_lines("[da_gps]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean)
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
         _ce = int(args.checkpoint_every)
@@ -2626,6 +3006,7 @@ def main() -> None:
             "meta_aux_target_cols": list(pv_aux_cols) if n_pv_aux > 0 else [],
             "cap_target_cols": cap_cols,
             "reg_target_cols": reg_cols,
+            "reg_loss": reg_loss,
         },
         ckpt,
     )
@@ -2649,7 +3030,8 @@ def main() -> None:
     _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
     print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}{_pv_tail}  time={train_seconds:.1f}s",
+        f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  "
+        f"reg_MAE(pu)={met.get('reg_mae_tap_pu', float('nan')):.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
     _print_test_per_head_block("[da_gps]", met, cap_cols, reg_cols, list(pv_aux_cols) if n_pv_aux > 0 else [])

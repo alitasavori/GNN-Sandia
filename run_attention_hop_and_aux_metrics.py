@@ -43,6 +43,25 @@ from extract_da_gps_attention import (
 )
 from plot_da_gps_attention_hop_histograms_all import plot_all_regulator_layer_hop_histograms
 
+
+def _resolve_da_gps_ckpt(run_dir: Path, explicit) -> Path:
+    if explicit is not None:
+        p = Path(explicit).expanduser().resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"CKPT_PATH not found: {p}")
+        return p
+    rd = Path(run_dir).resolve()
+    best = rd / "da_gps_multitask_best.pt"
+    last = rd / "training_last.pt"
+    if best.is_file():
+        return best
+    if last.is_file():
+        return last
+    raise FileNotFoundError(
+        f"No checkpoint in {rd}: expected {best.name} or {last.name} (or set CKPT_PATH)."
+    )
+
+
 # =============================================================================
 # Knobs — edit here
 # =============================================================================
@@ -68,10 +87,12 @@ HOP_CSV = REPO_ROOT / r"datasets_gnn2_from pc\load_hop_distance_to_each_regulato
 OUT_DIR = RUN_DIR / "attention_extract"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DOWNSTREAM_RULE = "hop_gt_0"
+CKPT_PATH = None
 # =============================================================================
 
 print("DEVICE =", DEVICE)
-ckpt = RUN_DIR / "da_gps_multitask_best.pt"
+ckpt = _resolve_da_gps_ckpt(RUN_DIR, CKPT_PATH)
+print("ckpt =", ckpt)
 
 _z = torch.load(CACHE_PT, map_location="cpu", weights_only=False)
 _n_cache = int(_z["x"].shape[0])
@@ -98,7 +119,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 hop_df = load_hop_frame(HOP_CSV)
 
 # --- per-device reg (pu) + cap: same cache rows, model loaded once inside helper ---
-reg_df, cap_df, aux_meta = eval_aux_per_device_on_cache_indices(
+reg_df, cap_df, aux_meta, meta_aux_df = eval_aux_per_device_on_cache_indices(
     ckpt,
     RUN_DIR,
     CACHE_PT,
@@ -112,6 +133,10 @@ cap_csv = OUT_DIR / f"aux_cap_per_device_avg{_n_avg}.csv"
 reg_df.to_csv(reg_csv, index=False)
 cap_df.to_csv(cap_csv, index=False)
 (OUT_DIR / f"aux_metrics_meta_avg{_n_avg}.json").write_text(json.dumps(aux_meta, indent=2), encoding="utf-8")
+if len(meta_aux_df):
+    _mcsv = OUT_DIR / f"aux_meta_per_col_avg{_n_avg}.csv"
+    meta_aux_df.to_csv(_mcsv, index=False)
+    print(f"wrote {_mcsv}")
 print(f"wrote {reg_csv}")
 print(f"wrote {cap_csv}")
 print(f"aggregate reg_mse_tap_pu={aux_meta['reg_mse_tap_pu_all']:.8f}  cap_bce_all={aux_meta['cap_bce_all']:.6f}")
@@ -170,6 +195,17 @@ node_err_df.to_csv(_node_csv, index=False)
     json.dumps(node_err_meta, indent=2), encoding="utf-8"
 )
 print(f"wrote {_node_csv}")
+print(
+    f"voltage pooled over all nodes×cache rows (n={node_err_meta.get('n_points_vmag_finite_overlap', 0)}): "
+    f"|V| MAE={node_err_meta.get('mae_global_vmag_pu', float('nan')):.6f} pu  "
+    f"RMSE={node_err_meta.get('rmse_global_vmag_pu', float('nan')):.6f} pu  "
+    f"R²={node_err_meta.get('r2_global_vmag_pu', float('nan')):.6f}"
+)
+print(
+    f"angle pooled (circular MAE, naive linear R² vs true angle in deg): "
+    f"MAE={node_err_meta.get('mae_global_angle_deg', float('nan')):.4f} deg  "
+    f"R²={node_err_meta.get('r2_global_vang_deg_naive', float('nan')):.6f}"
+)
 print(
     f"worst bus (mean |V| MAE over n={_n_avg}): {node_err_meta['worst_node']}  "
     f"mean_mae_vmag_pu={node_err_meta['worst_mean_mae_vmag_pu']:.6f}"

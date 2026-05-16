@@ -53,6 +53,10 @@ SAMPLE_CSV = OUT_DIR / "gnn_sample_meta.csv"
 NODE_INDEX_CSV = OUT_DIR / "gnn_node_index_master.csv"
 RUN_DSS_DAILY = REPO_ROOT / "8500-node" / "Run_8500Node_Daily_5min.dss"
 
+# Unbalanced IEEE 8500 with PV (same tree as ``run_original_style_dataset_8500_unbalanced``).
+SOLAR_UNBAL_8500_DIR = REPO_ROOT / "8500 nodes with solar unbalanced"
+MASTER_PV2_INV_DSS = SOLAR_UNBAL_8500_DIR / "Master-PV2MW-inv.dss"
+
 
 def _is_source_like_bus(bus_name: str) -> bool:
     b = str(bus_name).strip().lower()
@@ -115,6 +119,36 @@ def _compile_8500_daily_setup() -> None:
         raise FileNotFoundError(f"Missing daily setup entrypoint: {RUN_DSS_DAILY}")
     dss.Basic.ClearAll()
     dss.Text.Command(f'redirect "{os.path.abspath(str(RUN_DSS_DAILY))}"')
+    dss.Text.Command("set mode=daily")
+    dss.Text.Command("set stepsize=5m")
+    dss.Text.Command("set number=1")
+    dss.Text.Command("set maxiterations=30")
+    dss.Text.Command("set maxcontroliter=20000")
+
+
+def _compile_8500_solar_unbalanced_pv_daily_setup() -> None:
+    """Compile the PV/unbalanced feeder (``Master-PV2MW-inv.dss``).
+
+    Matches ``run_original_style_dataset_8500_unbalanced._compile_8500_unbalanced_daily_setup``:
+    ``cd`` into the model folder, redirect the PV master, attach ``Day5min`` from that folder's
+    ``5minDayShape.csv``, then apply the same solver knobs as :func:`_compile_8500_daily_setup`.
+
+    Use this for workflows that must read ``PVSystem`` post-solve P/Q (e.g. DA-GPS daily compare
+    meta columns ``pv_*_p_post_kw``). The legacy :func:`_compile_8500_daily_setup` builds
+    ``8500-node/Master.dss``, which has **no** PV objects.
+    """
+    if not MASTER_PV2_INV_DSS.is_file():
+        raise FileNotFoundError(f"Missing PV master DSS: {MASTER_PV2_INV_DSS}")
+    dayshape_csv = SOLAR_UNBAL_8500_DIR / "5minDayShape.csv"
+    if not dayshape_csv.is_file():
+        raise FileNotFoundError(f"Missing 5minDayShape.csv next to PV master: {dayshape_csv}")
+    dss.Basic.ClearAll()
+    dss.Text.Command(f'cd "{os.path.abspath(str(SOLAR_UNBAL_8500_DIR))}"')
+    dss.Text.Command(f'redirect "{os.path.abspath(str(MASTER_PV2_INV_DSS))}"')
+    dss.Text.Command(
+        f'New Loadshape.Day5min npts=288 interval=0.0833333333333333 mult=(file="{os.path.abspath(str(dayshape_csv))}", col=2, header=no)'
+    )
+    dss.Text.Command("BatchEdit Load..* Daily=Day5min")
     dss.Text.Command("set mode=daily")
     dss.Text.Command("set stepsize=5m")
     dss.Text.Command("set number=1")

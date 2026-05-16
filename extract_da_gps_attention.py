@@ -16,8 +16,10 @@ Example (Colab paths):
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
+import re
 import warnings
 from pathlib import Path
 
@@ -27,17 +29,40 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 
-from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
-
 
 def _dagps_model_cls():
-    """Fresh ``DAGPSModel`` class (reload train script — notebooks cache old 4-return forward)."""
+    """Fresh **GINE** ``DAGPSModel`` (``train_da_gps_multitask_complex_voltage_gine``)."""
     import importlib
 
     import train_da_gps_multitask_complex_voltage_gine as tdg
 
     importlib.reload(tdg)
     return tdg.DAGPSModel
+
+
+def _dagps_model_cls_legacy():
+    """Fresh **legacy EdgeAttn** ``DAGPSModel`` (``train_da_gps_multitask_complex_voltage``)."""
+    import importlib
+
+    import train_da_gps_multitask_complex_voltage as tdg
+
+    importlib.reload(tdg)
+    return tdg.DAGPSModel
+
+
+def _state_dict_is_gine_da_gps(sd: dict) -> bool:
+    """``True`` if weights use PyG ``GINEConv`` (``…mpnn.conv…``); else EdgeAttn MPNN (``…mpnn.msg…``)."""
+    return any(str(k).startswith("blocks.0.mpnn.conv.") for k in sd)
+
+
+def _train_da_gps_targets_module(sd: dict):
+    """Training script module for ``TARGET_*_COLS`` (GINE vs legacy); reload for notebooks."""
+    if _state_dict_is_gine_da_gps(sd):
+        mod = importlib.import_module("train_da_gps_multitask_complex_voltage_gine")
+    else:
+        mod = importlib.import_module("train_da_gps_multitask_complex_voltage")
+    importlib.reload(mod)
+    return mod
 
 
 def _node_order_from_ntl(node_to_local: dict[str, int]) -> list[str]:
@@ -49,27 +74,386 @@ def _node_order_from_ntl(node_to_local: dict[str, int]) -> list[str]:
     return [str(x) for x in inv]
 
 
+def _assert_x_zscore_shapes(
+    x: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    *,
+    run_dir: Path,
+    cache_pt: Path,
+) -> None:
+    """``x`` ends with ``[..., n_feats]``; ``x_mean`` / ``x_std`` from ``run_dir`` must be ``(1, n_feats)``."""
+    nfe = int(x.shape[-1])
+    if x_mean.dim() != 2 or x_mean.shape[0] != 1 or x_std.dim() != 2 or x_std.shape[0] != 1:
+        raise ValueError(f"x_mean/x_std must be shape (1, n_feats); got {tuple(x_mean.shape)}, {tuple(x_std.shape)}")
+    nmean = int(x_mean.shape[-1])
+    nstdw = int(x_std.shape[-1])
+    if nmean != nfe or nstdw != nfe:
+        raise ValueError(
+            f"Cache vs RUN_DIR node-feature mismatch: cache ``x`` has {nfe} features per node, but "
+            f"``{run_dir / 'x_mean.pt'}`` / ``x_std.pt`` have width {nmean} / {nstdw}. "
+            f"Use a ``CACHE_PT`` tensor cache built for this training run (same BESS / ``__nobess__`` / meta-aux "
+            f"column set as ``RUN_DIR``), or set ``RUN_DIR`` to the run that produced this cache. cache_pt={cache_pt}"
+        )
+
+
 def _token_names(cap_cols: list[str], reg_cols: list[str], n_system: int) -> list[str]:
     return list(cap_cols) + list(reg_cols) + [f"sys_{i}" for i in range(int(n_system))]
 
 
-def _infer_node_in_edge_dim(state_dict: dict, *, hidden: int, node_emb_dim: int) -> tuple[int, int]:
+# Order for expanding static edge CSVs beyond (R_full, X_full) when checkpoints use more raw edge dims.
+_EDGE_ATTR_COL_PRIORITY: tuple[str, ...] = (
+    "R_full",
+    "X_full",
+    "length",
+    "phase",
+    "C_full",
+    "nph_line",
+    "R_per_len",
+    "X_per_len",
+    "C_per_len",
+)
+
+
+def _pick_edge_attr_columns(edge_csv: Path, raw_edge_dim: int) -> tuple[str, ...]:
+    """Choose ``raw_edge_dim`` numeric columns present in ``gnn_edges_phase_static.csv``-style files."""
+    p = Path(edge_csv).resolve()
+    if int(raw_edge_dim) < 1:
+        raise ValueError(f"raw_edge_dim must be >= 1, got {raw_edge_dim}")
+    head = pd.read_csv(p, nrows=1)
+    cols = set(head.columns)
+    picked: list[str] = []
+    for c in _EDGE_ATTR_COL_PRIORITY:
+        if c in cols and c not in picked:
+            picked.append(c)
+        if len(picked) >= int(raw_edge_dim):
+            return tuple(picked[: int(raw_edge_dim)])
+    raise ValueError(
+        f"Cannot build edge_attr with raw_edge_dim={raw_edge_dim} from {p}: "
+        f"found priority columns {picked!r} among {sorted(cols)}."
+    )
+
+
+def _load_named_bidir_edges(
+    edge_csv: Path,
+    node_to_local: dict[str, int],
+    attr_cols: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bidirectional edges (same convention as ``_load_compacted_edges``) with explicit feature columns."""
+    p = Path(edge_csv).resolve()
+    df = pd.read_csv(p)
+    for c in ("from_node", "to_node", *attr_cols):
+        if c not in df.columns:
+            raise ValueError(f"{p} missing column {c!r} (need from_node, to_node, and {attr_cols!r})")
+    src: list[int] = []
+    dst: list[int] = []
+    feat_rows: list[list[float]] = []
+    for _, r in df.iterrows():
+        u = str(r["from_node"]).strip()
+        v = str(r["to_node"]).strip()
+        if u not in node_to_local or v not in node_to_local:
+            continue
+        iu, iv = node_to_local[u], node_to_local[v]
+        feats = [float(r[c]) for c in attr_cols]
+        src.extend([iu, iv])
+        dst.extend([iv, iu])
+        feat_rows.extend([feats, feats])
+    edge_index = torch.tensor([src, dst], dtype=torch.long)
+    edge_attr = torch.tensor(np.asarray(feat_rows, dtype=np.float32))
+    return edge_index, edge_attr
+
+
+def _load_eval_edges(
+    edge_csv: Path,
+    node_to_local: dict[str, int],
+    *,
+    raw_edge_dim: int,
+    cache_z: dict | None,
+    sd: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Topology for eval: prefer cache ``edge_index``/``edge_attr`` if they match checkpoint raw width."""
+    n_loc = len(node_to_local)
+    eemb_w = sd.get("edge_emb.weight")
+    n_emb_edges = int(eemb_w.shape[0]) if isinstance(eemb_w, torch.Tensor) else None
+
+    if cache_z is not None:
+        ei = cache_z.get("edge_index")
+        ea = cache_z.get("edge_attr")
+        if isinstance(ei, torch.Tensor) and isinstance(ea, torch.Tensor) and ea.dim() == 2:
+            if int(ea.size(1)) == int(raw_edge_dim) and ei.numel() > 0:
+                mx = int(ei.max().item())
+                if 0 <= mx < n_loc:
+                    ne = int(ei.shape[1])
+                    if n_emb_edges is None or ne == n_emb_edges:
+                        return ei.long().cpu(), ea.float().cpu()
+                    warnings.warn(
+                        f"Ignoring cache edge_index: num_edges={ne} != checkpoint edge_emb rows={n_emb_edges}; "
+                        f"reloading from {edge_csv}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+    attr_cols = _pick_edge_attr_columns(edge_csv, int(raw_edge_dim))
+    ei, ea = _load_named_bidir_edges(edge_csv, node_to_local, attr_cols)
+    if n_emb_edges is not None and int(ei.shape[1]) != n_emb_edges:
+        raise RuntimeError(
+            f"Edge count mismatch: built {int(ei.shape[1])} directed edges from {edge_csv} but "
+            f"checkpoint edge_emb has {n_emb_edges} rows. Use the same edge CSV / node map as training."
+        )
+    return ei, ea
+
+
+def _infer_node_in_edge_dim(
+    state_dict: dict, *, hidden: int, node_emb_dim: int, edge_emb_dim: int = 0
+) -> tuple[int, int]:
+    """Recover ``node_in_dim`` and raw ``edge_dim`` (excluding learned edge-id embedding)."""
     w_node = state_dict["node_in.0.weight"]
     node_in_dim = int(w_node.shape[1]) - int(node_emb_dim)
-    w_msg = state_dict["blocks.0.mpnn.msg.0.weight"]
-    edge_dim = int(w_msg.shape[1]) - 2 * int(hidden)
+    eemb = int(edge_emb_dim)
+
+    w_gine = state_dict.get("blocks.0.mpnn.conv.lin.weight")
+    if w_gine is not None:
+        # PyG GINEConv: ``lin: edge_dim -> nn.in_channels``; DAGPS passes ``edge_dim + edge_emb_dim``.
+        eff_edge = int(w_gine.shape[1])
+        edge_dim = eff_edge - eemb
+    else:
+        w_msg = state_dict.get("blocks.0.mpnn.msg.0.weight")
+        if w_msg is None:
+            raise KeyError(
+                "Cannot infer edge dim: expected ``blocks.0.mpnn.conv.lin.weight`` (GINE) "
+                "or ``blocks.0.mpnn.msg.0.weight`` (legacy EdgeAttn MPNN)."
+            )
+        # Legacy EdgeAttn MPNN: message input is ``[h_src || h_dst || edge_attr_cat]`` where
+        # ``edge_attr_cat`` has width ``raw_edge_dim + edge_emb_dim`` (see ``DAGPSModel``).
+        eff_edge = int(w_msg.shape[1]) - 2 * int(hidden)
+        edge_dim = eff_edge - eemb
+
     if node_in_dim < 1 or edge_dim < 1:
         raise ValueError(f"Bad inferred dims: node_in_dim={node_in_dim}, edge_dim={edge_dim}")
     return node_in_dim, edge_dim
 
 
+def _read_hyperparameters(run_dir: Path) -> dict:
+    p = Path(run_dir) / "da_gps_report.json"
+    if not p.is_file():
+        return {}
+    try:
+        r = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    hp = r.get("hyperparameters")
+    return hp if isinstance(hp, dict) else {}
+
+
+def _max_block_index(sd: dict) -> int:
+    mx = -1
+    for k in sd:
+        m = re.match(r"blocks\.(\d+)\.", k)
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx
+
+
+def _infer_heads_from_state(hidden: int, hp: dict) -> int:
+    h = int(hp.get("heads", 0) or 0)
+    if 0 < h <= hidden and hidden % h == 0:
+        return h
+    for cand in (8, 4, 2, 1, 16, 32, 6, 3, 12):
+        if cand <= hidden and hidden % cand == 0:
+            return cand
+    return 1
+
+
+def _pack_has_arch_lists(pack: dict) -> bool:
+    rc = pack.get("reg_target_cols")
+    cc = pack.get("cap_target_cols")
+    return (
+        isinstance(rc, (list, tuple))
+        and len(rc) > 0
+        and isinstance(cc, (list, tuple))
+        and len(cc) > 0
+    )
+
+
+def _pack_complete_for_build(pack: dict) -> bool:
+    if not _pack_has_arch_lists(pack):
+        return False
+    try:
+        nn = int(pack.get("n_nodes", 0) or 0)
+        hi = int(pack.get("hidden", 0) or 0)
+        la = int(pack.get("layers", 0) or 0)
+        ns = pack.get("n_system_tokens")
+        if ns is None:
+            return False
+        ns_i = int(ns)
+    except (TypeError, ValueError):
+        return False
+    return nn > 0 and hi > 0 and la > 0 and ns_i >= 0
+
+
+def _merge_metadata_from_best_pt(pack: dict, ckpt_path: Path, run_dir: Path) -> None:
+    """Copy all keys except ``model_state_dict`` from ``da_gps_multitask_best.pt`` when the loaded file is periodic."""
+    best = (Path(run_dir) / "da_gps_multitask_best.pt").resolve()
+    cur = Path(ckpt_path).resolve()
+    if not best.is_file() or best == cur:
+        return
+    mp = torch.load(best, map_location="cpu", weights_only=False)
+    for k, v in mp.items():
+        if k == "model_state_dict":
+            continue
+        if k not in pack or pack[k] is None:
+            pack[k] = v
+            continue
+        if k in ("reg_target_cols", "cap_target_cols", "pv_target_cols", "meta_aux_target_cols"):
+            cur_v = pack.get(k)
+            if not cur_v:
+                pack[k] = v
+
+
+def _sync_edge_emb_dim_from_state_dict(pack: dict, sd: dict) -> None:
+    """Align ``pack['edge_emb_dim']`` with ``edge_emb.weight`` (saved metadata is often 0 or missing).
+
+    Legacy / GINE DA-GPS both use ``nn.Embedding(num_edges, edge_emb_dim)`` when ``edge_emb_dim > 0``.
+    If this disagrees with ``blocks.*.mpnn`` input width, eval loads too few raw edge columns (e.g. 5 vs 11).
+    """
+    w = sd.get("edge_emb.weight")
+    if isinstance(w, torch.Tensor) and w.ndim == 2 and int(w.shape[1]) > 0:
+        pack["edge_emb_dim"] = int(w.shape[1])
+    else:
+        pack["edge_emb_dim"] = 0
+
+
+def augment_da_gps_pack_for_eval(
+    pack: dict,
+    sd: dict,
+    ckpt_path: Path | str,
+    run_dir: Path | str,
+    *,
+    node_in_dim_hint: int | None = None,
+) -> None:
+    """Periodic ``training_last.pt`` checkpoints omit architecture metadata.
+
+    If ``reg_target_cols`` / ``cap_target_cols`` (etc.) are missing, merge non-weight keys from
+    ``run_dir/da_gps_multitask_best.pt`` when present; otherwise infer from ``state_dict`` and
+    ``train_da_gps_multitask_complex_voltage_gine`` / ``train_da_gps_multitask_complex_voltage`` defaults
+    (and optional ``da_gps_report.json``), chosen from checkpoint **weights** (GINE vs legacy EdgeAttn).
+
+    Mutates ``pack`` in place. Does not replace ``model_state_dict`` (caller's weights stay in ``sd``).
+    """
+    ckpt_path = Path(ckpt_path).resolve()
+    run_dir = Path(run_dir).resolve()
+    _sync_edge_emb_dim_from_state_dict(pack, sd)
+    if _pack_complete_for_build(pack):
+        return
+
+    _merge_metadata_from_best_pt(pack, ckpt_path, run_dir)
+    _sync_edge_emb_dim_from_state_dict(pack, sd)
+    if _pack_complete_for_build(pack):
+        return
+
+    tdg = _train_da_gps_targets_module(sd)
+
+    hp = _read_hyperparameters(run_dir)
+
+    if not _pack_has_arch_lists(pack):
+        pack["reg_target_cols"] = list(tdg.TARGET_REG_COLS)
+        pack["cap_target_cols"] = list(tdg.TARGET_CAP_COLS)
+
+    reg_cols = list(pack["reg_target_cols"])
+    cap_cols = list(pack["cap_target_cols"])
+    pack.setdefault("n_reg", len(reg_cols))
+    pack.setdefault("n_cap", len(cap_cols))
+
+    tlat = sd.get("token_latent")
+    if tlat is None:
+        raise KeyError("state_dict missing token_latent (not a DA-GPS checkpoint?)")
+    g_tok, hidden = int(tlat.shape[0]), int(tlat.shape[1])
+    pack.setdefault("hidden", hidden)
+
+    n_cap = int(pack["n_cap"])
+    n_reg = int(pack["n_reg"])
+    n_sys = g_tok - n_cap - n_reg
+    if n_sys < 0:
+        raise ValueError(
+            f"token_latent rows={g_tok} incompatible with n_cap={n_cap}, n_reg={n_reg} from target column lists"
+        )
+    pack.setdefault("n_system_tokens", n_sys)
+
+    if sd.get("pv_W") is not None:
+        pack["n_pv_aux"] = int(sd["pv_W"].shape[0])
+    else:
+        pack.setdefault("n_pv_aux", int(hp.get("n_pv_aux", 0) or 0))
+    if int(pack.get("n_pv_aux", 0) or 0) > int(pack["n_system_tokens"]):
+        warnings.warn(
+            f"Inferred n_pv_aux={pack.get('n_pv_aux')} > n_system_tokens={pack.get('n_system_tokens')}; "
+            "if eval fails, use da_gps_multitask_best.pt or wait for da_gps_report.json.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    mx = _max_block_index(sd)
+    pack.setdefault("layers", mx + 1 if mx >= 0 else int(hp.get("layers", 1)))
+    pack.setdefault("heads", _infer_heads_from_state(int(pack["hidden"]), hp))
+
+    w_node = sd["node_in.0.weight"]
+    w1 = int(w_node.shape[1])
+    if pack.get("node_emb_dim") is None:
+        if node_in_dim_hint is not None and 0 < int(node_in_dim_hint) <= w1:
+            pack["node_emb_dim"] = w1 - int(node_in_dim_hint)
+        else:
+            pack["node_emb_dim"] = int(hp.get("node_emb_dim", 0) or 0)
+    else:
+        pack["node_emb_dim"] = int(pack["node_emb_dim"])
+
+    _sync_edge_emb_dim_from_state_dict(pack, sd)
+
+    if sd.get("volt_W") is not None:
+        pack["per_node_heads"] = True
+        pack["n_nodes"] = int(sd["volt_W"].shape[0])
+    else:
+        pack.setdefault("per_node_heads", bool(hp.get("per_node_heads", False)))
+        nw = sd.get("node_emb.weight")
+        if nw is not None:
+            pack["n_nodes"] = int(nw.shape[0])
+        else:
+            pack.setdefault("n_nodes", int(hp.get("n_nodes", 0) or 0))
+        if int(pack.get("n_nodes", 0) or 0) <= 0:
+            raise ValueError(
+                "Cannot infer n_nodes (no volt_W / node_emb in state_dict and no hyperparameters.n_nodes in report)"
+            )
+
+    pack.setdefault("per_device_cap_head", "cap_W" in sd and sd["cap_W"] is not None)
+    pack.setdefault("per_device_reg_head", "reg_W" in sd and sd["reg_W"] is not None)
+
+    n_pv = int(pack.get("n_pv_aux", 0) or 0)
+    if n_pv > 0 and not pack.get("meta_aux_target_cols") and not pack.get("pv_target_cols"):
+        aux_s = hp.get("aux_meta_cols")
+        if isinstance(aux_s, str) and aux_s.strip():
+            cols = [c.strip() for c in aux_s.split(",") if c.strip()]
+            pack["meta_aux_target_cols"] = cols[:n_pv]
+            pack["pv_target_cols"] = list(pack["meta_aux_target_cols"])
+        else:
+            pack.setdefault("meta_aux_target_cols", [])
+            pack.setdefault("pv_target_cols", [])
+
+    _infer_node_in_edge_dim(
+        sd,
+        hidden=int(pack["hidden"]),
+        node_emb_dim=int(pack["node_emb_dim"]),
+        edge_emb_dim=int(pack["edge_emb_dim"]),
+    )
+
+
 def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
-    DAGPSModel = _dagps_model_cls()
+    gine = _state_dict_is_gine_da_gps(sd)
+    DAGPSModel = _dagps_model_cls() if gine else _dagps_model_cls_legacy()
     hidden = int(ckpt["hidden"])
     node_emb_dim = int(ckpt["node_emb_dim"])
     edge_emb_dim = int(ckpt["edge_emb_dim"])
-    node_in_dim, edge_dim = _infer_node_in_edge_dim(sd, hidden=hidden, node_emb_dim=node_emb_dim)
-    return DAGPSModel(
+    node_in_dim, edge_dim = _infer_node_in_edge_dim(
+        sd, hidden=hidden, node_emb_dim=node_emb_dim, edge_emb_dim=edge_emb_dim
+    )
+    kw: dict = dict(
         n_nodes=int(ckpt["n_nodes"]),
         num_edges=int(num_edges),
         hidden=hidden,
@@ -87,8 +471,10 @@ def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
         per_node_heads=bool(ckpt.get("per_node_heads", False)),
         per_device_cap_head=bool(ckpt.get("per_device_cap_head", False)),
         per_device_reg_head=bool(ckpt.get("per_device_reg_head", False)),
-        n_pv_aux=int(ckpt.get("n_pv_aux", 0)),
     )
+    if gine:
+        kw["n_pv_aux"] = int(ckpt.get("n_pv_aux", 0))
+    return DAGPSModel(**kw)
 
 
 def run_attention_extract(
@@ -157,11 +543,26 @@ def run_attention_extract(
 
     x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=True).float()
     x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=True).float()
-    if x_mean.shape != (1, x.shape[2]) or x_std.shape != (1, x.shape[2]):
-        raise ValueError(f"x_mean/x_std shape {x_mean.shape} vs x feature dim {x.shape[2]}")
+    _assert_x_zscore_shapes(x, x_mean, x_std, run_dir=run_dir, cache_pt=cache_pt)
+
+    augment_da_gps_pack_for_eval(
+        pack, sd, ckpt_path, run_dir, node_in_dim_hint=int(x.shape[-1])
+    )
 
     node_order = _node_order_from_ntl(node_to_local)
-    edge_index, edge_attr = _load_compacted_edges(Path(edges_csv).resolve(), node_to_local)
+    hidden = int(pack["hidden"])
+    node_emb_dim = int(pack["node_emb_dim"])
+    edge_emb_dim = int(pack["edge_emb_dim"])
+    _, raw_edge_dim = _infer_node_in_edge_dim(
+        sd, hidden=hidden, node_emb_dim=node_emb_dim, edge_emb_dim=edge_emb_dim
+    )
+    edge_index, edge_attr = _load_eval_edges(
+        Path(edges_csv).resolve(),
+        node_to_local,
+        raw_edge_dim=int(raw_edge_dim),
+        cache_z=z,
+        sd=sd,
+    )
     num_edges_train = int(edge_index.shape[1])
     model = _build_model(pack, sd, num_edges=num_edges_train, dropout=float(dropout))
     model.load_state_dict(sd, strict=True)
@@ -183,12 +584,19 @@ def run_attention_extract(
     if len(_attn) == 4:
         raise ValueError(
             "forward_node_to_token_attention returned 4 values (stale DA-GPS code in this process). "
-            "Restart the Jupyter kernel, or run before extract:\n"
-            "  import importlib, train_da_gps_multitask_complex_voltage_gine as m; importlib.reload(m)"
+            "Restart the Jupyter kernel, or reload the matching train script before extract:\n"
+            "  import importlib, train_da_gps_multitask_complex_voltage_gine as m; importlib.reload(m)\n"
+            "  # legacy EdgeAttn: import train_da_gps_multitask_complex_voltage as m; importlib.reload(m)"
         )
-    if len(_attn) != 6:
-        raise ValueError(f"expected 6 return values from forward_node_to_token_attention, got {len(_attn)}")
-    layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred, pv_pred = _attn
+    if len(_attn) == 5:
+        layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred = _attn
+    elif len(_attn) == 6:
+        layer_probs_nt, layer_probs_tn, volt, cap_logits, reg_pred, _pv_pred = _attn
+    else:
+        raise ValueError(
+            f"expected 5 (legacy EdgeAttn DA-GPS) or 6 (GINE + meta-aux) return values from "
+            f"forward_node_to_token_attention, got {len(_attn)}"
+        )
 
     cap_cols = list(pack["cap_target_cols"])
     reg_cols = list(pack["reg_target_cols"])
@@ -284,11 +692,11 @@ def eval_aux_per_device_on_cache_indices(
     *,
     device: str | None = None,
     dropout: float = 0.0,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame]:
     """Run ``model.forward`` on selected cache rows; per-regulator MAE/MSE in **tap pu**; per-cap BCE + accuracy.
 
-    Targets come from the DA cache tensor ``y_reg`` (raw pu) and ``y_cap`` (0/1), same as training.
-    Predictions use ``reg_mean.pt`` / ``reg_std.pt`` from ``run_dir`` to denormalize regulator outputs.
+    Returns ``(reg_df, cap_df, meta, meta_aux_df)``. ``meta_aux_df`` is empty unless the checkpoint
+    has ``n_pv_aux > 0``, the cache includes ``y_pv``, and ``pv_mean.pt`` / ``pv_std.pt`` exist in ``run_dir``.
     """
     ckpt_path = Path(ckpt_path).resolve()
     run_dir = Path(run_dir).resolve()
@@ -303,8 +711,6 @@ def eval_aux_per_device_on_cache_indices(
 
     pack = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = pack["model_state_dict"]
-    reg_cols = list(pack["reg_target_cols"])
-    cap_cols = list(pack["cap_target_cols"])
 
     z = torch.load(cache_pt, map_location="cpu", weights_only=False)
     if "y_reg" not in z or "y_cap" not in z:
@@ -312,6 +718,7 @@ def eval_aux_per_device_on_cache_indices(
     x = z["x"].float()
     y_cap_all = z["y_cap"].float()
     y_reg_all = z["y_reg"].float()
+    y_pv_all = z.get("y_pv")
     node_to_local = z["node_to_local"]
 
     for si in sample_indices:
@@ -320,18 +727,42 @@ def eval_aux_per_device_on_cache_indices(
 
     x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=True).float()
     x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=True).float()
+    _assert_x_zscore_shapes(x, x_mean, x_std, run_dir=run_dir, cache_pt=cache_pt)
+
+    augment_da_gps_pack_for_eval(
+        pack, sd, ckpt_path, run_dir, node_in_dim_hint=int(x.shape[-1])
+    )
+    reg_cols = list(pack["reg_target_cols"])
+    cap_cols = list(pack["cap_target_cols"])
+
     reg_mean = torch.load(run_dir / "reg_mean.pt", map_location="cpu", weights_only=True).float()
     reg_std = torch.load(run_dir / "reg_std.pt", map_location="cpu", weights_only=True).float()
 
-    edge_index, edge_attr = _load_compacted_edges(edges_csv, node_to_local)
+    hidden = int(pack["hidden"])
+    node_emb_dim = int(pack["node_emb_dim"])
+    edge_emb_dim = int(pack["edge_emb_dim"])
+    _, raw_edge_dim = _infer_node_in_edge_dim(
+        sd, hidden=hidden, node_emb_dim=node_emb_dim, edge_emb_dim=edge_emb_dim
+    )
+    edge_index, edge_attr = _load_eval_edges(
+        edges_csv,
+        node_to_local,
+        raw_edge_dim=int(raw_edge_dim),
+        cache_z=z,
+        sd=sd,
+    )
     num_edges_train = int(edge_index.shape[1])
     model = _build_model(pack, sd, num_edges=num_edges_train, dropout=float(dropout))
     model.load_state_dict(sd, strict=True)
     model.to(dev)
     model.eval()
 
+    n_pv_aux = int(pack.get("n_pv_aux", 0) or 0)
+    meta_aux_cols = list(pack.get("meta_aux_target_cols") or pack.get("pv_target_cols") or [])
+
     reg_preds: list[torch.Tensor] = []
     cap_logits_l: list[torch.Tensor] = []
+    pv_preds: list[torch.Tensor] = []
     for si in sample_indices:
         si = int(si)
         x_row = x[si : si + 1]
@@ -342,9 +773,19 @@ def eval_aux_per_device_on_cache_indices(
             edge_attr=edge_attr.to(dev),
         )
         data.num_graphs = 1
-        _v, c_log, r_p, _pv = model(data)
+        _fwd = model(data)
+        if len(_fwd) == 3:
+            _v, c_log, r_p = _fwd
+        elif len(_fwd) == 4:
+            _v, c_log, r_p, _pv_p = _fwd
+        else:
+            raise ValueError(f"model.forward returned {len(_fwd)} values (expected 3 or 4)")
         reg_preds.append(r_p.float().cpu())
         cap_logits_l.append(c_log.float().cpu())
+        if n_pv_aux > 0:
+            if len(_fwd) != 4:
+                raise RuntimeError("n_pv_aux>0 but legacy model.forward has no pv head (expected GINE ckpt)")
+            pv_preds.append(_fwd[3].float().cpu())
 
     reg_pred_n = torch.cat(reg_preds, dim=0)
     cap_log = torch.cat(cap_logits_l, dim=0)
@@ -358,12 +799,15 @@ def eval_aux_per_device_on_cache_indices(
         pred_j = rp_denorm[:, j]
         tgt_j = y_reg[:, j]
         err = pred_j - tgt_j
+        abs_e = err.abs()
         reg_rows.append(
             {
                 "reg_col": name,
-                "mae_tap_pu": float(err.abs().mean().item()),
+                "mae_tap_pu": float(abs_e.mean().item()),
                 "mse_tap_pu": float((err * err).mean().item()),
                 "rmse_tap_pu": float(torch.sqrt((err * err).mean()).item()),
+                "frac_abs_err_le_0p01_tap_pu": float((abs_e <= 0.01).float().mean().item()),
+                "frac_abs_err_le_0p02_tap_pu": float((abs_e <= 0.02).float().mean().item()),
             }
         )
 
@@ -375,7 +819,7 @@ def eval_aux_per_device_on_cache_indices(
         bce_j = F.binary_cross_entropy_with_logits(logits_j, tgt_j).item()
         pred_on = (probs[:, j] >= 0.5).float()
         acc_j = float((pred_on == tgt_j).float().mean().item())
-        cap_rows.append({"cap_col": name, "bce": float(bce_j), "accuracy_thresh0p5": acc_j})
+        cap_rows.append({"cap_col": name, "bce": float(bce_j), "accuracy": acc_j})
 
     meta = {
         "n_evaluated": len(sample_indices),
@@ -384,7 +828,78 @@ def eval_aux_per_device_on_cache_indices(
         "reg_mse_tap_pu_all": float(F.mse_loss(rp_denorm, y_reg.to(rp_denorm.dtype)).item()),
         "cap_bce_all": float(F.binary_cross_entropy_with_logits(cap_log, y_cap.to(cap_log.dtype)).item()),
     }
-    return pd.DataFrame(reg_rows), pd.DataFrame(cap_rows), meta
+
+    meta_aux_rows: list[dict] = []
+    if (
+        n_pv_aux > 0
+        and len(pv_preds) == len(sample_indices)
+        and y_pv_all is not None
+        and len(meta_aux_cols) == n_pv_aux
+    ):
+        pm_path = run_dir / "pv_mean.pt"
+        ps_path = run_dir / "pv_std.pt"
+        if pm_path.is_file() and ps_path.is_file():
+            pv_mean = torch.load(pm_path, map_location="cpu", weights_only=True).float()
+            pv_std = torch.load(ps_path, map_location="cpu", weights_only=True).float()
+            pv_pred_n = torch.cat(pv_preds, dim=0)
+            y_pv = y_pv_all.index_select(0, idx_t).to(dtype=torch.float32)
+            if pv_pred_n.shape == y_pv.shape:
+                pv_pred_raw = pv_pred_n * pv_std + pv_mean
+                y_pv_n = (y_pv - pv_mean) / pv_std
+                meta["pv_mse_nrm_all"] = float(F.mse_loss(pv_pred_n, y_pv_n.to(pv_pred_n.dtype)).item())
+                meta["pv_mse_raw_all"] = float(F.mse_loss(pv_pred_raw, y_pv.to(pv_pred_raw.dtype)).item())
+                for j, name in enumerate(meta_aux_cols):
+                    pred_nj = pv_pred_n[:, j]
+                    tgt_nj = y_pv_n[:, j]
+                    pred_rj = pv_pred_raw[:, j]
+                    tgt_rj = y_pv[:, j]
+                    err_n = pred_nj - tgt_nj
+                    err_r = pred_rj - tgt_rj
+                    abs_r = err_r.abs()
+                    yv = tgt_rj.double()
+                    vy = yv - yv.mean()
+                    var_y = float((vy * vy).mean().item())
+                    r2_raw = float("nan")
+                    if var_y > 1e-12:
+                        mse_r = float((err_r * err_r).mean().item())
+                        r2_raw = 1.0 - mse_r / var_y
+                    meta_aux_rows.append(
+                        {
+                            "meta_col": str(name),
+                            "mse_nrm": float((err_n * err_n).mean().item()),
+                            "rmse_nrm": float(torch.sqrt((err_n * err_n).mean()).item()),
+                            "mae_nrm": float(err_n.abs().mean().item()),
+                            "mse_raw": float((err_r * err_r).mean().item()),
+                            "rmse_raw": float(torch.sqrt((err_r * err_r).mean()).item()),
+                            "mae_raw": float(abs_r.mean().item()),
+                            "r2_raw_across_samples": float(r2_raw),
+                            "frac_rel_err_le_5pct": float(
+                                (abs_r / (tgt_rj.abs().clamp(min=1e-6))).le(0.05).float().mean().item()
+                            ),
+                        }
+                    )
+            else:
+                warnings.warn(
+                    f"meta aux shape mismatch: pv_pred {tuple(pv_pred_n.shape)} vs y_pv {tuple(y_pv.shape)}; "
+                    "skipping meta_aux metrics.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        else:
+            warnings.warn(
+                f"Checkpoint has n_pv_aux={n_pv_aux} but {pm_path} or {ps_path} missing; skipping meta_aux metrics.",
+                UserWarning,
+                stacklevel=2,
+            )
+    elif n_pv_aux > 0 and y_pv_all is None:
+        warnings.warn(
+            f"Checkpoint has n_pv_aux={n_pv_aux} but cache has no 'y_pv'; skipping meta_aux metrics.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    meta_aux_df = pd.DataFrame(meta_aux_rows)
+    return pd.DataFrame(reg_rows), pd.DataFrame(cap_rows), meta, meta_aux_df
 
 
 @torch.no_grad()
@@ -410,11 +925,21 @@ def eval_voltage_per_node_errors_on_cache_indices(
     - ``rmse_vmag_pu``: root mean square of :math:`|V|_{pred} - |V|_{true}|` over samples
     - ``std_vmag_true_pu``: population std of true :math:`|V|` across the same cache rows (pu);
       near-zero where :math:`|V|` is almost constant.
-    - ``r2_vmag``: R² of :math:`|V|` **across the evaluated cache rows** (one value per bus); finite only
-      where the sample variance of true :math:`|V|` exceeds ``1e-10`` pu² (otherwise ``NaN``).
+    - ``r2_vmag``: R² of :math:`|V|` **across the evaluated cache rows only** (one value per bus). Uses the
+      same definition as training validation: :math:`1 - \\mathrm{MSE}/\\mathrm{Var}` where MSE is the mean
+      squared error of **magnitude** :math:`|\\hat V|-|V|` and Var is the **population** variance of true
+      :math:`|V|` over those same rows. ``NaN`` when :math:`\\mathrm{Var}(|V|) \\le 10^{-10}` pu² (near-constant
+      true magnitude across rows). With few rows (e.g. 10), Var is often tiny for stiff buses, so R² is
+      **legitimately** very negative or volatile even when MAE looks moderate — this is not a sign error in code.
 
     - ``rank_vmag``: 1 = largest mean |V| MAE (table sorted by this, worst MAE first).
     - ``rank_r2_worst``: 1 = lowest finite ``r2_vmag`` (worst R²); NaN ``r2_vmag`` ranked last.
+
+    The returned ``meta`` includes pooled globals over all node×cache-row pairs (same definitions as
+    ``run_da_gps_daily_opendss_compare`` overall metrics): ``mae_global_vmag_pu``, ``rmse_global_vmag_pu``,
+    ``r2_global_vmag_pu``, ``mae_global_angle_deg``, ``r2_global_vang_deg_naive``. Legacy keys
+    ``mean_mae_vmag_pu_global`` / ``mean_mae_angle_deg_global`` equal the |V|/angle MAE globals (mean over
+    all pairs, same as training ``_metrics_voltage`` on these rows).
 
     Returned rows are ordered by ``mean_mae_vmag_pu`` (worst MAE first). For a view sorted by
     worst R² first, sort by ``r2_vmag`` ascending (``na_position='last'``); the attention
@@ -450,6 +975,12 @@ def eval_voltage_per_node_errors_on_cache_indices(
 
     x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=True).float()
     x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=True).float()
+    _assert_x_zscore_shapes(x, x_mean, x_std, run_dir=run_dir, cache_pt=cache_pt)
+
+    augment_da_gps_pack_for_eval(
+        pack, sd, ckpt_path, run_dir, node_in_dim_hint=int(x.shape[-1])
+    )
+
     y_mean = torch.load(run_dir / "y_mean.pt", map_location="cpu", weights_only=True).float()
     y_std = torch.load(run_dir / "y_std.pt", map_location="cpu", weights_only=True).float()
 
@@ -458,7 +989,19 @@ def eval_voltage_per_node_errors_on_cache_indices(
     if int(y_ri_all.shape[1]) != n_nodes or int(y_ri_all.shape[2]) != 2:
         raise ValueError(f"y_ri shape {tuple(y_ri_all.shape)} vs n_nodes={n_nodes}")
 
-    edge_index, edge_attr = _load_compacted_edges(edges_csv, node_to_local)
+    hidden = int(pack["hidden"])
+    node_emb_dim = int(pack["node_emb_dim"])
+    edge_emb_dim = int(pack["edge_emb_dim"])
+    _, raw_edge_dim = _infer_node_in_edge_dim(
+        sd, hidden=hidden, node_emb_dim=node_emb_dim, edge_emb_dim=edge_emb_dim
+    )
+    edge_index, edge_attr = _load_eval_edges(
+        edges_csv,
+        node_to_local,
+        raw_edge_dim=int(raw_edge_dim),
+        cache_z=z,
+        sd=sd,
+    )
     num_edges_train = int(edge_index.shape[1])
     model = _build_model(pack, sd, num_edges=num_edges_train, dropout=float(dropout))
     model.load_state_dict(sd, strict=True)
@@ -471,8 +1014,11 @@ def eval_voltage_per_node_errors_on_cache_indices(
     sum_mae_v = torch.zeros(n_nodes, dtype=torch.float64)
     sum_mae_a = torch.zeros(n_nodes, dtype=torch.float64)
     sum_sq_v = torch.zeros(n_nodes, dtype=torch.float64)
+    sum_sq_ang_deg = torch.zeros(n_nodes, dtype=torch.float64)
     sum_true_m = torch.zeros(n_nodes, dtype=torch.float64)
     sum_true_m2 = torch.zeros(n_nodes, dtype=torch.float64)
+    sum_true_ang_deg = torch.zeros(n_nodes, dtype=torch.float64)
+    sum_true_ang2_deg = torch.zeros(n_nodes, dtype=torch.float64)
     n_s = 0
     for si in sample_indices:
         si = int(si)
@@ -484,7 +1030,8 @@ def eval_voltage_per_node_errors_on_cache_indices(
             edge_attr=edge_attr.to(dev),
         )
         data.num_graphs = 1
-        volt_n, _, _, _ = model(data)
+        _out = model(data)
+        volt_n = _out[0]
         v_flat = volt_n.view(1, -1)
         pred_flat = v_flat * y_std_d + y_mean_d
         pred = pred_flat.view(n_nodes, 2)
@@ -497,26 +1044,71 @@ def eval_voltage_per_node_errors_on_cache_indices(
         true_ang = torch.atan2(tim, tre)
         d_ang = pred_ang - true_ang
         d_ang = (d_ang + math.pi) % (2.0 * math.pi) - math.pi
-        ang_err_deg = torch.rad2deg(d_ang).abs()
+        d_ang_deg = torch.rad2deg(d_ang)
+        ang_err_deg = d_ang_deg.abs()
         vmag_err = pred_mag - true_mag
         tm = true_mag.double().cpu()
+        ta_deg = torch.rad2deg(true_ang).double().cpu()
         sum_true_m += tm
         sum_true_m2 += tm * tm
+        sum_true_ang_deg += ta_deg
+        sum_true_ang2_deg += ta_deg * ta_deg
         sum_mae_v += vmag_err.abs().double().cpu()
         sum_mae_a += ang_err_deg.double().cpu()
         sum_sq_v += (vmag_err * vmag_err).double().cpu()
+        sum_sq_ang_deg += (d_ang_deg * d_ang_deg).double().cpu()
         n_s += 1
 
     mean_mae_v = (sum_mae_v / float(n_s)).numpy()
     mean_mae_a = (sum_mae_a / float(n_s)).numpy()
     rmse_v = torch.sqrt(sum_sq_v / float(n_s)).numpy()
+    # Same as training ``_metrics_voltage`` ``mae_vmag_pu`` / ``mae_angle_deg`` over these rows:
+    # mean of per-node mean abs error equals mean over all (node, sample) pairs.
+    mean_mae_vmag_pu_global = float(np.mean(mean_mae_v))
+    mean_mae_angle_deg_global = float(np.mean(mean_mae_a))
+    n_pairs = int(n_nodes) * int(n_s)
+    if n_pairs > 0:
+        ss_res_v_global = float(sum_sq_v.sum().item())
+        sum_t_v = float(sum_true_m.sum().item())
+        sum_t2_v = float(sum_true_m2.sum().item())
+        mae_global_vmag_pu = float(sum_mae_v.sum().item()) / float(n_pairs)
+        mse_global_vmag_pu = ss_res_v_global / float(n_pairs)
+        rmse_global_vmag_pu = float(np.sqrt(mse_global_vmag_pu))
+        y_mean_v_global = sum_t_v / float(n_pairs)
+        ss_tot_v_global = sum_t2_v - float(n_pairs) * y_mean_v_global * y_mean_v_global
+        if ss_tot_v_global > 1e-30 and np.isfinite(ss_tot_v_global):
+            r2_global_vmag_pu = float(1.0 - ss_res_v_global / ss_tot_v_global)
+        else:
+            r2_global_vmag_pu = float("nan")
+
+        ss_res_ang_global = float(sum_sq_ang_deg.sum().item())
+        sum_t_a = float(sum_true_ang_deg.sum().item())
+        sum_t2_a = float(sum_true_ang2_deg.sum().item())
+        mae_global_angle_deg = float(sum_mae_a.sum().item()) / float(n_pairs)
+        y_mean_a_global = sum_t_a / float(n_pairs)
+        ss_tot_ang_global = sum_t2_a - float(n_pairs) * y_mean_a_global * y_mean_a_global
+        if ss_tot_ang_global > 1e-30 and np.isfinite(ss_tot_ang_global):
+            r2_global_vang_deg_naive = float(1.0 - ss_res_ang_global / ss_tot_ang_global)
+        else:
+            r2_global_vang_deg_naive = float("nan")
+        n_points_vmag_finite_overlap = n_pairs
+        n_points_angle_finite_overlap = n_pairs
+    else:
+        mae_global_vmag_pu = rmse_global_vmag_pu = r2_global_vmag_pu = float("nan")
+        mae_global_angle_deg = r2_global_vang_deg_naive = float("nan")
+        n_points_vmag_finite_overlap = 0
+        n_points_angle_finite_overlap = 0
     mean_t = sum_true_m / float(n_s)
     var_t = sum_true_m2 / float(n_s) - mean_t * mean_t
     mse_v = (sum_sq_v / float(n_s)).numpy()
     var_np = var_t.numpy()
     std_vmag = np.sqrt(np.maximum(var_np, 0.0))
+    # Match train_da_gps_multitask_complex_voltage_gine validation: r2 = 1 - mse / var_true (population var).
+    # Use a small floor only for masking "undefined" R² (near-constant |V| across rows), not the 1e-8 clamp
+    # used inside training (which never emits NaN per node).
+    _var_floor_r2_mask = 1e-10
     r2_v = np.full(n_nodes, np.nan, dtype=np.float64)
-    mask = var_np > 1e-10
+    mask = var_np > _var_floor_r2_mask
     r2_v[mask] = 1.0 - mse_v[mask] / var_np[mask]
 
     rows = [
@@ -551,6 +1143,30 @@ def eval_voltage_per_node_errors_on_cache_indices(
         "n_samples": int(n_s),
         "sample_indices": [int(s) for s in sample_indices],
         "cache_pt": str(cache_pt),
+        "mean_mae_vmag_pu_global": mean_mae_vmag_pu_global,
+        "mean_mae_angle_deg_global": mean_mae_angle_deg_global,
+        "mae_global_vmag_pu": mae_global_vmag_pu,
+        "rmse_global_vmag_pu": rmse_global_vmag_pu,
+        "r2_global_vmag_pu": r2_global_vmag_pu,
+        "n_points_vmag_finite_overlap": int(n_points_vmag_finite_overlap),
+        "mae_global_angle_deg": mae_global_angle_deg,
+        "r2_global_vang_deg_naive": r2_global_vang_deg_naive,
+        "n_points_angle_finite_overlap": int(n_points_angle_finite_overlap),
+        "r2_global_vmag_pu_definition": (
+            "pooled over all (node, cache row): 1 - sum((|V_pred|-|V_true|)^2) / sum((|V_true|-mean)^2); "
+            "same as run_da_gps_daily_opendss_compare overall |V| R²."
+        ),
+        "r2_global_vang_deg_naive_definition": (
+            "pooled over all (node, cache row): circular wrapped pred-true angle residual in deg; "
+            "R² vs linear variance of true angle in deg (naive, same as daily compare)."
+        ),
+        "r2_vmag_definition": (
+            "per bus: 1 - mean_s((|V_pred,s|-|V_true,s|)^2) / var_s(|V_true,s|) over evaluated cache rows s; "
+            f"NaN if var_s(|V_true|) <= {_var_floor_r2_mask:g} pu^2. Same structure as training val R², "
+            "but training aggregates many val graphs — few rows here makes R² noisy / often negative."
+        ),
+        "r2_vmag_var_floor_pu2": float(_var_floor_r2_mask),
+        "r2_vmag_small_n_warning": bool(int(n_s) < 30),
         "worst_node": str(df.iloc[0]["node"]) if len(df) else "",
         "worst_mean_mae_vmag_pu": float(df.iloc[0]["mean_mae_vmag_pu"]) if len(df) else float("nan"),
         "r2_vmag_mean": float(np.mean(r2_fin)) if len(r2_fin) else float("nan"),
