@@ -1,0 +1,14 @@
+# Dependencies for the DA-GPS vs OpenDSS daily-compare notebook cell
+# (nonunique.ipynb cell "da_gps_daily_compare" / nonunique_colab.ipynb).
+#
+# On Google Colab, torch already ships with the correct CUDA build, so prefer:
+#   pip install torch_geometric opendssdirect.py
+# (see nonunique_colab.ipynb / COLAB_README.md). Versions below are lower bounds
+# known to work; unpin if your platform needs a different wheel.
+
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+opendssdirect.py>=0.8
+torch>=2.1
+torch_geometric>=2.4

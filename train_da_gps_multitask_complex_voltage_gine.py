@@ -1683,6 +1683,41 @@ def _da_gps_checkpoint_payload(
     }
 
 
+def _write_da_gps_run_manifest(
+    out_dir: Path,
+    *,
+    task: str,
+    chunk_parent: str | None,
+    chunks: list[str],
+    cache_dir: str | None,
+    args: argparse.Namespace,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    meta_aux_cols: list[str],
+    reg_loss: str,
+    n_chunks: int | None = None,
+) -> None:
+    """Written before the training loop so daily compare / snapshots work without ``da_gps_report.json``."""
+    manifest: dict[str, object] = {
+        "task": str(task),
+        "chunk_parent": str(chunk_parent) if chunk_parent else "",
+        "chunks": list(chunks),
+        "hyperparameters": vars(args),
+        "cap_target_cols": list(cap_cols),
+        "reg_target_cols": list(reg_cols),
+        "meta_aux_target_cols": list(meta_aux_cols),
+        "reg_loss": str(reg_loss),
+        "manifest_stage": "pre_train",
+    }
+    if cache_dir is not None:
+        manifest["chunk_tensor_cache_dir"] = str(cache_dir)
+    if n_chunks is not None:
+        manifest["n_chunks"] = int(n_chunks)
+    path = out_dir / "da_gps_run_manifest.json"
+    path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    print(f"Wrote run manifest (for daily compare / mid-train snapshots): {path}", flush=True)
+
+
 def _save_periodic_training_checkpoint(
     path: Path,
     base_model: nn.Module,
@@ -2008,6 +2043,20 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     torch.save(reg_std, out_dir / "reg_std.pt")
     if reg_class_values is not None:
         torch.save(reg_class_values, out_dir / "reg_class_values.pt")
+
+    _write_da_gps_run_manifest(
+        out_dir,
+        task="DA-GPS multitask chunk_parent",
+        chunk_parent=str(chunk_parent),
+        chunks=[str(p) for p in chunk_dirs],
+        cache_dir=str(cache_dir),
+        args=args,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        meta_aux_cols=list(pv_aux_cols),
+        reg_loss=reg_loss,
+        n_chunks=len(chunk_dirs),
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.type == "cuda"
@@ -2791,6 +2840,20 @@ def main() -> None:
     torch.save(y_std, out_dir / "y_std.pt")
     torch.save(reg_mean, out_dir / "reg_mean.pt")
     torch.save(reg_std, out_dir / "reg_std.pt")
+
+    _write_da_gps_run_manifest(
+        out_dir,
+        task="DA-GPS multitask single dataset",
+        chunk_parent=str(data_root),
+        chunks=[str(nodes_path.parent)],
+        cache_dir=str(Path(args.cache_tensor).resolve().parent) if args.cache_tensor else None,
+        args=args,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        meta_aux_cols=list(pv_aux_cols),
+        reg_loss=reg_loss,
+        n_chunks=1,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
