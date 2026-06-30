@@ -46,7 +46,8 @@ from nonunique_opendss_daily import (
     resolve_monitor_nodes,
     tap_pu_to_tap_number,
 )
-from nonunique_plots import plot_all, print_run_summary
+from compare_mv_daily_timing import amortize_gnn_timing_to_display_grid, format_gnn_grid_log
+from nonunique_plots import plot_all
 
 DAILY_COMPARE_STYLE = [("OpenDSS daily", "-")]
 
@@ -215,6 +216,21 @@ def run_da_gps_predictions(
         os.chdir(cfg.repo_root)
         dev = resolve_da_gps_device(device)
         log_da_gps_device(dev)
+        print(
+            format_gnn_grid_log(
+                amortize_gnn_timing_to_display_grid(
+                    display_npts=cfg.npts,
+                    display_step_min=cfg.step_min,
+                    internal_npts=NATIVE_NPTS,
+                    internal_step_min=NATIVE_STEP_MIN,
+                    gnn_setup_once_s=None,
+                    gnn_per_step_s=None,
+                    gnn_total_wall_s=None,
+                    gnn_n_ok=None,
+                )
+            ),
+            flush=True,
+        )
         sys.modules.pop("run_da_gps_daily_opendss_compare", None)
         from run_da_gps_daily_opendss_compare import (
             align_da_gps_trajectory_to_opendss_names,
@@ -272,6 +288,16 @@ def run_da_gps_predictions(
             )
 
         gnn_wall = time.perf_counter() - t0
+        timing = amortize_gnn_timing_to_display_grid(
+            display_npts=cfg.npts,
+            display_step_min=cfg.step_min,
+            internal_npts=NATIVE_NPTS,
+            internal_step_min=NATIVE_STEP_MIN,
+            gnn_setup_once_s=bundle.get("gnn_setup_once_s"),
+            gnn_per_step_s=bundle.get("gnn_per_step_s"),
+            gnn_total_wall_s=bundle.get("gnn_total_wall_s"),
+            gnn_n_ok=bundle.get("n_ok"),
+        )
         return {
             "voltages": voltages,
             "reg_cols": reg_cols,
@@ -281,10 +307,11 @@ def run_da_gps_predictions(
             "align_fn": align_da_gps_trajectory_to_opendss_names,
             "hours": da_hours,
             "gnn_wall_s": gnn_wall,
-            "gnn_setup_once_s": bundle.get("gnn_setup_once_s"),
-            "gnn_per_step_s": bundle.get("gnn_per_step_s"),
-            "gnn_total_wall_s": bundle.get("gnn_total_wall_s"),
-            "n_ok": bundle.get("n_ok"),
+            "gnn_setup_once_s": timing["gnn_setup_once_s"],
+            "gnn_per_step_s": timing["gnn_per_step_s"],
+            "gnn_total_wall_s": timing["gnn_total_wall_s"],
+            "n_ok": timing["n_ok"],
+            "gnn_grid": timing,
         }
     finally:
         try:
@@ -383,6 +410,7 @@ def print_timing_summary(
     *,
     n_ok: int,
     npts: int,
+    step_min: int,
     dss_wall_s: float,
     dss_solve_s: np.ndarray,
     dss_collect_s: np.ndarray,
@@ -391,6 +419,7 @@ def print_timing_summary(
     gnn_per_step_s: float | None = None,
     gnn_total_wall_s: float | None = None,
     gnn_n_ok: int | None = None,
+    gnn_grid: dict[str, float | int | bool] | None = None,
 ) -> None:
     n_ok = max(1, int(n_ok))
     npts = max(1, int(npts))
@@ -401,6 +430,9 @@ def print_timing_summary(
     gnn_ms_per = 1000.0 * gnn_wall_s / npts
     ratio = dss_wall_s / gnn_wall_s if gnn_wall_s > 1e-9 else float("nan")
     print("\n[da_gps_daily_compare] === Timing summary ===", flush=True)
+    print(f"  step_min={step_min} min, npts={npts}", flush=True)
+    if gnn_grid is not None:
+        print(f"  {format_gnn_grid_log(gnn_grid, prefix='').strip()}", flush=True)
     print(
         f"  OpenDSS Solve() wall:         {n_ok} × {dss_solve_per:.4f}s = {dss_solve_total:.4f}s  "
         f"(compile-once not timed; loop wall incl. collect = {dss_wall_s:.2f} s)",
@@ -418,13 +450,71 @@ def print_timing_summary(
         print(
             f"  DA-GPS deployment wall:       {float(gnn_setup_once_s):.4f}s + {int(gnn_n_ok)} × "
             f"{float(gnn_per_step_s):.4f}s = {float(gnn_total_wall_s):.4f}s  "
-            f"(gnn_setup_once_s + n_ok × gnn_per_step_s = gnn_total_wall_s)",
+            f"(gnn_setup_once_s + npts × gnn_per_step_s = gnn_total_wall_s; per displayed step)",
             flush=True,
         )
     print(f"  DA-GPS GNN total wall:        {gnn_wall_s:.2f} s", flush=True)
-    print(f"  DA-GPS mean wall / step:      {gnn_ms_per:.2f} ms", flush=True)
+    print(f"  DA-GPS mean wall / step:      {gnn_ms_per:.2f} ms  (at step_min={step_min}, npts={npts})", flush=True)
     if np.isfinite(ratio):
         print(f"  Wall speedup (OpenDSS/GNN):   {ratio:.2f}x", flush=True)
+
+
+def _final_devices_one_liner(
+    reg_names: list[str],
+    cap_names: list[str],
+    reg_tap: np.ndarray,
+    cap_on: np.ndarray,
+) -> str:
+    taps = ", ".join(f"{nm}={int(tap_pu_to_tap_number(reg_tap[-1, j]))}" for j, nm in enumerate(reg_names))
+    caps = ", ".join(f"{nm}={int(cap_on[-1, j])}" for j, nm in enumerate(cap_names))
+    return f"final taps: {taps}; final cap steps ON: {caps}"
+
+
+def _da_gps_compare_summary(
+    *,
+    cfg: DailySimConfig,
+    load_csv: Path,
+    irr_csv: Path,
+    monitor_nodes: list[str],
+    per_node_mae: dict[str, float],
+    mae: float,
+    rmse: float,
+    dss_wall_s: float,
+    gnn: dict[str, Any],
+    dss: dict[str, Any],
+    n_voltage_figures: int,
+    n_reg_figures: int,
+    n_cap_figures: int,
+    n_control_iter_figures: int,
+    n_pf_iter_figures: int,
+) -> dict[str, Any]:
+    gnn_grid = gnn.get("gnn_grid") or {}
+    speedup = dss_wall_s / gnn["gnn_wall_s"] if gnn["gnn_wall_s"] > 1e-9 else float("nan")
+    return {
+        "mode": "da_gps_daily_compare",
+        "step_min": cfg.step_min,
+        "npts": cfg.npts,
+        "gnn_internal_npts": int(gnn_grid.get("internal_npts", NATIVE_NPTS)),
+        "gnn_internal_step_min": int(gnn_grid.get("internal_step_min", NATIVE_STEP_MIN)),
+        "gnn_resampled": bool(gnn_grid.get("resampled", False)),
+        "load_profile": str(load_csv),
+        "pv_profile": str(irr_csv),
+        "monitor_nodes": monitor_nodes,
+        "overall_mae_pu": mae,
+        "overall_rmse_pu": rmse,
+        "per_node_mae_pu": per_node_mae,
+        "dss_wall_s": dss_wall_s,
+        "gnn_wall_s": gnn["gnn_wall_s"],
+        "gnn_setup_once_s": gnn.get("gnn_setup_once_s"),
+        "gnn_per_step_s": gnn.get("gnn_per_step_s"),
+        "gnn_total_wall_s": gnn.get("gnn_total_wall_s"),
+        "wall_speedup": speedup,
+        "final_devices": _final_devices_one_liner(
+            dss["reg_names"], dss["cap_names"], dss["reg_tap"], dss["cap_on"]
+        ),
+        "n_figures_total": n_voltage_figures + n_reg_figures + n_cap_figures
+        + n_control_iter_figures + n_pf_iter_figures,
+    }
 
 
 def run_da_gps_daily_compare_and_plot(
@@ -565,13 +655,11 @@ def run_da_gps_daily_compare_and_plot(
         show=show,
     )
 
-    print_run_summary(
-        cfg,
-        runs,
-        header=(
-            "\nOpenDSS native daily QSTS truth run (DA-GPS overlay in magenta on plots):"
-        ),
-        compare_final=False,
+    print(
+        f"\n[da_gps_daily_compare] OpenDSS daily truth: "
+        f"{int(dss['converged'].sum())}/{cfg.npts} converged; "
+        f"{_final_devices_one_liner(dss['reg_names'], dss['cap_names'], dss['reg_tap'], dss['cap_on'])}",
+        flush=True,
     )
 
     n_reg = len(dss["reg_names"])
@@ -586,6 +674,7 @@ def run_da_gps_daily_compare_and_plot(
     print_timing_summary(
         n_ok=n_ok,
         npts=cfg.npts,
+        step_min=cfg.step_min,
         dss_wall_s=float(dss["total_wall_s"]),
         dss_solve_s=dss["solve_s"],
         dss_collect_s=dss["collect_s"],
@@ -594,36 +683,26 @@ def run_da_gps_daily_compare_and_plot(
         gnn_per_step_s=gnn.get("gnn_per_step_s"),
         gnn_total_wall_s=gnn.get("gnn_total_wall_s"),
         gnn_n_ok=gnn.get("n_ok"),
+        gnn_grid=gnn.get("gnn_grid"),
     )
 
-    return {
-        "cfg": cfg,
-        "load_profile": str(load_csv),
-        "pv_profile": str(irr_csv),
-        "monitor_nodes": monitor_nodes,
-        "collect_nodes": collect_nodes,
-        "plot_nodes": monitor_nodes,
-        "runs": runs,
-        "dss": dss,
-        "gnn_voltages": gnn_voltages,
-        "gnn_reg_by_name": gnn_reg,
-        "gnn_cap_by_name": gnn_cap,
-        "per_node_mae_pu": per_node_mae,
-        "overall_mae_pu": mae,
-        "overall_rmse_pu": rmse,
-        "n_voltage_figures": n_voltage_figures,
-        "n_reg_figures": n_reg_figures,
-        "n_cap_figures": n_cap_figures,
-        "n_control_iter_figures": n_control_iter_figures,
-        "n_pf_iter_figures": n_pf_iter_figures,
-        "n_figures_total": n_voltage_figures + n_reg_figures + n_cap_figures
-        + n_control_iter_figures + n_pf_iter_figures,
-        "n_voltage_plots": n_voltage_figures,
-        "n_reg_plots": n_reg_figures,
-        "n_cap_plots": n_cap_figures,
-        "gnn_wall_s": gnn["gnn_wall_s"],
-        "dss_wall_s": dss["total_wall_s"],
-    }
+    return _da_gps_compare_summary(
+        cfg=cfg,
+        load_csv=load_csv,
+        irr_csv=irr_csv,
+        monitor_nodes=monitor_nodes,
+        per_node_mae=per_node_mae,
+        mae=mae,
+        rmse=rmse,
+        dss_wall_s=float(dss["total_wall_s"]),
+        gnn=gnn,
+        dss=dss,
+        n_voltage_figures=n_voltage_figures,
+        n_reg_figures=n_reg_figures,
+        n_cap_figures=n_cap_figures,
+        n_control_iter_figures=n_control_iter_figures,
+        n_pf_iter_figures=n_pf_iter_figures,
+    )
 
 
 __all__ = [

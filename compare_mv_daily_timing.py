@@ -296,3 +296,67 @@ def print_mv_daily_timing_summary(
     print(f"GNN net (feature + fwd-only):     {gnn_net:.3f} ms/ok-step", flush=True)
     if gnn_net > 0:
         print(f"Net speedup (DSS_net / GNN_net):  {dss_net / gnn_net:.2f}×", flush=True)
+
+
+def amortize_gnn_timing_to_display_grid(
+    *,
+    display_npts: int,
+    display_step_min: int,
+    internal_npts: int,
+    internal_step_min: int,
+    gnn_setup_once_s: float | None,
+    gnn_per_step_s: float | None,
+    gnn_total_wall_s: float | None,
+    gnn_n_ok: int | None,
+) -> dict[str, float | int | bool]:
+    """Map native GNN step timers onto the user-facing ``(npts, step_min)`` grid.
+
+    The DA-GPS model is trained at 288×5 min; coarser OpenDSS / plot grids keep the
+    same total wall time but spread step work over fewer displayed timesteps.
+    """
+    reported_npts = max(1, int(display_npts))
+    internal_n = max(1, int(internal_npts))
+    setup = float(gnn_setup_once_s or 0.0)
+    internal_n_ok = max(1, int(gnn_n_ok if gnn_n_ok is not None else internal_n))
+    if gnn_total_wall_s is not None:
+        total = float(gnn_total_wall_s)
+    elif gnn_per_step_s is not None:
+        total = setup + float(gnn_per_step_s) * internal_n_ok
+    else:
+        total = setup
+    step_wall_total = max(0.0, total - setup)
+    per_step_reported = step_wall_total / reported_npts
+    resampled = not (
+        int(display_step_min) == int(internal_step_min) and reported_npts == internal_n
+    )
+    return {
+        "display_npts": reported_npts,
+        "display_step_min": int(display_step_min),
+        "internal_npts": internal_n,
+        "internal_step_min": int(internal_step_min),
+        "resampled": resampled,
+        "gnn_setup_once_s": setup,
+        "gnn_per_step_s": per_step_reported,
+        "gnn_total_wall_s": total,
+        "n_ok": reported_npts,
+        "internal_n_ok": internal_n_ok,
+        "internal_per_step_s": step_wall_total / internal_n_ok,
+    }
+
+
+def format_gnn_grid_log(
+    timing: dict[str, float | int | bool],
+    *,
+    prefix: str = "[da_gps_daily_compare]",
+) -> str:
+    """One-line description of native vs displayed GNN timestep grids."""
+    if timing.get("resampled"):
+        return (
+            f"{prefix} DA-GPS GNN: internal {timing['internal_npts']} @ "
+            f"{timing['internal_step_min']} min, overlay resampled to "
+            f"{timing['display_npts']} @ {timing['display_step_min']} min"
+        )
+    return (
+        f"{prefix} DA-GPS GNN: {timing['display_npts']} steps @ "
+        f"{timing['display_step_min']} min (native grid)"
+    )
