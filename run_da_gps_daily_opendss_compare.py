@@ -93,6 +93,11 @@ Timing buckets match the **OpenDSS vs GNN pipeline** diagram used elsewhere in t
 OpenDSS total ≈ **apply** + **Solve() only** + **collect** (``collect`` = Python read of |V| and angle after solve for MAE/plots);
 GNN total ≈ **feature generation** + **forward** (see printed ``dss_*_ms`` / ``gnn_*_ms`` block and ``da_gps_daily_run_summary.json``).
 
+GNN deployment inference opts (env, default off unless noted):
+``GNN_CUDA_GRAPHS`` (default on CUDA), ``GNN_DEFER_D2H`` (default on CUDA),
+``GNN_BATCH_STEPS`` / ``gnn_batch_steps`` kwarg, ``GNN_TORCH_COMPILE=1``, ``GNN_TF32=0``.
+Timing: ``gnn_setup_once_s``, ``gnn_per_step_s``, ``gnn_total_wall_s`` in summary JSON and console.
+
 For meta-aux mismatches (DSS vs GNN curves), pass ``--meta-debug`` or set ``GNN_DAILY_META_DEBUG=1`` to log
 normalized vs denormalized heads, DSS meta rows, clock, and ``x_n`` means at a few timesteps.
 """
@@ -120,7 +125,13 @@ from torch_geometric.data import Data
 
 import run_injection_dataset as inj
 import run_daily_aggregate_dataset_8500 as rd8500
-from compare_gnn_inference_utils import configure_cuda_inference, maybe_torch_compile
+from compare_gnn_inference_utils import (
+    DailyGnnInferenceRunner,
+    build_scatter_indices,
+    configure_cuda_inference,
+    maybe_torch_compile,
+    read_gnn_batch_steps,
+)
 from compare_mv_daily_timing import (
     per_ok_ms,
     print_mv_daily_timing_summary,
@@ -1053,7 +1064,11 @@ def _precompute_daily_feature_tables(
     der_max_kw: float,
     der_q_frac: float,
 ) -> dict[str, object]:
-    """Static tables for per-step node feature assembly (load P/Q, PV presolve, DER)."""
+    """Static tables for per-step node feature assembly (load P/Q, PV presolve, DER).
+
+    Deployment split: topology-bound columns live in ``x_static``; only load P/Q, ``p_pv_kw``
+    (irradiance scalar), and DER scalars are written each step via :func:`_apply_daily_feature_tables`.
+    """
     N = int(ref_x.shape[0])
     key_to_idx: dict[tuple[str, int], int] = {}
     load_j_list: list[int] = []
@@ -1573,6 +1588,7 @@ def run(
     der_q_frac_p: float = 0.1,
     voltages_only: bool = False,
     skip_opendss_solve: bool = False,
+    gnn_batch_steps: int | None = None,
 ) -> dict[str, np.ndarray] | None:
     run_dir = Path(run_dir).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
@@ -1901,6 +1917,7 @@ def run(
     dev = torch.device(resolve_da_gps_device(device))
     log_da_gps_device(str(dev))
     configure_cuda_inference(dev)
+    t_gnn_setup0 = time.perf_counter()
 
     dropout = float(hp.get("dropout", 0.1))
     if bool(hp.get("disable_dropout", False)):
@@ -1958,7 +1975,7 @@ def run(
             "(3) mixed training_last vs best.pt from different runs."
         ) from e
     base_model.eval()
-    model = maybe_torch_compile(base_model, label="da_gps_daily")
+    model = maybe_torch_compile(base_model, label="da_gps_daily", device=dev)
     model.to(dev)
 
     x_mean_d = x_mean.to(dev)
@@ -2167,6 +2184,7 @@ def run(
     feature_build_s_total = 0.0
     gnn_infer_s_total = 0.0
     gnn_forward_only_s_total = 0.0
+    gnn_setup_once_s = 0.0
     first_diag = True
     pv_read_diag = False
     reg_tap_align_printed = False
@@ -2197,16 +2215,61 @@ def run(
         der_max_kw=float(der_max_kw),
         der_q_frac=float(der_q_frac_p),
     )
-    x_torch_host = torch.from_numpy(feat_tables["x_static"].copy())
-    if dev.type == "cuda":
-        # pin_memory() returns a NEW page-locked tensor whose storage is *not*
-        # shared with the source numpy array. Bind x_step_buf to that tensor's
-        # storage so per-step feature writes land in the buffer we actually copy
-        # to the GPU; otherwise the device only ever sees the initial static
-        # features and every step produces identical output.
-        x_torch_host = x_torch_host.pin_memory()
-    x_step_buf = x_torch_host.numpy()
-    x_t_dev = torch.empty((N, n_feat), dtype=torch.float32, device=dev)
+    batch_k = read_gnn_batch_steps(gnn_batch_steps)
+    if batch_k > 1:
+        print(
+            f"[da_gps_daily] GNN batched inference: {batch_k} steps/forward "
+            f"(GNN_BATCH_STEPS or gnn_batch_steps; per-step P/Q still applied on host)",
+            flush=True,
+        )
+    x_static_np = feat_tables["x_static"]
+    x_ring_bufs: list[np.ndarray] = []
+    x_ring_torch: list[torch.Tensor] = []
+    for _ in range(max(1, batch_k)):
+        xt = torch.from_numpy(np.ascontiguousarray(x_static_np, dtype=np.float32))
+        if dev.type == "cuda":
+            xt = xt.pin_memory()
+        x_ring_torch.append(xt)
+        x_ring_bufs.append(xt.numpy())
+    scatter_li_t, scatter_j_np, scatter_li_np = build_scatter_indices(node_order, node_to_idx, dev)
+    gnn_runner = DailyGnnInferenceRunner(
+        model=model,
+        device=dev,
+        n_nodes=N,
+        n_feat=n_feat,
+        edge_index=ei,
+        edge_attr=ea,
+        x_mean_d=x_mean_d,
+        x_std_d=x_std_d,
+        y_mean_d=y_mean_d,
+        y_std_d=y_std_d,
+        reg_mean_d=reg_mean_d,
+        reg_std_d=reg_std_d,
+        pv_mean_d=pv_mean_d,
+        pv_std_d=pv_std_d,
+        reg_loss_mode=reg_loss_mode,
+        reg_class_values=reg_class_values.to(dev) if reg_class_values is not None else None,
+        n_cap=n_cap_plot,
+        n_reg=n_reg_plot,
+        n_pv=n_pv_plot,
+        batch_steps=batch_k,
+        scatter_li=scatter_li_t,
+        scatter_j=torch.tensor(scatter_j_np, dtype=torch.long, device=dev) if scatter_j_np.size else None,
+        n_scatter_cols=int(scatter_j_np.size),
+    )
+    gnn_runner.alloc_deferred_buffers(npts)
+    gnn_setup_graph_s = gnn_runner.setup()
+    gnn_setup_once_s = time.perf_counter() - t_gnn_setup0
+    print(
+        f"[da_gps_daily] GNN setup once: {gnn_setup_once_s:.4f}s "
+        f"(model+norm tensors+static feature tables+cuda-graph/warmup={gnn_setup_graph_s:.4f}s)  "
+        f"defer_d2h={gnn_runner.defer_d2h} cuda_graphs={gnn_runner.use_cuda_graphs}",
+        flush=True,
+    )
+
+    pending_step_i: list[int] = []
+    pending_x_hosts: list[torch.Tensor] = []
+    ring_slot = 0
 
     _meta_dbg_steps: set[int] = set()
     if meta_debug:
@@ -2229,6 +2292,63 @@ def run(
                 "(``_collect_pv_to_busph_weights``); DSS Pmpp = Pmpp0×m_irr[i] under snapshot.",
                 flush=True,
             )
+
+    def _flush_gnn_pending(*, force: bool = False) -> None:
+        nonlocal gnn_infer_s_total, gnn_forward_only_s_total
+        if not pending_step_i:
+            return
+        if not force and len(pending_step_i) < batch_k:
+            return
+        t_gnn0 = time.perf_counter()
+        t_fwd0 = time.perf_counter()
+        if len(pending_step_i) == 1:
+            gnn_runner.copy_host_features(pending_x_hosts[0])
+            outs = [gnn_runner.forward_single(sync_forward=True)]
+        else:
+            outs = gnn_runner.forward_batch(pending_x_hosts, sync_forward=True)
+        t_fwd1 = time.perf_counter()
+        gnn_forward_only_s_total += t_fwd1 - t_fwd0
+        for si, out in zip(pending_step_i, outs):
+            if gnn_runner.defer_d2h:
+                gnn_runner.store_step(si, out)
+            else:
+                gnn_runner.write_step_host(
+                    si,
+                    out,
+                    v_gnn=v_gnn,
+                    va_gnn=va_gnn,
+                    cap_gnn_prob=cap_gnn_prob,
+                    reg_gnn_tap=reg_gnn_tap,
+                    meta_gnn=meta_gnn,
+                    scatter_j_np=scatter_j_np,
+                    scatter_li_np=scatter_li_np,
+                    n_cap_plot=n_cap_plot,
+                    n_reg_plot=n_reg_plot,
+                    n_pv_plot=n_pv_plot,
+                )
+            if (
+                meta_debug
+                and meta_gnn is not None
+                and n_pv_plot > 0
+                and (si in _meta_dbg_steps)
+                and out.pv_dn is not None
+            ):
+                hr, sec = snapshot_step_hr_sec(si, step_min=float(step_min))
+                try:
+                    dbl_h = float(dss.Solution.DblHour())
+                except Exception:
+                    dbl_h = float("nan")
+                pv_dn_np = out.pv_dn.detach().cpu().numpy().reshape(-1)[:n_pv_plot]
+                print(
+                    f"[da_gps_daily][meta_debug] step={si} clock hour={hr} sec={sec} DblHour={dbl_h:.6g} | "
+                    f"GNN pv_pred denorm={np.array2string(pv_dn_np, precision=4, separator=', ')}",
+                    flush=True,
+                )
+        if not gnn_runner.defer_d2h:
+            sync_inference_device(dev)
+        gnn_infer_s_total += time.perf_counter() - t_gnn0
+        pending_step_i.clear()
+        pending_x_hosts.clear()
 
     for i in range(npts):
         hr, sec = snapshot_step_hr_sec(i, step_min=float(step_min))
@@ -2364,9 +2484,10 @@ def run(
                 else 0.0
             )
 
+        step_buf = x_ring_bufs[ring_slot]
         t_fb0 = time.perf_counter()
         _apply_daily_feature_tables(
-            x_step_buf,
+            step_buf,
             feat_tables,
             m_t=float(m_t),
             ir_t=float(ir_t),
@@ -2376,60 +2497,12 @@ def run(
 
         if first_diag:
             first_diag = False
-            nz = int(np.sum(np.abs(x_step_buf[:, col_p]) + np.abs(x_step_buf[:, col_q]) > 1e-3))
+            nz = int(np.sum(np.abs(step_buf[:, col_p]) + np.abs(step_buf[:, col_q]) > 1e-3))
             print(f"[da_gps_daily] feature diag (first step): nodes with |P|+|Q|>1e-3: {nz}/{N}", flush=True)
 
         feature_build_s_total += time.perf_counter() - t_fb0
 
-        t_gnn0 = time.perf_counter()
-        x_t_dev.copy_(x_torch_host, non_blocking=(dev.type == "cuda"))
-        x_n = (x_t_dev - x_mean_d) / x_std_d
-        data = Data(x=x_n, edge_index=ei, edge_attr=ea)
-        with torch.no_grad():
-            t_fwd0 = time.perf_counter()
-            out_m = model(data)
-            volt_n = out_m[0]
-            cap_log_b = out_m[1] if len(out_m) > 1 else None
-            reg_pred_b = out_m[2] if len(out_m) > 2 else None
-            pv_pred_b = out_m[3] if len(out_m) > 3 else None
-            t_fwd1 = time.perf_counter()
-        gnn_forward_only_s_total += t_fwd1 - t_fwd0
-        v_flat = volt_n.view(1, -1) * y_std_d + y_mean_d
-        pred_ri = v_flat.view(N, 2)
-        pred_mag = torch.sqrt(pred_ri[:, 0] ** 2 + pred_ri[:, 1] ** 2 + 1e-12)
-        pred_np = pred_mag.detach().cpu().numpy().astype(np.float32)
-        pred_ri_np = pred_ri.detach().cpu().numpy()
-        pred_ang_deg = np.degrees(np.arctan2(pred_ri_np[:, 1], pred_ri_np[:, 0])).astype(np.float32)
-
-        if cap_gnn_prob is not None and cap_log_b is not None and n_cap_plot > 0:
-            cap_act = torch.sigmoid(cap_log_b.view(1, -1)).detach().cpu().numpy().reshape(-1)
-            for jc in range(n_cap_plot):
-                cap_gnn_prob[i, jc] = float(cap_act[jc]) if jc < int(cap_act.shape[0]) else np.nan
-        if reg_gnn_tap is not None and reg_pred_b is not None and n_reg_plot > 0:
-            if reg_loss_mode == "ce" and reg_class_values is not None:
-                pred_idx = reg_pred_b.view(1, -1).long()
-                tap_pu, _ = _reg_indices_to_tap_pu(pred_idx, pred_idx, reg_class_values)
-                reg_dn = tap_pu.detach().cpu().numpy().reshape(-1)
-                for jr in range(n_reg_plot):
-                    reg_gnn_tap[i, jr] = float(reg_dn[jr]) if jr < int(reg_dn.shape[0]) else np.nan
-            elif reg_mean_d is not None and reg_std_d is not None:
-                reg_dn = (reg_pred_b.view(1, -1) * reg_std_d + reg_mean_d).detach().cpu().numpy().reshape(-1)
-                for jr in range(n_reg_plot):
-                    reg_gnn_tap[i, jr] = float(reg_dn[jr]) if jr < int(reg_dn.shape[0]) else np.nan
-        if meta_gnn is not None and pv_pred_b is not None and pv_mean_d is not None and pv_std_d is not None and n_pv_plot > 0:
-            pv_dn = (pv_pred_b.view(1, -1) * pv_std_d + pv_mean_d).detach().cpu().numpy().reshape(-1)
-            for jm in range(n_pv_plot):
-                meta_gnn[i, jm] = float(pv_dn[jm]) if jm < int(pv_dn.shape[0]) else np.nan
-
-        if (
-            meta_debug
-            and meta_gnn is not None
-            and n_pv_plot > 0
-            and (i in _meta_dbg_steps)
-            and pv_pred_b is not None
-            and pv_mean_d is not None
-            and pv_std_d is not None
-        ):
+        if meta_debug and (i in _meta_dbg_steps):
             try:
                 dbl_h = float(dss.Solution.DblHour())
             except Exception:
@@ -2442,38 +2515,22 @@ def run(
             if want_der:
                 bits.append(f"m_der[i]={m_der_t:.6g}")
             if col_pv is not None:
-                bits.append(f"x_step[p_pv_kw]_mean={float(np.mean(x_step_buf[:, col_pv])):.6g}")
-                bits.append(f"x_n[p_pv_kw]_mean={float(x_n[:, col_pv].mean().item()):.6g}")
+                bits.append(f"x_step[p_pv_kw]_mean={float(np.mean(step_buf[:, col_pv])):.6g}")
             if col_p is not None:
-                bits.append(f"x_n[p_load_kw]_mean={float(x_n[:, col_p].mean().item()):.6g}")
+                bits.append(f"x_step[p_load_kw]_mean={float(np.mean(step_buf[:, col_p])):.6g}")
             print("[da_gps_daily][meta_debug] " + " | ".join(bits), flush=True)
-            if meta_dss is not None:
+            if meta_dss is not None and n_pv_plot > 0:
                 print(
                     f"[da_gps_daily][meta_debug]   DSS meta_dss[{i}]={np.array2string(np.asarray(meta_dss[i, :n_pv_plot]), precision=4, separator=', ')}",
                     flush=True,
                 )
-                print(
-                    f"[da_gps_daily][meta_debug]      (cols={[pv_aux_cols[jm] for jm in range(n_pv_plot)]})",
-                    flush=True,
-                )
-            pvn = pv_pred_b.detach().float().cpu().numpy().reshape(-1)[:n_pv_plot]
-            print(
-                f"[da_gps_daily][meta_debug]   GNN pv_pred **normalized** (MSE target space)={np.array2string(pvn, precision=5, separator=', ')}",
-                flush=True,
-            )
-            print(
-                f"[da_gps_daily][meta_debug]   GNN pv_pred denorm (pred*pv_std+pv_mean)={np.array2string(np.asarray(meta_gnn[i, :n_pv_plot]), precision=4, separator=', ')}",
-                flush=True,
-            )
-        for li, name in enumerate(node_order):
-            nk = str(name).strip().lower()
-            j = node_to_idx.get(nk)
-            if j is not None:
-                v_gnn[i, j] = float(pred_np[li])
-                va_gnn[i, j] = float(pred_ang_deg[li])
 
-        sync_inference_device(dev)
-        gnn_infer_s_total += time.perf_counter() - t_gnn0
+        pending_step_i.append(i)
+        pending_x_hosts.append(x_ring_torch[ring_slot])
+        ring_slot = (ring_slot + 1) % max(1, batch_k)
+        at_last = (i + 1) == npts
+        if len(pending_step_i) >= batch_k or at_last:
+            _flush_gnn_pending(force=at_last)
 
         if (i + 1) % max(1, npts // 12) == 0 or (voltages_only and (i + 1) == npts):
             if skip_opendss_solve:
@@ -2488,6 +2545,31 @@ def run(
                     f"feat={feature_build_s_total:.2f}s gnn={gnn_infer_s_total:.2f}s",
                     flush=True,
                 )
+
+    _flush_gnn_pending(force=True)
+    if gnn_runner.defer_d2h:
+        t_fin0 = time.perf_counter()
+        with torch.no_grad():
+            gnn_runner.finalize_deferred(
+                v_gnn,
+                va_gnn,
+                cap_gnn_prob,
+                reg_gnn_tap,
+                meta_gnn,
+                scatter_j_np,
+            )
+        gnn_infer_s_total += time.perf_counter() - t_fin0
+
+    if scatter_j_np.size > 0 and npts >= 2:
+        j0 = int(scatter_j_np[0])
+        v_trace = v_gnn[: min(npts, 12), j0]
+        fin = v_trace[np.isfinite(v_trace)]
+        if fin.size >= 2 and np.allclose(fin, fin[0], rtol=0, atol=1e-7):
+            print(
+                "[da_gps_daily] WARNING: GNN |V| appears flat across timesteps at first mapped node "
+                f"({node_order[int(scatter_li_np[0])] if scatter_li_np.size else '?'}) — check pin_memory / feature apply.",
+                flush=True,
+            )
 
     if voltages_only:
         targets = plot_nodes if plot_nodes else list(node_order)
@@ -2520,6 +2602,8 @@ def run(
         }
 
     n_ok = int(npts - n_nonconv)
+    gnn_per_step_s = (feature_build_s_total + gnn_infer_s_total) / max(n_ok, 1)
+    gnn_total_wall_s = gnn_setup_once_s + feature_build_s_total + gnn_infer_s_total
     cfg_stem = _safe_stem(ckpt_path.stem)
     _backbone = "EdgeAttn (legacy)" if use_legacy_edgeattn else "GINE"
     _timing_title = f"Daily Timing Summary (DA-GPS {_backbone} vs OpenDSS)"
@@ -2539,6 +2623,9 @@ def run(
         title=_timing_title,
         feature_label="DA-GPS feature build (bus P/Q + PV presolve p_pv_kw)",
         log_prefix="[da_gps_daily]",
+        gnn_setup_once_s=gnn_setup_once_s,
+        gnn_per_step_s=gnn_per_step_s,
+        gnn_total_wall_s=gnn_total_wall_s,
     )
 
     # --- Flowchart-aligned labels (same timers as homo/hetero daily compare) ---
@@ -2972,9 +3059,12 @@ def run(
             "dss_solve_only": open_solve_only_s_total,
             "dss_collect_v": open_get_s_total,
             "dss_reassert": open_reassert_s_total,
+            "gnn_setup_once": gnn_setup_once_s,
             "gnn_feature_generation": feature_build_s_total,
             "gnn_forward_only": gnn_forward_only_s_total,
             "gnn_bucket_including_prep": gnn_infer_s_total,
+            "gnn_per_step_amortized": gnn_per_step_s,
+            "gnn_total_wall": gnn_total_wall_s,
         },
         "timing_ms_per_ok_step": {
             "dss_apply_ms": dss_apply_ms,

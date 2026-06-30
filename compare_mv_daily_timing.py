@@ -149,6 +149,9 @@ def print_mv_daily_timing_summary(
     log_prefix: str = "[compare_mv_daily_timing]",
     gnn_forward_only_parts: tuple[float, float] | None = None,
     gnn_forward_only_part_labels: tuple[str, str] = ("model A", "model B"),
+    gnn_setup_once_s: float | None = None,
+    gnn_per_step_s: float | None = None,
+    gnn_total_wall_s: float | None = None,
 ) -> None:
     """
     Print full breakdown + deployment / net speedup sections.
@@ -197,7 +200,8 @@ def print_mv_daily_timing_summary(
     )
     print(
         "GNN model forward only: total "
-        f"{gnn_forward_only_s_total:.4f}s | mean {_po(gnn_forward_only_s_total):.3f} ms/ok-step",
+        f"{gnn_forward_only_s_total:.4f}s | mean {_po(gnn_forward_only_s_total):.3f} ms/ok-step  "
+        "(CUDA: ``torch.cuda.synchronize()`` immediately after ``model(...)``)",
         flush=True,
     )
     if gnn_forward_only_parts is not None:
@@ -214,15 +218,41 @@ def print_mv_daily_timing_summary(
     )
     print(f"Device: {device}", flush=True)
     print(
-        "GNN timing note: on CUDA, ``torch.cuda.synchronize()`` runs before stopping the GNN bucket timer "
-        "so async kernel time is included; on CPU there is no GPU sync.",
+        "GNN bucket note: includes H2D feature copy, norm, forward, denorm, scatter/D2H; on CUDA the bucket "
+        "timer also syncs after the step unless ``GNN_DEFER_D2H=1`` (single bulk copy at end).",
         flush=True,
     )
+    if gnn_setup_once_s is not None:
+        print(
+            f"GNN setup once (model load + static tables + graph capture): {gnn_setup_once_s:.4f}s",
+            flush=True,
+        )
+    if gnn_per_step_s is not None:
+        print(
+            f"GNN per-step wall (feature apply + infer bucket, amortized): "
+            f"{1000.0 * gnn_per_step_s:.3f} ms/ok-step",
+            flush=True,
+        )
+    if gnn_total_wall_s is not None:
+        print(
+            f"GNN total wall (setup once + all steps): {gnn_total_wall_s:.4f}s",
+            flush=True,
+        )
     print(f"Timesteps converged: {n_ok}/{npts}  (nonconv={n_nonconv})", flush=True)
 
     # --- Deployment comparison (shared apply on both sides; collect V excluded) ---
     dss_deploy = _po(open_apply_s_total + open_solve_only_s_total)
     gnn_deploy = _po(open_apply_s_total + feature_build_s_total + gnn_forward_only_s_total)
+    if gnn_setup_once_s is not None and gnn_total_wall_s is not None and n_ok > 0:
+        gnn_full_day_ms = 1000.0 * (float(gnn_setup_once_s) + float(gnn_per_step_s or 0.0) * n_ok) / max(n_ok, 1)
+        print("\n=== Full-day GNN deployment wall (setup once + 288 steps) ===", flush=True)
+        print(
+            f"gnn_setup_once_s={float(gnn_setup_once_s):.4f}s  "
+            f"gnn_per_step_s≈{1000.0 * float(gnn_per_step_s or 0.0):.3f} ms/ok-step  "
+            f"gnn_total_wall_s={float(gnn_total_wall_s):.4f}s  "
+            f"(amortized full-day mean {gnn_full_day_ms:.3f} ms/ok-step incl. setup/{n_ok})",
+            flush=True,
+        )
     print("\n=== Deployment comparison (shared apply included; collect V excluded) ===", flush=True)
     print(
         f"DSS deployment cost (apply + Solve() only):     {dss_deploy:.3f} ms/ok-step",
