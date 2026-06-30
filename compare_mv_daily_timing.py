@@ -244,13 +244,28 @@ def print_mv_daily_timing_summary(
     dss_deploy = _po(open_apply_s_total + open_solve_only_s_total)
     gnn_deploy = _po(open_apply_s_total + feature_build_s_total + gnn_forward_only_s_total)
     if gnn_setup_once_s is not None and gnn_total_wall_s is not None and n_ok > 0:
-        gnn_full_day_ms = 1000.0 * (float(gnn_setup_once_s) + float(gnn_per_step_s or 0.0) * n_ok) / max(n_ok, 1)
-        print("\n=== Full-day GNN deployment wall (setup once + 288 steps) ===", flush=True)
+        gnn_setup = float(gnn_setup_once_s)
+        gnn_per = float(gnn_per_step_s or 0.0)
+        gnn_total = float(gnn_total_wall_s)
+        gnn_full_day_ms = 1000.0 * (gnn_setup + gnn_per * n_ok) / max(n_ok, 1)
+        dss_solve_total = float(open_solve_only_s_total)
+        dss_solve_per = dss_solve_total / max(n_ok, 1)
+        print("\n=== Deployment wall (setup once + converged steps) ===", flush=True)
         print(
-            f"gnn_setup_once_s={float(gnn_setup_once_s):.4f}s  "
-            f"gnn_per_step_s≈{1000.0 * float(gnn_per_step_s or 0.0):.3f} ms/ok-step  "
-            f"gnn_total_wall_s={float(gnn_total_wall_s):.4f}s  "
-            f"(amortized full-day mean {gnn_full_day_ms:.3f} ms/ok-step incl. setup/{n_ok})",
+            f"{log_prefix} DA-GPS deployment wall: "
+            f"{gnn_setup:.4f}s + {n_ok} × {gnn_per:.4f}s = {gnn_total:.4f}s  "
+            f"(gnn_setup_once_s + n_ok × gnn_per_step_s = gnn_total_wall_s)",
+            flush=True,
+        )
+        print(
+            f"{log_prefix} OpenDSS Solve() wall: "
+            f"{n_ok} × {dss_solve_per:.4f}s = {dss_solve_total:.4f}s  "
+            f"(n_ok × mean_Solve_per_step = dss_solve_only_s_total; compile-once not timed)",
+            flush=True,
+        )
+        print(
+            f"{log_prefix} DA-GPS amortized mean incl. setup: {gnn_full_day_ms:.3f} ms/ok-step "
+            f"(setup/{n_ok} steps spread over converged steps)",
             flush=True,
         )
     print("\n=== Deployment comparison (shared apply included; collect V excluded) ===", flush=True)

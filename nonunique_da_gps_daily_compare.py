@@ -281,6 +281,10 @@ def run_da_gps_predictions(
             "align_fn": align_da_gps_trajectory_to_opendss_names,
             "hours": da_hours,
             "gnn_wall_s": gnn_wall,
+            "gnn_setup_once_s": bundle.get("gnn_setup_once_s"),
+            "gnn_per_step_s": bundle.get("gnn_per_step_s"),
+            "gnn_total_wall_s": bundle.get("gnn_total_wall_s"),
+            "n_ok": bundle.get("n_ok"),
         }
     finally:
         try:
@@ -383,16 +387,40 @@ def print_timing_summary(
     dss_solve_s: np.ndarray,
     dss_collect_s: np.ndarray,
     gnn_wall_s: float,
+    gnn_setup_once_s: float | None = None,
+    gnn_per_step_s: float | None = None,
+    gnn_total_wall_s: float | None = None,
+    gnn_n_ok: int | None = None,
 ) -> None:
     n_ok = max(1, int(n_ok))
+    npts = max(1, int(npts))
     mean_solve_ms = 1000.0 * float(np.sum(dss_solve_s[:npts])) / n_ok
     mean_collect_ms = 1000.0 * float(np.sum(dss_collect_s[:npts])) / n_ok
-    gnn_ms_per = 1000.0 * gnn_wall_s / max(1, npts)
+    dss_solve_total = float(np.sum(dss_solve_s[:npts]))
+    dss_solve_per = dss_solve_total / n_ok
+    gnn_ms_per = 1000.0 * gnn_wall_s / npts
     ratio = dss_wall_s / gnn_wall_s if gnn_wall_s > 1e-9 else float("nan")
     print("\n[da_gps_daily_compare] === Timing summary ===", flush=True)
-    print(f"  OpenDSS daily total wall:     {dss_wall_s:.2f} s", flush=True)
+    print(
+        f"  OpenDSS Solve() wall:         {n_ok} × {dss_solve_per:.4f}s = {dss_solve_total:.4f}s  "
+        f"(compile-once not timed; loop wall incl. collect = {dss_wall_s:.2f} s)",
+        flush=True,
+    )
     print(f"  OpenDSS mean Solve() / step:  {mean_solve_ms:.2f} ms  (converged steps only in denominator)", flush=True)
     print(f"  OpenDSS mean collect V/step:  {mean_collect_ms:.2f} ms", flush=True)
+    if (
+        gnn_setup_once_s is not None
+        and gnn_per_step_s is not None
+        and gnn_total_wall_s is not None
+        and gnn_n_ok is not None
+        and gnn_n_ok > 0
+    ):
+        print(
+            f"  DA-GPS deployment wall:       {float(gnn_setup_once_s):.4f}s + {int(gnn_n_ok)} × "
+            f"{float(gnn_per_step_s):.4f}s = {float(gnn_total_wall_s):.4f}s  "
+            f"(gnn_setup_once_s + n_ok × gnn_per_step_s = gnn_total_wall_s)",
+            flush=True,
+        )
     print(f"  DA-GPS GNN total wall:        {gnn_wall_s:.2f} s", flush=True)
     print(f"  DA-GPS mean wall / step:      {gnn_ms_per:.2f} ms", flush=True)
     if np.isfinite(ratio):
@@ -562,6 +590,10 @@ def run_da_gps_daily_compare_and_plot(
         dss_solve_s=dss["solve_s"],
         dss_collect_s=dss["collect_s"],
         gnn_wall_s=float(gnn["gnn_wall_s"]),
+        gnn_setup_once_s=gnn.get("gnn_setup_once_s"),
+        gnn_per_step_s=gnn.get("gnn_per_step_s"),
+        gnn_total_wall_s=gnn.get("gnn_total_wall_s"),
+        gnn_n_ok=gnn.get("n_ok"),
     )
 
     return {

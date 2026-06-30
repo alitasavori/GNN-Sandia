@@ -2571,6 +2571,10 @@ def run(
                 flush=True,
             )
 
+    n_ok = int(npts - n_nonconv)
+    gnn_per_step_s = (feature_build_s_total + gnn_infer_s_total) / max(n_ok, 1)
+    gnn_total_wall_s = gnn_setup_once_s + feature_build_s_total + gnn_infer_s_total
+
     if voltages_only:
         targets = plot_nodes if plot_nodes else list(node_order)
         out_v = _gnn_voltages_for_nodes(targets, v_gnn, node_to_idx, npts)
@@ -2599,11 +2603,13 @@ def run(
             "cap_sigmoid": cap_out,
             "reg_cols": [str(c) for c in reg_cols[:n_reg_plot]],
             "cap_cols": [str(c) for c in cap_cols[:n_cap_plot]],
+            "gnn_setup_once_s": gnn_setup_once_s,
+            "gnn_per_step_s": gnn_per_step_s,
+            "gnn_total_wall_s": gnn_total_wall_s,
+            "n_ok": n_ok,
+            "npts": npts,
         }
 
-    n_ok = int(npts - n_nonconv)
-    gnn_per_step_s = (feature_build_s_total + gnn_infer_s_total) / max(n_ok, 1)
-    gnn_total_wall_s = gnn_setup_once_s + feature_build_s_total + gnn_infer_s_total
     cfg_stem = _safe_stem(ckpt_path.stem)
     _backbone = "EdgeAttn (legacy)" if use_legacy_edgeattn else "GINE"
     _timing_title = f"Daily Timing Summary (DA-GPS {_backbone} vs OpenDSS)"
@@ -3065,6 +3071,12 @@ def run(
             "gnn_bucket_including_prep": gnn_infer_s_total,
             "gnn_per_step_amortized": gnn_per_step_s,
             "gnn_total_wall": gnn_total_wall_s,
+            "da_gps_deployment_wall_line": (
+                f"{gnn_setup_once_s:.6g}s + {n_ok} × {gnn_per_step_s:.6g}s = {gnn_total_wall_s:.6g}s"
+            ),
+            "opendss_solve_wall_line": (
+                f"{n_ok} × {open_solve_only_s_total / max(n_ok, 1):.6g}s = {open_solve_only_s_total:.6g}s"
+            ),
         },
         "timing_ms_per_ok_step": {
             "dss_apply_ms": dss_apply_ms,
