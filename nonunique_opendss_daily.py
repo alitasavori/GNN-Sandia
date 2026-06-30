@@ -44,7 +44,7 @@ DA_GPS_RUN_DIR = REPO_ROOT / (
 )
 DA_GPS_CACHE_PT = REPO_ROOT / (
     "datasets_gnn2_from pc/"
-    "run_001_scen_0000_0049_seed_20420233__full__nobess__regce__mauxb7bd1d58.pt"
+    "run_001_ref0_slim__full__nobess__regce__mauxb7bd1d58.pt"
 )
 DA_GPS_CHECKPOINT = DA_GPS_RUN_DIR / "training_last.pt"
 DA_GPS_LOAD_PROFILE = GRID_DIR / "5minDayShape.csv"
