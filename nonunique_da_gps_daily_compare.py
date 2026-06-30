@@ -411,6 +411,25 @@ def _build_opendss_run_for_plots(
     )
 
 
+def _gnn_deployment_wall_s(
+    gnn_total_wall_s: float | None,
+    gnn_setup_once_s: float | None,
+    gnn_per_step_s: float | None,
+    gnn_n_ok: int | None,
+) -> float | None:
+    """Deployment GNN wall (setup once + converged steps), matching ``run_da_gps_daily`` timers."""
+    if gnn_total_wall_s is not None and float(gnn_total_wall_s) > 0.0:
+        return float(gnn_total_wall_s)
+    if (
+        gnn_setup_once_s is not None
+        and gnn_per_step_s is not None
+        and gnn_n_ok is not None
+        and int(gnn_n_ok) > 0
+    ):
+        return float(gnn_setup_once_s) + int(gnn_n_ok) * float(gnn_per_step_s)
+    return None
+
+
 def print_timing_summary(
     *,
     n_ok: int,
@@ -432,8 +451,19 @@ def print_timing_summary(
     mean_collect_ms = 1000.0 * float(np.sum(dss_collect_s[:npts])) / n_ok
     dss_solve_total = float(np.sum(dss_solve_s[:npts]))
     dss_solve_per = dss_solve_total / n_ok
-    gnn_ms_per = 1000.0 * gnn_wall_s / npts
-    ratio = dss_wall_s / gnn_wall_s if gnn_wall_s > 1e-9 else float("nan")
+    gnn_deploy_s = _gnn_deployment_wall_s(
+        gnn_total_wall_s, gnn_setup_once_s, gnn_per_step_s, gnn_n_ok
+    )
+    gnn_ms_per = (
+        1000.0 * gnn_deploy_s / npts
+        if gnn_deploy_s is not None
+        else 1000.0 * gnn_wall_s / npts
+    )
+    ratio = (
+        dss_wall_s / gnn_deploy_s
+        if gnn_deploy_s is not None and gnn_deploy_s > 1e-9
+        else float("nan")
+    )
     print("\n[da_gps_daily_compare] === Timing summary ===", flush=True)
     print(f"  Display grid: step_min={step_min} min, npts={npts}", flush=True)
     if gnn_grid is not None:
@@ -464,17 +494,42 @@ def print_timing_summary(
         print(
             f"  DA-GPS deployment wall:       {float(gnn_setup_once_s):.4f}s + {int(gnn_n_ok)} × "
             f"{float(gnn_per_step_s):.4f}s = {float(gnn_total_wall_s):.4f}s  "
-            f"(setup + one GNN forward per displayed step)",
+            f"(setup + feature + infer per displayed step)",
             flush=True,
         )
-    print(f"  DA-GPS GNN total wall:        {gnn_wall_s:.2f} s  (full inference loop)", flush=True)
+    elif gnn_deploy_s is not None:
+        print(
+            f"  DA-GPS deployment wall:       {gnn_deploy_s:.2f} s  "
+            f"(setup + feature + infer; from run_da_gps_daily timers)",
+            flush=True,
+        )
+    wrapper_overhead = (
+        float(gnn_wall_s) - float(gnn_deploy_s)
+        if gnn_deploy_s is not None and gnn_wall_s > gnn_deploy_s + 1e-3
+        else None
+    )
+    print(
+        f"  DA-GPS wrapper wall:          {gnn_wall_s:.2f} s  "
+        f"(outer cell: import + cache/ckpt load before timed setup)",
+        flush=True,
+    )
+    if wrapper_overhead is not None:
+        print(
+            f"  DA-GPS wrapper overhead:      {wrapper_overhead:.2f} s  "
+            f"(wrapper − deployment; mostly one-time import/load)",
+            flush=True,
+        )
     print(
         f"  DA-GPS mean wall / display step: {gnn_ms_per:.2f} ms  "
-        f"(total wall / npts={npts}; compare to OpenDSS mean Solve above)",
+        f"(deployment wall / npts={npts}; compare to OpenDSS mean Solve above)",
         flush=True,
     )
     if np.isfinite(ratio):
-        print(f"  Wall speedup (OpenDSS/GNN):   {ratio:.2f}x", flush=True)
+        print(
+            f"  Wall speedup (OpenDSS/GNN deploy): {ratio:.2f}x  "
+            f"(dss loop wall / gnn_total_wall_s; excludes wrapper import)",
+            flush=True,
+        )
 
 
 def _final_devices_one_liner(
@@ -507,7 +562,17 @@ def _da_gps_compare_summary(
     n_pf_iter_figures: int,
 ) -> dict[str, Any]:
     gnn_grid = gnn.get("gnn_grid") or {}
-    speedup = dss_wall_s / gnn["gnn_wall_s"] if gnn["gnn_wall_s"] > 1e-9 else float("nan")
+    gnn_deploy_s = _gnn_deployment_wall_s(
+        gnn.get("gnn_total_wall_s"),
+        gnn.get("gnn_setup_once_s"),
+        gnn.get("gnn_per_step_s"),
+        gnn.get("n_ok"),
+    )
+    speedup = (
+        dss_wall_s / gnn_deploy_s
+        if gnn_deploy_s is not None and gnn_deploy_s > 1e-9
+        else float("nan")
+    )
     return {
         "mode": "da_gps_daily_compare",
         "step_min": cfg.step_min,
@@ -523,10 +588,12 @@ def _da_gps_compare_summary(
         "per_node_mae_pu": per_node_mae,
         "dss_wall_s": dss_wall_s,
         "gnn_wall_s": gnn["gnn_wall_s"],
+        "gnn_deployment_wall_s": gnn_deploy_s,
         "gnn_setup_once_s": gnn.get("gnn_setup_once_s"),
         "gnn_per_step_s": gnn.get("gnn_per_step_s"),
         "gnn_total_wall_s": gnn.get("gnn_total_wall_s"),
         "wall_speedup": speedup,
+        "wall_speedup_basis": "dss_wall_s / gnn_deployment_wall_s",
         "final_devices": _final_devices_one_liner(
             dss["reg_names"], dss["cap_names"], dss["reg_tap"], dss["cap_on"]
         ),
