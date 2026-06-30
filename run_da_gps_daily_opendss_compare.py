@@ -2197,10 +2197,15 @@ def run(
         der_max_kw=float(der_max_kw),
         der_q_frac=float(der_q_frac_p),
     )
-    x_step_buf = feat_tables["x_static"].copy()
-    x_torch_host = torch.from_numpy(x_step_buf)
+    x_torch_host = torch.from_numpy(feat_tables["x_static"].copy())
     if dev.type == "cuda":
+        # pin_memory() returns a NEW page-locked tensor whose storage is *not*
+        # shared with the source numpy array. Bind x_step_buf to that tensor's
+        # storage so per-step feature writes land in the buffer we actually copy
+        # to the GPU; otherwise the device only ever sees the initial static
+        # features and every step produces identical output.
         x_torch_host = x_torch_host.pin_memory()
+    x_step_buf = x_torch_host.numpy()
     x_t_dev = torch.empty((N, n_feat), dtype=torch.float32, device=dev)
 
     _meta_dbg_steps: set[int] = set()
