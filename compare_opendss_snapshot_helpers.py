@@ -256,6 +256,37 @@ def _profile_bind_csv(
     return out
 
 
+def _profile_mult_on_grid(
+    csv_path: Path,
+    *,
+    npts: int,
+    step_min: float,
+    native_npts: int = 288,
+    native_step_min: float = 5.0,
+) -> np.ndarray:
+    """Read a daily profile CSV and map it onto ``(npts, step_min)``.
+
+    Native training/driver CSVs are usually 288 rows at 5-min spacing. Coarser
+    OpenDSS / GNN grids use linear resampling over the 24 h day, not truncation.
+    """
+    import run_injection_dataset as inj
+    from nonunique_opendss_daily import resample_daily_profile
+
+    fp = csv_path.expanduser().resolve()
+    m_full = np.asarray(
+        inj.read_profile_csv_two_col_noheader(str(fp), npts=int(native_npts), debug=False),
+        dtype=np.float64,
+    )
+    if int(npts) == int(m_full.shape[0]) and float(step_min) == float(native_step_min):
+        return m_full
+    return resample_daily_profile(
+        m_full,
+        npts=int(npts),
+        step_min=int(step_min),
+        native_npts=int(m_full.shape[0]),
+    )
+
+
 def prepare_parity_profiles(
     load_csv: Path,
     irr_csv: Path,
@@ -267,12 +298,7 @@ def prepare_parity_profiles(
     stress_clip_hi: float = 3.0,
 ) -> ParityProfiles:
     """Single source for load / irradiance multipliers used by daily march and snapshot paths."""
-    import run_injection_dataset as inj
-
-    m_raw = np.asarray(
-        inj.read_profile_csv_two_col_noheader(str(load_csv), npts=int(npts), debug=False),
-        dtype=np.float64,
-    )
+    m_raw = _profile_mult_on_grid(load_csv, npts=int(npts), step_min=float(step_min))
     m_eff = stress_profile(
         m_raw,
         daily_stress=float(daily_stress),
@@ -280,10 +306,7 @@ def prepare_parity_profiles(
         hi=float(stress_clip_hi),
     )
     m_irr = np.clip(
-        np.asarray(
-            inj.read_profile_csv_two_col_noheader(str(irr_csv), npts=int(npts), debug=False),
-            dtype=np.float64,
-        ),
+        _profile_mult_on_grid(irr_csv, npts=int(npts), step_min=float(step_min)),
         0.0,
         None,
     )

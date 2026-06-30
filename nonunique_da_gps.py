@@ -14,6 +14,8 @@ from nonunique_opendss_daily import (
     NATIVE_NPTS,
     NATIVE_STEP_MIN,
     DailySimConfig,
+    da_gps_inference_grid,
+    display_hours_array,
     log_da_gps_device,
     resample_daily_profile_2d,
     resolve_da_gps_device,
@@ -74,9 +76,10 @@ def load_da_gps_overlay(
         print("=" * 72)
         print("DA-GPS overlay: profiles aligned with OpenDSS")
         print(f"  load/PV: {cfg.da_gps_load_profile} / {cfg.da_gps_pv_profile}")
+        inf_npts, inf_step_min = da_gps_inference_grid(cfg)
         print(
-            f"  steps: native {NATIVE_NPTS} @ {NATIVE_STEP_MIN} min, "
-            f"resampled to {cfg.npts} @ step_min={cfg.step_min} min"
+            f"  steps: {inf_npts} @ {inf_step_min} min "
+            f"(display grid; native training grid is {NATIVE_NPTS} @ {NATIVE_STEP_MIN} min)"
         )
         print("=" * 72)
 
@@ -99,8 +102,8 @@ def load_da_gps_overlay(
             der_max_kw=float(cfg.der_nominal_kw if cfg.include_der else 0.0),
             der_buses=str(cfg.der_bus if cfg.include_der else ""),
             der_profile_path=str(cfg.der_profile_csv if cfg.include_der else "") or None,
-            npts=int(NATIVE_NPTS),
-            step_min=int(NATIVE_STEP_MIN),
+            npts=int(inf_npts),
+            step_min=int(inf_step_min),
             skip_opendss=True,
             device=dev,
         )
@@ -110,13 +113,13 @@ def load_da_gps_overlay(
         reg_cols = list(bundle["reg_cols"])
         cap_cols = list(bundle["cap_cols"])
 
-        da_hours = np.arange(cfg.npts) * (cfg.step_min / 60.0)
-        da_src_h = np.arange(int(NATIVE_NPTS), dtype=float) * (NATIVE_STEP_MIN / 60.0)
-        if cfg.step_min == NATIVE_STEP_MIN and cfg.npts == NATIVE_NPTS:
+        da_hours = display_hours_array(cfg)
+        if int(inf_npts) == int(cfg.npts) and int(inf_step_min) == int(cfg.step_min):
             voltages = voltages_native
             reg_rs = reg_native
             cap_rs = cap_native
         else:
+            da_src_h = np.arange(int(inf_npts), dtype=float) * (float(inf_step_min) / 60.0)
             voltages = {
                 k: np.interp(da_hours, da_src_h, np.asarray(v, dtype=float))
                 for k, v in voltages_native.items()
@@ -125,14 +128,16 @@ def load_da_gps_overlay(
                 reg_native,
                 npts=cfg.npts,
                 step_min=cfg.step_min,
-                native_npts=NATIVE_NPTS,
+                native_npts=int(inf_npts),
+                native_step_min=int(inf_step_min),
                 method="nearest",
             )
             cap_rs = resample_daily_profile_2d(
                 cap_native,
                 npts=cfg.npts,
                 step_min=cfg.step_min,
-                native_npts=NATIVE_NPTS,
+                native_npts=int(inf_npts),
+                native_step_min=int(inf_step_min),
                 method="nearest",
             )
 

@@ -7,7 +7,22 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-from nonunique_opendss_daily import DailySimConfig, tap_pu_to_tap_number
+from nonunique_opendss_daily import DailySimConfig, display_hours_array, tap_pu_to_tap_number
+
+
+def _plot_npts(cfg: DailySimConfig) -> int:
+    return max(1, int(cfg.npts))
+
+
+def _trim_1d(series, n: int) -> np.ndarray:
+    return np.asarray(series, dtype=float).ravel()[:n]
+
+
+def _trim_step_matrix(matrix, n: int) -> np.ndarray:
+    arr = np.asarray(matrix, dtype=float)
+    if arr.ndim == 1:
+        return arr[:n]
+    return arr[:n, ...]
 
 
 def plot_voltage_monitors(
@@ -21,7 +36,8 @@ def plot_voltage_monitors(
     show: bool = True,
 ):
     monitor_nodes = runs[0]["monitor_nodes"]
-    hours = cfg.hours
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
     n_nodes = len(monitor_nodes)
     fig, axes = plt.subplots(n_nodes, 1, figsize=(16, 3.5 * n_nodes), sharex=True)
     axes = np.atleast_1d(axes)
@@ -29,15 +45,15 @@ def plot_voltage_monitors(
     for ax, node, j in zip(axes, monitor_nodes, range(n_nodes)):
         for run in runs:
             ls, lbl = style_lut[run["label"]]
-            ax.plot(hours, run["volts"][:, j], label=lbl, linestyle=ls)
+            ax.plot(hours, _trim_step_matrix(run["volts"], n)[:, j], label=lbl, linestyle=ls)
         if da_gps_voltages is not None and da_gps_hours is not None:
             v_da = da_gps_voltages.get(node)
             if v_da is None:
                 v_da = da_gps_voltages.get(str(node).lower())
             if v_da is not None:
                 ax.plot(
-                    da_gps_hours,
-                    v_da[: cfg.npts],
+                    _trim_1d(da_gps_hours, n),
+                    _trim_1d(v_da, n),
                     label="DA-GPS",
                     linestyle="-.",
                     color="magenta",
@@ -63,21 +79,22 @@ def plot_regulator_taps(
     da_gps_hours: np.ndarray | None = None,
     show: bool = True,
 ):
-    hours = cfg.hours
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
     reg_names = runs[0]["reg_names"]
     for idx, rname in enumerate(reg_names):
         fig, ax = plt.subplots(figsize=(16, 4))
         for run in runs:
             ls, lbl = style_lut[run["label"]]
-            ax.plot(hours, run["taps"][:, idx], label=lbl, linestyle=ls)
+            ax.plot(hours, _trim_step_matrix(run["taps"], n)[:, idx], label=lbl, linestyle=ls)
         if da_gps_reg_by_name is not None and da_gps_hours is not None:
             y_reg = da_gps_reg_by_name.get(rname)
             if y_reg is None:
                 y_reg = da_gps_reg_by_name.get(str(rname).lower())
             if y_reg is not None and np.isfinite(y_reg).any():
                 ax.plot(
-                    da_gps_hours,
-                    tap_pu_to_tap_number(y_reg[: cfg.npts]),
+                    _trim_1d(da_gps_hours, n),
+                    tap_pu_to_tap_number(_trim_1d(y_reg, n)),
                     label="DA-GPS",
                     linestyle="-.",
                     color="magenta",
@@ -103,21 +120,22 @@ def plot_capacitor_steps(
     da_gps_hours: np.ndarray | None = None,
     show: bool = True,
 ):
-    hours = cfg.hours
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
     cap_names = runs[0]["cap_names"]
     for j, cname in enumerate(cap_names):
         fig, ax = plt.subplots(figsize=(16, 4))
         for run in runs:
             ls, lbl = style_lut[run["label"]]
-            ax.plot(hours, run["cap_on"][:, j], label=lbl, linestyle=ls)
+            ax.plot(hours, _trim_step_matrix(run["cap_on"], n)[:, j], label=lbl, linestyle=ls)
         if da_gps_cap_by_name is not None and da_gps_hours is not None:
             y_cap = da_gps_cap_by_name.get(cname)
             if y_cap is None:
                 y_cap = da_gps_cap_by_name.get(str(cname).lower())
             if y_cap is not None and np.isfinite(y_cap).any():
                 ax.plot(
-                    da_gps_hours,
-                    y_cap[: cfg.npts],
+                    _trim_1d(da_gps_hours, n),
+                    _trim_1d(y_cap, n),
                     label="DA-GPS",
                     linestyle="-.",
                     color="magenta",
@@ -144,11 +162,12 @@ def plot_iteration_series(
     title: str,
     show: bool = True,
 ):
-    hours = cfg.hours
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
     fig, ax = plt.subplots(figsize=(16, 4))
     for run in runs:
         ls, lbl = style_lut[run["label"]]
-        ax.plot(hours, run[field], label=lbl, linestyle=ls)
+        ax.plot(hours, _trim_1d(run[field], n), label=lbl, linestyle=ls)
     ax.set_title(title)
     ax.set_xlabel("Hour of day")
     ax.set_ylabel(ylabel)

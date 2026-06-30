@@ -150,6 +150,22 @@ class DailySimConfig:
         return self.step_min / 60.0
 
 
+def da_gps_inference_grid(cfg: DailySimConfig) -> tuple[int, int]:
+    """``(npts, step_min)`` for DA-GPS GNN forwards on the user display grid.
+
+    When the notebook uses a coarser ``step_min`` than the native 5-min training
+    grid, inference runs one forward per displayed timestep (fair vs OpenDSS).
+    """
+    if cfg.step_min == NATIVE_STEP_MIN and cfg.npts == NATIVE_NPTS:
+        return int(NATIVE_NPTS), int(NATIVE_STEP_MIN)
+    return int(cfg.npts), int(cfg.step_min)
+
+
+def display_hours_array(cfg: DailySimConfig) -> np.ndarray:
+    """Hour-of-day axis for plots and overlays (length ``cfg.npts``)."""
+    return np.asarray(cfg.hours, dtype=np.float64)[: int(cfg.npts)]
+
+
 def tap_pu_to_tap_number(tap_pu, mintap=0.9, maxtap=1.1, n_steps=32):
     """Map winding tap (pu) to OpenDSS TapNumber scale (e.g. -16..+16)."""
     min_tap_num = -n_steps // 2
@@ -192,6 +208,7 @@ def resample_daily_profile_2d(
     npts: int,
     step_min: int,
     native_npts: int | None = None,
+    native_step_min: int = NATIVE_STEP_MIN,
     method: str = "linear",
 ):
     arr = np.asarray(arr, dtype=float)
@@ -199,7 +216,7 @@ def resample_daily_profile_2d(
         native_npts = int(arr.shape[0])
     if int(arr.shape[0]) == int(npts):
         return arr.copy()
-    src_h = np.arange(int(native_npts), dtype=float) * (NATIVE_STEP_MIN / 60.0)
+    src_h = np.arange(int(native_npts), dtype=float) * (int(native_step_min) / 60.0)
     tgt_h = np.arange(int(npts), dtype=float) * (step_min / 60.0)
     if method == "nearest":
         return arr[_nearest_source_indices(src_h, tgt_h), :].copy()

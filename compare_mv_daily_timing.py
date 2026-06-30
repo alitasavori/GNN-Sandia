@@ -356,6 +356,13 @@ def format_gnn_grid_log(
             f"{timing['internal_step_min']} min, overlay resampled to "
             f"{timing['display_npts']} @ {timing['display_step_min']} min"
         )
+    if int(timing.get("internal_npts", 0)) == int(timing.get("display_npts", 0)) and int(
+        timing.get("internal_step_min", 0)
+    ) == int(timing.get("display_step_min", 0)):
+        return (
+            f"{prefix} DA-GPS GNN: {timing['display_npts']} forwards @ "
+            f"{timing['display_step_min']} min (display grid; matches OpenDSS)"
+        )
     return (
         f"{prefix} DA-GPS GNN: {timing['display_npts']} steps @ "
         f"{timing['display_step_min']} min (native grid)"

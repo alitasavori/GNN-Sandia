@@ -3,8 +3,8 @@
 OpenDSS truth path: compile once, ``mode=daily``, sequential ``Solve()`` with warm-start
 carry-forward — **not** snapshot-by-snapshot independent solves.
 
-DA-GPS path: GNN-only inference (``skip_opendss=True``), native 288@5 min then resampled
-onto the notebook ``step_min`` grid.
+DA-GPS path: GNN-only inference (``skip_opendss=True``) on the notebook
+``(step_min, npts)`` grid — same timestep as OpenDSS when ``STEP_MIN`` > 5 min.
 
 Default load/PV profiles: ``load_day_004.csv`` / ``irr_day_004.csv`` (reference driver).
 """
@@ -38,6 +38,8 @@ from nonunique_opendss_daily import (
     DA_GPS_REF_PV_PROFILE,
     MONITOR_CANDIDATES,
     DailySimConfig,
+    da_gps_inference_grid,
+    display_hours_array,
     log_da_gps_device,
     make_run_result,
     read_solve_iterations,
@@ -188,7 +190,7 @@ def run_opendss_daily_truth(
         "control_iters": control_iters,
         "pf_iters_total": pf_iters_total,
         "total_wall_s": total_wall,
-        "hours": cfg.hours.copy(),
+        "hours": display_hours_array(cfg),
     }
 
 
@@ -201,7 +203,7 @@ def run_da_gps_predictions(
     scenario_scale: float = 1.0,
     inline_backend: str | None = None,
 ) -> dict[str, Any]:
-    """GNN-only DA-GPS inference; resample native 288@5 min onto ``cfg`` grid."""
+    """GNN-only DA-GPS inference on the notebook display ``(npts, step_min)`` grid."""
     cwd_before = os.getcwd()
     t0 = time.perf_counter()
     try:
@@ -216,13 +218,14 @@ def run_da_gps_predictions(
         os.chdir(cfg.repo_root)
         dev = resolve_da_gps_device(device)
         log_da_gps_device(dev)
+        inf_npts, inf_step_min = da_gps_inference_grid(cfg)
         print(
             format_gnn_grid_log(
                 amortize_gnn_timing_to_display_grid(
                     display_npts=cfg.npts,
                     display_step_min=cfg.step_min,
-                    internal_npts=NATIVE_NPTS,
-                    internal_step_min=NATIVE_STEP_MIN,
+                    internal_npts=inf_npts,
+                    internal_step_min=inf_step_min,
                     gnn_setup_once_s=None,
                     gnn_per_step_s=None,
                     gnn_total_wall_s=None,
@@ -247,8 +250,8 @@ def run_da_gps_predictions(
             der_max_kw=float(cfg.der_nominal_kw if cfg.include_der else 0.0),
             der_buses=str(cfg.der_bus if cfg.include_der else ""),
             der_profile_path=str(cfg.der_profile_csv if cfg.include_der else "") or None,
-            npts=int(NATIVE_NPTS),
-            step_min=int(NATIVE_STEP_MIN),
+            npts=int(inf_npts),
+            step_min=int(inf_step_min),
             scenario_scale=float(scenario_scale),
             ref_sample_index=int(ref_sample_index),
             skip_opendss=True,
@@ -261,13 +264,13 @@ def run_da_gps_predictions(
         reg_cols = list(bundle["reg_cols"])
         cap_cols = list(bundle["cap_cols"])
 
-        da_hours = cfg.hours
-        da_src_h = np.arange(int(NATIVE_NPTS), dtype=float) * (NATIVE_STEP_MIN / 60.0)
-        if cfg.step_min == NATIVE_STEP_MIN and cfg.npts == NATIVE_NPTS:
+        da_hours = display_hours_array(cfg)
+        if int(inf_npts) == int(cfg.npts) and int(inf_step_min) == int(cfg.step_min):
             voltages = voltages_native
             reg_rs = reg_native
             cap_rs = cap_native
         else:
+            da_src_h = np.arange(int(inf_npts), dtype=float) * (float(inf_step_min) / 60.0)
             voltages = {
                 k: np.interp(da_hours, da_src_h, np.asarray(v, dtype=float))
                 for k, v in voltages_native.items()
@@ -276,14 +279,16 @@ def run_da_gps_predictions(
                 reg_native,
                 npts=cfg.npts,
                 step_min=cfg.step_min,
-                native_npts=NATIVE_NPTS,
+                native_npts=int(inf_npts),
+                native_step_min=int(inf_step_min),
                 method="nearest",
             )
             cap_rs = resample_daily_profile_2d(
                 cap_native,
                 npts=cfg.npts,
                 step_min=cfg.step_min,
-                native_npts=NATIVE_NPTS,
+                native_npts=int(inf_npts),
+                native_step_min=int(inf_step_min),
                 method="nearest",
             )
 
@@ -291,8 +296,8 @@ def run_da_gps_predictions(
         timing = amortize_gnn_timing_to_display_grid(
             display_npts=cfg.npts,
             display_step_min=cfg.step_min,
-            internal_npts=NATIVE_NPTS,
-            internal_step_min=NATIVE_STEP_MIN,
+            internal_npts=int(inf_npts),
+            internal_step_min=int(inf_step_min),
             gnn_setup_once_s=bundle.get("gnn_setup_once_s"),
             gnn_per_step_s=bundle.get("gnn_per_step_s"),
             gnn_total_wall_s=bundle.get("gnn_total_wall_s"),
@@ -430,9 +435,18 @@ def print_timing_summary(
     gnn_ms_per = 1000.0 * gnn_wall_s / npts
     ratio = dss_wall_s / gnn_wall_s if gnn_wall_s > 1e-9 else float("nan")
     print("\n[da_gps_daily_compare] === Timing summary ===", flush=True)
-    print(f"  step_min={step_min} min, npts={npts}", flush=True)
+    print(f"  Display grid: step_min={step_min} min, npts={npts}", flush=True)
     if gnn_grid is not None:
         print(f"  {format_gnn_grid_log(gnn_grid, prefix='').strip()}", flush=True)
+        internal_n = int(gnn_grid.get("internal_npts", npts))
+        internal_step = int(gnn_grid.get("internal_step_min", step_min))
+        if internal_n != npts or internal_step != step_min:
+            internal_per_ms = 1000.0 * float(gnn_grid.get("internal_per_step_s", 0.0))
+            print(
+                f"  DA-GPS internal forwards:   {internal_n} × {internal_per_ms:.2f} ms "
+                f"@ {internal_step} min",
+                flush=True,
+            )
     print(
         f"  OpenDSS Solve() wall:         {n_ok} × {dss_solve_per:.4f}s = {dss_solve_total:.4f}s  "
         f"(compile-once not timed; loop wall incl. collect = {dss_wall_s:.2f} s)",
@@ -450,11 +464,15 @@ def print_timing_summary(
         print(
             f"  DA-GPS deployment wall:       {float(gnn_setup_once_s):.4f}s + {int(gnn_n_ok)} × "
             f"{float(gnn_per_step_s):.4f}s = {float(gnn_total_wall_s):.4f}s  "
-            f"(gnn_setup_once_s + npts × gnn_per_step_s = gnn_total_wall_s; per displayed step)",
+            f"(setup + one GNN forward per displayed step)",
             flush=True,
         )
-    print(f"  DA-GPS GNN total wall:        {gnn_wall_s:.2f} s", flush=True)
-    print(f"  DA-GPS mean wall / step:      {gnn_ms_per:.2f} ms  (at step_min={step_min}, npts={npts})", flush=True)
+    print(f"  DA-GPS GNN total wall:        {gnn_wall_s:.2f} s  (full inference loop)", flush=True)
+    print(
+        f"  DA-GPS mean wall / display step: {gnn_ms_per:.2f} ms  "
+        f"(total wall / npts={npts}; compare to OpenDSS mean Solve above)",
+        flush=True,
+    )
     if np.isfinite(ratio):
         print(f"  Wall speedup (OpenDSS/GNN):   {ratio:.2f}x", flush=True)
 
