@@ -10,8 +10,26 @@ import torch.nn as nn
 
 
 def _default_gnn_torch_compile() -> str:
-    """Windows + CPU Inductor often needs MSVC ``cl``; default compile off unless user opts in."""
-    return "0" if sys.platform == "win32" else "1"
+    """Default compile **off** (CPU and GPU). Set ``GNN_TORCH_COMPILE=1`` to opt in."""
+    return "0"
+
+
+def configure_cuda_inference(device) -> None:
+    """Enable safe CUDA matmul/conv speedups for sequential batch-1 inference."""
+    if not isinstance(device, torch.device):
+        device = torch.device(str(device))
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    if hasattr(torch.backends.cuda, "matmul") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = True
+    print(
+        "[GNN] CUDA inference opts: TF32 matmul (float32_matmul_precision=high), cudnn.benchmark=True",
+        flush=True,
+    )
 
 
 class _CompileOrEager(nn.Module):
@@ -55,8 +73,8 @@ def maybe_torch_compile(model: nn.Module, *, label: str = "GNN") -> nn.Module:
     Wrap ``model`` with ``torch.compile`` when PyTorch supports it and
     ``GNN_TORCH_COMPILE`` is not ``0``/``false``.
 
-    Default: **on** on Linux/macOS, **off** on Windows (CPU Inductor there typically needs
-    MSVC ``cl``; set ``GNN_TORCH_COMPILE=1`` to try anyway — failures fall back to eager).
+    Default: **off** everywhere. Set ``GNN_TORCH_COMPILE=1`` to opt in (Inductor on Linux/macOS;
+    on Windows uses Dynamo+eager backend — failures fall back to plain eager).
 
     First few forwards after compile can be slow (graph capture); timing prints
     still include that overhead unless you add a separate warmup loop.

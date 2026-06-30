@@ -120,7 +120,7 @@ from torch_geometric.data import Data
 
 import run_injection_dataset as inj
 import run_daily_aggregate_dataset_8500 as rd8500
-from compare_gnn_inference_utils import maybe_torch_compile
+from compare_gnn_inference_utils import configure_cuda_inference, maybe_torch_compile
 from compare_mv_daily_timing import (
     per_ok_ms,
     print_mv_daily_timing_summary,
@@ -1019,6 +1019,219 @@ def _fill_pq_columns(
                 x_step[li, col_q] = float(node_Q.get(nk, 0.0))
 
 
+def _busph_key_from_node_key(key_str: str) -> tuple[str, int] | None:
+    parts = str(key_str).strip().lower().rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return parts[0], int(parts[1])
+    except ValueError:
+        return None
+
+
+def _precompute_daily_feature_tables(
+    *,
+    ref_x: np.ndarray,
+    node_order: list[str],
+    load_to_busph: dict[str, list[tuple[str, int, float]]],
+    base_names: list[str],
+    base_kw: np.ndarray,
+    base_kvar: np.ndarray,
+    col_p: int | None,
+    col_q: int | None,
+    col_pv: int | None,
+    col_bess_p: int | None,
+    col_bess_q: int | None,
+    mv_rules: list[dict[str, str]],
+    pv_names: list[str],
+    pv_base_pmpp_kw: dict[str, float],
+    pv_to_busph: dict[str, list[tuple[str, int, float]]],
+    der_effective_buses: list[str],
+    der_bus_phases: dict[str, list[int]],
+    node_to_local: dict[str, int],
+    der_use_bess_columns: bool,
+    der_max_kw: float,
+    der_q_frac: float,
+) -> dict[str, object]:
+    """Static tables for per-step node feature assembly (load P/Q, PV presolve, DER)."""
+    N = int(ref_x.shape[0])
+    key_to_idx: dict[tuple[str, int], int] = {}
+    load_j_list: list[int] = []
+    w_list: list[float] = []
+    idx_list: list[int] = []
+    for j, name in enumerate(base_names):
+        for bus, ph, w in load_to_busph.get(name, []):
+            bk = str(bus).strip().lower()
+            key = (bk, int(ph))
+            if key not in key_to_idx:
+                key_to_idx[key] = len(key_to_idx)
+            idx_list.append(key_to_idx[key])
+            load_j_list.append(j)
+            w_list.append(float(w))
+    n_busph = len(key_to_idx)
+    busph_load_j = np.asarray(load_j_list, dtype=np.int32)
+    busph_idx = np.asarray(idx_list, dtype=np.int32)
+    busph_w = np.asarray(w_list, dtype=np.float64)
+
+    node_busph_idx = np.full(N, -1, dtype=np.int32)
+    for li, nk in enumerate(node_order):
+        key = _busph_key_from_node_key(nk)
+        if key is not None:
+            bi = key_to_idx.get(key)
+            if bi is not None:
+                node_busph_idx[li] = int(bi)
+
+    mv_li: np.ndarray | None = None
+    mv_a_idx: np.ndarray | None = None
+    mv_b_idx: np.ndarray | None = None
+    if mv_rules and (col_p is not None or col_q is not None):
+        nk_to_li = {str(nk).strip().lower(): li for li, nk in enumerate(node_order)}
+        mvl: list[int] = []
+        mva: list[int] = []
+        mvb: list[int] = []
+        for rec in mv_rules:
+            mv = str(rec["mv_key"]).strip().lower()
+            li = nk_to_li.get(mv)
+            if li is None:
+                continue
+            ka = _busph_key_from_node_key(rec["load_a"])
+            kb = _busph_key_from_node_key(rec["load_b"])
+            if ka is None or kb is None:
+                continue
+            a_idx = key_to_idx.get(ka)
+            b_idx = key_to_idx.get(kb)
+            if a_idx is None or b_idx is None:
+                continue
+            mvl.append(int(li))
+            mva.append(int(a_idx))
+            mvb.append(int(b_idx))
+        if mvl:
+            mv_li = np.asarray(mvl, dtype=np.int32)
+            mv_a_idx = np.asarray(mva, dtype=np.int32)
+            mv_b_idx = np.asarray(mvb, dtype=np.int32)
+
+    pv_node_coeff: np.ndarray | None = None
+    if col_pv is not None:
+        pv_busph_coeff = np.zeros(max(1, n_busph), dtype=np.float32)
+        for nm in pv_names:
+            raw = str(nm).strip()
+            b0 = float(pv_base_pmpp_kw.get(raw, 0.0))
+            if b0 <= 0.0 or not np.isfinite(b0):
+                continue
+            for bus, ph, w in pv_to_busph.get(raw, []):
+                bk = str(bus).strip().lower()
+                key = (bk, int(ph))
+                bi = key_to_idx.get(key)
+                if bi is not None:
+                    pv_busph_coeff[bi] += float(b0) * float(w)
+        pv_node_coeff = np.zeros(N, dtype=np.float32)
+        valid = node_busph_idx >= 0
+        pv_node_coeff[valid] = pv_busph_coeff[node_busph_idx[valid]]
+
+    der_p_unit = np.zeros(N, dtype=np.float32)
+    der_q_unit = np.zeros(N, dtype=np.float32)
+    if der_effective_buses:
+        n_bus = max(1, len(der_effective_buses))
+        for bus_raw in der_effective_buses:
+            bk = str(bus_raw).strip().lower()
+            phases = der_bus_phases.get(bk) or []
+            if not phases:
+                continue
+            nph = max(1, len(phases))
+            p_unit = 1.0 / float(n_bus * nph)
+            q_unit = float(der_q_frac) * p_unit
+            for ph in phases:
+                nk = f"{bk}.{int(ph)}"
+                li = node_to_local.get(nk)
+                if li is None:
+                    continue
+                der_p_unit[int(li)] = float(p_unit)
+                der_q_unit[int(li)] = float(q_unit)
+
+    return {
+        "x_static": np.ascontiguousarray(ref_x, dtype=np.float32),
+        "base_kw": base_kw,
+        "base_kvar": base_kvar,
+        "busph_load_j": busph_load_j,
+        "busph_idx": busph_idx,
+        "busph_w": busph_w,
+        "n_busph": n_busph,
+        "node_busph_idx": node_busph_idx,
+        "mv_li": mv_li,
+        "mv_a_idx": mv_a_idx,
+        "mv_b_idx": mv_b_idx,
+        "pv_node_coeff": pv_node_coeff,
+        "der_p_unit": der_p_unit,
+        "der_q_unit": der_q_unit,
+        "der_use_bess_columns": bool(der_use_bess_columns),
+        "der_max_kw": float(der_max_kw),
+        "der_q_frac": float(der_q_frac),
+        "col_p": col_p,
+        "col_q": col_q,
+        "col_pv": col_pv,
+        "col_bess_p": col_bess_p,
+        "col_bess_q": col_bess_q,
+    }
+
+
+def _apply_daily_feature_tables(
+    x_step: np.ndarray,
+    ft: dict[str, object],
+    *,
+    m_t: float,
+    ir_t: float,
+    m_der_t: float,
+    want_der: bool,
+) -> None:
+    """Fill dynamic node-feature columns in ``x_step`` (reuses static tail from prior copy)."""
+    kw_set = ft["base_kw"] * float(m_t)
+    kvar_set = ft["base_kvar"] * float(m_t)
+    w = ft["busph_w"]
+    lj = ft["busph_load_j"]
+    bi = ft["busph_idx"]
+    nb = int(ft["n_busph"])
+    busph_P = np.bincount(bi, weights=kw_set[lj] * w, minlength=nb)
+    busph_Q = np.bincount(bi, weights=kvar_set[lj] * w, minlength=nb)
+
+    col_p = ft["col_p"]
+    col_q = ft["col_q"]
+    mv_li = ft["mv_li"]
+    if mv_li is not None:
+        if col_p is not None:
+            x_step[mv_li, int(col_p)] = (busph_P[ft["mv_a_idx"]] + busph_P[ft["mv_b_idx"]]).astype(np.float32)
+        if col_q is not None:
+            x_step[mv_li, int(col_q)] = (busph_Q[ft["mv_a_idx"]] + busph_Q[ft["mv_b_idx"]]).astype(np.float32)
+    else:
+        nbi = ft["node_busph_idx"]
+        valid = nbi >= 0
+        if col_p is not None:
+            x_step[:, int(col_p)] = 0.0
+            x_step[valid, int(col_p)] = busph_P[nbi[valid]].astype(np.float32)
+        if col_q is not None:
+            x_step[:, int(col_q)] = 0.0
+            x_step[valid, int(col_q)] = busph_Q[nbi[valid]].astype(np.float32)
+
+    col_pv = ft["col_pv"]
+    pv_node_coeff = ft["pv_node_coeff"]
+    if col_pv is not None and pv_node_coeff is not None:
+        x_step[:, int(col_pv)] = pv_node_coeff * float(ir_t)
+
+    if want_der:
+        der_scale = float(m_der_t) * float(ft["der_max_kw"])
+        if ft["der_use_bess_columns"]:
+            col_pb = ft["col_bess_p"]
+            col_qb = ft["col_bess_q"]
+            if col_pb is not None:
+                x_step[:, int(col_pb)] = ft["der_p_unit"] * der_scale
+            if col_qb is not None:
+                x_step[:, int(col_qb)] = ft["der_q_unit"] * der_scale
+        else:
+            if col_p is not None:
+                x_step[:, int(col_p)] += ft["der_p_unit"] * der_scale
+            if col_q is not None:
+                x_step[:, int(col_q)] += ft["der_q_unit"] * der_scale
+
+
 def _auto_ylim_padded(*series: np.ndarray, pad_frac: float = 0.22, pad_floor: float = 0.0) -> tuple[float, float] | None:
     """Union of finite values across 1+ arrays → (lo, hi) with padding (for shared-scale plots)."""
     chunks: list[np.ndarray] = []
@@ -1687,6 +1900,7 @@ def run(
 
     dev = torch.device(resolve_da_gps_device(device))
     log_da_gps_device(str(dev))
+    configure_cuda_inference(dev)
 
     dropout = float(hp.get("dropout", 0.1))
     if bool(hp.get("disable_dropout", False)):
@@ -1960,6 +2174,35 @@ def run(
     ei = edge_index.to(dev)
     ea = edge_attr.to(dev)
 
+    feat_tables = _precompute_daily_feature_tables(
+        ref_x=ref_x,
+        node_order=node_order,
+        load_to_busph=load_to_busph,
+        base_names=base_names,
+        base_kw=base_kw,
+        base_kvar=base_kvar,
+        col_p=col_p,
+        col_q=col_q,
+        col_pv=col_pv,
+        col_bess_p=col_bess_p,
+        col_bess_q=col_bess_q,
+        mv_rules=mv_rules,
+        pv_names=pv_names_dss,
+        pv_base_pmpp_kw=pv_base_pmpp_kw,
+        pv_to_busph=pv_to_busph_w,
+        der_effective_buses=der_effective_buses,
+        der_bus_phases=der_bus_phases,
+        node_to_local=node_to_local,
+        der_use_bess_columns=der_use_bess_columns,
+        der_max_kw=float(der_max_kw),
+        der_q_frac=float(der_q_frac_p),
+    )
+    x_step_buf = feat_tables["x_static"].copy()
+    x_torch_host = torch.from_numpy(x_step_buf)
+    if dev.type == "cuda":
+        x_torch_host = x_torch_host.pin_memory()
+    x_t_dev = torch.empty((N, n_feat), dtype=torch.float32, device=dev)
+
     _meta_dbg_steps: set[int] = set()
     if meta_debug:
         _meta_dbg_steps = {
@@ -2117,73 +2360,25 @@ def run(
             )
 
         t_fb0 = time.perf_counter()
-        kw_set = base_kw * float(m_t)
-        kvar_set = base_kvar * float(m_t)
-        busphP_load: dict[tuple[str, int], float] = {}
-        busphQ_load: dict[tuple[str, int], float] = {}
-        for j, name in enumerate(base_names):
-            for bus, ph, w in load_to_busph[name]:
-                bk = str(bus).strip().lower()
-                busphP_load[(bk, int(ph))] = busphP_load.get((bk, int(ph)), 0.0) + float(kw_set[j]) * float(w)
-                busphQ_load[(bk, int(ph))] = busphQ_load.get((bk, int(ph)), 0.0) + float(kvar_set[j]) * float(w)
-        node_P: dict[str, float] = {}
-        node_Q: dict[str, float] = {}
-        for (bus, ph), pval in busphP_load.items():
-            nk = f"{str(bus).strip().lower()}.{int(ph)}"
-            node_P[nk] = float(pval)
-        for (bus, ph), qval in busphQ_load.items():
-            nk = f"{str(bus).strip().lower()}.{int(ph)}"
-            node_Q[nk] = float(qval)
-
-        x_step = np.array(ref_x, copy=True, dtype=np.float32)
-        _fill_pq_columns(x_step, col_p, col_q, node_order, node_P, node_Q, mv_rules)
-        if col_pv is not None:
-            _fill_p_pv_kw_from_pmpp_and_irr(
-                x_step,
-                int(col_pv),
-                node_order,
-                pv_names_dss,
-                pv_base_pmpp_kw,
-                pv_to_busph_w,
-                ir_t,
-            )
-        if want_der:
-            if der_use_bess_columns:
-                _zero_bess_columns(x_step, col_bess_p, col_bess_q)
-                _fill_der_as_bess_node_features(
-                    x_step,
-                    der_effective_buses,
-                    der_bus_phases,
-                    node_to_local,
-                    col_bess_p,
-                    col_bess_q,
-                    p_profile_scale=m_der_t,
-                    der_max_kw=float(der_max_kw),
-                    der_q_frac=float(der_q_frac_p),
-                )
-            else:
-                _add_der_to_pq_load_columns(
-                    x_step,
-                    der_effective_buses,
-                    der_bus_phases,
-                    node_to_local,
-                    col_p,
-                    col_q,
-                    p_profile_scale=m_der_t,
-                    der_max_kw=float(der_max_kw),
-                    der_q_frac=float(der_q_frac_p),
-                )
+        _apply_daily_feature_tables(
+            x_step_buf,
+            feat_tables,
+            m_t=float(m_t),
+            ir_t=float(ir_t),
+            m_der_t=float(m_der_t),
+            want_der=bool(want_der),
+        )
 
         if first_diag:
             first_diag = False
-            nz = int(np.sum(np.abs(x_step[:, col_p]) + np.abs(x_step[:, col_q]) > 1e-3))
+            nz = int(np.sum(np.abs(x_step_buf[:, col_p]) + np.abs(x_step_buf[:, col_q]) > 1e-3))
             print(f"[da_gps_daily] feature diag (first step): nodes with |P|+|Q|>1e-3: {nz}/{N}", flush=True)
 
         feature_build_s_total += time.perf_counter() - t_fb0
 
         t_gnn0 = time.perf_counter()
-        x_t = torch.from_numpy(x_step).to(dev)
-        x_n = (x_t - x_mean_d) / x_std_d
+        x_t_dev.copy_(x_torch_host, non_blocking=(dev.type == "cuda"))
+        x_n = (x_t_dev - x_mean_d) / x_std_d
         data = Data(x=x_n, edge_index=ei, edge_attr=ea)
         with torch.no_grad():
             t_fwd0 = time.perf_counter()
@@ -2242,7 +2437,7 @@ def run(
             if want_der:
                 bits.append(f"m_der[i]={m_der_t:.6g}")
             if col_pv is not None:
-                bits.append(f"x_step[p_pv_kw]_mean={float(np.mean(x_step[:, col_pv])):.6g}")
+                bits.append(f"x_step[p_pv_kw]_mean={float(np.mean(x_step_buf[:, col_pv])):.6g}")
                 bits.append(f"x_n[p_pv_kw]_mean={float(x_n[:, col_pv].mean().item()):.6g}")
             if col_p is not None:
                 bits.append(f"x_n[p_load_kw]_mean={float(x_n[:, col_p].mean().item()):.6g}")
