@@ -8,6 +8,15 @@ v2 alignment:
 - Tokens are pure learnable parameters (no host-node warm start).
 - No effective-resistance attention bias.
 - Aux targets are hardcoded in-script (old aux-trainer style).
+
+Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent fallbacks):
+- After denormalizing predicted complex voltage (Re/Im head), penalize nodal P/Q balance residuals
+  ``r_P = P_inj - Re(V*conj(YV))``, ``r_Q = Q_inj - Im(V*conj(YV))`` on selected nodes.
+- Base ``Y`` from line ``R_full``/``X_full`` in ``--edge_catalog_csv``; regulator branches from
+  ``--pf_reg_edge_catalog`` are stamped with **predicted** tap ratios and capacitor banks add shunt ``j*B`` at mapped
+  cap buses from **predicted** cap states (``--pf_detach_controls`` optionally stops gradients through controls).
+- ``P_inj``/``Q_inj`` are assembled from denormalized loads, meta-aux PV head outputs (``pv_*_p_post_kw``), and
+  predicted cap Q at mapped cap nodes (see ``_assemble_pf_injections``). Missing catalog/mapping/normalization → error.
 """
 from __future__ import annotations
 
@@ -18,7 +27,9 @@ import gc
 import hashlib
 import json
 import math
+import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 import torch
@@ -55,6 +66,697 @@ def _to_dense_batch_mv(
         return dense, mask
     return to_dense_batch(x, batch)
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
+
+
+def _device_stem(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
+
+def _cap_col_stem(col: str) -> str | None:
+    m = re.match(r"^cap_(.+)_n_steps_on$", str(col).strip(), flags=re.IGNORECASE)
+    return _device_stem(m.group(1)) if m else None
+
+
+def _reg_col_stem(col: str) -> str | None:
+    m = re.match(r"^reg_(.+)_tap_pu$", str(col).strip(), flags=re.IGNORECASE)
+    return _device_stem(m.group(1)) if m else None
+
+
+def _parse_capacitors_dss(dss_path: Path) -> dict[str, tuple[str, float]]:
+    """``stem -> (bus1_node, kvar)`` from ``New Capacitor.NAME Bus1=... kvar=...`` lines."""
+    out: dict[str, tuple[str, float]] = {}
+    if not dss_path.is_file():
+        return out
+    pat = re.compile(
+        r"New\s+Capacitor\.(\S+)\s+.*?Bus1=(\S+)\s+.*?kvar=([0-9.eE+-]+)",
+        flags=re.IGNORECASE,
+    )
+    for line in dss_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = pat.search(line.replace("~", " "))
+        if not m:
+            continue
+        nm, bus, kvar = m.group(1), m.group(2), float(m.group(3))
+        out[_device_stem(nm)] = (str(bus).strip().lower(), float(kvar))
+    return out
+
+
+def _resolve_cap_bus_nodes(
+    cap_cols: list[str],
+    node_to_local: dict[str, int],
+    *,
+    cap_nodes_csv: Path | None,
+    meta_csv: Path | None,
+    capacitors_dss: Path | None,
+) -> list[tuple[int, float, int]]:
+    """``(local_node_idx, q_nominal_kvar, cap_col_index)`` for shunt-Y and Q injection."""
+    import pandas as pd
+
+    q_nom_by_stem: dict[str, float] = {}
+    if meta_csv is not None and meta_csv.is_file():
+        hdr = [str(c).lower() for c in pd.read_csv(meta_csv, nrows=0).columns.tolist()]
+        for c in hdr:
+            m = re.match(r"^cap_(.+)_q_nominal_kvar$", c, flags=re.IGNORECASE)
+            if m:
+                st = _device_stem(m.group(1))
+                row = pd.read_csv(meta_csv, usecols=[c], nrows=1)
+                q_nom_by_stem[st] = float(row[c].iloc[0])
+
+    bus_by_stem: dict[str, str] = {}
+    if capacitors_dss is not None:
+        for st, (bus, kvar) in _parse_capacitors_dss(capacitors_dss).items():
+            bus_by_stem[st] = bus
+            q_nom_by_stem.setdefault(st, float(kvar))
+
+    if cap_nodes_csv is not None and cap_nodes_csv.is_file():
+        cdf = pd.read_csv(cap_nodes_csv)
+        cap_name_col = next((c for c in cdf.columns if str(c).strip().upper() == "CAP"), None)
+        bus_col = next(
+            (
+                c
+                for c in cdf.columns
+                if str(c).strip().lower() in ("cap bus node", "feeder-side node", "from node")
+            ),
+            None,
+        )
+        if cap_name_col and bus_col:
+            for _, row in cdf.iterrows():
+                st = _device_stem(row[cap_name_col])
+                bus = str(row[bus_col]).strip().lower()
+                if bus and bus != "nan":
+                    bus_by_stem.setdefault(st, bus)
+
+    banks: list[tuple[int, float, int]] = []
+    for j, col in enumerate(cap_cols):
+        st = _cap_col_stem(col)
+        if not st:
+            raise ValueError(f"Cannot parse capacitor stem from meta column {col!r}")
+        bus = bus_by_stem.get(st)
+        if bus is None:
+            raise ValueError(
+                f"No bus mapping for capacitor {st!r} (column {col!r}). "
+                "Set --pf_cap_nodes_csv or provide capacitor_involved_nodes.csv with CAP and bus columns."
+            )
+        if bus not in node_to_local:
+            raise ValueError(f"Capacitor bus {bus!r} for {st!r} not in node index map")
+        if st not in q_nom_by_stem:
+            raise ValueError(
+                f"No q_nominal_kvar for capacitor {st!r}; need cap_*_q_nominal_kvar in meta CSV or Capacitors.dss"
+            )
+        q_nom = float(q_nom_by_stem[st])
+        banks.append((int(node_to_local[bus]), q_nom, int(j)))
+    return banks
+
+
+def _load_regulator_edges_for_pf(
+    reg_catalog_csv: Path,
+    node_to_local: dict[str, int],
+    reg_cols: list[str],
+    z_base_ohm: float,
+) -> list[tuple[int, int, float, float, int]]:
+    """Regulator series branches: ``(iu, iv, g_pu, b_pu, reg_col_idx)``.
+
+    Catalog row ``from_node`` is the regulated (downstream) bus; ``to_node`` is ``regxfmr_*``.
+    OpenDSS places the off-nominal tap on winding 2 (downstream). Stamp uses tap ``a`` on node ``iu``.
+    """
+    import pandas as pd
+
+    if not reg_catalog_csv.is_file():
+        raise FileNotFoundError(f"Regulator edge catalog not found: {reg_catalog_csv}")
+    df = pd.read_csv(reg_catalog_csv)
+    if "edge_type" not in df.columns:
+        raise ValueError(f"{reg_catalog_csv} missing 'edge_type' column")
+    reg_rows = df[df["edge_type"].astype(str).str.strip().str.lower() == "regulator"]
+    col_to_j = {_reg_col_stem(c): j for j, c in enumerate(reg_cols) if _reg_col_stem(c)}
+    z_base = float(z_base_ohm)
+    edges: list[tuple[int, int, float, float, int]] = []
+    for _, row in reg_rows.iterrows():
+        u = str(row["from_node"]).strip().lower()
+        v = str(row["to_node"]).strip().lower()
+        if u not in node_to_local or v not in node_to_local:
+            raise ValueError(
+                f"Regulator edge nodes {u!r}/{v!r} from {reg_catalog_csv} not in node index map"
+            )
+        tap_col = str(row.get("tap_column", "")).strip().lower()
+        rj = col_to_j.get(_reg_col_stem(tap_col))
+        rlab = str(row.get("Regulator", "")).strip()
+        if rj is None:
+            rj = col_to_j.get(_device_stem(rlab))
+        if rj is None:
+            raise ValueError(
+                f"Cannot map regulator row (tap_column={tap_col!r}, Regulator={rlab!r}) "
+                f"to reg_cols {reg_cols!r} in {reg_catalog_csv}"
+            )
+        rf = float(row.get("R_full", 0.0) or 0.0)
+        xf = float(row.get("X_full", 0.0) or 0.0)
+        z2 = rf * rf + xf * xf
+        if z2 < 1e-24:
+            continue
+        g = (rf / z2) * z_base
+        b = (-xf / z2) * z_base
+        edges.append((int(node_to_local[u]), int(node_to_local[v]), float(g), float(b), int(rj)))
+    if reg_cols:
+        mapped = {e[4] for e in edges}
+        missing = [reg_cols[j] for j in range(len(reg_cols)) if j not in mapped]
+        if missing:
+            raise ValueError(
+                f"Regulator columns not mapped to catalog edges in {reg_catalog_csv}: {missing}"
+            )
+    return edges
+
+
+@dataclass
+class PfPhysicsState:
+    weight: float = 0.0
+    s_base_kva: float = 5000.0
+    Y_re_base: torch.Tensor | None = None
+    Y_im_base: torch.Tensor | None = None
+    mask: torch.Tensor | None = None
+    reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
+    cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
+    meta_aux_cols: list[str] = field(default_factory=list)
+    detach_controls: bool = False
+    node_feature_cols: list[str] = field(default_factory=list)
+
+
+def _build_ybus_pu_from_edge_csv(
+    edge_csv: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+    z_base_ohm: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build dense per-unit Ybus (Re/Im) from undirected ``R_full``/``X_full`` line edges."""
+    import pandas as pd
+
+    df = pd.read_csv(edge_csv)
+    for c in ("from_node", "to_node", "R_full", "X_full"):
+        if c not in df.columns:
+            raise ValueError(f"{edge_csv} missing {c!r}")
+    y_re = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+    y_im = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+    seen: set[tuple[int, int]] = set()
+    z_base = float(z_base_ohm)
+    for _, row in df.iterrows():
+        u = str(row["from_node"]).strip().lower()
+        v = str(row["to_node"]).strip().lower()
+        if u not in node_to_local or v not in node_to_local:
+            continue
+        iu = int(node_to_local[u])
+        iv = int(node_to_local[v])
+        if iu == iv:
+            continue
+        key = (min(iu, iv), max(iu, iv))
+        if key in seen:
+            continue
+        seen.add(key)
+        rf = float(row.get("R_full", 0.0) or 0.0)
+        xf = float(row.get("X_full", 0.0) or 0.0)
+        z2 = rf * rf + xf * xf
+        if z2 < 1e-24:
+            continue
+        g = rf / z2
+        b = -xf / z2
+        y_line_re = g * z_base
+        y_line_im = b * z_base
+        y_re[iu, iv] -= y_line_re
+        y_re[iv, iu] -= y_line_re
+        y_im[iu, iv] -= y_line_im
+        y_im[iv, iu] -= y_line_im
+        y_re[iu, iu] += y_line_re
+        y_re[iv, iv] += y_line_re
+        y_im[iu, iu] += y_line_im
+        y_im[iv, iv] += y_line_im
+    return torch.from_numpy(y_re).float(), torch.from_numpy(y_im).float()
+
+
+def _load_pf_balance_mask(
+    nodes_csv: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+    mode: str,
+) -> torch.Tensor:
+    """``all`` = every node; ``mv`` = nodes with ``electrical_distance_ohm > 0`` (downstream MV)."""
+    m = str(mode).strip().lower()
+    if m == "all":
+        return torch.ones(n_nodes, dtype=torch.bool)
+    import pandas as pd
+
+    hdr = pd.read_csv(nodes_csv, nrows=0).columns.tolist()
+    if "electrical_distance_ohm" not in hdr:
+        raise ValueError(
+            f"--pf_balance_nodes mv requires electrical_distance_ohm in {nodes_csv}"
+        )
+    usecols = ["sample_id", "node", "electrical_distance_ohm"]
+    sid0 = int(pd.read_csv(nodes_csv, usecols=["sample_id"], nrows=1)["sample_id"].iloc[0])
+    sub = pd.read_csv(nodes_csv, usecols=usecols)
+    sub = sub[sub["sample_id"].map(_norm_sid) == sid0]
+    mask = torch.zeros(n_nodes, dtype=torch.bool)
+    for _, row in sub.iterrows():
+        node = str(row["node"]).strip().lower()
+        if node not in node_to_local:
+            continue
+        if float(row["electrical_distance_ohm"]) > 1e-9:
+            mask[int(node_to_local[node])] = True
+    if not bool(mask.any()):
+        raise ValueError(
+            f"--pf_balance_nodes mv produced empty mask from {nodes_csv}; "
+            "check electrical_distance_ohm and node index mapping."
+        )
+    return mask
+
+
+def nodal_power_balance_residual(
+    pred_ri: torch.Tensor,
+    p_inj_kw: torch.Tensor,
+    q_inj_kvar: torch.Tensor,
+    Y_re: torch.Tensor,
+    Y_im: torch.Tensor,
+    node_mask: torch.Tensor | None,
+    s_base_kva: float,
+) -> torch.Tensor:
+    """Mean squared P/Q injection residual using denormalized complex voltage (pu) and pu Ybus."""
+    v_re = pred_ri[..., 0]
+    v_im = pred_ri[..., 1]
+    if Y_re.dim() == 2:
+        i_re = torch.matmul(v_re, Y_re.T) - torch.matmul(v_im, Y_im.T)
+        i_im = torch.matmul(v_re, Y_im.T) + torch.matmul(v_im, Y_re.T)
+    else:
+        i_re = torch.matmul(v_re, Y_re.transpose(-1, -2)) - torch.matmul(v_im, Y_im.transpose(-1, -2))
+        i_im = torch.matmul(v_re, Y_im.transpose(-1, -2)) + torch.matmul(v_im, Y_re.transpose(-1, -2))
+    s_re = v_re * i_re + v_im * i_im
+    s_im = v_im * i_re - v_re * i_im
+    p_kw = s_re * float(s_base_kva)
+    q_kvar = s_im * float(s_base_kva)
+    r_p = p_inj_kw - p_kw
+    r_q = q_inj_kvar - q_kvar
+    if node_mask is not None:
+        m = node_mask.to(device=pred_ri.device, dtype=torch.bool).view(1, -1)
+        r_p = r_p.masked_select(m)
+        r_q = r_q.masked_select(m)
+    return r_p.square().mean() + r_q.square().mean()
+
+
+def _expected_reg_tap_pu(
+    reg_pred: torch.Tensor,
+    *,
+    reg_loss: str,
+    reg_mean: torch.Tensor | None,
+    reg_std: torch.Tensor | None,
+    reg_logits: list[torch.Tensor] | None,
+    reg_class_values: torch.Tensor | None,
+) -> torch.Tensor:
+    """Differentiable tap (pu) per graph for physics Y stamping."""
+    if reg_loss == "ce":
+        if not reg_logits or reg_class_values is None:
+            return reg_pred
+        taps = []
+        cv = reg_class_values.to(device=reg_pred.device, dtype=torch.float32)
+        for j, lg in enumerate(reg_logits):
+            probs = F.softmax(lg.float(), dim=-1)
+            taps.append(torch.matmul(probs, cv[j]))
+        return torch.stack(taps, dim=1)
+    if reg_mean is not None and reg_std is not None:
+        return reg_pred.float() * reg_std.view(1, -1) + reg_mean.view(1, -1)
+    return reg_pred.float()
+
+
+def _stamp_reg_branch_ybus(
+    Y_re: torch.Tensor,
+    Y_im: torch.Tensor,
+    iu: int,
+    iv: int,
+    g: float,
+    b: float,
+    tap: torch.Tensor,
+) -> None:
+    """Off-nominal tap ``a`` on secondary (node ``iu``); primary at ``iv``. In-place on batched ``(B,N,N)``."""
+    a = tap.clamp(0.9, 1.1)
+    a2 = a * a
+    g_t = torch.as_tensor(g, device=Y_re.device, dtype=Y_re.dtype)
+    b_t = torch.as_tensor(b, device=Y_im.device, dtype=Y_im.dtype)
+    Y_re[..., iu, iu] = Y_re[..., iu, iu] + g_t
+    Y_im[..., iu, iu] = Y_im[..., iu, iu] + b_t
+    Y_re[..., iv, iv] = Y_re[..., iv, iv] + g_t / a2
+    Y_im[..., iv, iv] = Y_im[..., iv, iv] + b_t / a2
+    Y_re[..., iu, iv] = Y_re[..., iu, iv] - g_t / a
+    Y_re[..., iv, iu] = Y_re[..., iv, iu] - g_t / a
+    Y_im[..., iu, iv] = Y_im[..., iu, iv] - b_t / a
+    Y_im[..., iv, iu] = Y_im[..., iv, iu] - b_t / a
+
+
+def _ybus_with_predicted_controls(
+    Y_re_base: torch.Tensor,
+    Y_im_base: torch.Tensor,
+    *,
+    reg_edges: list[tuple[int, int, float, float, int]],
+    cap_banks: list[tuple[int, float, int]],
+    tap_pu: torch.Tensor,
+    cap_on: torch.Tensor,
+    s_base_kva: float,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``(B,N,N)`` Ybus: line base + regulator taps + cap shunt ``j*B``."""
+    dev, dt = Y_re_base.device, Y_re_base.dtype
+    y_re = Y_re_base.unsqueeze(0).expand(batch_size, -1, -1).clone()
+    y_im = Y_im_base.unsqueeze(0).expand(batch_size, -1, -1).clone()
+    for iu, iv, g, b, rj in reg_edges:
+        _stamp_reg_branch_ybus(y_re, y_im, iu, iv, g, b, tap_pu[:, rj])
+    s_base = float(s_base_kva)
+    for ni, q_nom, cj in cap_banks:
+        b_pu = cap_on[:, cj] * (float(q_nom) / s_base)
+        y_im[:, ni, ni] = y_im[:, ni, ni] + b_pu
+    return y_re, y_im
+
+
+def _denorm_node_features(
+    x_n: torch.Tensor,
+    batch: Data,
+    n_nodes: int,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+) -> torch.Tensor:
+    xm = x_mean.view(1, 1, -1)
+    xs = x_std.view(1, 1, -1)
+    return x_n.view(batch.num_graphs, n_nodes, -1).float() * xs + xm
+
+
+def _assemble_pf_injections(
+    x_denorm: torch.Tensor,
+    node_feature_cols: list[str],
+    *,
+    cap_banks: list[tuple[int, float, int]],
+    cap_on: torch.Tensor,
+    meta_aux_cols: list[str],
+    pv_pred_denorm: torch.Tensor | None,
+    batch: Data,
+    n_nodes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Loads from denormalized features, meta-aux PV (proportional), predicted cap Q at mapped banks."""
+    B = int(batch.num_graphs)
+    dev, dt = x_denorm.device, x_denorm.dtype
+    cols = {str(c).lower(): i for i, c in enumerate(node_feature_cols)}
+    if "p_load_kw" not in cols or "q_load_kvar" not in cols:
+        raise ValueError(
+            "Physics injection assembly requires p_load_kw and q_load_kvar in --node_feature_cols "
+            f"(got {node_feature_cols!r})."
+        )
+    if not cap_banks:
+        raise ValueError("Physics injection assembly requires mapped capacitor banks (see --pf_cap_nodes_csv).")
+    if not meta_aux_cols:
+        raise ValueError(
+            "Physics injection assembly requires meta-aux PV columns (--aux_meta_cols / --aux_pv_meta_cols)."
+        )
+    if pv_pred_denorm is None:
+        raise ValueError("Physics injection assembly requires denormalized pv_pred from meta-aux head.")
+
+    p_inj = torch.zeros(B, n_nodes, device=dev, dtype=dt)
+    q_inj = torch.zeros(B, n_nodes, device=dev, dtype=dt)
+
+    feat_p = x_denorm[..., cols["p_pv_kw"]] if "p_pv_kw" in cols else None
+    feat_q = x_denorm[..., cols["q_pv_kvar"]] if "q_pv_kvar" in cols else None
+    used_meta_pv = False
+    for j, col in enumerate(meta_aux_cols):
+        cl = str(col).lower()
+        if cl.endswith("_p_post_kw") and cl.startswith("pv_"):
+            total_p = pv_pred_denorm[:, j]
+            if feat_p is None:
+                raise ValueError(
+                    f"Physics needs p_pv_kw in node features to distribute meta-aux column {col!r}"
+                )
+            if float(feat_p.abs().sum()) <= 1e-9:
+                raise ValueError(f"p_pv_kw features are all zero; cannot distribute {col!r}")
+            w = feat_p.clamp(min=0.0)
+            p_inj = p_inj + w / w.sum(dim=1, keepdim=True).clamp(min=1e-9) * total_p.unsqueeze(1)
+            used_meta_pv = True
+        elif cl.endswith("_q_post_kvar") and cl.startswith("pv_"):
+            total_q = pv_pred_denorm[:, j]
+            if feat_q is None:
+                raise ValueError(
+                    f"Physics needs q_pv_kvar in node features to distribute meta-aux column {col!r}"
+                )
+            if float(feat_q.abs().sum()) <= 1e-9:
+                raise ValueError(f"q_pv_kvar features are all zero; cannot distribute {col!r}")
+            w = feat_q.abs().clamp(min=0.0)
+            q_inj = q_inj - w / w.sum(dim=1, keepdim=True).clamp(min=1e-9) * total_q.unsqueeze(1)
+            used_meta_pv = True
+
+    if not used_meta_pv:
+        raise ValueError(
+            f"Physics injection assembly found no pv_*_p_post_kw / pv_*_q_post_kvar columns in meta_aux_cols "
+            f"{meta_aux_cols!r}."
+        )
+
+    p_inj = p_inj - x_denorm[..., cols["p_load_kw"]]
+    q_inj = q_inj - x_denorm[..., cols["q_load_kvar"]]
+
+    for ni, q_nom, cj in cap_banks:
+        q_inj[:, ni] = q_inj[:, ni] + cap_on[:, cj] * float(q_nom)
+
+    return p_inj, q_inj
+
+
+def _power_balance_loss_from_batch(
+    v_n: torch.Tensor,
+    batch: Data,
+    *,
+    n_nodes: int,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    pf: PfPhysicsState,
+    cap_logits: torch.Tensor | None = None,
+    reg_pred: torch.Tensor | None = None,
+    pv_pred: torch.Tensor | None = None,
+    x_mean: torch.Tensor | None = None,
+    x_std: torch.Tensor | None = None,
+    pv_mean: torch.Tensor | None = None,
+    pv_std: torch.Tensor | None = None,
+    reg_loss: str = "mse",
+    reg_mean: torch.Tensor | None = None,
+    reg_std: torch.Tensor | None = None,
+    reg_logits: list[torch.Tensor] | None = None,
+    reg_class_values: torch.Tensor | None = None,
+) -> torch.Tensor:
+    y_mean_ri = y_mean.view(1, n_nodes, 2)
+    y_std_ri = y_std.view(1, n_nodes, 2)
+    pred_ri = v_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
+    assert pf.Y_re_base is not None and pf.Y_im_base is not None
+
+    if cap_logits is None or reg_pred is None:
+        raise ValueError("Power-balance loss requires model cap_logits and reg_pred outputs.")
+    if x_mean is None or x_std is None:
+        raise ValueError("Power-balance loss requires x_mean and x_std for load denormalization.")
+    if pv_pred is None:
+        raise ValueError("Power-balance loss requires pv_pred from meta-aux head.")
+    if pv_mean is None or pv_std is None:
+        raise ValueError("Power-balance loss requires pv_mean and pv_std for meta-aux denormalization.")
+
+    cap_on = torch.sigmoid(cap_logits.float())
+    if pf.detach_controls:
+        cap_on = cap_on.detach()
+    tap_pu = _expected_reg_tap_pu(
+        reg_pred,
+        reg_loss=reg_loss,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        reg_logits=reg_logits,
+        reg_class_values=reg_class_values,
+    )
+    if pf.detach_controls:
+        tap_pu = tap_pu.detach()
+    y_re, y_im = _ybus_with_predicted_controls(
+        pf.Y_re_base,
+        pf.Y_im_base,
+        reg_edges=pf.reg_edges,
+        cap_banks=pf.cap_banks,
+        tap_pu=tap_pu,
+        cap_on=cap_on,
+        s_base_kva=pf.s_base_kva,
+        batch_size=int(batch.num_graphs),
+    )
+    pv_den = pv_pred.float() * pv_std.view(1, -1) + pv_mean.view(1, -1)
+    x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean, x_std)
+    p_inj, q_inj = _assemble_pf_injections(
+        x_den,
+        pf.node_feature_cols,
+        cap_banks=pf.cap_banks,
+        cap_on=cap_on,
+        meta_aux_cols=pf.meta_aux_cols,
+        pv_pred_denorm=pv_den,
+        batch=batch,
+        n_nodes=n_nodes,
+    )
+
+    return nodal_power_balance_residual(
+        pred_ri, p_inj, q_inj, y_re, y_im, pf.mask, pf.s_base_kva
+    )
+
+
+def _pf_loss_if_enabled(
+    pf: PfPhysicsState,
+    v_n: torch.Tensor,
+    batch: Data,
+    *,
+    n_nodes: int,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    x_mean: torch.Tensor | None,
+    x_std: torch.Tensor | None,
+    cap_logits: torch.Tensor,
+    reg_pred: torch.Tensor,
+    pv_pred: torch.Tensor,
+    reg_loss: str,
+    reg_mean: torch.Tensor | None,
+    reg_std: torch.Tensor | None,
+    pv_mean: torch.Tensor | None,
+    pv_std: torch.Tensor | None,
+    reg_logits: list[torch.Tensor] | None = None,
+    reg_class_values: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if pf.weight <= 0.0 or pf.Y_re_base is None:
+        return None
+    return _power_balance_loss_from_batch(
+        v_n,
+        batch,
+        n_nodes=n_nodes,
+        y_mean=y_mean,
+        y_std=y_std,
+        pf=pf,
+        cap_logits=cap_logits,
+        reg_pred=reg_pred,
+        pv_pred=pv_pred,
+        x_mean=x_mean,
+        x_std=x_std,
+        pv_mean=pv_mean,
+        pv_std=pv_std,
+        reg_loss=reg_loss,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        reg_logits=reg_logits,
+        reg_class_values=reg_class_values,
+    )
+
+
+def _resolve_pf_reg_catalog(edges_path: Path, data_root: Path, args: argparse.Namespace) -> Path | None:
+    raw = str(getattr(args, "pf_reg_edge_catalog", "") or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (data_root / p).resolve()
+        return p if p.is_file() else None
+    candidates = [
+        data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
+        edges_path.parent / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
+        edges_path.parent / "hetero_mv_edge_catalog.csv",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    return None
+
+
+def _setup_pf_physics(
+    *,
+    edges_path: Path,
+    nodes_path: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    data_root: Path,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    meta_aux_cols: list[str],
+    node_feature_cols: list[str],
+) -> PfPhysicsState:
+    w = float(getattr(args, "loss_power_balance_weight", 0.0) or 0.0)
+    if w <= 0.0:
+        return PfPhysicsState(weight=0.0)
+    s_base = float(getattr(args, "pf_s_base_kva", 5000.0))
+    kv_base = float(getattr(args, "pf_kv_base", 12.47))
+    z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
+    y_re, y_im = _build_ybus_pu_from_edge_csv(edges_path, node_to_local, n_nodes, z_base)
+    pf_mask = _load_pf_balance_mask(nodes_path, node_to_local, n_nodes, str(args.pf_balance_nodes))
+    detach = bool(getattr(args, "pf_detach_controls", False))
+
+    reg_catalog = _resolve_pf_reg_catalog(edges_path, data_root, args)
+    if reg_catalog is None:
+        raise FileNotFoundError(
+            "Physics loss enabled but regulator edge catalog not found. "
+            "Set --pf_reg_edge_catalog or place hetero_mv_edge_catalog.csv under data_root."
+        )
+    reg_edges = _load_regulator_edges_for_pf(reg_catalog, node_to_local, reg_cols, z_base)
+
+    raw_cap = str(getattr(args, "pf_cap_nodes_csv", "") or "").strip()
+    if raw_cap:
+        cap_nodes_csv = Path(raw_cap)
+        if not cap_nodes_csv.is_absolute():
+            cap_nodes_csv = (data_root / cap_nodes_csv).resolve()
+        if not cap_nodes_csv.is_file():
+            raise FileNotFoundError(f"--pf_cap_nodes_csv not found: {cap_nodes_csv}")
+    else:
+        cap_candidates = [
+            data_root / "capacitor_involved_nodes.csv",
+            nodes_path.parent / "capacitor_involved_nodes.csv",
+        ]
+        cap_nodes_csv = None
+        for c in cap_candidates:
+            if c.is_file():
+                cap_nodes_csv = c.resolve()
+                break
+        if cap_nodes_csv is None:
+            raise FileNotFoundError(
+                "Physics loss enabled but capacitor bus map not found. "
+                f"Tried {cap_candidates}. Set --pf_cap_nodes_csv."
+            )
+
+    if not meta_aux_cols:
+        raise ValueError(
+            "Physics loss requires meta-aux PV columns (--aux_meta_cols / --aux_pv_meta_cols)."
+        )
+    load_cols = {"p_load_kw", "q_load_kvar"}
+    missing_load = load_cols - {str(c).lower() for c in node_feature_cols}
+    if missing_load:
+        raise ValueError(
+            f"Physics loss requires node feature columns {sorted(missing_load)} in --node_feature_cols"
+        )
+    if cap_cols and len(cap_cols) != len({_cap_col_stem(c) for c in cap_cols if _cap_col_stem(c)}):
+        raise ValueError(f"Duplicate or unparseable cap columns in meta: {cap_cols!r}")
+
+    meta_csv = nodes_path.parent / str(getattr(args, "meta_csv", "gnn_sample_meta.csv"))
+    repo = Path(__file__).resolve().parent
+    cap_dss = repo / "8500-node" / "Capacitors.dss"
+    cap_banks = _resolve_cap_bus_nodes(
+        cap_cols,
+        node_to_local,
+        cap_nodes_csv=cap_nodes_csv,
+        meta_csv=meta_csv if meta_csv.is_file() else None,
+        capacitors_dss=cap_dss,
+    )
+    if cap_cols and len(cap_banks) != len(cap_cols):
+        raise ValueError(
+            f"Mapped {len(cap_banks)} capacitor banks but expected {len(cap_cols)} from meta columns."
+        )
+
+    print(
+        f"Power-balance physics: weight={w}, nodes={args.pf_balance_nodes}, "
+        f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
+        f"masked_nodes={int(pf_mask.sum())}/{n_nodes}, "
+        f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}",
+        flush=True,
+    )
+
+    return PfPhysicsState(
+        weight=w,
+        s_base_kva=s_base,
+        Y_re_base=y_re.to(device),
+        Y_im_base=y_im.to(device),
+        mask=pf_mask.to(device),
+        reg_edges=reg_edges,
+        cap_banks=cap_banks,
+        meta_aux_cols=list(meta_aux_cols),
+        detach_controls=detach,
+        node_feature_cols=list(node_feature_cols),
+    )
+
 
 TARGET_REG_COLS: tuple[str, ...] = (
     "reg_feeder_rega_tap_pu",
@@ -2126,6 +2828,21 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     reg_std_d = reg_std.to(device).float()
     pv_mean_d = pv_mean.to(device).float() if pv_mean is not None else None
     pv_std_d = pv_std.to(device).float() if pv_std is not None else None
+    x_mean_d = x_mean.to(device).float()
+    x_std_d = x_std.to(device).float()
+    pf_state = _setup_pf_physics(
+        edges_path=chunk_dirs[0] / edge_name,
+        nodes_path=chunk_dirs[0] / nodes_name,
+        node_to_local=ref_ntl,
+        n_nodes=n_nodes,
+        args=args,
+        device=device,
+        data_root=chunk_dirs[0],
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        meta_aux_cols=list(pv_aux_cols),
+        node_feature_cols=node_feature_cols,
+    )
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
@@ -2183,7 +2900,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             y_pv_n = None
             if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
                 y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
-            ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
+            ds = DAGPSDataset(
+                x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
+            )
             dl_tr = DataLoader(
                 Subset(ds, idx_train_list[ci_i].tolist()),
                 batch_size=args.batch_size,
@@ -2212,6 +2931,28 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_logits=reg_logits,
                     )
                     loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                    loss_pf = _pf_loss_if_enabled(
+                        pf_state,
+                        v_n,
+                        batch,
+                        n_nodes=n_nodes,
+                        y_mean=y_mean_d,
+                        y_std=y_std_d,
+                        x_mean=x_mean_d,
+                        x_std=x_std_d,
+                        cap_logits=c_log,
+                        reg_pred=r_p,
+                        pv_pred=pv_p,
+                        reg_loss=reg_loss,
+                        reg_mean=reg_mean_d,
+                        reg_std=reg_std_d,
+                        pv_mean=pv_mean_d,
+                        pv_std=pv_std_d,
+                        reg_logits=reg_logits,
+                        reg_class_values=reg_class_values_d,
+                    )
+                    if loss_pf is not None:
+                        loss = loss + pf_state.weight * loss_pf
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                         loss_pv = mse(pv_p, y_pv_b)
@@ -2288,7 +3029,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 y_pv_n = None
                 if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
                     y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
-                ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
+                ds = DAGPSDataset(
+                    x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
+                )
                 dl_va = DataLoader(
                     Subset(ds, idx_val_list[ci].tolist()),
                     batch_size=args.batch_size,
@@ -2316,6 +3059,28 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             reg_logits=reg_logits_v,
                         )
                         lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                        lpf = _pf_loss_if_enabled(
+                            pf_state,
+                            v_n,
+                            batch,
+                            n_nodes=n_nodes,
+                            y_mean=y_mean_d,
+                            y_std=y_std_d,
+                            x_mean=x_mean_d,
+                            x_std=x_std_d,
+                            cap_logits=c_log,
+                            reg_pred=r_p,
+                            pv_pred=pv_p,
+                            reg_loss=reg_loss,
+                            reg_mean=reg_mean_d,
+                            reg_std=reg_std_d,
+                            pv_mean=pv_mean_d,
+                            pv_std=pv_std_d,
+                            reg_logits=reg_logits_v,
+                            reg_class_values=reg_class_values_d,
+                        )
+                        if lpf is not None:
+                            lt = lt + pf_state.weight * lpf
                         if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                             lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                             lt = lt + float(args.lambda_pv) * lpv
@@ -2668,6 +3433,48 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Loss weight for meta-aux MSE (all --aux_meta_cols targets; normalized like regulators).",
     )
+    p.add_argument(
+        "--loss_power_balance_weight",
+        type=float,
+        default=0.0,
+        help="Weight for nodal P/Q power-balance physics loss on denormalized voltage (0 = disabled).",
+    )
+    p.add_argument(
+        "--pf_balance_nodes",
+        type=str,
+        default="mv",
+        choices=("mv", "all"),
+        help="Nodes included in power-balance residual: mv=electrical_distance>0, all=every node.",
+    )
+    p.add_argument(
+        "--pf_s_base_kva",
+        type=float,
+        default=5000.0,
+        help="System base kVA for converting pu power S=V*conj(I) to kW/kvar in physics loss.",
+    )
+    p.add_argument(
+        "--pf_kv_base",
+        type=float,
+        default=12.47,
+        help="Nominal line-line kV for Z_base=(kV*1000)^2/(S_base_kVA*1000) when converting line ohms to pu Y.",
+    )
+    p.add_argument(
+        "--pf_detach_controls",
+        action="store_true",
+        help="Stop gradients through predicted taps/cap states inside physics loss (stability).",
+    )
+    p.add_argument(
+        "--pf_reg_edge_catalog",
+        type=str,
+        default="",
+        help="CSV with edge_type=regulator rows (default: auto-find hetero_mv_edge_catalog.csv under data_root).",
+    )
+    p.add_argument(
+        "--pf_cap_nodes_csv",
+        type=str,
+        default="",
+        help="Capacitor bus map CSV (default: capacitor_involved_nodes.csv under data_root).",
+    )
     return p.parse_args()
 
 
@@ -2856,7 +3663,22 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
+    pf_state = _setup_pf_physics(
+        edges_path=edges_path,
+        nodes_path=nodes_path,
+        node_to_local=node_to_local,
+        n_nodes=n_nodes,
+        args=args,
+        device=device,
+        data_root=data_root,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        meta_aux_cols=list(pv_aux_cols),
+        node_feature_cols=node_feature_cols,
+    )
+    ds = DAGPSDataset(
+        x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
+    )
     pin = device.type == "cuda"
     nw = int(args.num_workers)
     dl_tr = DataLoader(
@@ -2943,6 +3765,9 @@ def main() -> None:
     reg_std_d = reg_std.to(device).float()
     pv_mean_d = pv_mean.to(device).float() if pv_mean is not None else None
     pv_std_d = pv_std.to(device).float() if pv_std is not None else None
+    x_mean_d = x_mean.to(device).float()
+    x_std_d = x_std.to(device).float()
+    reg_class_values_d = None
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         from torch.cuda.amp import GradScaler as _GradScaler
@@ -2983,6 +3808,28 @@ def main() -> None:
                 loss_c = bce(c_log, y_cap)
                 loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
                 loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                loss_pf = _pf_loss_if_enabled(
+                    pf_state,
+                    v_n,
+                    batch,
+                    n_nodes=n_nodes,
+                    y_mean=y_mean_d,
+                    y_std=y_std_d,
+                    x_mean=x_mean_d,
+                    x_std=x_std_d,
+                    cap_logits=c_log,
+                    reg_pred=r_p,
+                    pv_pred=pv_p,
+                    reg_loss=reg_loss,
+                    reg_mean=reg_mean_d,
+                    reg_std=reg_std_d,
+                    pv_mean=pv_mean_d,
+                    pv_std=pv_std_d,
+                    reg_logits=None,
+                    reg_class_values=reg_class_values_d,
+                )
+                if loss_pf is not None:
+                    loss = loss + pf_state.weight * loss_pf
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     loss_pv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                     loss = loss + float(args.lambda_pv) * loss_pv
@@ -3034,6 +3881,28 @@ def main() -> None:
                     lc = bce(c_log, y_cap)
                     lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
                     lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                    lpf = _pf_loss_if_enabled(
+                        pf_state,
+                        v_n,
+                        batch,
+                        n_nodes=n_nodes,
+                        y_mean=y_mean_d,
+                        y_std=y_std_d,
+                        x_mean=x_mean_d,
+                        x_std=x_std_d,
+                        cap_logits=c_log,
+                        reg_pred=r_p,
+                        pv_pred=pv_p,
+                        reg_loss=reg_loss,
+                        reg_mean=reg_mean_d,
+                        reg_std=reg_std_d,
+                        pv_mean=pv_mean_d,
+                        pv_std=pv_std_d,
+                        reg_logits=None,
+                        reg_class_values=reg_class_values_d,
+                    )
+                    if lpf is not None:
+                        lt = lt + pf_state.weight * lpf
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                         lt = lt + float(args.lambda_pv) * lpv
