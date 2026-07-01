@@ -307,6 +307,19 @@ def set_controllers(low_init: bool):
         dss.Capacitors.States([0] * n if low_init else [1] * n)
 
 
+def randomize_controllers(rng: np.random.Generator | None = None) -> None:
+    """Random regulator taps and capacitor bank on/off before an independent snapshot solve."""
+    rng = rng or np.random.default_rng()
+    for nm in dss.RegControls.AllNames():
+        dss.RegControls.Name(nm)
+        dss.RegControls.TapNumber(int(rng.integers(LOW_TAP, HIGH_TAP + 1)))
+    for nm in dss.Capacitors.AllNames():
+        dss.Capacitors.Name(nm)
+        n = dss.Capacitors.NumSteps()
+        bank_on = bool(rng.integers(0, 2))
+        dss.Capacitors.States([1] * n if bank_on else [0] * n)
+
+
 def inject_controller_warmstart(
     step: int,
     reg_names: list[str],
@@ -461,6 +474,15 @@ def apply_explicit_loads_pv(load_names, base_kw, base_kvar, pv_names, pv_base, m
     for nm, pmpp in zip(pv_names, pv_base):
         dss.PVsystems.Name(nm)
         dss.PVsystems.Pmpp(float(pmpp * ir_t))
+
+
+def safe_solve() -> bool:
+    """Run ``Solve()``; swallow DSS warnings such as #485 max control iterations."""
+    try:
+        dss.Solution.Solve()
+    except Exception:
+        pass
+    return bool(dss.Solution.Converged())
 
 
 def read_solve_iterations() -> tuple[int, int, int]:

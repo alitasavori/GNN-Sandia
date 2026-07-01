@@ -236,6 +236,195 @@ def plot_all(
     )
 
 
+def plot_warmstart_voltage_band(
+    cfg: DailySimConfig,
+    *,
+    monitor_nodes: list[str],
+    volts: np.ndarray,
+    volts_min: np.ndarray,
+    volts_max: np.ndarray,
+    n_warm_starts: int,
+    da_gps_voltages: dict[str, np.ndarray] | None = None,
+    da_gps_hours: np.ndarray | None = None,
+    plot_warmstart_lines: bool = True,
+    show: bool = True,
+):
+    """Shaded min–max band across independent warm starts with optional DA-GPS overlay."""
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
+    n_nodes = len(monitor_nodes)
+    fig, axes = plt.subplots(n_nodes, 1, figsize=(16, 3.5 * n_nodes), sharex=True)
+    axes = np.atleast_1d(axes)
+    fig.suptitle(
+        f"OpenDSS |V| band from {n_warm_starts} independent random controller warm-starts per step",
+        fontsize=11,
+    )
+    for ax, node, j in zip(axes, monitor_nodes, range(n_nodes)):
+        v_lo = _trim_step_matrix(volts_min, n)[:, j]
+        v_hi = _trim_step_matrix(volts_max, n)[:, j]
+        ax.fill_between(hours, v_lo, v_hi, alpha=0.25, color="steelblue", label="OpenDSS band [min,max]")
+        if plot_warmstart_lines:
+            for k in range(int(volts.shape[1])):
+                ax.plot(
+                    hours,
+                    _trim_step_matrix(volts, n)[:, k, j],
+                    color="steelblue",
+                    alpha=0.12,
+                    linewidth=0.8,
+                )
+        if da_gps_voltages is not None and da_gps_hours is not None:
+            v_da = da_gps_voltages.get(node)
+            if v_da is None:
+                v_da = da_gps_voltages.get(str(node).lower())
+            if v_da is not None:
+                ax.plot(
+                    _trim_1d(da_gps_hours, n),
+                    _trim_1d(v_da, n),
+                    label="DA-GPS",
+                    linestyle="-.",
+                    color="magenta",
+                    linewidth=1.5,
+                )
+        ax.set_title(node)
+        ax.set_ylabel("|V| (pu)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Hour of day")
+    plt.tight_layout()
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_warmstart_device_band(
+    cfg: DailySimConfig,
+    *,
+    device_names: list[str],
+    values: np.ndarray,
+    vmin: np.ndarray,
+    vmax: np.ndarray,
+    ylabel: str,
+    title_prefix: str,
+    da_gps_by_name: dict[str, np.ndarray] | None = None,
+    da_gps_hours: np.ndarray | None = None,
+    da_transform=None,
+    n_warm_starts: int,
+    plot_warmstart_lines: bool = True,
+    show: bool = True,
+):
+    n = _plot_npts(cfg)
+    hours = display_hours_array(cfg)
+    for idx, dname in enumerate(device_names):
+        fig, ax = plt.subplots(figsize=(16, 4))
+        lo = _trim_step_matrix(vmin, n)[:, idx]
+        hi = _trim_step_matrix(vmax, n)[:, idx]
+        ax.fill_between(hours, lo, hi, alpha=0.25, color="steelblue", label="OpenDSS band [min,max]")
+        if plot_warmstart_lines:
+            for k in range(int(values.shape[1])):
+                ax.plot(
+                    hours,
+                    _trim_step_matrix(values, n)[:, k, idx],
+                    color="steelblue",
+                    alpha=0.12,
+                    linewidth=0.8,
+                )
+        if da_gps_by_name is not None and da_gps_hours is not None:
+            y_da = da_gps_by_name.get(dname)
+            if y_da is None:
+                y_da = da_gps_by_name.get(str(dname).lower())
+            if y_da is not None and np.isfinite(y_da).any():
+                y_plot = _trim_1d(y_da, n)
+                if da_transform is not None:
+                    y_plot = da_transform(y_plot)
+                ax.plot(
+                    _trim_1d(da_gps_hours, n),
+                    y_plot,
+                    label="DA-GPS",
+                    linestyle="-.",
+                    color="magenta",
+                    linewidth=1.5,
+                )
+        ax.set_title(f"{title_prefix} {dname} ({n_warm_starts} warm starts/step)")
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        if show:
+            plt.show()
+        plt.close(fig)
+
+
+def plot_warmstart_band_all(
+    cfg: DailySimConfig,
+    *,
+    monitor_nodes: list[str],
+    reg_names: list[str],
+    cap_names: list[str],
+    volts: np.ndarray,
+    volts_min: np.ndarray,
+    volts_max: np.ndarray,
+    taps: np.ndarray,
+    taps_min: np.ndarray,
+    taps_max: np.ndarray,
+    cap_on: np.ndarray,
+    cap_min: np.ndarray,
+    cap_max: np.ndarray,
+    da_gps_voltages: dict[str, np.ndarray] | None = None,
+    da_gps_reg_by_name: dict[str, np.ndarray] | None = None,
+    da_gps_cap_by_name: dict[str, np.ndarray] | None = None,
+    da_gps_hours: np.ndarray | None = None,
+    n_warm_starts: int,
+    plot_reg_cap: bool = True,
+    plot_warmstart_lines: bool = True,
+    show: bool = True,
+):
+    plot_warmstart_voltage_band(
+        cfg,
+        monitor_nodes=monitor_nodes,
+        volts=volts,
+        volts_min=volts_min,
+        volts_max=volts_max,
+        n_warm_starts=n_warm_starts,
+        da_gps_voltages=da_gps_voltages,
+        da_gps_hours=da_gps_hours,
+        plot_warmstart_lines=plot_warmstart_lines,
+        show=show,
+    )
+    if not plot_reg_cap:
+        return
+    plot_warmstart_device_band(
+        cfg,
+        device_names=reg_names,
+        values=taps,
+        vmin=taps_min,
+        vmax=taps_max,
+        ylabel="tap #",
+        title_prefix="Regulator",
+        da_gps_by_name=da_gps_reg_by_name,
+        da_gps_hours=da_gps_hours,
+        da_transform=tap_pu_to_tap_number,
+        n_warm_starts=n_warm_starts,
+        plot_warmstart_lines=plot_warmstart_lines,
+        show=show,
+    )
+    plot_warmstart_device_band(
+        cfg,
+        device_names=cap_names,
+        values=cap_on,
+        vmin=cap_min,
+        vmax=cap_max,
+        ylabel="steps ON",
+        title_prefix="Capacitor",
+        da_gps_by_name=da_gps_cap_by_name,
+        da_gps_hours=da_gps_hours,
+        da_transform=None,
+        n_warm_starts=n_warm_starts,
+        plot_warmstart_lines=plot_warmstart_lines,
+        show=show,
+    )
+
+
 def print_run_summary(
     cfg: DailySimConfig,
     runs: list[dict[str, Any]],

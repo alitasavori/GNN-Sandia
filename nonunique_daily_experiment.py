@@ -11,6 +11,7 @@ from nonunique_opendss_daily import (
     DA_GPS_REF_PV_PROFILE,
     DailySimConfig,
 )
+from nonunique_warmstart_band_daily import run_warmstart_band_daily
 from nonunique_warmstart_compare import run_warmstart_compare
 
 
@@ -31,6 +32,7 @@ def run_and_plot(
         ``warmstart`` (default) — two-scenario DA-GPS warm-start compare.
         ``four_scenario`` — legacy init_low/init_high/init_default/snapshot_cold demo.
         ``da_gps_daily_compare`` — DA-GPS GNN vs OpenDSS native daily QSTS truth.
+        ``warmstart_band_daily`` — per-step band from N independent random controller warm-starts.
     """
     npts_override = kwargs.pop("npts", None)
     device = kwargs.pop("device", None)
@@ -41,6 +43,18 @@ def run_and_plot(
         return run_four_scenario_demo(cfg, show=show, device=device)
     if mode == "warmstart":
         return run_warmstart_compare(cfg, show=show, device=device)
+    if mode == "warmstart_band_daily":
+        return run_warmstart_band_daily(
+            cfg,
+            n_warm_starts=int(kwargs.pop("n_warm_starts", 10)),
+            monitor_nodes=kwargs.pop("monitor_nodes", None),
+            include_da_gps=kwargs.pop("include_da_gps", include_da_gps),
+            plot_reg_cap=bool(kwargs.pop("plot_reg_cap", True)),
+            plot_warmstart_lines=bool(kwargs.pop("plot_warmstart_lines", True)),
+            seed=kwargs.pop("seed", 42),
+            show=show,
+            device=device,
+        )
     if mode == "da_gps_daily_compare":
         if not include_da_gps:
             raise ValueError("da_gps_daily_compare requires include_da_gps=True")
@@ -63,7 +77,8 @@ def run_and_plot(
             **kwargs,
         )
     raise ValueError(
-        f"Unknown mode={mode!r}; use 'warmstart', 'four_scenario', or 'da_gps_daily_compare'"
+        f"Unknown mode={mode!r}; use 'warmstart', 'four_scenario', "
+        f"'da_gps_daily_compare', or 'warmstart_band_daily'"
     )
 
 
@@ -73,4 +88,5 @@ __all__ = [
     "run_da_gps_daily_compare_and_plot",
     "run_four_scenario_demo",
     "run_warmstart_compare",
+    "run_warmstart_band_daily",
 ]
