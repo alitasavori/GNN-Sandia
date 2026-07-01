@@ -923,10 +923,15 @@ def _setup_pf_physics(
         meta_csv=meta_csv if meta_csv.is_file() else None,
         capacitors_dss=cap_dss,
     )
-    if cap_cols and len(cap_banks) != len(cap_cols):
-        raise ValueError(
-            f"Mapped {len(cap_banks)} capacitor banks but expected {len(cap_cols)} from meta columns."
-        )
+    if cap_cols:
+        n_cap = len(cap_cols)
+        mapped_cj = {int(cj) for _, _, cj in cap_banks}
+        if len(mapped_cj) != n_cap:
+            missing = [cap_cols[j] for j in range(n_cap) if j not in mapped_cj]
+            raise ValueError(
+                f"Capacitor meta columns not mapped to any stamped node: {missing!r} "
+                f"(stamped {len(cap_banks)} node(s) for {n_cap} logical bank(s))."
+            )
 
     print(
         f"Power-balance physics: weight={w}, nodes={args.pf_balance_nodes}, "
