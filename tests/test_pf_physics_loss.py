@@ -673,3 +673,96 @@ class TestEdgeCases:
         for slack in ("sourcebus.1", "_hvmv_sub_lsb.1", "hvmv_sub_48332.1"):
             if slack in ntl:
                 assert not bool(mask[int(ntl[slack])].item())
+
+    @pytest.mark.skipif(
+        not (REPO / "datasets_gnn2_from pc" / "gnn_node_index_master.csv").is_file(),
+        reason="no repo node index with electrical_distance_ohm",
+    )
+    def test_mv_mask_from_node_pe_when_mvagg_lacks_distance(self):
+        import pandas as pd
+        import tempfile
+
+        idx = pd.read_csv(DATA_DAILYAGG / "gnn_node_index_master.csv")
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        pe_path = REPO / "datasets_gnn2_from pc" / "gnn_node_index_master.csv"
+        if not pe_path.is_file():
+            pytest.skip("no repo gnn_node_index_master with electrical_distance_ohm")
+
+        with tempfile.TemporaryDirectory() as td:
+            nodes_path = Path(td) / "gnn_node_features_and_targets_mvagg.csv"
+            pd.DataFrame(
+                {
+                    "sample_id": [0, 0],
+                    "node": ["l1234567.1", "sourcebus.1"],
+                    "p_load_kw": [1.0, 0.0],
+                    "q_load_kvar": [0.5, 0.0],
+                    "p_pv_kw": [0.0, 0.0],
+                }
+            ).to_csv(nodes_path, index=False)
+
+            distance_csv, _ = pfmod._resolve_pf_electrical_distance_csv(
+                nodes_csv=nodes_path,
+                node_pe_csv=pe_path,
+                data_root=DATA_DAILYAGG,
+                repo=REPO,
+                mode="mv",
+            )
+            assert distance_csv == pe_path
+
+            mask = pfmod._load_pf_balance_mask(
+                nodes_path,
+                ntl,
+                n_nodes,
+                "mv",
+                distance_csv=pe_path,
+            )
+            assert bool(mask.any())
+            if "sourcebus.1" in ntl:
+                assert not bool(mask[int(ntl["sourcebus.1"])].item())
+
+    def test_mv_mask_clear_error_without_distance_sources(self, tmp_path):
+        import pandas as pd
+
+        nodes_path = tmp_path / "nodes.csv"
+        pd.DataFrame(
+            {
+                "sample_id": [0],
+                "node": ["l1234567.1"],
+                "p_load_kw": [1.0],
+            }
+        ).to_csv(nodes_path, index=False)
+        ntl = {"l1234567.1": 0}
+        with pytest.raises(ValueError, match="electrical_distance_ohm"):
+            pfmod._load_pf_balance_mask(
+                nodes_path,
+                ntl,
+                1,
+                "mv",
+                distance_tried=["nodes_csv=" + str(nodes_path)],
+            )
+
+    def test_mv_mask_fallback_all_non_slack_warns(self, tmp_path, capsys):
+        import pandas as pd
+
+        nodes_path = tmp_path / "nodes.csv"
+        pd.DataFrame(
+            {
+                "sample_id": [0, 0],
+                "node": ["l1234567.1", "sourcebus.1"],
+                "p_load_kw": [1.0, 0.0],
+            }
+        ).to_csv(nodes_path, index=False)
+        ntl = {"l1234567.1": 0, "sourcebus.1": 1}
+        mask = pfmod._load_pf_balance_mask(
+            nodes_path,
+            ntl,
+            2,
+            "mv",
+            mv_fallback_all_non_slack=True,
+            distance_tried=["nodes_csv=" + str(nodes_path)],
+        )
+        out = capsys.readouterr().out
+        assert "falling back to all non-slack" in out
+        assert bool(mask[0].item())
+        assert not bool(mask[1].item())

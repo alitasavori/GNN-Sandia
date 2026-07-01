@@ -9,7 +9,7 @@ v2 alignment:
 - No effective-resistance attention bias.
 - Aux targets are hardcoded in-script (old aux-trainer style).
 
-Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent fallbacks):
+Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent physics fallbacks):
 - After denormalizing predicted complex voltage (Re/Im head), penalize nodal P/Q balance residuals
   ``r_P = P_inj - Re(V*conj(YV))``, ``r_Q = Q_inj - Im(V*conj(YV))`` on selected nodes (slack/source excluded).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
@@ -335,40 +335,205 @@ def _build_ybus_pu_from_edge_csv(
     return torch.from_numpy(y_re).float(), torch.from_numpy(y_im).float()
 
 
+_PF_ELECTRICAL_DISTANCE_REL = Path("electrical_distance_from_substation.csv")
+_PF_NODE_INDEX_REL = Path("gnn_node_index_master.csv")
+_PF_HETERO_MV_NODES_REL = (
+    Path("Heterogenous GNN dataset") / "nodes" / "hetero_mv_nodes_load_transformer.csv"
+)
+
+
+def _csv_has_columns(csv_path: Path, *cols: str) -> bool:
+    import pandas as pd
+
+    if not csv_path.is_file():
+        return False
+    hdr = {str(c).strip().lower() for c in pd.read_csv(csv_path, nrows=0).columns.tolist()}
+    return all(str(c).strip().lower() in hdr for c in cols)
+
+
+def _pf_distance_csv_candidates(
+    *,
+    nodes_csv: Path,
+    node_pe_csv: Path | None,
+    data_root: Path | None,
+    repo: Path,
+) -> list[tuple[str, Path]]:
+    """Ordered (label, path) candidates that may carry ``electrical_distance_ohm``."""
+    out: list[tuple[str, Path]] = [("nodes_csv", nodes_csv)]
+    if node_pe_csv is not None:
+        out.append(("node_pe_csv", node_pe_csv))
+    extra: list[Path] = []
+    if data_root is not None:
+        extra.extend(
+            [
+                data_root / _PF_ELECTRICAL_DISTANCE_REL,
+                data_root / _PF_NODE_INDEX_REL,
+                data_root / _PF_HETERO_MV_NODES_REL,
+            ]
+        )
+    from gnn2_pf_data_paths import candidate_pf_data_roots
+
+    chunk_parent = nodes_csv.parent.parent if nodes_csv.parent.name.startswith("run_") else None
+    preferred = None
+    if data_root is not None and not data_root.name.startswith("run_"):
+        preferred = data_root
+    for root in candidate_pf_data_roots(
+        repo=repo, preferred=preferred, chunk_parent=chunk_parent
+    ):
+        extra.extend(
+            [
+                root / _PF_ELECTRICAL_DISTANCE_REL,
+                root / _PF_NODE_INDEX_REL,
+                root / _PF_HETERO_MV_NODES_REL,
+            ]
+        )
+    seen: set[str] = {str(nodes_csv.resolve()).lower()} if nodes_csv.is_file() else set()
+    if node_pe_csv is not None and node_pe_csv.is_file():
+        seen.add(str(node_pe_csv.resolve()).lower())
+    for p in extra:
+        try:
+            key = str(p.resolve()).lower()
+        except OSError:
+            key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.name == _PF_ELECTRICAL_DISTANCE_REL.name:
+            out.append(("pf_data_electrical_distance", p))
+        elif p.name == _PF_NODE_INDEX_REL.name:
+            out.append(("pf_data_node_index", p))
+        else:
+            out.append(("pf_data_hetero_mv_nodes", p))
+    return out
+
+
+def _resolve_pf_electrical_distance_csv(
+    *,
+    nodes_csv: Path,
+    node_pe_csv: Path | None,
+    data_root: Path | None,
+    repo: Path,
+    mode: str,
+) -> tuple[Path | None, list[str]]:
+    """Pick a CSV with ``electrical_distance_ohm`` for ``--pf_balance_nodes mv``."""
+    m = str(mode).strip().lower()
+    if m != "mv":
+        return None, []
+    tried: list[str] = []
+    for label, path in _pf_distance_csv_candidates(
+        nodes_csv=nodes_csv,
+        node_pe_csv=node_pe_csv,
+        data_root=data_root,
+        repo=repo,
+    ):
+        tried.append(f"{label}={path}")
+        if _csv_has_columns(path, "node", "electrical_distance_ohm"):
+            if path != nodes_csv:
+                print(
+                    f"WARNING: {nodes_csv} lacks electrical_distance_ohm; "
+                    f"using {path} ({label}) for --pf_balance_nodes mv mask.",
+                    flush=True,
+                )
+            return path, tried
+    return None, tried
+
+
+def _load_pf_distance_by_node(
+    distance_csv: Path,
+    *,
+    sample_id: int | None,
+) -> dict[str, float]:
+    import pandas as pd
+
+    hdr = pd.read_csv(distance_csv, nrows=0).columns.tolist()
+    usecols = ["node", "electrical_distance_ohm"]
+    if "sample_id" in hdr:
+        usecols.insert(0, "sample_id")
+    df = pd.read_csv(distance_csv, usecols=usecols)
+    if "sample_id" in df.columns and sample_id is not None:
+        df = df[df["sample_id"].map(_norm_sid) == int(sample_id)]
+    return {
+        str(row["node"]).strip().lower(): float(row["electrical_distance_ohm"])
+        for _, row in df.iterrows()
+    }
+
+
 def _load_pf_balance_mask(
     nodes_csv: Path,
     node_to_local: dict[str, int],
     n_nodes: int,
     mode: str,
+    *,
+    distance_csv: Path | None = None,
+    mv_fallback_all_non_slack: bool = False,
+    distance_tried: list[str] | None = None,
 ) -> torch.Tensor:
     """Balance mask excluding slack/source buses.
 
     ``all`` = every non-slack node; ``mv`` = ``electrical_distance_ohm > 0`` and non-slack (downstream MV).
+    When ``nodes_csv`` lacks ``electrical_distance_ohm``, pass ``distance_csv`` (e.g. ``--node_pe_csv``).
     """
     import pandas as pd
 
     m = str(mode).strip().lower()
-    usecols = ["sample_id", "node"]
-    hdr = pd.read_csv(nodes_csv, nrows=0).columns.tolist()
-    if m == "mv":
-        if "electrical_distance_ohm" not in hdr:
-            raise ValueError(
-                f"--pf_balance_nodes mv requires electrical_distance_ohm in {nodes_csv}"
-            )
-        usecols.append("electrical_distance_ohm")
-    sid0 = int(pd.read_csv(nodes_csv, usecols=["sample_id"], nrows=1)["sample_id"].iloc[0])
-    sub = pd.read_csv(nodes_csv, usecols=usecols)
-    sub = sub[sub["sample_id"].map(_norm_sid) == sid0]
     mask = torch.zeros(n_nodes, dtype=torch.bool)
-    for _, row in sub.iterrows():
-        node = str(row["node"]).strip().lower()
-        if node not in node_to_local:
-            continue
-        if _is_pf_slack_source_node(node):
-            continue
-        if m == "mv" and float(row["electrical_distance_ohm"]) <= 1e-9:
-            continue
-        mask[int(node_to_local[node])] = True
+    dist_by_node: dict[str, float] | None = None
+    dist_src = distance_csv if distance_csv is not None else nodes_csv
+
+    if m == "mv":
+        if not _csv_has_columns(dist_src, "node", "electrical_distance_ohm"):
+            tried = distance_tried or [str(dist_src)]
+            if mv_fallback_all_non_slack:
+                print(
+                    "WARNING: --pf_balance_nodes mv but electrical_distance_ohm was not found; "
+                    f"falling back to all non-slack nodes. Tried:\n  "
+                    + "\n  ".join(tried)
+                    + "\nPass --node_pe_csv (e.g. gnn_node_index_master.csv) or use --pf_balance_nodes all.",
+                    flush=True,
+                )
+            else:
+                raise ValueError(
+                    "--pf_balance_nodes mv requires electrical_distance_ohm but it is missing from "
+                    f"{nodes_csv}. Tried:\n  "
+                    + "\n  ".join(tried)
+                    + "\nPass --node_pe_csv (e.g. gnn_node_index_master.csv) or use --pf_balance_nodes all."
+                )
+        elif dist_src != nodes_csv or not _csv_has_columns(nodes_csv, "electrical_distance_ohm"):
+            sid0 = int(pd.read_csv(nodes_csv, usecols=["sample_id"], nrows=1)["sample_id"].iloc[0])
+            dist_by_node = _load_pf_distance_by_node(dist_src, sample_id=sid0)
+
+    if dist_by_node is not None:
+        for node, li in node_to_local.items():
+            if _is_pf_slack_source_node(node):
+                continue
+            dist = dist_by_node.get(node)
+            if dist is None:
+                continue
+            if m == "mv" and float(dist) <= 1e-9:
+                continue
+            mask[int(li)] = True
+    elif m == "all" or mv_fallback_all_non_slack:
+        for node, li in node_to_local.items():
+            if _is_pf_slack_source_node(node):
+                continue
+            mask[int(li)] = True
+    else:
+        usecols = ["sample_id", "node"]
+        if m == "mv":
+            usecols.append("electrical_distance_ohm")
+        sid0 = int(pd.read_csv(nodes_csv, usecols=["sample_id"], nrows=1)["sample_id"].iloc[0])
+        sub = pd.read_csv(nodes_csv, usecols=usecols)
+        sub = sub[sub["sample_id"].map(_norm_sid) == sid0]
+        for _, row in sub.iterrows():
+            node = str(row["node"]).strip().lower()
+            if node not in node_to_local:
+                continue
+            if _is_pf_slack_source_node(node):
+                continue
+            if m == "mv" and float(row["electrical_distance_ohm"]) <= 1e-9:
+                continue
+            mask[int(node_to_local[node])] = True
+
     if not bool(mask.any()):
         raise ValueError(
             f"--pf_balance_nodes {mode!r} produced empty mask from {nodes_csv}; "
@@ -668,6 +833,7 @@ def _setup_pf_physics(
     reg_cols: list[str],
     meta_aux_cols: list[str],
     node_feature_cols: list[str],
+    node_pe_csv: Path | None = None,
 ) -> PfPhysicsState:
     w = float(getattr(args, "loss_power_balance_weight", 0.0) or 0.0)
     if w <= 0.0:
@@ -688,7 +854,30 @@ def _setup_pf_physics(
     y_re, y_im = _build_ybus_pu_from_edge_csv(
         edges_path, node_to_local, n_nodes, z_base, skip_undirected=skip_reg_pairs
     )
-    pf_mask = _load_pf_balance_mask(nodes_path, node_to_local, n_nodes, str(args.pf_balance_nodes))
+    repo = Path(__file__).resolve().parent
+    balance_mode = str(args.pf_balance_nodes)
+    distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
+        nodes_csv=nodes_path,
+        node_pe_csv=node_pe_csv,
+        data_root=data_root,
+        repo=repo,
+        mode=balance_mode,
+    )
+    use_distance_csv = (
+        distance_csv
+        if distance_csv is not None and distance_csv != nodes_path
+        else None
+    )
+    mv_fallback = balance_mode.strip().lower() == "mv" and distance_csv is None
+    pf_mask = _load_pf_balance_mask(
+        nodes_path,
+        node_to_local,
+        n_nodes,
+        balance_mode,
+        distance_csv=use_distance_csv,
+        mv_fallback_all_non_slack=mv_fallback,
+        distance_tried=distance_tried,
+    )
 
     raw_cap = str(getattr(args, "pf_cap_nodes_csv", "") or "").strip()
     if raw_cap:
@@ -2845,6 +3034,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_cols=reg_cols,
         meta_aux_cols=list(pv_aux_cols),
         node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
     )
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
@@ -3441,7 +3631,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="mv",
         choices=("mv", "all"),
-        help="Nodes included in power-balance residual: mv=electrical_distance>0, all=every node.",
+        help="Nodes included in power-balance residual: mv=electrical_distance>0 (from nodes CSV, else --node_pe_csv / PF_DATA_ROOT), all=every node.",
     )
     p.add_argument(
         "--pf_s_base_kva",
@@ -3672,6 +3862,7 @@ def main() -> None:
         reg_cols=reg_cols,
         meta_aux_cols=list(pv_aux_cols),
         node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
     )
     ds = DAGPSDataset(
         x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
