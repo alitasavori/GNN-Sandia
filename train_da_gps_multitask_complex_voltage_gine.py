@@ -639,15 +639,20 @@ def _resolve_pf_reg_catalog(edges_path: Path, data_root: Path, args: argparse.Na
         if not p.is_absolute():
             p = (data_root / p).resolve()
         return p if p.is_file() else None
-    candidates = [
-        data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
-        edges_path.parent / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
-        edges_path.parent / "hetero_mv_edge_catalog.csv",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c.resolve()
-    return None
+    from gnn2_pf_data_paths import resolve_pf_catalog_paths
+
+    repo = Path(__file__).resolve().parent
+    chunk_parent = edges_path.parent.parent if edges_path.parent.name.startswith("run_") else None
+    preferred = None if data_root.name.startswith("run_") else data_root
+    try:
+        reg, _, _ = resolve_pf_catalog_paths(
+            repo=repo,
+            preferred_root=preferred,
+            chunk_parent=chunk_parent,
+        )
+    except FileNotFoundError:
+        return None
+    return reg
 
 
 def _setup_pf_physics(
@@ -693,20 +698,22 @@ def _setup_pf_physics(
         if not cap_nodes_csv.is_file():
             raise FileNotFoundError(f"--pf_cap_nodes_csv not found: {cap_nodes_csv}")
     else:
-        cap_candidates = [
-            data_root / "capacitor_involved_nodes.csv",
-            nodes_path.parent / "capacitor_involved_nodes.csv",
-        ]
-        cap_nodes_csv = None
-        for c in cap_candidates:
-            if c.is_file():
-                cap_nodes_csv = c.resolve()
-                break
-        if cap_nodes_csv is None:
+        from gnn2_pf_data_paths import resolve_pf_catalog_paths
+
+        repo = Path(__file__).resolve().parent
+        chunk_parent = nodes_path.parent.parent if nodes_path.parent.name.startswith("run_") else None
+        preferred = None if data_root.name.startswith("run_") else data_root
+        try:
+            _, cap_nodes_csv, _ = resolve_pf_catalog_paths(
+                repo=repo,
+                preferred_root=preferred,
+                chunk_parent=chunk_parent,
+            )
+        except FileNotFoundError as ex:
             raise FileNotFoundError(
                 "Physics loss enabled but capacitor bus map not found. "
-                f"Tried {cap_candidates}. Set --pf_cap_nodes_csv."
-            )
+                "Set --pf_cap_nodes_csv."
+            ) from ex
 
     load_cols = {"p_load_kw", "q_load_kvar", "p_pv_kw"}
     missing_load = load_cols - {str(c).lower() for c in node_feature_cols}
