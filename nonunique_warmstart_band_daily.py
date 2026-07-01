@@ -109,7 +109,8 @@ def run_warmstart_band_daily(
 
     print(
         f"Warm-start band daily: step_min={cfg.step_min} min, npts={npts}, "
-        f"n_warm_starts={n_ws} (independent random reg/cap init per solve)"
+        f"n_warm_starts={n_ws} (independent random reg + dynamic-cap init per solve; "
+        f"static caps fixed ON)"
     )
 
     ctx = _snapshot_step_context(cfg)

@@ -296,28 +296,77 @@ def compile_and_setup(cfg: DailySimConfig, *, snapshot: bool = False):
         install_der_generator(cfg, cfg.der_bus)
 
 
+def _controlled_capacitor_names() -> frozenset[str]:
+    """Capacitor names with a ``CapControl`` object (dynamic on/off switching)."""
+    out: set[str] = set()
+    for ctrl_nm in dss.CapControls.AllNames():
+        dss.CapControls.Name(ctrl_nm)
+        out.add(str(dss.CapControls.Capacitor()).lower())
+    return frozenset(out)
+
+
+def _is_dynamic_capacitor(name: str, *, controlled: frozenset[str] | None = None) -> bool:
+    controlled = controlled if controlled is not None else _controlled_capacitor_names()
+    return str(name).lower() in controlled
+
+
+def _set_capacitor_states(name: str, *, on: bool) -> None:
+    dss.Capacitors.Name(name)
+    n = dss.Capacitors.NumSteps()
+    dss.Capacitors.States([1] * n if on else [0] * n)
+
+
+def classify_controller_warmstart_devices() -> dict[str, list[str]]:
+    """Return OpenDSS device names grouped by warm-start randomization policy.
+
+    Requires an compiled circuit. Static capacitors have no ``CapControl`` (e.g.
+    ``CAPBank3`` is always energized). All ``RegControl`` objects are dynamic.
+    """
+    dynamic_caps = sorted(_controlled_capacitor_names())
+    static_caps = sorted(
+        nm for nm in dss.Capacitors.AllNames() if not _is_dynamic_capacitor(nm, controlled=frozenset(dynamic_caps))
+    )
+    return {
+        "dynamic_regulators": sorted(dss.RegControls.AllNames()),
+        "dynamic_capacitors": dynamic_caps,
+        "static_capacitors": static_caps,
+    }
+
+
 def set_controllers(low_init: bool):
     tap = LOW_TAP if low_init else HIGH_TAP
+    controlled = _controlled_capacitor_names()
     for nm in dss.RegControls.AllNames():
         dss.RegControls.Name(nm)
         dss.RegControls.TapNumber(tap)
     for nm in dss.Capacitors.AllNames():
-        dss.Capacitors.Name(nm)
-        n = dss.Capacitors.NumSteps()
-        dss.Capacitors.States([0] * n if low_init else [1] * n)
+        if _is_dynamic_capacitor(nm, controlled=controlled):
+            _set_capacitor_states(nm, on=not low_init)
+        else:
+            _set_capacitor_states(nm, on=True)
 
 
-def randomize_controllers(rng: np.random.Generator | None = None) -> None:
-    """Random regulator taps and capacitor bank on/off before an independent snapshot solve."""
+def randomize_controllers(
+    rng: np.random.Generator | None = None,
+    *,
+    dynamic_only: bool = True,
+) -> None:
+    """Random regulator taps and dynamic capacitor bank on/off before an independent snapshot solve.
+
+    When ``dynamic_only`` is True (default), static capacitors without ``CapControl``
+    (e.g. ``CAPBank3``) are left energized instead of randomized.
+    """
     rng = rng or np.random.default_rng()
+    controlled = _controlled_capacitor_names() if dynamic_only else None
     for nm in dss.RegControls.AllNames():
         dss.RegControls.Name(nm)
         dss.RegControls.TapNumber(int(rng.integers(LOW_TAP, HIGH_TAP + 1)))
     for nm in dss.Capacitors.AllNames():
-        dss.Capacitors.Name(nm)
-        n = dss.Capacitors.NumSteps()
+        if dynamic_only and not _is_dynamic_capacitor(nm, controlled=controlled):
+            _set_capacitor_states(nm, on=True)
+            continue
         bank_on = bool(rng.integers(0, 2))
-        dss.Capacitors.States([1] * n if bank_on else [0] * n)
+        _set_capacitor_states(nm, on=bank_on)
 
 
 def inject_controller_warmstart(
