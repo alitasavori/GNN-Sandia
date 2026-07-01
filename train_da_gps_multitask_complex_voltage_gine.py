@@ -102,6 +102,19 @@ def _parse_capacitors_dss(dss_path: Path) -> dict[str, tuple[str, float]]:
     return out
 
 
+def _cap_bus_local_indices(bus: str, node_to_local: dict[str, int]) -> list[int]:
+    """Map a capacitor bus name (phased or bare) to one or more local node indices."""
+    b = str(bus).strip().lower()
+    if b in node_to_local:
+        return [int(node_to_local[b])]
+    if re.search(r"\.\d+$", b):
+        raise ValueError(f"Capacitor bus {bus!r} not in node index map")
+    phased = [int(node_to_local[f"{b}{ph}"]) for ph in (".1", ".2", ".3") if f"{b}{ph}" in node_to_local]
+    if phased:
+        return phased
+    raise ValueError(f"Capacitor bus {bus!r} not in node index map")
+
+
 def _resolve_cap_bus_nodes(
     cap_cols: list[str],
     node_to_local: dict[str, int],
@@ -110,7 +123,7 @@ def _resolve_cap_bus_nodes(
     meta_csv: Path | None,
     capacitors_dss: Path | None,
 ) -> list[tuple[int, float, int]]:
-    """``(local_node_idx, q_nominal_kvar, cap_col_index)`` for shunt-Y and Q injection."""
+    """``(local_node_idx, q_nominal_kvar_per_stamped_node, cap_col_index)`` for shunt-Y only."""
     import pandas as pd
 
     q_nom_by_stem: dict[str, float] = {}
@@ -123,12 +136,7 @@ def _resolve_cap_bus_nodes(
                 row = pd.read_csv(meta_csv, usecols=[c], nrows=1)
                 q_nom_by_stem[st] = float(row[c].iloc[0])
 
-    bus_by_stem: dict[str, str] = {}
-    if capacitors_dss is not None:
-        for st, (bus, kvar) in _parse_capacitors_dss(capacitors_dss).items():
-            bus_by_stem[st] = bus
-            q_nom_by_stem.setdefault(st, float(kvar))
-
+    bus_nodes_by_stem: dict[str, list[str]] = {}
     if cap_nodes_csv is not None and cap_nodes_csv.is_file():
         cdf = pd.read_csv(cap_nodes_csv)
         cap_name_col = next((c for c in cdf.columns if str(c).strip().upper() == "CAP"), None)
@@ -145,27 +153,39 @@ def _resolve_cap_bus_nodes(
                 st = _device_stem(row[cap_name_col])
                 bus = str(row[bus_col]).strip().lower()
                 if bus and bus != "nan":
-                    bus_by_stem.setdefault(st, bus)
+                    bus_nodes_by_stem.setdefault(st, []).append(bus)
+
+    if capacitors_dss is not None:
+        for st, (bus, kvar) in _parse_capacitors_dss(capacitors_dss).items():
+            q_nom_by_stem.setdefault(st, float(kvar))
+            bus_nodes_by_stem.setdefault(st, [bus])
 
     banks: list[tuple[int, float, int]] = []
     for j, col in enumerate(cap_cols):
         st = _cap_col_stem(col)
         if not st:
             raise ValueError(f"Cannot parse capacitor stem from meta column {col!r}")
-        bus = bus_by_stem.get(st)
-        if bus is None:
+        buses = bus_nodes_by_stem.get(st)
+        if not buses:
             raise ValueError(
                 f"No bus mapping for capacitor {st!r} (column {col!r}). "
                 "Set --pf_cap_nodes_csv or provide capacitor_involved_nodes.csv with CAP and bus columns."
             )
-        if bus not in node_to_local:
-            raise ValueError(f"Capacitor bus {bus!r} for {st!r} not in node index map")
         if st not in q_nom_by_stem:
             raise ValueError(
                 f"No q_nominal_kvar for capacitor {st!r}; need cap_*_q_nominal_kvar in meta CSV or Capacitors.dss"
             )
         q_nom = float(q_nom_by_stem[st])
-        banks.append((int(node_to_local[bus]), q_nom, int(j)))
+        node_indices: list[int] = []
+        for bus in buses:
+            for ni in _cap_bus_local_indices(bus, node_to_local):
+                if ni not in node_indices:
+                    node_indices.append(ni)
+        if not node_indices:
+            raise ValueError(f"No local nodes resolved for capacitor {st!r} buses {buses!r}")
+        q_each = q_nom / float(len(node_indices))
+        for ni in node_indices:
+            banks.append((int(ni), float(q_each), int(j)))
     return banks
 
 
