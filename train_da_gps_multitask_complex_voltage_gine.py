@@ -11,7 +11,8 @@ v2 alignment:
 
 Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent physics fallbacks):
 - After denormalizing predicted complex voltage (Re/Im head), penalize nodal P/Q balance residuals
-  ``r_P = P_inj - Re(V*conj(YV))``, ``r_Q = Q_inj - Im(V*conj(YV))`` on selected nodes (slack/source excluded).
+  ``r_P = P_inj_pu - Re(V*conj(YV))``, ``r_Q = Q_inj_pu - Im(V*conj(YV))`` (per-unit power) with
+  Huber aggregation (``--pf_huber_delta_pu``, default 0.02) on selected nodes (slack/source excluded).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -250,6 +251,7 @@ def _load_regulator_edges_for_pf(
 class PfPhysicsState:
     weight: float = 0.0
     s_base_kva: float = 5000.0
+    huber_delta_pu: float = 0.02
     Y_re_base: torch.Tensor | None = None
     Y_im_base: torch.Tensor | None = None
     mask: torch.Tensor | None = None
@@ -542,6 +544,15 @@ def _load_pf_balance_mask(
     return mask
 
 
+def _pf_huber_mean_sq(r_pu: torch.Tensor, *, delta_pu: float) -> torch.Tensor:
+    """Huber on per-unit residuals; linear tail avoids MV/interface outliers dominating mean(r²)."""
+    d = max(float(delta_pu), 1e-12)
+    abs_r = r_pu.abs()
+    quad = 0.5 * r_pu.square()
+    lin = d * (abs_r - 0.5 * d)
+    return torch.where(abs_r <= d, quad, lin).mean()
+
+
 def nodal_power_balance_residual(
     pred_ri: torch.Tensor,
     p_inj_kw: torch.Tensor,
@@ -550,8 +561,10 @@ def nodal_power_balance_residual(
     Y_im: torch.Tensor,
     node_mask: torch.Tensor | None,
     s_base_kva: float,
+    *,
+    huber_delta_pu: float = 0.02,
 ) -> torch.Tensor:
-    """Mean squared P/Q injection residual using denormalized complex voltage (pu) and pu Ybus."""
+    """Huber-smoothed mean P/Q balance residual in per-unit power (pu S_base)."""
     v_re = pred_ri[..., 0]
     v_im = pred_ri[..., 1]
     if Y_re.dim() == 2:
@@ -562,15 +575,16 @@ def nodal_power_balance_residual(
         i_im = torch.matmul(v_re, Y_im.transpose(-1, -2)) + torch.matmul(v_im, Y_re.transpose(-1, -2))
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
-    p_kw = s_re * float(s_base_kva)
-    q_kvar = s_im * float(s_base_kva)
-    r_p = p_inj_kw - p_kw
-    r_q = q_inj_kvar - q_kvar
+    s_base = max(float(s_base_kva), 1e-12)
+    p_pu = s_re
+    q_pu = s_im
+    r_p = (p_inj_kw / s_base) - p_pu
+    r_q = (q_inj_kvar / s_base) - q_pu
     if node_mask is not None:
         m = node_mask.to(device=pred_ri.device, dtype=torch.bool).view(1, -1)
         r_p = r_p.masked_select(m)
         r_q = r_q.masked_select(m)
-    return r_p.square().mean() + r_q.square().mean()
+    return _pf_huber_mean_sq(r_p, delta_pu=huber_delta_pu) + _pf_huber_mean_sq(r_q, delta_pu=huber_delta_pu)
 
 
 def _expected_reg_tap_pu(
@@ -755,7 +769,14 @@ def _power_balance_loss_from_batch(
     )
 
     return nodal_power_balance_residual(
-        pred_ri, p_inj, q_inj, y_re, y_im, pf.mask, pf.s_base_kva
+        pred_ri,
+        p_inj,
+        q_inj,
+        y_re,
+        y_im,
+        pf.mask,
+        pf.s_base_kva,
+        huber_delta_pu=pf.huber_delta_pu,
     )
 
 
@@ -843,6 +864,7 @@ def _setup_pf_physics(
     kv_base = float(getattr(args, "pf_kv_base", 12.47))
     z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
     detach = bool(getattr(args, "pf_detach_controls", False))
+    huber_delta_pu = float(getattr(args, "pf_huber_delta_pu", 0.02) or 0.02)
 
     reg_catalog = _resolve_pf_reg_catalog(edges_path, data_root, args)
     if reg_catalog is None:
@@ -937,6 +959,7 @@ def _setup_pf_physics(
     print(
         f"Power-balance physics: weight={w}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
+        f"huber_delta_pu={huber_delta_pu}, "
         f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
         f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}",
@@ -946,6 +969,7 @@ def _setup_pf_physics(
     return PfPhysicsState(
         weight=w,
         s_base_kva=s_base,
+        huber_delta_pu=huber_delta_pu,
         Y_re_base=y_re.to(device),
         Y_im_base=y_im.to(device),
         mask=pf_mask.to(device),
@@ -3060,7 +3084,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = train_pf_sum = 0.0
         train_n = 0
         train_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
         train_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
@@ -3149,6 +3173,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     )
                     if loss_pf is not None:
                         loss = loss + pf_state.weight * loss_pf
+                        train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                         loss_pv = mse(pv_p, y_pv_b)
@@ -3190,7 +3215,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
 
         model.eval()
         val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = val_pv_sum = 0.0
+        val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
         nv = 0
         val_sum_true = torch.zeros(n_nodes, device=device)
         val_sum_true2 = torch.zeros(n_nodes, device=device)
@@ -3274,6 +3299,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         )
                         if lpf is not None:
                             lt = lt + pf_state.weight * lpf
+                            val_pf_sum += float(lpf.item()) * batch.num_graphs
                         if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                             lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                             lt = lt + float(args.lambda_pv) * lpv
@@ -3313,6 +3339,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         val_c = val_c_sum / max(nv, 1)
         val_r = val_r_sum / max(nv, 1)
         val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
+        val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
         true_mean = val_sum_true / max(nv, 1)
         var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
         mse_node = val_sum_se / max(nv, 1)
@@ -3324,6 +3351,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         train_c = train_c_sum / max(train_n, 1)
         train_r = train_r_sum / max(train_n, 1)
         train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
+        train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
         train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
         train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
@@ -3351,6 +3379,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            if pf_state.weight > 0:
+                _log += (
+                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                    f" pf_wt={pf_state.weight:g}"
+                )
             _log += (
                 f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
                 f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
@@ -3655,6 +3688,12 @@ def parse_args() -> argparse.Namespace:
         "--pf_detach_controls",
         action="store_true",
         help="Stop gradients through predicted taps/cap states inside physics loss (stability).",
+    )
+    p.add_argument(
+        "--pf_huber_delta_pu",
+        type=float,
+        default=0.02,
+        help="Huber delta (per-unit power) for physics residual; ~0.02 pu ≈ 100 kW at 5 MVA base.",
     )
     p.add_argument(
         "--pf_reg_edge_catalog",
@@ -3980,7 +4019,7 @@ def main() -> None:
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = 0.0
+        train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = train_pf_sum = 0.0
         train_n = 0
         train_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
         train_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
@@ -4021,6 +4060,7 @@ def main() -> None:
                 )
                 if loss_pf is not None:
                     loss = loss + pf_state.weight * loss_pf
+                    train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     loss_pv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                     loss = loss + float(args.lambda_pv) * loss_pv
@@ -4052,7 +4092,7 @@ def main() -> None:
 
         model.eval()
         val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = val_pv_sum = 0.0
+        val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
         nv = 0
         val_sum_true = torch.zeros(n_nodes, device=device)
         val_sum_true2 = torch.zeros(n_nodes, device=device)
@@ -4091,6 +4131,7 @@ def main() -> None:
                     )
                     if lpf is not None:
                         lt = lt + pf_state.weight * lpf
+                        val_pf_sum += float(lpf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
                         lt = lt + float(args.lambda_pv) * lpv
@@ -4122,6 +4163,7 @@ def main() -> None:
         val_c = val_c_sum / max(nv, 1)
         val_r = val_r_sum / max(nv, 1)
         val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
+        val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
         true_mean = val_sum_true / max(nv, 1)
         var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
         mse_node = val_sum_se / max(nv, 1)
@@ -4133,6 +4175,7 @@ def main() -> None:
         train_c = train_c_sum / max(train_n, 1)
         train_r = train_r_sum / max(train_n, 1)
         train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
+        train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
         train_tot = train_loss_sum / max(train_n, 1)
         train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
         train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
@@ -4160,6 +4203,11 @@ def main() -> None:
             )
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            if pf_state.weight > 0:
+                _log += (
+                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                    f" pf_wt={pf_state.weight:g}"
+                )
             _log += (
                 f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
                 f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "

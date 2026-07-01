@@ -266,21 +266,24 @@ class TestWrongPhysics:
         res_bad = float(
             _run_impl_residual(synthetic_truth, q_inj_cap_extra=extra).item()
         )
-        assert res_bad > res_ok + TOL_GROW
+        assert res_bad > res_ok * 50.0
+        assert res_bad > 1e-6
 
     def test_wrong_p_inj_sign_inflates_residual(self, synthetic_truth):
         res_ok = float(_run_impl_residual(synthetic_truth).item())
         x_bad = synthetic_truth["x_denorm"].clone()
         x_bad[:, synthetic_truth["col"]["p_pv_kw"]] *= -1.0
         res_bad = float(_run_impl_residual(synthetic_truth, x_denorm=x_bad).item())
-        assert res_bad > res_ok + TOL_GROW
+        assert res_bad > res_ok * 50.0
+        assert res_bad > 1e-6
 
     def test_wrong_q_inj_sign_inflates_residual(self, synthetic_truth):
         res_ok = float(_run_impl_residual(synthetic_truth).item())
         x_bad = synthetic_truth["x_denorm"].clone()
         x_bad[:, synthetic_truth["col"]["q_load_kvar"]] *= -1.0
         res_bad = float(_run_impl_residual(synthetic_truth, x_denorm=x_bad).item())
-        assert res_bad > res_ok + TOL_GROW
+        assert res_bad > res_ok * 50.0
+        assert res_bad > 1e-6
 
     def test_slack_excluded_despite_large_imbalance(self, synthetic_truth):
         """Slack (node 0) can violate balance; excluding it from mask should drop residual."""
@@ -313,7 +316,7 @@ class TestWrongPhysics:
         res_mv = float(
             pfmod.nodal_power_balance_residual(v, p_slack, q_slack, y_re, y_im, mask_no_slack, S_BASE_KVA).item()
         )
-        assert res_all > res_mv + TOL_GROW
+        assert res_all > res_mv + 0.05
         assert res_mv < TOL_ZERO_F32 * 10
 
 
@@ -671,10 +674,35 @@ class TestExpectedRegTapPu:
         assert all(lg.grad is not None and float(lg.grad.abs().sum()) > 0 for lg in reg_logits)
 
 
-# ---------------------------------------------------------------------------
-# F. Edge cases
-# ---------------------------------------------------------------------------
-class TestEdgeCases:
+class TestScaleRobustness:
+    def test_huber_truth_loss_not_dominated_by_outliers(self, synthetic_truth):
+        """At exact balance, Huber+pu loss stays O(1); raw kW MSE would be unusable at IEEE scale."""
+        res_huber = float(_run_impl_residual(synthetic_truth).item())
+        assert res_huber < TOL_ZERO_F32
+
+    @pytest.mark.skipif(
+        not all(
+            p.is_file()
+            for p in (
+                DATA_DAILYAGG / "gnn_edges_phase_static.csv",
+                HETERO_LOAD_NODES,
+                NODES8500,
+                DATA_DAILYAGG / "electrical_distance_from_substation.csv",
+            )
+        ),
+        reason="local OpenDSS snapshot CSVs not available",
+    )
+    def test_real_snapshot_huber_loss_bounded_at_truth(self):
+        snap = _real_snapshot_tensors(0)
+        v, p_inj, q_inj, mask = snap["v"], snap["p_inj"], snap["q_inj"], snap["mask"]
+        y_re, y_im = snap["y_full"]
+        res_huber = float(
+            pfmod.nodal_power_balance_residual(
+                v, p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA, huber_delta_pu=0.02
+            ).item()
+        )
+        # Raw kW MSE at truth is ~1e14 on this feeder; Huber+pu must stay trainable-scale.
+        assert res_huber < 500.0, f"huber loss at truth too large: {res_huber:.4e}"
     def test_batch_size_gt_one(self, synthetic_truth):
         res = float(_run_impl_residual(synthetic_truth, batch_size=2).item())
         assert res < TOL_ZERO_F32
