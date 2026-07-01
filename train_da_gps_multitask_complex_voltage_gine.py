@@ -590,7 +590,8 @@ def _expected_reg_tap_pu(
         cv = reg_class_values.to(device=reg_pred.device, dtype=torch.float32)
         for j, lg in enumerate(reg_logits):
             probs = F.softmax(lg.float(), dim=-1)
-            taps.append(torch.matmul(probs, cv[j]))
+            nc = int(probs.shape[-1])
+            taps.append(torch.matmul(probs, cv[j, :nc]))
         return torch.stack(taps, dim=1)
     if reg_mean is not None and reg_std is not None:
         return reg_pred.float() * reg_std.view(1, -1) + reg_mean.view(1, -1)

@@ -639,6 +639,39 @@ class TestGradients:
 
 
 # ---------------------------------------------------------------------------
+# G. Regulator CE tap expectation (heterogeneous n_classes)
+# ---------------------------------------------------------------------------
+class TestExpectedRegTapPu:
+    def test_heterogeneous_n_classes_batch_matmul(self):
+        """cv[j] is padded to max_classes; probs[j] width must match per-regulator slice."""
+        batch_size = 4
+        n_reg = 2
+        n_classes = (19, 29)
+        reg_class_values = torch.full((n_reg, max(n_classes)), float("nan"), dtype=torch.float32)
+        for j, nc in enumerate(n_classes):
+            reg_class_values[j, :nc] = torch.linspace(0.95, 1.05, nc)
+
+        reg_logits = [torch.randn(batch_size, nc, requires_grad=True) for nc in n_classes]
+        tap = pfmod._expected_reg_tap_pu(
+            torch.zeros(batch_size, n_reg),
+            reg_loss="ce",
+            reg_mean=None,
+            reg_std=None,
+            reg_logits=reg_logits,
+            reg_class_values=reg_class_values,
+        )
+        assert tap.shape == (batch_size, n_reg)
+        for j, lg in enumerate(reg_logits):
+            probs = torch.softmax(lg.float(), dim=-1)
+            expected = probs @ reg_class_values[j, : n_classes[j]]
+            assert torch.allclose(tap[:, j], expected, atol=1e-5)
+
+        loss = tap.sum()
+        loss.backward()
+        assert all(lg.grad is not None and float(lg.grad.abs().sum()) > 0 for lg in reg_logits)
+
+
+# ---------------------------------------------------------------------------
 # F. Edge cases
 # ---------------------------------------------------------------------------
 class TestEdgeCases:
