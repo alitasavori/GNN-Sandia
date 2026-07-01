@@ -1,0 +1,276 @@
+% =============================================================================
+% DA-GPS GNN, QSTS non-uniqueness, and physics-informed training (GNN2)
+% Compile:
+%   pdflatex da_gps_physics_nonuniqueness_report.tex
+%   bibtex da_gps_physics_nonuniqueness_report
+%   pdflatex da_gps_physics_nonuniqueness_report.tex
+%   pdflatex da_gps_physics_nonuniqueness_report.tex
+% =============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=black}
+
+\title{DA-GPS Surrogate Modeling for Quasi-Static Time-Series\\
+with Autonomous Voltage Controls:\\
+Non-Uniqueness, Closed-Loop Physics, and Evaluation on the IEEE~8500 Feeder}
+\author{GNN2 technical report (draft)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Quasi-static time-series (QSTS) analysis of distribution feeders with autonomous
+voltage controllers does not admit a one-to-one map from exogenous injections to
+converged voltages and device states: deadbands, delays, and hysteresis make the
+same load and PV inputs consistent with multiple valid coupled solutions unless
+controller history is tracked~\cite{deboever2017qsts}.
+This report summarizes the problem framing, the DA-GPS graph-neural surrogate
+(multitask voltage, regulator, capacitor, and meta-auxiliary heads), optional
+physics-informed nodal loss, and evaluation against OpenDSS native daily QSTS on
+the large unbalanced IEEE~8500-node test feeder with 2~MW preinstalled PV.
+Representative notebook runs report monitor-node voltage MAE $\approx 4.3\times
+10^{-3}$~p.u.\ and deployment wall-time speedups of roughly $3$--$4\times$
+relative to sequential OpenDSS \texttt{Solve()} calls on the same display grid.
+\end{abstract}
+
+% =============================================================================
+\section{Introduction and Problem Statement}
+\label{sec:problem}
+% =============================================================================
+
+Distribution interconnection and hosting-capacity studies increasingly require
+QSTS simulation to capture fast PV variability, on-load tap changer (LTC)
+actions, switched capacitor banks, and smart-inverter Volt--VAr
+curves~\cite{deboever2017qsts,reno2017vq,ieee1547}.
+On the IEEE~8500-node unbalanced OpenDSS model (\texttt{Master-PV2MW-inv.dss}),
+three device classes operate autonomously: \texttt{PV2} Volt--VAr control, nine
+switched single-phase capacitor banks, and twelve single-phase LTC
+regulators~\cite{gnn2_ieee8500_avc,ieee8500}.
+
+\subsection{Non-uniqueness of injection-to-output mappings}
+
+At each 5-minute snapshot, exogenous inputs are load and irradiance multipliers
+applied before \texttt{Solve()}:
+\begin{equation}
+  \mathbf{u}(t) = \big[m_L(t),\; m_{\mathrm{irr}}(t),\; t\big]^\top .
+  \label{eq:inputs}
+\end{equation}
+Let $\boldsymbol{\kappa}(t)$ collect LTC taps, capacitor switch states, and
+post-control inverter reactive power.  A converged OpenDSS state satisfies
+\begin{equation}
+  \mathbf{v}(t) = f_{\mathrm{DSS}}\!\big(\mathbf{u}(t),\boldsymbol{\kappa}(t)\big),
+\end{equation}
+but $\boldsymbol{\kappa}$ is \emph{not} a deterministic function of
+$\mathbf{u}(t)$ alone.
+
+Sandia and Georgia Tech document the root cause in distribution QSTS with
+autonomous controls~\cite{deboever2017qsts}:
+\begin{quote}
+\emph{Because the deadbands in controllers create a hysteresis in the state of
+the system, approximating control logic models can become extremely complex
+without modeling the actual logic of the controllers.  Models based on power
+injections cannot be used when controllers are considered since multiple discrete
+system states would be valid for the same power injections.  For example, a
+machine learning model, which seeks to establish a one to one mapping between
+the QSTS inputs and outputs, is not able to learn the correlation because the
+same inputs will yield multiple valid possible power flow solutions.}
+\end{quote}
+The report lists \emph{multiple valid power flow solutions} among the principal
+barriers to fast QSTS~\cite{deboever2017qsts}.  Subsequent Sandia work on
+rapid QSTS via machine learning therefore samples representative time windows,
+predicts aggregate indices (e.g.\ yearly tap changes), or tracks discrete system
+states rather than assuming a static injection-only
+map~\cite{blakely2018evaluation,reno2017pvsc,reno2017vq,blakely2018isgt}.
+
+\paragraph{Empirical demonstration (GNN2).}
+The \texttt{nonunique\_four\_scenario\_demo} experiment in \texttt{nonunique.ipynb}
+(cell~0) holds $\mathbf{u}(t)$ fixed and varies only initial controller seeds
+(\texttt{init\_low}, \texttt{init\_high}, \texttt{init\_default}) or uses cold
+snapshot recompiles without carry-forward (\texttt{snapshot\_cold}).  Divergent
+tap, capacitor, and voltage trajectories under identical injections illustrate
+path dependence and non-uniqueness on the IEEE~8500 model.
+
+% =============================================================================
+\section{Closed-Loop Power Flow with Autonomous Controls}
+\label{sec:closedloop}
+% =============================================================================
+
+OpenDSS does not treat controllers as post-processing corrections.  At each time
+step it alternates ac power-flow solves with control updates until device laws are
+satisfied or \texttt{maxcontroliter} is reached~\cite{opendss,gnn2_ieee8500_avc}:
+\begin{equation}
+  (\mathbf{x}^\star,\boldsymbol{\kappa}^\star)=
+  \find_{\mathbf{x},\boldsymbol{\kappa}}
+  \Big\{
+    \mathrm{PF}(\mathbf{x},\boldsymbol{\kappa};\mathbf{u}(t))=\mathbf{0},\;
+    \mathcal{C}(\mathbf{x},\boldsymbol{\kappa})=\mathbf{0}
+  \Big\},
+  \label{eq:coupled}
+\end{equation}
+where $\mathrm{PF}(\cdot)=\mathbf{0}$ is nodal ac balance and
+$\mathcal{C}(\cdot)=\mathbf{0}$ collects Volt--VAr curves, capacitor hysteresis
+with voltage override and switching delay, and LTC deadband relay
+logic~\cite{gnn2_ieee8500_avc}.
+
+\paragraph{Interpretation.}
+Solving distribution power flow with autonomous controllers is a \emph{closed-loop
+control system}: the plant is the unbalanced network, the controller state
+$\boldsymbol{\kappa}$ has memory (hysteresis, delays, warm-started taps), and the
+fixed point \eqref{eq:coupled} couples algebraic PF constraints with hybrid
+discrete--continuous device laws.  Snapshot-only surrogates that ignore
+$\boldsymbol{\kappa}(t{-}1)$ therefore target the wrong map for daily QSTS.
+
+Native OpenDSS daily mode (\texttt{mode=daily}) marches sequentially with
+warm-start carry-forward of voltages and controller states; the GNN2 daily-compare
+scripts compile once and call \texttt{Solve()} for each display step on that
+path~\cite{opendss}.
+
+% =============================================================================
+\section{Approach: DA-GPS Multitask GNN}
+\label{sec:approach}
+% =============================================================================
+
+\subsection{Architecture and targets}
+
+The DA-GPS (Distribution-Aggregate Graph Perceiver with System tokens) surrogate
+is implemented in \texttt{train\_da\_gps\_multitask\_complex\_voltage\_gine.py}.
+It uses GINE message passing on the MV-aggregated IEEE~8500 graph, learnable
+system tokens with cross-attention, and multitask heads:
+\begin{itemize}
+  \item complex voltage magnitude/angle (Re/Im head, denormalized for metrics);
+  \item per-device capacitor bank states (BCE);
+  \item per-regulator tap positions (cross-entropy on discrete tap classes);
+  \item meta-auxiliary scalars (e.g.\ \texttt{PV2} post-solve $P/Q$, feeder
+        losses).
+\end{itemize}
+Training data come from chunked OpenDSS QSTS snapshots on the unbalanced
+8500-node feeder (thousands of scenarios); positional encodings and static edge
+attributes supply topology that flat MLP baselines omit.
+
+\paragraph{Why multitask helps under non-uniqueness.}
+Rather than learning $\mathbf{u}\mapsto\mathbf{v}$ alone, the model jointly
+predicts $\boldsymbol{\kappa}$ and auxiliary quantities that co-determine the
+coupled fixed point~\eqref{eq:coupled}.  Supervision is generated along the
+OpenDSS daily march path, so labels reflect the trajectory-selected branch of the
+multivalued map.  This aligns with Sandia's emphasis on state-aware or
+time-correlated QSTS acceleration~\cite{deboever2017qsts,reno2017vq}.
+
+\subsection{Optional physics-informed nodal loss}
+
+When \texttt{--loss\_power\_balance\_weight} $> 0$, the trainer adds a mean-squared
+residual on MV nodes:
+\begin{align}
+  r_P &= P_{\mathrm{inj}} - \Re\!\big\{ \mathbf{V}\,(\conj{\mathbf{Y}}\,\mathbf{V})^*\big\}, \\
+  r_Q &= Q_{\mathrm{inj}} - \Im\!\big\{ \mathbf{V}\,(\conj{\mathbf{Y}}\,\mathbf{V})^*\big\},
+\end{align}
+with $\mathbf{Y}_{\mathrm{bus}}$ assembled from line $R/X$, \emph{predicted} LTC
+tap ratios on regulator branches, and shunt $jB$ from \emph{predicted} capacitor
+states; $P_{\mathrm{inj}},Q_{\mathrm{inj}}$ combine denormalized loads, meta-aux
+PV totals, and predicted cap $Q$~\cite{gnn2_ieee8500_avc}.
+
+\paragraph{Validation scope.}
+\texttt{\_tmp\_pf\_physics\_validate.py} checks algebraic consistency on a
+hand-built 4-bus network (residual $\approx 0$ at truth, grows under deliberate
+perturbations, non-zero autograd).  This validates implementation fidelity of the
+loss assembly, \textbf{not} end-to-end agreement with OpenDSS on the full 8500-node
+feeder.  All preflight checks passed in the current repository snapshot.
+
+% =============================================================================
+\section{Evaluation Methodology}
+\label{sec:eval}
+% =============================================================================
+
+\subsection{OpenDSS truth and metrics}
+
+\texttt{nonunique.ipynb} cell~2 (\texttt{mode=da\_gps\_daily\_compare}) compares:
+\begin{enumerate}
+  \item \textbf{OpenDSS truth:} one compile, native \texttt{mode=daily}, sequential
+        \texttt{Solve()} with warm-start carry-forward on profiles
+        \texttt{load\_day\_004.csv} / \texttt{irr\_day\_004.csv}.
+  \item \textbf{DA-GPS inference:} GNN-only forward passes on the same display
+        grid (\texttt{step\_min}, \texttt{npts}), overlaying voltages, taps, and
+        capacitor states on four monitor buses.
+\end{enumerate}
+Metrics include per-monitor and overall voltage MAE/RMSE (p.u.), regulator and
+capacitor trajectories, control/PF iteration counts, and wall-clock timing.
+
+\subsection{Representative results (notebook cell~3)}
+
+On GPU, with \texttt{step\_min=5}~min ($n_{\mathrm{pts}}=288$):
+\begin{itemize}
+  \item OpenDSS mean \texttt{Solve()} time: $\approx 15.8$~ms/step (loop wall
+        $\approx 4.56$~s).
+  \item DA-GPS deployment mean: $\approx 4.9$~ms/display step (total deployment
+        wall $\approx 1.40$~s).
+  \item Wall speedup (OpenDSS loop / GNN deployment): $\approx 3.35\times$.
+  \item Overall monitor voltage MAE: $\approx 4.3\times 10^{-3}$~p.u.; RMSE
+        $\approx 5.2\times 10^{-3}$~p.u.
+\end{itemize}
+Coarser display grids ($10$--$60$~min) show similar or slightly higher speedups
+($\approx 4\times$) with proportionally fewer forwards.
+
+\subsection{Comparison to device-agnostic baselines}
+
+Flat MLP sweeps on the same 8500-node dataset (\texttt{mlp\_sweep\_8500}) achieve
+best test voltage MAE $\approx 0.25$~p.u.\ without graph structure or explicit
+device-state heads---orders of magnitude worse than DA-GPS daily-compare MAE and
+consistent with the failure mode of injection-only mappings under autonomous
+controls~\cite{deboever2017qsts}.  Graph-based DA-GPS exploits topology and
+multitask device supervision; timing comparisons in cell~3 are against OpenDSS
+sequential QSTS, not against MLP inference latency.
+
+% =============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =============================================================================
+
+\paragraph{Claims validated against the repository.}
+\begin{itemize}
+  \item \textbf{Sandia non-uniqueness / ML one-to-one mapping:} Supported by
+        \cite{deboever2017qsts} (primary) and demonstrated empirically in cell~0.
+  \item \textbf{IEEE~8500 unbalanced feeder vs OpenDSS baselines:} Supported;
+        daily compare uses \texttt{Master-PV2MW-inv.dss} native daily QSTS.
+  \item \textbf{PF + autonomous controls as closed-loop system:} Supported by
+        \eqref{eq:coupled} and OpenDSS outer control loop
+        documentation~\cite{gnn2_ieee8500_avc,opendss}.
+  \item \textbf{Physics-informed nodal loss accuracy:} Implementation algebra
+        validated synthetically; optional training term, not a substitute for
+        OpenDSS verification on the full feeder.
+\end{itemize}
+
+\paragraph{Limitations.}
+The surrogate is trained on OpenDSS trajectories and evaluated on paths that
+include warm-start carry-forward; cold-start snapshot parity remains difficult
+(cell~0 \texttt{snapshot\_cold}).  Physics loss uses predicted (not ground-truth)
+controls inside $\mathbf{Y}_{\mathrm{bus}}$.  Speedups exclude one-time compile
+and checkpoint load; wrapper overhead is reported separately in timing logs.
+
+% =============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% =============================================================================
+
+Autonomous voltage controls induce hysteresis and multiple valid coupled solutions
+for identical injections, breaking naive QSTS surrogates that map
+$\mathbf{u}\mapsto\mathbf{v}$~\cite{deboever2017qsts}.  Treating PF plus
+controllers as a closed-loop fixed-point problem clarifies why state-aware,
+multitask, graph-based training on sequential OpenDSS labels is appropriate for
+the IEEE~8500 feeder.  DA-GPS achieves sub-$10^{-2}$~p.u.\ monitor MAE against
+native daily QSTS while reducing deployment wall time by roughly $3$--$4\times$
+on representative notebook configurations; optional nodal power-balance loss adds
+physics consistency at the implementation level validated by synthetic tests.
+
+% =============================================================================
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+% =============================================================================
+
+\end{document}

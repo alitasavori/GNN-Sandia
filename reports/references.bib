@@ -1,0 +1,89 @@
+% =============================================================================
+% Bibliography for DA-GPS / QSTS non-uniqueness report (GNN2)
+% =============================================================================
+
+@techreport{deboever2017qsts,
+  author       = {Deboever, Jeremiah and Zhang, Xiaochen and Reno, Matthew J. and Broderick, Robert J. and Grijalva, Santiago and Therrien, Francis},
+  title        = {Challenges in Reducing the Computational Time of {QSTS} Simulations for Distribution System Analysis},
+  institution  = {Sandia National Laboratories},
+  address      = {Albuquerque, NM, USA},
+  year         = {2017},
+  month        = jun,
+  doi          = {10.2172/1367462},
+  url          = {https://www.osti.gov/biblio/1367462},
+  note         = {Technical report; Sandia co-authored. Identifies multiple valid power-flow solutions under autonomous controllers and the failure of injection-only ML mappings.}
+}
+
+@techreport{blakely2018evaluation,
+  author       = {Blakely, Logan and Reno, Matthew J. and Broderick, Robert J.},
+  title        = {Evaluation and Comparison of Machine Learning Techniques for Rapid {QSTS} Simulations},
+  institution  = {Sandia National Laboratories},
+  address      = {Albuquerque, NM, USA},
+  year         = {2018},
+  month        = jul,
+  number       = {SAND2018-8018},
+  doi          = {10.2172/1734485},
+  url          = {https://www.osti.gov/biblio/1734485}
+}
+
+@inproceedings{reno2017pvsc,
+  author       = {Reno, Matthew J. and Broderick, Robert J. and Blakely, Logan},
+  title        = {Machine Learning for Rapid {QSTS} Simulations Using Neural Networks},
+  booktitle    = {2017 {IEEE} 44th Photovoltaic Specialist Conference ({PVSC})},
+  year         = {2017},
+  pages        = {1573--1578},
+  doi          = {10.1109/PVSC.2017.8366148},
+  organization = {IEEE}
+}
+
+@article{reno2017vq,
+  author  = {Reno, Matthew J. and Broderick, Robert J. and Therrien, Francis and Grijalva, Santiago},
+  title   = {Fast Quasi-Static Time-Series ({QSTS}) for Yearlong {PV} Impact Studies Using Vector Quantization},
+  journal = {Solar Energy},
+  year    = {2017},
+  volume  = {155},
+  pages   = {973--984},
+  doi     = {10.1016/j.solener.2017.06.059},
+  note    = {OSTI ID 1472256. Tracks discrete controller states to avoid re-solving identical system configurations.}
+}
+
+@inproceedings{blakely2018isgt,
+  author       = {Blakely, Logan and Reno, Matthew J. and Broderick, Robert J.},
+  title        = {Decision Tree Ensemble Machine Learning for Rapid {QSTS} Simulations},
+  booktitle    = {2018 {IEEE} Power \& Energy Society Innovative Smart Grid Technologies Conference ({ISGT})},
+  year         = {2018},
+  pages        = {1--5},
+  doi          = {10.1109/ISGT.2018.8403323},
+  organization = {IEEE}
+}
+
+@misc{ieee8500,
+  author       = {{IEEE PES Distribution Systems Analysis Subcommittee}},
+  title        = {{IEEE} 8500-Node Test Feeder},
+  howpublished = {Distribution test feeder repository},
+  url          = {https://cmte.ieee.org/pes-testfeeders/resources/},
+  note         = {Large unbalanced distribution benchmark; basis for OpenDSS models used in GNN2.}
+}
+
+@standard{ieee1547,
+  author       = {{IEEE}},
+  title        = {{IEEE} Std 1547-2018: Standard for Interconnection and Interoperability of Distributed Energy Resources with Associated Electric Power Systems Interfaces},
+  organization = {IEEE},
+  year         = {2018}
+}
+
+@misc{opendss,
+  author       = {{Electric Power Research Institute (EPRI)}},
+  title        = {OpenDSS Documentation},
+  howpublished = {RegControl, CapControl, and InvControl object reference},
+  url          = {https://opendss.epri.com/},
+  note         = {Sequential daily QSTS with outer control loop until \texttt{maxcontroliter}.}
+}
+
+@misc{gnn2_ieee8500_avc,
+  author       = {{GNN2 project}},
+  title        = {Autonomous Voltage Controllers in the {IEEE} 8500-Node OpenDSS Model},
+  howpublished = {Repository note \texttt{ieee8500\_autonomous\_voltage\_controls.tex}},
+  year         = {2026},
+  note         = {Documents Volt--VAr, capacitor hysteresis, and LTC deadbands in \texttt{Master-PV2MW-inv.dss}.}
+}
