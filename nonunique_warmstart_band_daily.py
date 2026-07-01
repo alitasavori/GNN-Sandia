@@ -170,7 +170,9 @@ def run_warmstart_band_daily(
     inside_frac: dict[str, float] = {}
     if da_v is not None:
         for j, node in enumerate(nodes):
-            v_da = da_v.get(node) or da_v.get(str(node).lower())
+            v_da = da_v.get(node)
+            if v_da is None:
+                v_da = da_v.get(str(node).lower())
             if v_da is None:
                 continue
             v_da = np.asarray(v_da, dtype=float).ravel()[:npts]
