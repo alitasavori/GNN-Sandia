@@ -642,6 +642,157 @@ class TestGradients:
 
 
 # ---------------------------------------------------------------------------
+# H. Physical units (OpenDSS-faithful Siemens path)
+# ---------------------------------------------------------------------------
+KV_LN_DEFAULT = KV_BASE / np.sqrt(3.0)
+V_SCALE_SYN = KV_LN_DEFAULT * 1000.0
+
+
+def _build_synthetic_siemens_ybus_truth(y_re_base, y_im_base, tap, cap_on, v_scale_volts):
+    """Truth Y in Siemens with per-bus cap stamping."""
+    y_re = y_re_base.clone()
+    y_im = y_im_base.clone()
+    iu, iv = 0, 1
+    g = _REG_R / _REG_Z2
+    b = -_REG_X / _REG_Z2
+    a = float(np.clip(tap, 0.9, 1.1))
+    a2 = a * a
+    y_re[iu, iu] += g
+    y_im[iu, iu] += b
+    y_re[iv, iv] += g / a2
+    y_im[iv, iv] += b / a2
+    y_re[iu, iv] -= g / a
+    y_re[iv, iu] -= g / a
+    y_im[iu, iv] -= b / a
+    y_im[iv, iu] -= b / a
+    ni, q_nom, _ = CAP_BANK
+    v_nom = float(v_scale_volts[ni])
+    y_im[ni, ni] += cap_on * (float(q_nom) * 1000.0) / (v_nom * v_nom)
+    return y_re, y_im
+
+
+def _build_base_ybus_siemens():
+    y_re = np.zeros((N_NODES, N_NODES), dtype=np.float64)
+    y_im = np.zeros((N_NODES, N_NODES), dtype=np.float64)
+    for iu, iv, r, x in LINE_EDGES:
+        z2 = r * r + x * x
+        g, b = r / z2, -x / z2
+        y_re[iu, iv] -= g
+        y_re[iv, iu] -= g
+        y_im[iu, iv] -= b
+        y_im[iv, iu] -= b
+        y_re[iu, iu] += g
+        y_re[iv, iv] += g
+        y_im[iu, iu] += b
+        y_im[iv, iv] += b
+    return y_re, y_im
+
+
+class TestPhysicalUnits:
+    def test_siemens_ybus_no_zbase_multiplier(self):
+        import pandas as pd
+        import tempfile
+
+        nodes = ["a.1", "b.1"]
+        n2l = {n: i for i, n in enumerate(nodes)}
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "edges.csv"
+            pd.DataFrame(
+                [{"from_node": "a.1", "to_node": "b.1", "R_full": 0.02, "X_full": 0.04, "line_name": "L1", "linecode": "abc"}]
+            ).to_csv(p, index=False)
+            y_re_s, y_im_s = pfmod._build_ybus_siemens_from_edge_csv(p, n2l, 2)
+            y_re_p, y_im_p = pfmod._build_ybus_pu_from_edge_csv(p, n2l, 2, Z_BASE)
+        z2 = 0.02 * 0.02 + 0.04 * 0.04
+        g_s = 0.02 / z2
+        assert abs(float(y_re_s[0, 1].item()) + g_s) < 1e-9
+        assert abs(float(y_re_p[0, 1].item()) + g_s * Z_BASE) < 1e-6
+
+    def test_v_scale_array_per_node(self):
+        from gnn2_pf_bus_kv import kv_base_ln_v_array
+
+        ntl = {"a.1": 0, "b.2": 1}
+        kv = {"a.1": 7.2, "b.2": 7.1996}
+        arr = kv_base_ln_v_array(ntl, kv, 2)
+        assert arr[0] == pytest.approx(7200.0)
+        assert arr[1] == pytest.approx(7199.6)
+
+    def test_physical_residual_near_zero_at_truth(self):
+        y_re_b = torch.from_numpy(_build_base_ybus_siemens()[0]).float()
+        y_im_b = torch.from_numpy(_build_base_ybus_siemens()[1]).float()
+        v_scale = torch.full((N_NODES,), V_SCALE_SYN, dtype=torch.float32)
+        reg_g = _REG_R / _REG_Z2
+        reg_b = -_REG_X / _REG_Z2
+        reg_edge_s = (0, 1, reg_g, reg_b, 0)
+        y_re_f, y_im_f = _build_synthetic_siemens_ybus_truth(
+            y_re_b, y_im_b, TAP_TRUTH, CAP_ON_TRUTH, v_scale.numpy()
+        )
+        p_net, q_net = _nodal_power_kw_kvar_physical(V_TRUTH, y_re_f.numpy(), y_im_f.numpy(), v_scale.numpy())
+        p_load, q_load, p_inj_exp, q_inj_exp = _loads_for_exact_assembly(p_net, q_net)
+        col = {c: i for i, c in enumerate(NODE_FEATURE_COLS)}
+        x_denorm = torch.zeros(N_NODES, 4, dtype=torch.float32)
+        x_denorm[:, col["p_load_kw"]] = torch.tensor(p_load, dtype=torch.float32)
+        x_denorm[:, col["q_load_kvar"]] = torch.tensor(q_load, dtype=torch.float32)
+        x_denorm[:, col["p_pv_kw"]] = torch.tensor(P_PV_NODE, dtype=torch.float32)
+        x_denorm[:, col["q_pv_kvar"]] = torch.tensor(Q_PV_NODE, dtype=torch.float32)
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            y_re_b,
+            y_im_b,
+            reg_edges=[reg_edge_s],
+            cap_banks=[CAP_BANK],
+            tap_pu=torch.tensor([[TAP_TRUTH]], dtype=torch.float32),
+            cap_on=torch.tensor([[CAP_ON_TRUTH]], dtype=torch.float32),
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            use_physical_units=True,
+            v_scale_volts=v_scale,
+        )
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            x_denorm.unsqueeze(0),
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(x_denorm),
+            n_nodes=N_NODES,
+        )
+        res = pfmod.nodal_power_balance_residual(
+            torch.tensor(V_TRUTH, dtype=torch.float32).unsqueeze(0),
+            p_inj,
+            q_inj,
+            y_re,
+            y_im,
+            None,
+            S_BASE_KVA,
+            use_physical_units=True,
+            v_scale_volts=v_scale,
+            huber_delta_kw=10.0,
+        )
+        assert float(res.item()) < TOL_ZERO_F32
+
+    @pytest.mark.skipif(
+        not (DATA_DAILYAGG / "gnn_node_index_master.csv").is_file(),
+        reason="no local dailyagg index for kV cache",
+    )
+    def test_bus_kv_cache_roundtrip(self, tmp_path):
+        from gnn2_pf_bus_kv import read_bus_kv_cache, write_bus_kv_cache
+
+        ntl = {"l1234567.1": 0, "l7654321.2": 1}
+        kv = {"l1234567.1": 7.2, "l7654321.2": 7.1996}
+        v_scale = np.array([7200.0, 7199.6])
+        cache = tmp_path / "bus_kv_base_by_node.csv"
+        write_bus_kv_cache(cache, ntl, kv, v_scale)
+        kv2, v2 = read_bus_kv_cache(cache)
+        assert kv2["l1234567.1"] == pytest.approx(7.2)
+        assert v2[0] == pytest.approx(7200.0)
+
+
+def _nodal_power_kw_kvar_physical(v_ri, y_re, y_im, v_scale):
+    vs = np.asarray(v_scale, dtype=np.float64).reshape(-1)
+    v_re = v_ri[:, 0] * vs
+    v_im = v_ri[:, 1] * vs
+    i_re = v_re @ y_re.T - v_im @ y_im.T
+    i_im = v_re @ y_im.T + v_im @ y_re.T
+    s_re = v_re * i_re + v_im * i_im
+    s_im = v_im * i_re - v_re * i_im
+    return s_re / 1000.0, s_im / 1000.0
+# ---------------------------------------------------------------------------
 # G. Regulator CE tap expectation (heterogeneous n_classes)
 # ---------------------------------------------------------------------------
 class TestExpectedRegTapPu:

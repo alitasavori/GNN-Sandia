@@ -91,12 +91,23 @@ def nodal_power_kw_from_yv(
     y_im: np.ndarray,
     *,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
+    v_scale_volts: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """``S = V · conj(Y V)`` → (P_kW, Q_kvar) using the training convention (pu × S_base)."""
+    """``S = V · conj(Y V)`` → (P_kW, Q_kvar).
+
+    Physical: pass ``v_scale_volts`` to convert pu ``V`` to volts; ``Y`` in Siemens; divide by 1000.
+    Legacy: per-unit ``V`` and ``Y``; multiply by ``s_base_kva``.
+    """
+    if v_scale_volts is not None:
+        vs = np.asarray(v_scale_volts, dtype=np.float64).reshape(-1)
+        v_re = v_re * vs
+        v_im = v_im * vs
     i_re = v_re @ y_re.T - v_im @ y_im.T
     i_im = v_re @ y_im.T + v_im @ y_re.T
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
+    if v_scale_volts is not None:
+        return s_re / 1000.0, s_im / 1000.0
     s_base = float(s_base_kva)
     return s_re * s_base, s_im * s_base
 
@@ -132,6 +143,8 @@ class SnapshotState:
     y_im_full: np.ndarray
     meta_row: dict[str, Any]
     pf_data_root: Path
+    v_scale_volts: np.ndarray | None = None
+    use_physical_units: bool = True
 
 
 def resolve_verify_data_roots(
@@ -162,6 +175,8 @@ def load_snapshot_state(
     chunk_parent: Path | None = None,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
     kv_base: float = KV_BASE_DEFAULT,
+    use_physical_units: bool = True,
+    pf_bus_kv_base_csv: Path | None = None,
 ) -> SnapshotState:
     """Load one dailyagg snapshot into numpy arrays (label V, controls, feature injections)."""
     import pandas as pd
@@ -190,14 +205,32 @@ def load_snapshot_state(
     n_nodes = int(idx["node_idx"].max()) + 1
     z_base = z_base_ohm(s_base_kva=s_base_kva, kv_base=kv_base)
 
+    v_scale: np.ndarray | None = None
+    if use_physical_units:
+        from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
+
+        v_scale, _, _ = load_or_build_bus_kv_tensors(
+            repo=repo,
+            data_root=data_root,
+            node_to_local=ntl,
+            n_nodes=n_nodes,
+            cache_csv=pf_bus_kv_base_csv,
+        )
+
+    z_for_reg = None if use_physical_units else z_base
     reg_cols = list(TARGET_REG_COLS)
     cap_cols = list(TARGET_CAP_COLS)
     reg_catalog = data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
-    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, ntl, reg_cols, z_base)
+    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, ntl, reg_cols, z_for_reg)
     skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-    y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
-        edges_path, ntl, n_nodes, z_base, skip_undirected=skip
-    )
+    if use_physical_units:
+        y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
+            edges_path, ntl, n_nodes, skip_undirected=skip
+        )
+    else:
+        y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
+            edges_path, ntl, n_nodes, z_base, skip_undirected=skip
+        )
     cap_banks = pfmod._resolve_cap_bus_nodes(
         cap_cols,
         ntl,
@@ -221,6 +254,8 @@ def load_snapshot_state(
         cap_on=cap_t,
         s_base_kva=float(s_base_kva),
         batch_size=1,
+        use_physical_units=use_physical_units,
+        v_scale_volts=torch.tensor(v_scale, dtype=torch.float32) if v_scale is not None else None,
     )
 
     het = pd.read_csv(het_path)
@@ -282,6 +317,8 @@ def load_snapshot_state(
         y_im_line=y_im_b.numpy(),
         y_re_full=y_re_f[0].numpy(),
         y_im_full=y_im_f[0].numpy(),
+        v_scale_volts=v_scale,
+        use_physical_units=use_physical_units,
         meta_row={str(k): mrow[k] for k in mrow.index},
         pf_data_root=data_root,
     )
@@ -295,6 +332,7 @@ def apply_random_perturbation(
     sigma_tap: float = 0.0,
     flip_cap_prob: float = 0.0,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
+    kv_base: float = KV_BASE_DEFAULT,
 ) -> SnapshotState:
     """Return a shallow copy with optional random V / controls (for stress tests)."""
     import torch
@@ -317,16 +355,22 @@ def apply_random_perturbation(
         cap_on = np.where(flip, 1.0 - cap_on, cap_on)
 
     repo = REPO
-    z_base = z_base_ohm(s_base_kva=s_base_kva)
+    z_base = z_base_ohm(s_base_kva=s_base_kva, kv_base=kv_base)
     reg_cols = list(TARGET_REG_COLS)
     cap_cols = list(TARGET_CAP_COLS)
     reg_catalog = snap.pf_data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
-    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, snap.node_to_local, reg_cols, z_base)
+    z_for_reg = None if snap.use_physical_units else z_base
+    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, snap.node_to_local, reg_cols, z_for_reg)
     skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
     edges_path = snap.pf_data_root / "gnn_edges_phase_static.csv"
-    y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
-        edges_path, snap.node_to_local, snap.n_nodes, z_base, skip_undirected=skip
-    )
+    if snap.use_physical_units:
+        y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
+            edges_path, snap.node_to_local, snap.n_nodes, skip_undirected=skip
+        )
+    else:
+        y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
+            edges_path, snap.node_to_local, snap.n_nodes, z_base, skip_undirected=skip
+        )
     cap_banks = pfmod._resolve_cap_bus_nodes(
         cap_cols,
         snap.node_to_local,
@@ -343,6 +387,12 @@ def apply_random_perturbation(
         cap_on=torch.tensor(cap_on, dtype=torch.float32).unsqueeze(0),
         s_base_kva=float(s_base_kva),
         batch_size=1,
+        use_physical_units=snap.use_physical_units,
+        v_scale_volts=(
+            torch.tensor(snap.v_scale_volts, dtype=torch.float32)
+            if snap.v_scale_volts is not None
+            else None
+        ),
     )
     out = SnapshotState(**{**snap.__dict__})
     out.v_re = v_re
@@ -363,7 +413,14 @@ def pytorch_verify_at_state(
     """Run PyTorch-side YV and balance checks; return per-node residuals (MV mask)."""
     y_re = snap.y_re_full if use_full_y else snap.y_re_line
     y_im = snap.y_im_full if use_full_y else snap.y_im_line
-    p_yv, q_yv = nodal_power_kw_from_yv(snap.v_re, snap.v_im, y_re, y_im, s_base_kva=s_base_kva)
+    p_yv, q_yv = nodal_power_kw_from_yv(
+        snap.v_re,
+        snap.v_im,
+        y_re,
+        y_im,
+        s_base_kva=s_base_kva,
+        v_scale_volts=snap.v_scale_volts if snap.use_physical_units else None,
+    )
     dp, dq = balance_residual_kw(snap.p_inj_kw, snap.q_inj_kvar, p_yv, q_yv)
     m = snap.mask_mv
     return {
@@ -575,6 +632,7 @@ def compare_pytorch_opendss(
         snap.y_re_full,
         snap.y_im_full,
         s_base_kva=s_base_kva,
+        v_scale_volts=snap.v_scale_volts if snap.use_physical_units else None,
     )
     dp_dss_v, dq_dss_v = balance_residual_kw(dss_out["p_inj_kw"], dss_out["q_inj_kvar"], p_yv_dss_v, q_yv_dss_v)
 

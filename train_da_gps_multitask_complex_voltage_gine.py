@@ -194,9 +194,12 @@ def _load_regulator_edges_for_pf(
     reg_catalog_csv: Path,
     node_to_local: dict[str, int],
     reg_cols: list[str],
-    z_base_ohm: float,
+    z_base_ohm: float | None,
 ) -> list[tuple[int, int, float, float, int]]:
-    """Regulator series branches: ``(iu, iv, g_pu, b_pu, reg_col_idx)``.
+    """Regulator series branches: ``(iu, iv, g, b, reg_col_idx)`` in pu or Siemens.
+
+    When ``z_base_ohm`` is ``None``, ``g=R/(R^2+X^2)`` and ``b=-X/(R^2+X^2)`` (ohms → Siemens).
+    Otherwise values are per-unit on ``z_base_ohm``.
 
     Catalog row ``from_node`` is the regulated (downstream) bus; ``to_node`` is ``regxfmr_*``.
     OpenDSS places the off-nominal tap on winding 2 (downstream). Stamp uses tap ``a`` on node ``iu``.
@@ -210,7 +213,7 @@ def _load_regulator_edges_for_pf(
         raise ValueError(f"{reg_catalog_csv} missing 'edge_type' column")
     reg_rows = df[df["edge_type"].astype(str).str.strip().str.lower() == "regulator"]
     col_to_j = {_reg_col_stem(c): j for j, c in enumerate(reg_cols) if _reg_col_stem(c)}
-    z_base = float(z_base_ohm)
+    z_base = None if z_base_ohm is None else float(z_base_ohm)
     edges: list[tuple[int, int, float, float, int]] = []
     for _, row in reg_rows.iterrows():
         u = str(row["from_node"]).strip().lower()
@@ -234,8 +237,11 @@ def _load_regulator_edges_for_pf(
         z2 = rf * rf + xf * xf
         if z2 < 1e-24:
             continue
-        g = (rf / z2) * z_base
-        b = (-xf / z2) * z_base
+        g = rf / z2
+        b = -xf / z2
+        if z_base is not None:
+            g *= z_base
+            b *= z_base
         edges.append((int(node_to_local[u]), int(node_to_local[v]), float(g), float(b), int(rj)))
     if reg_cols:
         mapped = {e[4] for e in edges}
@@ -252,6 +258,9 @@ class PfPhysicsState:
     weight: float = 0.0
     s_base_kva: float = 5000.0
     huber_delta_pu: float = 0.02
+    huber_delta_kw: float = 10.0
+    use_physical_units: bool = True
+    v_scale_volts: torch.Tensor | None = None
     Y_re_base: torch.Tensor | None = None
     Y_im_base: torch.Tensor | None = None
     mask: torch.Tensor | None = None
@@ -276,15 +285,18 @@ def _is_pf_slack_source_node(node: str) -> bool:
     return False
 
 
-def _build_ybus_pu_from_edge_csv(
+def _build_ybus_from_edge_csv(
     edge_csv: Path,
     node_to_local: dict[str, int],
     n_nodes: int,
-    z_base_ohm: float,
+    z_base_ohm: float | None,
     *,
     skip_undirected: set[tuple[int, int]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build dense per-unit Ybus (Re/Im) from undirected ``R_full``/``X_full`` **line** edges only.
+    """Build dense Ybus (Re/Im) from undirected ``R_full``/``X_full`` **line** edges only.
+
+    When ``z_base_ohm`` is set, admittance is per-unit on that impedance base; when ``None``,
+    ``R_full``/``X_full`` are treated as ohms and stamped in Siemens.
 
     Skips regulator-transformer branches (``skip_undirected`` from hetero catalog, and rows whose
     ``line_name`` starts with ``Transformer.`` or ``linecode`` is ``xfmr``) so taps are not double-stamped.
@@ -299,7 +311,7 @@ def _build_ybus_pu_from_edge_csv(
     y_im = np.zeros((n_nodes, n_nodes), dtype=np.float64)
     seen: set[tuple[int, int]] = set()
     skip = skip_undirected or set()
-    z_base = float(z_base_ohm)
+    z_base = None if z_base_ohm is None else float(z_base_ohm)
     for _, row in df.iterrows():
         line_name = str(row.get("line_name", "") or "").strip()
         linecode = str(row.get("linecode", "") or "").strip().lower()
@@ -324,8 +336,11 @@ def _build_ybus_pu_from_edge_csv(
             continue
         g = rf / z2
         b = -xf / z2
-        y_line_re = g * z_base
-        y_line_im = b * z_base
+        if z_base is not None:
+            g *= z_base
+            b *= z_base
+        y_line_re = g
+        y_line_im = b
         y_re[iu, iv] -= y_line_re
         y_re[iv, iu] -= y_line_re
         y_im[iu, iv] -= y_line_im
@@ -335,6 +350,33 @@ def _build_ybus_pu_from_edge_csv(
         y_im[iu, iu] += y_line_im
         y_im[iv, iv] += y_line_im
     return torch.from_numpy(y_re).float(), torch.from_numpy(y_im).float()
+
+
+def _build_ybus_pu_from_edge_csv(
+    edge_csv: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+    z_base_ohm: float,
+    *,
+    skip_undirected: set[tuple[int, int]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Legacy per-unit Y-bus builder (``z_base_ohm`` scaling)."""
+    return _build_ybus_from_edge_csv(
+        edge_csv, node_to_local, n_nodes, z_base_ohm, skip_undirected=skip_undirected
+    )
+
+
+def _build_ybus_siemens_from_edge_csv(
+    edge_csv: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+    *,
+    skip_undirected: set[tuple[int, int]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Physical Siemens Y-bus from ``R_full``/``X_full`` in ohms."""
+    return _build_ybus_from_edge_csv(
+        edge_csv, node_to_local, n_nodes, None, skip_undirected=skip_undirected
+    )
 
 
 _PF_ELECTRICAL_DISTANCE_REL = Path("electrical_distance_from_substation.csv")
@@ -544,13 +586,17 @@ def _load_pf_balance_mask(
     return mask
 
 
-def _pf_huber_mean_sq(r_pu: torch.Tensor, *, delta_pu: float) -> torch.Tensor:
-    """Huber on per-unit residuals; linear tail avoids MV/interface outliers dominating mean(r²)."""
-    d = max(float(delta_pu), 1e-12)
-    abs_r = r_pu.abs()
-    quad = 0.5 * r_pu.square()
+def _pf_huber_mean_sq(r: torch.Tensor, *, delta: float) -> torch.Tensor:
+    """Huber on residuals; ``delta`` is in the same units as ``r`` (pu or kW)."""
+    d = max(float(delta), 1e-12)
+    abs_r = r.abs()
+    quad = 0.5 * r.square()
     lin = d * (abs_r - 0.5 * d)
     return torch.where(abs_r <= d, quad, lin).mean()
+
+
+def _pf_huber_mean_sq_pu(r_pu: torch.Tensor, *, delta_pu: float) -> torch.Tensor:
+    return _pf_huber_mean_sq(r_pu, delta=delta_pu)
 
 
 def nodal_power_balance_residual(
@@ -562,11 +608,24 @@ def nodal_power_balance_residual(
     node_mask: torch.Tensor | None,
     s_base_kva: float,
     *,
+    use_physical_units: bool = False,
+    v_scale_volts: torch.Tensor | None = None,
     huber_delta_pu: float = 0.02,
+    huber_delta_kw: float = 10.0,
 ) -> torch.Tensor:
-    """Huber-smoothed mean P/Q balance residual in per-unit power (pu S_base)."""
+    """Huber-smoothed mean P/Q balance residual.
+
+  Physical (default): ``V`` in volts, ``Y`` in Siemens, residuals in kW/kvar.
+    Legacy pu: per-unit power on ``s_base_kva``.
+    """
     v_re = pred_ri[..., 0]
     v_im = pred_ri[..., 1]
+    if use_physical_units:
+        if v_scale_volts is None:
+            raise ValueError("use_physical_units requires v_scale_volts on PfPhysicsState")
+        vs = v_scale_volts.to(device=v_re.device, dtype=v_re.dtype).view(1, -1)
+        v_re = v_re * vs
+        v_im = v_im * vs
     if Y_re.dim() == 2:
         i_re = torch.matmul(v_re, Y_re.T) - torch.matmul(v_im, Y_im.T)
         i_im = torch.matmul(v_re, Y_im.T) + torch.matmul(v_im, Y_re.T)
@@ -575,16 +634,22 @@ def nodal_power_balance_residual(
         i_im = torch.matmul(v_re, Y_im.transpose(-1, -2)) + torch.matmul(v_im, Y_re.transpose(-1, -2))
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
-    s_base = max(float(s_base_kva), 1e-12)
-    p_pu = s_re
-    q_pu = s_im
-    r_p = (p_inj_kw / s_base) - p_pu
-    r_q = (q_inj_kvar / s_base) - q_pu
+    if use_physical_units:
+        p_yv_kw = s_re / 1000.0
+        q_yv_kvar = s_im / 1000.0
+        r_p = p_inj_kw - p_yv_kw
+        r_q = q_inj_kvar - q_yv_kvar
+        delta = huber_delta_kw
+    else:
+        s_base = max(float(s_base_kva), 1e-12)
+        r_p = (p_inj_kw / s_base) - s_re
+        r_q = (q_inj_kvar / s_base) - s_im
+        delta = huber_delta_pu
     if node_mask is not None:
         m = node_mask.to(device=pred_ri.device, dtype=torch.bool).view(1, -1)
         r_p = r_p.masked_select(m)
         r_q = r_q.masked_select(m)
-    return _pf_huber_mean_sq(r_p, delta_pu=huber_delta_pu) + _pf_huber_mean_sq(r_q, delta_pu=huber_delta_pu)
+    return _pf_huber_mean_sq(r_p, delta=delta) + _pf_huber_mean_sq(r_q, delta=delta)
 
 
 def _expected_reg_tap_pu(
@@ -646,6 +711,8 @@ def _ybus_with_predicted_controls(
     cap_on: torch.Tensor,
     s_base_kva: float,
     batch_size: int,
+    use_physical_units: bool = False,
+    v_scale_volts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``(B,N,N)`` Ybus: line base + regulator taps + cap shunt ``j*B``."""
     dev, dt = Y_re_base.device, Y_re_base.dtype
@@ -654,9 +721,19 @@ def _ybus_with_predicted_controls(
     for iu, iv, g, b, rj in reg_edges:
         _stamp_reg_branch_ybus(y_re, y_im, iu, iv, g, b, tap_pu[:, rj])
     s_base = float(s_base_kva)
+    v_scale = None
+    if use_physical_units:
+        if v_scale_volts is None:
+            raise ValueError("use_physical_units requires v_scale_volts for cap shunt stamping")
+        v_scale = v_scale_volts.to(device=dev, dtype=dt)
     for ni, q_nom, cj in cap_banks:
-        b_pu = cap_on[:, cj] * (float(q_nom) / s_base)
-        y_im[:, ni, ni] = y_im[:, ni, ni] + b_pu
+        if use_physical_units:
+            v_nom = v_scale[int(ni)].clamp(min=1.0)
+            b_siemens = cap_on[:, cj] * (float(q_nom) * 1000.0) / (v_nom * v_nom)
+            y_im[:, ni, ni] = y_im[:, ni, ni] + b_siemens
+        else:
+            b_pu = cap_on[:, cj] * (float(q_nom) / s_base)
+            y_im[:, ni, ni] = y_im[:, ni, ni] + b_pu
     return y_re, y_im
 
 
@@ -759,6 +836,8 @@ def _power_balance_loss_from_batch(
         cap_on=cap_on,
         s_base_kva=pf.s_base_kva,
         batch_size=int(batch.num_graphs),
+        use_physical_units=pf.use_physical_units,
+        v_scale_volts=pf.v_scale_volts,
     )
     x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean, x_std)
     p_inj, q_inj = _assemble_pf_injections(
@@ -776,7 +855,10 @@ def _power_balance_loss_from_batch(
         y_im,
         pf.mask,
         pf.s_base_kva,
+        use_physical_units=pf.use_physical_units,
+        v_scale_volts=pf.v_scale_volts,
         huber_delta_pu=pf.huber_delta_pu,
+        huber_delta_kw=pf.huber_delta_kw,
     )
 
 
@@ -865,6 +947,9 @@ def _setup_pf_physics(
     z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
     detach = bool(getattr(args, "pf_detach_controls", False))
     huber_delta_pu = float(getattr(args, "pf_huber_delta_pu", 0.02) or 0.02)
+    huber_delta_kw = float(getattr(args, "pf_huber_delta_kw", 10.0) or 10.0)
+    pf_units = str(getattr(args, "pf_units", "physical") or "physical").strip().lower()
+    use_physical = pf_units not in ("legacy_pu", "legacy", "pu")
 
     reg_catalog = _resolve_pf_reg_catalog(edges_path, data_root, args)
     if reg_catalog is None:
@@ -872,11 +957,17 @@ def _setup_pf_physics(
             "Physics loss enabled but regulator edge catalog not found. "
             "Set --pf_reg_edge_catalog or place hetero_mv_edge_catalog.csv under data_root."
         )
-    reg_edges = _load_regulator_edges_for_pf(reg_catalog, node_to_local, reg_cols, z_base)
+    z_for_reg = None if use_physical else z_base
+    reg_edges = _load_regulator_edges_for_pf(reg_catalog, node_to_local, reg_cols, z_for_reg)
     skip_reg_pairs = {_undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-    y_re, y_im = _build_ybus_pu_from_edge_csv(
-        edges_path, node_to_local, n_nodes, z_base, skip_undirected=skip_reg_pairs
-    )
+    if use_physical:
+        y_re, y_im = _build_ybus_siemens_from_edge_csv(
+            edges_path, node_to_local, n_nodes, skip_undirected=skip_reg_pairs
+        )
+    else:
+        y_re, y_im = _build_ybus_pu_from_edge_csv(
+            edges_path, node_to_local, n_nodes, z_base, skip_undirected=skip_reg_pairs
+        )
     repo = Path(__file__).resolve().parent
     balance_mode = str(args.pf_balance_nodes)
     distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
@@ -956,13 +1047,34 @@ def _setup_pf_physics(
                 f"(stamped {len(cap_banks)} node(s) for {n_cap} logical bank(s))."
             )
 
+    v_scale_t: torch.Tensor | None = None
+    kv_cache_path = ""
+    if use_physical:
+        from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
+
+        repo = Path(__file__).resolve().parent
+        raw_kv_csv = str(getattr(args, "pf_bus_kv_base_csv", "") or "").strip()
+        cache_csv = Path(raw_kv_csv) if raw_kv_csv else None
+        if cache_csv is not None and not cache_csv.is_absolute():
+            cache_csv = (data_root / cache_csv).resolve()
+        v_scale_np, _, kv_cache_path = load_or_build_bus_kv_tensors(
+            repo=repo,
+            data_root=data_root,
+            node_to_local=node_to_local,
+            n_nodes=n_nodes,
+            cache_csv=cache_csv,
+        )
+        v_scale_t = torch.tensor(v_scale_np, dtype=torch.float32, device=device)
+
+    units_label = "physical (V volts, Y Siemens, kW Huber)" if use_physical else "legacy_pu"
     print(
-        f"Power-balance physics: weight={w}, nodes={args.pf_balance_nodes}, "
+        f"Power-balance physics: weight={w}, units={units_label}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
-        f"huber_delta_pu={huber_delta_pu}, "
+        f"huber_delta_pu={huber_delta_pu}, huber_delta_kw={huber_delta_kw}, "
         f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
-        f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}",
+        f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}"
+        + (f", kv_cache={kv_cache_path}" if kv_cache_path else ""),
         flush=True,
     )
 
@@ -970,6 +1082,9 @@ def _setup_pf_physics(
         weight=w,
         s_base_kva=s_base,
         huber_delta_pu=huber_delta_pu,
+        huber_delta_kw=huber_delta_kw,
+        use_physical_units=use_physical,
+        v_scale_volts=v_scale_t,
         Y_re_base=y_re.to(device),
         Y_im_base=y_im.to(device),
         mask=pf_mask.to(device),
@@ -3693,7 +3808,26 @@ def parse_args() -> argparse.Namespace:
         "--pf_huber_delta_pu",
         type=float,
         default=0.02,
-        help="Huber delta (per-unit power) for physics residual; ~0.02 pu ≈ 100 kW at 5 MVA base.",
+        help="Huber delta (per-unit power) for legacy_pu physics residual; ~0.02 pu ≈ 100 kW at 5 MVA base.",
+    )
+    p.add_argument(
+        "--pf_huber_delta_kw",
+        type=float,
+        default=10.0,
+        help="Huber delta (kW/kvar) for physical-units physics residual (default 10 kW).",
+    )
+    p.add_argument(
+        "--pf_units",
+        type=str,
+        default="physical",
+        choices=("physical", "legacy_pu"),
+        help="Physics loss unit system: physical (V volts, Y Siemens, kW residuals) or legacy_pu.",
+    )
+    p.add_argument(
+        "--pf_bus_kv_base_csv",
+        type=str,
+        default="",
+        help="Optional cache CSV for per-bus kVBase (default: bus_kv_base_by_node.csv under data_root).",
     )
     p.add_argument(
         "--pf_reg_edge_catalog",
