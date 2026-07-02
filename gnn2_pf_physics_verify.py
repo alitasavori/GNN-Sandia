@@ -69,6 +69,15 @@ def opendss_available() -> bool:
         return False
 
 
+def _get_pfmod():
+    """Fresh trainer import (notebooks cache stale modules without reload)."""
+    import importlib
+
+    import train_da_gps_multitask_complex_voltage_gine as pfmod
+
+    return importlib.reload(pfmod)
+
+
 def summarize_abs_kw(x: np.ndarray) -> dict[str, float]:
     """Robust stats on |ΔP| or |ΔQ| in kW/kvar (masked MV nodes)."""
     a = np.asarray(x, dtype=np.float64).ravel()
@@ -182,7 +191,7 @@ def load_snapshot_state(
     import pandas as pd
     import torch
 
-    import train_da_gps_multitask_complex_voltage_gine as pfmod
+    pfmod = _get_pfmod()
 
     repo, data_root = resolve_verify_data_roots(
         repo=repo, pf_data_root=pf_data_root, chunk_parent=chunk_parent
@@ -337,7 +346,7 @@ def apply_random_perturbation(
     """Return a shallow copy with optional random V / controls (for stress tests)."""
     import torch
 
-    import train_da_gps_multitask_complex_voltage_gine as pfmod
+    pfmod = _get_pfmod()
 
     v_re = snap.v_re.copy()
     v_im = snap.v_im.copy()
@@ -666,6 +675,113 @@ def compare_pytorch_opendss(
     }
 
 
+def compare_physical_opendss(
+    snap: SnapshotState,
+    *,
+    repo: Path | None = None,
+    run_opendss: bool = True,
+    s_base_kva: float = S_BASE_KVA_DEFAULT,
+) -> dict[str, Any]:
+    """Aligned physical PyTorch vs OpenDSS on one snapshot (MV mask).
+
+    Metrics (kW on MV nodes):
+    - ``|P_inj feature − P_inj OpenDSS|``
+    - ``|r_py|`` = ``|P_inj − Re(VYV)|`` at **label** V with physical Y
+    - ``|r_dss|`` = same balance with OpenDSS V and OpenDSS injections
+    - ``|r_py − r_dss|`` — what the backprop path misses vs OpenDSS
+    """
+    if not snap.use_physical_units:
+        raise ValueError("compare_physical_opendss requires use_physical_units=True (pf_units=physical)")
+
+    py_label = pytorch_verify_at_state(snap, use_full_y=True, s_base_kva=s_base_kva)
+    m = snap.mask_mv
+    out: dict[str, Any] = {
+        "sample_id": int(snap.sample_id),
+        "snap": snap,
+        "mask_mv": m,
+        "r_py_kw": py_label["dp_kw"],
+        "r_py_kvar": py_label["dq_kvar"],
+        "abs_r_py_mv": py_label["abs_dp_mv"],
+        "r_py_stats_p": py_label["stats_p"],
+        "r_py_stats_q": py_label["stats_q"],
+    }
+
+    if not run_opendss:
+        out["opendss_skipped"] = "run_opendss=False"
+        return out
+    if not opendss_available():
+        out["opendss_skipped"] = "opendssdirect not installed"
+        return out
+
+    try:
+        dss_out = opendss_solve_snapshot(snap, repo=repo or REPO)
+    except Exception as exc:
+        out["opendss_skipped"] = str(exc)
+        return out
+
+    m_eff = m.copy()
+    fin = np.isfinite(dss_out["p_inj_kw"][m]) & np.isfinite(dss_out["q_inj_kvar"][m])
+    m_eff[m] = m[m] & fin
+
+    d_p_inj = snap.p_inj_kw - dss_out["p_inj_kw"]
+    d_q_inj = snap.q_inj_kvar - dss_out["q_inj_kvar"]
+    r_dss_kw, r_dss_kvar = _dss_residual_at_state(snap, dss_out, s_base_kva=s_base_kva)
+    gap_p = py_label["dp_kw"] - r_dss_kw
+    gap_q = py_label["dq_kvar"] - r_dss_kvar
+
+    out.update(
+        {
+            "dss_out": dss_out,
+            "dss_converged": bool(dss_out.get("converged", False)),
+            "mask_mv_effective": m_eff,
+            "inj_abs_dp_mv": np.abs(d_p_inj[m_eff]),
+            "inj_abs_dq_mv": np.abs(d_q_inj[m_eff]),
+            "inj_stats_p": summarize_abs_kw(np.abs(d_p_inj[m_eff])),
+            "inj_stats_q": summarize_abs_kw(np.abs(d_q_inj[m_eff])),
+            "r_dss_kw": r_dss_kw,
+            "r_dss_kvar": r_dss_kvar,
+            "abs_r_dss_mv": np.abs(r_dss_kw[m_eff]),
+            "r_dss_stats_p": summarize_abs_kw(np.abs(r_dss_kw[m_eff])),
+            "r_dss_stats_q": summarize_abs_kw(np.abs(r_dss_kvar[m_eff])),
+            "residual_gap_abs_dp_mv": np.abs(gap_p[m_eff]),
+            "residual_gap_abs_dq_mv": np.abs(gap_q[m_eff]),
+            "residual_gap_stats_p": summarize_abs_kw(np.abs(gap_p[m_eff])),
+            "residual_gap_stats_q": summarize_abs_kw(np.abs(gap_q[m_eff])),
+        }
+    )
+    return out
+
+
+def _fmt_stats_row(label: str, st: dict[str, float]) -> str:
+    return (
+        f"  {label:<42} max={st['max']:>10.3g}  p95={st['p95']:>10.3g}  "
+        f"median={st['median']:>10.3g}  n={int(st['n'])}"
+    )
+
+
+def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
+    """Human-readable table for ``compare_physical_opendss`` results."""
+    print(f"\n=== Physical PyTorch vs OpenDSS (sample {cmp['sample_id']}, MV mask) ===")
+    print(_fmt_stats_row("|r_py| at label V", cmp["r_py_stats_p"]))
+
+    if "inj_stats_p" in cmp:
+        print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
+        print(_fmt_stats_row("|r_dss| at OpenDSS V", cmp["r_dss_stats_p"]))
+        print(_fmt_stats_row("|r_py - r_dss| (backprop gap)", cmp["residual_gap_stats_p"]))
+        print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
+    elif cmp.get("opendss_skipped"):
+        print(f"\n[OpenDSS] skipped: {cmp['opendss_skipped']}")
+    else:
+        print("\n[OpenDSS] not requested (run_opendss=False).")
+
+    print(
+        "\nBackprop: train with pf_units=physical; Huber on kW residuals. "
+        "Median |r_py| << max is expected (interface buses). "
+        "|r_py - r_dss| reflects omitted LV xfmr, line charging, and Q_inj recipe — "
+        "acceptable if medians/p95 stay in the kW-few x10 kW band."
+    )
+
+
 def compare_legacy_physical_opendss(
     sample_id: int,
     *,
@@ -678,14 +794,7 @@ def compare_legacy_physical_opendss(
     run_opendss: bool = True,
     snap_physical: SnapshotState | None = None,
 ) -> dict[str, Any]:
-    """Side-by-side **legacy_pu** vs **physical** vs optional **OpenDSS** on one snapshot.
-
-    Returns per-path MV-mask stats for:
-    - ``|P_inj feature − P_inj OpenDSS|`` (feature path; kW either way)
-    - ``|r_py|`` at label V (legacy and physical full Y)
-    - ``|r_dss|`` at OpenDSS V with OpenDSS injections (legacy and physical Y)
-    - ``|r_py − r_dss|`` residual gaps
-    """
+    """Side-by-side **legacy_pu** vs **physical** vs optional **OpenDSS** on one snapshot."""
     if snap_physical is None:
         snap_physical = load_snapshot_state(
             int(sample_id),
@@ -696,125 +805,71 @@ def compare_legacy_physical_opendss(
             kv_base=kv_base,
             use_physical_units=True,
         )
-    snap_legacy: SnapshotState | None = None
-    if compare_legacy:
-        snap_legacy = load_snapshot_state(
-            int(sample_id),
-            repo=repo,
-            pf_data_root=pf_data_root or snap_physical.pf_data_root,
-            chunk_parent=chunk_parent,
-            s_base_kva=s_base_kva,
-            kv_base=kv_base,
-            use_physical_units=False,
-        )
+    out = compare_physical_opendss(
+        snap_physical,
+        repo=repo,
+        run_opendss=run_opendss,
+        s_base_kva=s_base_kva,
+    )
+    out["physical_abs_dp_mv"] = out["abs_r_py_mv"]
+    out["physical_abs_dq_mv"] = np.abs(out["r_py_kvar"][out["mask_mv"]])
 
-    py_phys = pytorch_verify_at_state(snap_physical, use_full_y=True, s_base_kva=s_base_kva)
-    py_legacy = (
-        pytorch_verify_at_state(snap_legacy, use_full_y=True, s_base_kva=s_base_kva)
-        if snap_legacy is not None
-        else None
+    if not compare_legacy:
+        return out
+
+    snap_legacy = load_snapshot_state(
+        int(sample_id),
+        repo=repo,
+        pf_data_root=pf_data_root or snap_physical.pf_data_root,
+        chunk_parent=chunk_parent,
+        s_base_kva=s_base_kva,
+        kv_base=kv_base,
+        use_physical_units=False,
+    )
+    py_legacy = pytorch_verify_at_state(snap_legacy, use_full_y=True, s_base_kva=s_base_kva)
+    m = out["mask_mv"]
+    abs_dp_leg = np.abs(py_legacy["dp_kw"][m])
+    abs_dp_phys = np.abs(out["r_py_kw"][m])
+    out.update(
+        {
+            "snap_legacy": snap_legacy,
+            "legacy_residual_stats_p": py_legacy["stats_p"],
+            "legacy_residual_stats_q": py_legacy["stats_q"],
+            "legacy_abs_dp_mv": py_legacy["abs_dp_mv"],
+            "legacy_abs_dq_mv": py_legacy["abs_dq_mv"],
+            "legacy_dp_kw": py_legacy["dp_kw"],
+            "n_mv_buses_physical_better_p": int(np.sum(abs_dp_phys < abs_dp_leg)),
+            "n_mv_buses_legacy_better_p": int(np.sum(abs_dp_leg < abs_dp_phys)),
+            "n_mv_buses": int(m.sum()),
+        }
     )
 
-    m = snap_physical.mask_mv
-    out: dict[str, Any] = {
-        "sample_id": int(sample_id),
-        "snap_physical": snap_physical,
-        "snap_legacy": snap_legacy,
-        "physical_residual_stats_p": py_phys["stats_p"],
-        "physical_residual_stats_q": py_phys["stats_q"],
-        "physical_abs_dp_mv": py_phys["abs_dp_mv"],
-        "physical_abs_dq_mv": py_phys["abs_dq_mv"],
-        "physical_dp_kw": py_phys["dp_kw"],
-        "physical_dq_kvar": py_phys["dq_kvar"],
-        "mask_mv": m,
-    }
-
-    if py_legacy is not None:
-        abs_dp_leg = np.abs(py_legacy["dp_kw"][m])
-        abs_dp_phys = np.abs(py_phys["dp_kw"][m])
+    if "dss_out" in out:
+        m_eff = out["mask_mv_effective"]
+        dp_dss_leg, dq_dss_leg = _dss_residual_at_state(
+            snap_legacy, out["dss_out"], s_base_kva=s_base_kva
+        )
+        gap_p_leg = py_legacy["dp_kw"] - dp_dss_leg
+        gap_q_leg = py_legacy["dq_kvar"] - dq_dss_leg
         out.update(
             {
-                "legacy_residual_stats_p": py_legacy["stats_p"],
-                "legacy_residual_stats_q": py_legacy["stats_q"],
-                "legacy_abs_dp_mv": py_legacy["abs_dp_mv"],
-                "legacy_abs_dq_mv": py_legacy["abs_dq_mv"],
-                "legacy_dp_kw": py_legacy["dp_kw"],
-                "n_mv_buses_physical_better_p": int(np.sum(abs_dp_phys < abs_dp_leg)),
-                "n_mv_buses_legacy_better_p": int(np.sum(abs_dp_leg < abs_dp_phys)),
-                "n_mv_buses": int(m.sum()),
+                "dss_legacy_residual_stats_p": summarize_abs_kw(np.abs(dp_dss_leg[m_eff])),
+                "dss_legacy_residual_stats_q": summarize_abs_kw(np.abs(dq_dss_leg[m_eff])),
+                "dss_legacy_abs_dp_mv": np.abs(dp_dss_leg[m_eff]),
+                "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p_leg[m_eff])),
+                "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q_leg[m_eff])),
+                "residual_gap_legacy_abs_dp_mv": np.abs(gap_p_leg[m_eff]),
+                "residual_gap_physical_abs_dp_mv": out["residual_gap_abs_dp_mv"],
+                "dss_physical_residual_stats_p": out["r_dss_stats_p"],
             }
         )
-
-    dss_out: dict[str, Any] | None = None
-    if run_opendss:
-        if not opendss_available():
-            out["opendss_skipped"] = "opendssdirect not installed"
-        else:
-            try:
-                dss_out = opendss_solve_snapshot(snap_physical, repo=repo or REPO)
-            except Exception as exc:
-                out["opendss_skipped"] = str(exc)
-            else:
-                m_eff = snap_physical.mask_mv.copy()
-                fin = np.isfinite(dss_out["p_inj_kw"][m]) & np.isfinite(dss_out["q_inj_kvar"][m])
-                m_eff[m] = m[m] & fin
-
-                d_p_inj = snap_physical.p_inj_kw - dss_out["p_inj_kw"]
-                d_q_inj = snap_physical.q_inj_kvar - dss_out["q_inj_kvar"]
-
-                dp_dss_phys, dq_dss_phys = _dss_residual_at_state(
-                    snap_physical, dss_out, s_base_kva=s_base_kva
-                )
-                gap_p_phys = py_phys["dp_kw"] - dp_dss_phys
-                gap_q_phys = py_phys["dq_kvar"] - dq_dss_phys
-
-                out.update(
-                    {
-                        "dss_out": dss_out,
-                        "dss_converged": bool(dss_out.get("converged", False)),
-                        "inj_stats_p": summarize_abs_kw(np.abs(d_p_inj[m_eff])),
-                        "inj_stats_q": summarize_abs_kw(np.abs(d_q_inj[m_eff])),
-                        "inj_abs_dp_mv": np.abs(d_p_inj[m_eff]),
-                        "dss_physical_residual_stats_p": summarize_abs_kw(np.abs(dp_dss_phys[m_eff])),
-                        "dss_physical_residual_stats_q": summarize_abs_kw(np.abs(dq_dss_phys[m_eff])),
-                        "dss_physical_abs_dp_mv": np.abs(dp_dss_phys[m_eff]),
-                        "residual_gap_physical_stats_p": summarize_abs_kw(np.abs(gap_p_phys[m_eff])),
-                        "residual_gap_physical_stats_q": summarize_abs_kw(np.abs(gap_q_phys[m_eff])),
-                        "residual_gap_physical_abs_dp_mv": np.abs(gap_p_phys[m_eff]),
-                        "mask_mv_effective": m_eff,
-                    }
-                )
-
-                if snap_legacy is not None:
-                    dp_dss_leg, dq_dss_leg = _dss_residual_at_state(
-                        snap_legacy, dss_out, s_base_kva=s_base_kva
-                    )
-                    gap_p_leg = py_legacy["dp_kw"] - dp_dss_leg
-                    out.update(
-                        {
-                            "dss_legacy_residual_stats_p": summarize_abs_kw(np.abs(dp_dss_leg[m_eff])),
-                            "dss_legacy_residual_stats_q": summarize_abs_kw(np.abs(dq_dss_leg[m_eff])),
-                            "dss_legacy_abs_dp_mv": np.abs(dp_dss_leg[m_eff]),
-                            "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p_leg[m_eff])),
-                            "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q_leg[m_eff])),
-                            "residual_gap_legacy_abs_dp_mv": np.abs(gap_p_leg[m_eff]),
-                        }
-                    )
-
     return out
-
-
-def _fmt_stats_row(label: str, st: dict[str, float]) -> str:
-    return (
-        f"  {label:<42} max={st['max']:>10.3g}  p95={st['p95']:>10.3g}  "
-        f"median={st['median']:>10.3g}  n={int(st['n'])}"
-    )
 
 
 def print_legacy_physical_opendss_report(cmp: dict[str, Any]) -> None:
     """Human-readable table for ``compare_legacy_physical_opendss`` results."""
     print(f"\n=== Physics path comparison (sample {cmp['sample_id']}, MV mask) ===")
-    print(_fmt_stats_row("|r_py| physical (label V)", cmp["physical_residual_stats_p"]))
+    print(_fmt_stats_row("|r_py| physical (label V)", cmp["r_py_stats_p"]))
     if "legacy_residual_stats_p" in cmp:
         print(_fmt_stats_row("|r_py| legacy_pu (label V)", cmp["legacy_residual_stats_p"]))
         print(
@@ -823,12 +878,12 @@ def print_legacy_physical_opendss_report(cmp: dict[str, Any]) -> None:
         )
 
     if "inj_stats_p" in cmp:
-        print(_fmt_stats_row("|P_inj feature − OpenDSS|", cmp["inj_stats_p"]))
-        print(_fmt_stats_row("|r_dss| physical (OpenDSS V)", cmp["dss_physical_residual_stats_p"]))
-        print(_fmt_stats_row("|r_py − r_dss| physical", cmp["residual_gap_physical_stats_p"]))
+        print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
+        print(_fmt_stats_row("|r_dss| physical (OpenDSS V)", cmp["r_dss_stats_p"]))
+        print(_fmt_stats_row("|r_py - r_dss| physical", cmp["residual_gap_stats_p"]))
         if "dss_legacy_residual_stats_p" in cmp:
             print(_fmt_stats_row("|r_dss| legacy_pu (OpenDSS V)", cmp["dss_legacy_residual_stats_p"]))
-            print(_fmt_stats_row("|r_py − r_dss| legacy_pu", cmp["residual_gap_legacy_stats_p"]))
+            print(_fmt_stats_row("|r_py - r_dss| legacy_pu", cmp["residual_gap_legacy_stats_p"]))
         print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
     elif cmp.get("opendss_skipped"):
         print(f"\n[OpenDSS] skipped: {cmp['opendss_skipped']}")
@@ -837,7 +892,7 @@ def print_legacy_physical_opendss_report(cmp: dict[str, Any]) -> None:
 
     print(
         "\nBackprop note: train with pf_units=physical; Huber on kW residuals. "
-        "Median |r_py| ≪ max is expected (interface buses). "
+        "Median |r_py| << max is expected (interface buses). "
         "Gaps vs OpenDSS reflect omitted LV xfmr, line charging, and Q_inj recipe — "
-        "not a blocker if medians/p95 stay in the kW–few×10 kW band."
+        "not a blocker if medians/p95 stay in the kW-few x10 kW band."
     )
