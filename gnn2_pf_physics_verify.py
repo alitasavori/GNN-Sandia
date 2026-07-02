@@ -51,7 +51,9 @@ NODE_FEATURE_COLS: tuple[str, ...] = ("p_load_kw", "q_load_kvar", "p_pv_kw", "q_
 HETERO_MV_NODES_REL = (
     Path("Heterogenous GNN dataset") / "nodes" / "hetero_mv_nodes_load_transformer.csv"
 )
-NODES8500_REL = Path("datasets_gnn2_from pc") / "loadtype_8500" / "gnn_node_features_and_targets.csv"
+NODES8500_REL = (
+    Path("datasets_gnn2_from pc") / "loadtype_8500" / "gnn_node_features_and_targets.csv"
+)
 
 
 def z_base_ohm(*, s_base_kva: float = S_BASE_KVA_DEFAULT, kv_base: float = KV_BASE_DEFAULT) -> float:
@@ -170,12 +172,16 @@ def load_snapshot_state(
     repo, data_root = resolve_verify_data_roots(
         repo=repo, pf_data_root=pf_data_root, chunk_parent=chunk_parent
     )
+    from gnn2_pf_data_paths import resolve_nodes_pv_csv
+
     idx_path = data_root / "gnn_node_index_master.csv"
     edges_path = data_root / "gnn_edges_phase_static.csv"
     meta_path = data_root / "gnn_sample_meta.csv"
     het_path = data_root / HETERO_MV_NODES_REL
-    nodes8500 = (repo / NODES8500_REL).resolve()
-    for p in (idx_path, edges_path, meta_path, het_path, nodes8500):
+    nodes_pv_csv = resolve_nodes_pv_csv(
+        repo=repo, data_root=data_root, chunk_parent=chunk_parent
+    )
+    for p in (idx_path, edges_path, meta_path, het_path, nodes_pv_csv):
         if not p.is_file():
             raise FileNotFoundError(f"Missing snapshot CSV: {p}")
 
@@ -219,7 +225,7 @@ def load_snapshot_state(
 
     het = pd.read_csv(het_path)
     het = het[het["sample_id"] == int(sample_id)]
-    pv = pd.read_csv(nodes8500, usecols=["sample_id", "node", "p_pv_kw", "q_pv_kvar"])
+    pv = pd.read_csv(nodes_pv_csv, usecols=["sample_id", "node", "p_pv_kw", "q_pv_kvar"])
     pv = pv[pv["sample_id"] == int(sample_id)]
     pv_map = {
         str(r["node"]).strip().lower(): (float(r["p_pv_kw"]), float(r["q_pv_kvar"]))
