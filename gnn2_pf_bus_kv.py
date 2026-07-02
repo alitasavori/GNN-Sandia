@@ -139,13 +139,33 @@ def kv_base_ln_v_array(
     node_to_local: dict[str, int],
     kv_by_node: dict[str, float],
     n_nodes: int,
+    *,
+    warn_on_fallback: bool = True,
 ) -> np.ndarray:
-    """Per local index line-to-neutral base voltage in volts."""
-    arr = np.full(int(n_nodes), kv_ln_to_volts(DEFAULT_KV_FALLBACK_LN), dtype=np.float64)
+    """Per local index line-to-neutral base voltage in volts.
+
+  Indices without a finite ``kv_by_node`` entry keep ``DEFAULT_KV_FALLBACK_LN``
+  (MV-only legacy default) and emit a warning — never assume one global kV for
+  mixed-voltage feeders when secondary/sub-T nodes are present.
+    """
+    fallback_v = kv_ln_to_volts(DEFAULT_KV_FALLBACK_LN)
+    arr = np.full(int(n_nodes), fallback_v, dtype=np.float64)
+    filled: set[int] = set()
     for node, li in node_to_local.items():
         kv = kv_by_node.get(str(node).strip().lower())
         if kv is not None and np.isfinite(kv) and kv > 0:
             arr[int(li)] = kv_ln_to_volts(kv)
+            filled.add(int(li))
+    if warn_on_fallback:
+        missing_idx = [li for li in range(int(n_nodes)) if li not in filled]
+        if missing_idx:
+            idx_to_node = {int(v): str(k) for k, v in node_to_local.items()}
+            sample = [idx_to_node.get(li, f"idx={li}") for li in missing_idx[:5]]
+            print(
+                f"WARNING: kVBase missing for {len(missing_idx)} local index(es); "
+                f"using {DEFAULT_KV_FALLBACK_LN} kV LN fallback. First few: {sample}",
+                flush=True,
+            )
     return arr
 
 
@@ -172,6 +192,20 @@ def write_bus_kv_cache(
         )
     cache_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(cache_csv, index=False)
+
+
+def summarize_kv_coverage(kv_by_node: dict[str, float]) -> dict[str, int | float]:
+    """Return counts of distinct kV LN levels and fallback usage."""
+    vals = np.array(list(kv_by_node.values()), dtype=np.float64)
+    # Only the literal fallback constant counts — OpenDSS MV (~7.199558) differs from 7.1996.
+    fallback_n = int(np.sum(np.abs(vals - DEFAULT_KV_FALLBACK_LN) < 1e-7))
+    uniq = sorted({float(v) for v in vals if np.isfinite(v) and v > 0})
+    return {
+        "n_nodes": len(kv_by_node),
+        "n_distinct_kv_ln": len(uniq),
+        "n_fallback": fallback_n,
+        "kv_ln_levels": uniq,
+    }
 
 
 def read_bus_kv_cache(cache_csv: Path) -> tuple[dict[str, float], np.ndarray]:

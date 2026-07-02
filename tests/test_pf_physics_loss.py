@@ -1284,3 +1284,134 @@ class TestSparseYParity:
         i_sparse_re, i_sparse_im = pfmod._yv_from_line_coo(v_re, v_im, coo)
         assert torch.allclose(i_dense_re, i_sparse_re, atol=1e-3, rtol=1e-4)
         assert torch.allclose(i_dense_im, i_sparse_im, atol=1e-3, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# H. Regulator tap orientation vs OpenDSS + per-bus kVBase
+# ---------------------------------------------------------------------------
+_REG_CATALOG = DATA_DAILYAGG / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
+_REGULATOR_NODES_CSV = DATA_DAILYAGG / "regulator_involved_nodes.csv"
+_BUS_KV_CACHE = DATA_DAILYAGG / "bus_kv_base_by_node.csv"
+
+
+class TestRegulatorOrientation:
+    @pytest.mark.skipif(not _REGULATOR_NODES_CSV.is_file(), reason="no regulator_involved_nodes.csv")
+    @pytest.mark.skipif(not _REG_CATALOG.is_file(), reason="no hetero_mv_edge_catalog.csv")
+    def test_catalog_from_node_is_opendss_downstream_terminal(self):
+        """``from_node`` = terminal_2 (tap winding 2); ``to_node`` = terminal_1 (regxfmr)."""
+        import pandas as pd
+
+        reg_df = pd.read_csv(_REGULATOR_NODES_CSV)
+        catalog = pd.read_csv(_REG_CATALOG)
+        reg_rows = catalog[catalog["edge_type"].astype(str).str.strip().str.lower() == "regulator"]
+        for _, row in reg_rows.iterrows():
+            rname = str(row["Regulator"]).strip()
+            rrow = reg_df[reg_df["Regulator"].astype(str).str.strip() == rname].iloc[0]
+            t1 = str(rrow["terminal_1 node"]).strip().lower()
+            t2 = str(rrow["terminal_2 node"]).strip().lower()
+            assert str(row["from_node"]).strip().lower() == t2, (
+                f"{rname}: from_node must be downstream terminal_2 ({t2}), got {row['from_node']!r}"
+            )
+            assert str(row["to_node"]).strip().lower() == t1, (
+                f"{rname}: to_node must be upstream regxfmr terminal_1 ({t1}), got {row['to_node']!r}"
+            )
+
+    def test_regulator_stamp_tap_on_downstream_node_analytic(self):
+        """Isolated 2-bus stamp: tap on downstream (iu) vs swapped changes branch current."""
+        tap = torch.tensor([1.025], dtype=torch.float32)
+        g, b = 1.0, -0.5
+        v = np.array([1.02 + 0.01j, 1.00 + 0.0j], dtype=np.complex128)
+
+        y_re = torch.zeros(1, 2, 2)
+        y_im = torch.zeros(1, 2, 2)
+        pfmod._stamp_reg_branch_ybus(y_re, y_im, 1, 0, g, b, tap)
+        y_correct = y_re[0].detach().numpy() + 1j * y_im[0].detach().numpy()
+        i_down_correct = y_correct[1, :] @ v
+
+        y_re_s = torch.zeros(1, 2, 2)
+        y_im_s = torch.zeros(1, 2, 2)
+        pfmod._stamp_reg_branch_ybus(y_re_s, y_im_s, 0, 1, g, b, tap)
+        y_swapped = y_re_s[0].detach().numpy() + 1j * y_im_s[0].detach().numpy()
+        i_down_swapped = y_swapped[1, :] @ v
+
+        assert abs(i_down_correct - i_down_swapped) > 0.01
+
+    @pytest.mark.skipif(
+        not all(
+            p.is_file()
+            for p in (
+                DATA_DAILYAGG / "gnn_edges_phase_static.csv",
+                HETERO_LOAD_NODES,
+                NODES8500,
+                _REG_CATALOG,
+            )
+        ),
+        reason="local OpenDSS snapshot CSVs not available",
+    )
+    def test_catalog_orientation_opendss_residual_gap_small(self):
+        """Integration: catalog orientation keeps |r_py - r_dss| p95 in few-kW band."""
+        pytest.importorskip("opendssdirect")
+        from gnn2_pf_physics_verify import compare_physical_opendss, load_snapshot_state
+
+        snap = load_snapshot_state(0, repo=REPO)
+        cmp = compare_physical_opendss(snap, repo=REPO, run_opendss=True)
+        if cmp.get("opendss_skipped"):
+            pytest.skip(str(cmp["opendss_skipped"]))
+        gap = cmp["residual_gap_stats_p"]
+        assert gap["p95"] < 50.0, f"OpenDSS gap p95 too large: {gap['p95']:.4g} kW"
+
+
+class TestBusKvBase:
+    @pytest.mark.skipif(not _BUS_KV_CACHE.is_file(), reason="no bus_kv_base_by_node.csv cache")
+    def test_cache_has_per_bus_kv_no_global_fallback(self):
+        from gnn2_pf_bus_kv import DEFAULT_KV_FALLBACK_LN, read_bus_kv_cache, summarize_kv_coverage
+
+        kv_by, v_scale = read_bus_kv_cache(_BUS_KV_CACHE)
+        summary = summarize_kv_coverage(kv_by)
+        assert summary["n_fallback"] == 0
+        assert int(summary["n_distinct_kv_ln"]) >= 2
+        assert len(kv_by) == len(v_scale)
+
+    @pytest.mark.skipif(not _BUS_KV_CACHE.is_file(), reason="no bus_kv_base_by_node.csv cache")
+    def test_hetero_nodes_use_mv_kv_not_fallback(self):
+        import pandas as pd
+
+        from gnn2_pf_bus_kv import DEFAULT_KV_FALLBACK_LN, read_bus_kv_cache
+
+        kv_by, _ = read_bus_kv_cache(_BUS_KV_CACHE)
+        het = pd.read_csv(HETERO_LOAD_NODES)
+        het_nodes = het["node"].astype(str).str.strip().str.lower().unique()
+        mv_kv = 7.199558
+        for node in het_nodes:
+            kv = kv_by.get(str(node).lower())
+            assert kv is not None, f"missing kV for hetero node {node!r}"
+            assert kv > 1.0, f"hetero node {node!r} has non-MV kV LN={kv}"
+            assert abs(kv - mv_kv) / mv_kv < 0.01, f"hetero node {node!r} kv={kv}"
+
+    @pytest.mark.skipif(not _BUS_KV_CACHE.is_file(), reason="no bus_kv_base_by_node.csv cache")
+    def test_secondary_nodes_not_assigned_mv_fallback(self):
+        import pandas as pd
+
+        from gnn2_pf_bus_kv import DEFAULT_KV_FALLBACK_LN, read_bus_kv_cache
+
+        df = pd.read_csv(_BUS_KV_CACHE)
+        secondary = df[df["kv_base_ln"] < 1.0]
+        assert len(secondary) > 1000
+        assert not np.any(np.abs(secondary["kv_base_ln"] - DEFAULT_KV_FALLBACK_LN) < 1e-7)
+
+    @pytest.mark.skipif(not _BUS_KV_CACHE.is_file(), reason="no bus_kv_base_by_node.csv cache")
+    def test_bus_kv_matches_opendss_for_sample_buses(self):
+        """Spot-check cached kV LN against a fresh OpenDSS compile."""
+        pytest.importorskip("opendssdirect")
+        import pandas as pd
+
+        from gnn2_pf_bus_kv import _bus_kv_map_all_buses, node_bus_name, read_bus_kv_cache, resolve_opendss_master
+
+        kv_by, _ = read_bus_kv_cache(_BUS_KV_CACHE)
+        df = pd.read_csv(_BUS_KV_CACHE)
+        sample_nodes = df["node"].astype(str).str.lower().tolist()[::1700][:5]
+        bus_kv = _bus_kv_map_all_buses(resolve_opendss_master(REPO))
+        for node in sample_nodes:
+            bus = node_bus_name(node)
+            assert bus in bus_kv, f"OpenDSS missing bus {bus!r}"
+            assert abs(kv_by[node] - bus_kv[bus]) / bus_kv[bus] < 1e-4, node
