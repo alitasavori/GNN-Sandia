@@ -15,7 +15,6 @@ CHUNK_PARENT = None  # optional chunk fallback for CSV discovery
 
 SAMPLE_ID = 0
 USE_RANDOM_CONTROLS = False  # True: small tap noise + random cap flips
-COMPARE_LEGACY = True        # legacy_pu vs physical side-by-side
 RUN_OPENDSS_VERIFY = True    # False if opendssdirect not installed
 EXCLUDE_INTERFACE_BUSES = True       # regxfmr / 190- / m|p|n interface buses
 HETERO_Y_NEIGHBORS_ONLY = True       # hetero load nodes with hetero-only Y neighbors
@@ -63,7 +62,6 @@ importlib.reload(pf_verify)
 print(f"Repo:              {REPO}")
 print(f"PF_DATA_ROOT:      {PF_DATA_ROOT}")
 print(f"sample_id:         {SAMPLE_ID}")
-print(f"compare_legacy:    {COMPARE_LEGACY}")
 print(f"opendss_available: {pf_verify.opendss_available()}")
 print(f"exclude_interface: {EXCLUDE_INTERFACE_BUSES}")
 print(f"hetero_y_nbrs:     {HETERO_Y_NEIGHBORS_ONLY}")
@@ -84,16 +82,12 @@ if USE_RANDOM_CONTROLS:
     )
     print("Applied random control perturbation (label V unchanged)")
 
-cmp = pf_verify.compare_legacy_physical_opendss(
-    SAMPLE_ID,
+cmp = pf_verify.compare_physical_opendss(
+    snap,
     repo=REPO,
-    pf_data_root=PF_DATA_ROOT,
-    chunk_parent=CHUNK_PARENT,
-    compare_legacy=COMPARE_LEGACY,
     run_opendss=RUN_OPENDSS_VERIFY,
-    snap_physical=snap,
 )
-pf_verify.print_legacy_physical_opendss_report(cmp)
+pf_verify.print_physical_opendss_report(cmp)
 
 if "r_dss_kw" in cmp:
     outlier_tbl = pf_verify.diagnose_residual_outliers(snap, cmp, top_n=15)
@@ -102,57 +96,39 @@ if "r_dss_kw" in cmp:
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 axes[0].hist(
-    cmp["physical_abs_dp_mv"],
+    cmp["abs_r_py_mv"],
     bins=80,
     log=True,
     color="steelblue",
     alpha=0.75,
     label="physical",
 )
-if COMPARE_LEGACY and "legacy_abs_dp_mv" in cmp:
-    axes[0].hist(
-        cmp["legacy_abs_dp_mv"],
-        bins=80,
-        log=True,
-        color="coral",
-        alpha=0.55,
-        label="legacy_pu",
-    )
-axes[0].set_title("|P_inj - Re(VYV)| at label V (MV)")
+axes[0].set_title("|r_py| at label V (MV)")
 axes[0].set_xlabel("|dP| [kW]")
 axes[0].set_ylabel("count")
 axes[0].legend()
 
-if "residual_gap_physical_abs_dp_mv" in cmp:
+if "residual_gap_abs_dp_mv" in cmp:
     axes[1].hist(
-        cmp["residual_gap_physical_abs_dp_mv"],
+        cmp["residual_gap_abs_dp_mv"],
         bins=80,
         log=True,
         color="seagreen",
         alpha=0.85,
         label="physical gap",
     )
-    if "residual_gap_legacy_abs_dp_mv" in cmp:
-        axes[1].hist(
-            cmp["residual_gap_legacy_abs_dp_mv"],
-            bins=80,
-            log=True,
-            color="goldenrod",
-            alpha=0.55,
-            label="legacy gap",
-        )
     axes[1].set_title("|r_py - r_dss| (MV, OpenDSS V)")
     axes[1].set_xlabel("|d residual| [kW]")
     axes[1].legend()
 else:
     axes[1].hist(
-        cmp["physical_abs_dq_mv"],
+        np.abs(cmp["r_py_kvar"][cmp["mask_mv"]]),
         bins=80,
         log=True,
         color="darkorange",
         alpha=0.85,
     )
-    axes[1].set_title("|Q_inj - Im(VYV)| physical (MV)")
+    axes[1].set_title("|r_py| Q residual physical (MV)")
     axes[1].set_xlabel("|dQ| [kvar]")
 
 plt.tight_layout()
