@@ -254,6 +254,24 @@ def _load_regulator_edges_for_pf(
 
 
 @dataclass
+class PfYbusCoo:
+    """COO line-Y for O(E) ``Y @ V`` (row sums into nodal current)."""
+
+    row: torch.Tensor
+    col: torch.Tensor
+    y_re: torch.Tensor
+    y_im: torch.Tensor
+
+    def to(self, device: torch.device) -> PfYbusCoo:
+        return PfYbusCoo(
+            row=self.row.to(device),
+            col=self.col.to(device),
+            y_re=self.y_re.to(device),
+            y_im=self.y_im.to(device),
+        )
+
+
+@dataclass
 class PfPhysicsState:
     weight: float = 0.0
     s_base_kva: float = 5000.0
@@ -263,6 +281,8 @@ class PfPhysicsState:
     v_scale_volts: torch.Tensor | None = None
     Y_re_base: torch.Tensor | None = None
     Y_im_base: torch.Tensor | None = None
+    y_coo: PfYbusCoo | None = None
+    use_sparse_y: bool = True
     mask: torch.Tensor | None = None
     reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
     cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
@@ -440,6 +460,136 @@ def _build_ybus_siemens_from_edge_csv(
     return _build_ybus_from_edge_csv(
         edge_csv, node_to_local, n_nodes, None, skip_undirected=skip_undirected
     )
+
+
+def _dense_y_to_coo(
+    y_re: torch.Tensor,
+    y_im: torch.Tensor,
+    *,
+    tol: float = 1e-12,
+) -> PfYbusCoo:
+    """Compress dense ``(N,N)`` Y into COO for edge-local ``Y @ V``."""
+    yr = y_re.detach()
+    yi = y_im.detach()
+    mask = (yr.abs() > tol) | (yi.abs() > tol)
+    rows, cols = torch.where(mask)
+    flat = mask.flatten()
+    return PfYbusCoo(
+        row=rows.to(dtype=torch.long),
+        col=cols.to(dtype=torch.long),
+        y_re=yr.reshape(-1)[flat],
+        y_im=yi.reshape(-1)[flat],
+    )
+
+
+def _yv_from_line_coo(
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+    coo: PfYbusCoo,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``I = Y @ V`` via COO gather-scatter; ``v_*`` shape ``(B, N)``."""
+    row = coo.row
+    col = coo.col
+    yr = coo.y_re.to(device=v_re.device, dtype=v_re.dtype)
+    yi = coo.y_im.to(device=v_re.device, dtype=v_re.dtype)
+    v_re_j = v_re.index_select(1, col)
+    v_im_j = v_im.index_select(1, col)
+    term_re = yr.unsqueeze(0) * v_re_j - yi.unsqueeze(0) * v_im_j
+    term_im = yr.unsqueeze(0) * v_im_j + yi.unsqueeze(0) * v_re_j
+    batch_size, n_nodes = v_re.shape
+    row_b = row.unsqueeze(0).expand(batch_size, -1)
+    i_re = torch.zeros(batch_size, n_nodes, device=v_re.device, dtype=v_re.dtype)
+    i_im = torch.zeros(batch_size, n_nodes, device=v_re.device, dtype=v_re.dtype)
+    i_re.scatter_add_(1, row_b, term_re)
+    i_im.scatter_add_(1, row_b, term_im)
+    return i_re, i_im
+
+
+def _yv_add_reg_branch_contrib(
+    i_re: torch.Tensor,
+    i_im: torch.Tensor,
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+    iu: int,
+    iv: int,
+    g: float,
+    b: float,
+    tap: torch.Tensor,
+) -> None:
+    """Add regulator branch stamp to nodal current (matches ``_stamp_reg_branch_ybus``)."""
+    a = tap.clamp(0.9, 1.1)
+    a2 = a * a
+    g_t = torch.as_tensor(g, device=v_re.device, dtype=v_re.dtype)
+    b_t = torch.as_tensor(b, device=v_re.device, dtype=v_re.dtype)
+    i_re[:, iu] = i_re[:, iu] + g_t * v_re[:, iu] - b_t * v_im[:, iu]
+    i_im[:, iu] = i_im[:, iu] + g_t * v_im[:, iu] + b_t * v_re[:, iu]
+    i_re[:, iv] = i_re[:, iv] + (g_t / a2) * v_re[:, iv] - (b_t / a2) * v_im[:, iv]
+    i_im[:, iv] = i_im[:, iv] + (g_t / a2) * v_im[:, iv] + (b_t / a2) * v_re[:, iv]
+    i_re[:, iu] = i_re[:, iu] - (g_t / a) * v_re[:, iv] + (b_t / a) * v_im[:, iv]
+    i_im[:, iu] = i_im[:, iu] - (g_t / a) * v_im[:, iv] - (b_t / a) * v_re[:, iv]
+    i_re[:, iv] = i_re[:, iv] - (g_t / a) * v_re[:, iu] + (b_t / a) * v_im[:, iu]
+    i_im[:, iv] = i_im[:, iv] - (g_t / a) * v_im[:, iu] - (b_t / a) * v_re[:, iu]
+
+
+def _yv_add_cap_shunt_contrib(
+    i_re: torch.Tensor,
+    i_im: torch.Tensor,
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+    ni: int,
+    b_shunt: torch.Tensor,
+) -> None:
+    """Add shunt ``j*B`` diagonal stamp to nodal current."""
+    i_re[:, ni] = i_re[:, ni] - b_shunt * v_im[:, ni]
+    i_im[:, ni] = i_im[:, ni] + b_shunt * v_re[:, ni]
+
+
+def _compute_yv_current(
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+    *,
+    Y_re: torch.Tensor | None = None,
+    Y_im: torch.Tensor | None = None,
+    y_coo: PfYbusCoo | None = None,
+    reg_edges: list[tuple[int, int, float, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int]] | None = None,
+    tap_pu: torch.Tensor | None = None,
+    cap_on: torch.Tensor | None = None,
+    use_sparse_y: bool = True,
+    s_base_kva: float = 5000.0,
+    use_physical_units: bool = False,
+    v_scale_volts: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Branch current ``I = Y @ V`` as ``(i_re, i_im)`` each ``(B, N)``."""
+    if use_sparse_y and y_coo is not None:
+        i_re, i_im = _yv_from_line_coo(v_re, v_im, y_coo)
+        if reg_edges and tap_pu is not None:
+            for iu, iv, g, b, rj in reg_edges:
+                _yv_add_reg_branch_contrib(i_re, i_im, v_re, v_im, iu, iv, g, b, tap_pu[:, rj])
+        if cap_banks and cap_on is not None:
+            s_base = float(s_base_kva)
+            v_scale = None
+            if use_physical_units:
+                if v_scale_volts is None:
+                    raise ValueError("use_physical_units requires v_scale_volts for cap shunt stamping")
+                v_scale = v_scale_volts.to(device=v_re.device, dtype=v_re.dtype)
+            for ni, q_nom, cj in cap_banks:
+                if use_physical_units:
+                    v_nom = v_scale[int(ni)].clamp(min=1.0)
+                    b_shunt = cap_on[:, cj] * (float(q_nom) * 1000.0) / (v_nom * v_nom)
+                else:
+                    b_shunt = cap_on[:, cj] * (float(q_nom) / s_base)
+                _yv_add_cap_shunt_contrib(i_re, i_im, v_re, v_im, ni, b_shunt)
+        return i_re, i_im
+    if Y_re is None or Y_im is None:
+        raise ValueError("dense Y@V requires Y_re and Y_im when sparse coo is disabled")
+    if Y_re.dim() == 2:
+        i_re = torch.matmul(v_re, Y_re.T) - torch.matmul(v_im, Y_im.T)
+        i_im = torch.matmul(v_re, Y_im.T) + torch.matmul(v_im, Y_re.T)
+    else:
+        i_re = torch.matmul(v_re, Y_re.transpose(-1, -2)) - torch.matmul(v_im, Y_im.transpose(-1, -2))
+        i_im = torch.matmul(v_re, Y_im.transpose(-1, -2)) + torch.matmul(v_im, Y_re.transpose(-1, -2))
+    return i_re, i_im
 
 
 _PF_ELECTRICAL_DISTANCE_REL = Path("electrical_distance_from_substation.csv")
@@ -666,8 +816,8 @@ def nodal_power_balance_residual(
     pred_ri: torch.Tensor,
     p_inj_kw: torch.Tensor,
     q_inj_kvar: torch.Tensor,
-    Y_re: torch.Tensor,
-    Y_im: torch.Tensor,
+    Y_re: torch.Tensor | None,
+    Y_im: torch.Tensor | None,
     node_mask: torch.Tensor | None,
     s_base_kva: float,
     *,
@@ -675,6 +825,12 @@ def nodal_power_balance_residual(
     v_scale_volts: torch.Tensor | None = None,
     huber_delta_pu: float = 0.02,
     huber_delta_kw: float = 10.0,
+    y_coo: PfYbusCoo | None = None,
+    reg_edges: list[tuple[int, int, float, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int]] | None = None,
+    tap_pu: torch.Tensor | None = None,
+    cap_on: torch.Tensor | None = None,
+    use_sparse_y: bool = True,
 ) -> torch.Tensor:
     """Huber-smoothed mean P/Q balance residual.
 
@@ -689,12 +845,21 @@ def nodal_power_balance_residual(
         vs = v_scale_volts.to(device=v_re.device, dtype=v_re.dtype).view(1, -1)
         v_re = v_re * vs
         v_im = v_im * vs
-    if Y_re.dim() == 2:
-        i_re = torch.matmul(v_re, Y_re.T) - torch.matmul(v_im, Y_im.T)
-        i_im = torch.matmul(v_re, Y_im.T) + torch.matmul(v_im, Y_re.T)
-    else:
-        i_re = torch.matmul(v_re, Y_re.transpose(-1, -2)) - torch.matmul(v_im, Y_im.transpose(-1, -2))
-        i_im = torch.matmul(v_re, Y_im.transpose(-1, -2)) + torch.matmul(v_im, Y_re.transpose(-1, -2))
+    i_re, i_im = _compute_yv_current(
+        v_re,
+        v_im,
+        Y_re=Y_re,
+        Y_im=Y_im,
+        y_coo=y_coo,
+        reg_edges=reg_edges,
+        cap_banks=cap_banks,
+        tap_pu=tap_pu,
+        cap_on=cap_on,
+        use_sparse_y=use_sparse_y,
+        s_base_kva=s_base_kva,
+        use_physical_units=use_physical_units,
+        v_scale_volts=v_scale_volts,
+    )
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
     if use_physical_units:
@@ -890,18 +1055,6 @@ def _power_balance_loss_from_batch(
     )
     if pf.detach_controls:
         tap_pu = tap_pu.detach()
-    y_re, y_im = _ybus_with_predicted_controls(
-        pf.Y_re_base,
-        pf.Y_im_base,
-        reg_edges=pf.reg_edges,
-        cap_banks=pf.cap_banks,
-        tap_pu=tap_pu,
-        cap_on=cap_on,
-        s_base_kva=pf.s_base_kva,
-        batch_size=int(batch.num_graphs),
-        use_physical_units=pf.use_physical_units,
-        v_scale_volts=pf.v_scale_volts,
-    )
     x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean, x_std)
     p_inj, q_inj = _assemble_pf_injections(
         x_den,
@@ -909,6 +1062,23 @@ def _power_balance_loss_from_batch(
         batch=batch,
         n_nodes=n_nodes,
     )
+
+    use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
+    if use_sparse:
+        y_re, y_im = None, None
+    else:
+        y_re, y_im = _ybus_with_predicted_controls(
+            pf.Y_re_base,
+            pf.Y_im_base,
+            reg_edges=pf.reg_edges,
+            cap_banks=pf.cap_banks,
+            tap_pu=tap_pu,
+            cap_on=cap_on,
+            s_base_kva=pf.s_base_kva,
+            batch_size=int(batch.num_graphs),
+            use_physical_units=pf.use_physical_units,
+            v_scale_volts=pf.v_scale_volts,
+        )
 
     return nodal_power_balance_residual(
         pred_ri,
@@ -922,6 +1092,12 @@ def _power_balance_loss_from_batch(
         v_scale_volts=pf.v_scale_volts,
         huber_delta_pu=pf.huber_delta_pu,
         huber_delta_kw=pf.huber_delta_kw,
+        y_coo=pf.y_coo if use_sparse else None,
+        reg_edges=pf.reg_edges if use_sparse else None,
+        cap_banks=pf.cap_banks if use_sparse else None,
+        tap_pu=tap_pu if use_sparse else None,
+        cap_on=cap_on if use_sparse else None,
+        use_sparse_y=use_sparse,
     )
 
 
@@ -1158,13 +1334,19 @@ def _setup_pf_physics(
         v_scale_t = torch.tensor(v_scale_np, dtype=torch.float32, device=device)
 
     units_label = "physical (V volts, Y Siemens, kW Huber)" if use_physical else "legacy_pu"
+    use_sparse_y = bool(int(getattr(args, "pf_sparse_y", 1) or 1))
+    y_coo = _dense_y_to_coo(y_re, y_im).to(device) if use_sparse_y else None
+    nnz = int(y_coo.row.numel()) if y_coo is not None else 0
+    dense_elems = int(n_nodes) * int(n_nodes)
     print(
         f"Power-balance physics: weight={w}, units={units_label}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
         f"huber_delta_pu={huber_delta_pu}, huber_delta_kw={huber_delta_kw}, "
         f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
-        f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}"
+        f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}, "
+        f"sparse_y={use_sparse_y} (nnz={nnz} vs dense {dense_elems}, "
+        f"~{100.0 * (1.0 - nnz / max(dense_elems, 1)):.2f}% zero skip)"
         + (f", kv_cache={kv_cache_path}" if kv_cache_path else ""),
         flush=True,
     )
@@ -1178,6 +1360,8 @@ def _setup_pf_physics(
         v_scale_volts=v_scale_t,
         Y_re_base=y_re.to(device),
         Y_im_base=y_im.to(device),
+        y_coo=y_coo,
+        use_sparse_y=use_sparse_y,
         mask=pf_mask.to(device),
         reg_edges=reg_edges,
         cap_banks=cap_banks,
@@ -3945,6 +4129,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         choices=(0, 1),
         help="1=MV mask only hetero load nodes whose Y-neighbors are also hetero catalog nodes (default 1).",
+    )
+    p.add_argument(
+        "--pf_sparse_y",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="1=O(E) sparse edge-local Y@V for physics loss (default). 0=dense (B,N,N) debug path.",
     )
     return p.parse_args()
 

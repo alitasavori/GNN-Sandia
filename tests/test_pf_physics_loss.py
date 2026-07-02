@@ -1052,3 +1052,179 @@ class TestScaleRobustness:
         assert "falling back to all non-slack" in out
         assert bool(mask[0].item())
         assert not bool(mask[1].item())
+
+
+# ---------------------------------------------------------------------------
+# G. Sparse Y@V parity (O(E) vs dense)
+# ---------------------------------------------------------------------------
+def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1):
+    v_ri = truth["v_ri"]
+    tap = truth["tap"]
+    cap_on = truth["cap_on"]
+    x_denorm = truth["x_denorm"]
+    if batch_size > 1:
+        v_ri = v_ri.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+        tap = tap.expand(batch_size, -1)
+        cap_on = cap_on.expand(batch_size, -1)
+        x_denorm = x_denorm.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+    else:
+        v_ri = v_ri if v_ri.dim() == 2 else v_ri
+    v_batch = v_ri.unsqueeze(0) if v_ri.dim() == 2 else v_ri
+
+    p_inj, q_inj = pfmod._assemble_pf_injections(
+        x_denorm if batch_size > 1 else x_denorm.unsqueeze(0),
+        NODE_FEATURE_COLS,
+        batch=_make_synthetic_batch(x_denorm if batch_size == 1 else x_denorm[0], batch_size=batch_size),
+        n_nodes=N_NODES,
+    )
+    mask = torch.ones(N_NODES, dtype=torch.bool)
+
+    if use_sparse_y:
+        y_coo = pfmod._dense_y_to_coo(truth["y_re_b"], truth["y_im_b"])
+        return pfmod.nodal_power_balance_residual(
+            v_batch,
+            p_inj,
+            q_inj,
+            None,
+            None,
+            mask,
+            S_BASE_KVA,
+            y_coo=y_coo,
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=tap,
+            cap_on=cap_on,
+            use_sparse_y=True,
+        )
+
+    y_re, y_im = pfmod._ybus_with_predicted_controls(
+        truth["y_re_b"],
+        truth["y_im_b"],
+        reg_edges=[REG_EDGE],
+        cap_banks=[CAP_BANK],
+        tap_pu=tap,
+        cap_on=cap_on,
+        s_base_kva=S_BASE_KVA,
+        batch_size=batch_size,
+    )
+    return pfmod.nodal_power_balance_residual(
+        v_batch,
+        p_inj,
+        q_inj,
+        y_re,
+        y_im,
+        mask,
+        S_BASE_KVA,
+        use_sparse_y=False,
+    )
+
+
+class TestSparseYParity:
+    def test_sparse_dense_yv_current_parity(self, synthetic_truth):
+        v_re = synthetic_truth["v_ri"][:, 0].unsqueeze(0)
+        v_im = synthetic_truth["v_ri"][:, 1].unsqueeze(0)
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+        )
+        i_dense_re, i_dense_im = pfmod._compute_yv_current(
+            v_re,
+            v_im,
+            Y_re=y_re[0],
+            Y_im=y_im[0],
+            use_sparse_y=False,
+        )
+        y_coo = pfmod._dense_y_to_coo(synthetic_truth["y_re_b"], synthetic_truth["y_im_b"])
+        i_sparse_re, i_sparse_im = pfmod._compute_yv_current(
+            v_re,
+            v_im,
+            y_coo=y_coo,
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            use_sparse_y=True,
+            s_base_kva=S_BASE_KVA,
+        )
+        assert torch.allclose(i_dense_re, i_sparse_re, atol=1e-4, rtol=1e-5)
+        assert torch.allclose(i_dense_im, i_sparse_im, atol=1e-4, rtol=1e-5)
+
+    def test_sparse_dense_residual_parity_at_truth(self, synthetic_truth):
+        res_dense = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=False).item())
+        res_sparse = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=True).item())
+        assert res_dense < TOL_ZERO_F32
+        assert res_sparse < TOL_ZERO_F32
+        assert abs(res_sparse - res_dense) < 1e-5
+
+    def test_sparse_dense_residual_parity_batch_gt_one(self, synthetic_truth):
+        res_dense = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=False, batch_size=2).item())
+        res_sparse = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=True, batch_size=2).item())
+        assert res_dense < TOL_ZERO_F32
+        assert res_sparse < TOL_ZERO_F32
+        assert abs(res_sparse - res_dense) < 1e-5
+
+    def test_sparse_path_gradients_flow(self, synthetic_truth):
+        v = synthetic_truth["v_ri"].clone().requires_grad_(True)
+        tap = synthetic_truth["tap"].clone().requires_grad_(True)
+        cap_on = synthetic_truth["cap_on"].clone().requires_grad_(True)
+        x_denorm = synthetic_truth["x_denorm"].unsqueeze(0)
+        y_coo = pfmod._dense_y_to_coo(synthetic_truth["y_re_b"], synthetic_truth["y_im_b"])
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            x_denorm,
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(synthetic_truth["x_denorm"]),
+            n_nodes=N_NODES,
+        )
+        loss = pfmod.nodal_power_balance_residual(
+            v.unsqueeze(0),
+            p_inj,
+            q_inj,
+            None,
+            None,
+            torch.ones(N_NODES, dtype=torch.bool),
+            S_BASE_KVA,
+            y_coo=y_coo,
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=tap,
+            cap_on=cap_on,
+            use_sparse_y=True,
+        )
+        loss.backward()
+        assert v.grad is not None and float(v.grad.abs().sum()) > 0
+        assert tap.grad is not None and float(tap.grad.abs().sum()) > 0
+        assert cap_on.grad is not None and float(cap_on.grad.abs().sum()) > 0
+
+    @pytest.mark.skipif(
+        not all(
+            p.is_file()
+            for p in (
+                DATA_DAILYAGG / "gnn_edges_phase_static.csv",
+                HETERO_LOAD_NODES,
+                NODES8500,
+            )
+        ),
+        reason="local snapshot CSVs not available",
+    )
+    def test_real_snapshot_sparse_dense_yv_parity(self):
+        snap = _real_snapshot_tensors(0)
+        v = snap["v"]
+        y_re, y_im = snap["y_full"]
+        v_re, v_im = v[:, :, 0], v[:, :, 1]
+        i_dense_re, i_dense_im = pfmod._compute_yv_current(
+            v_re,
+            v_im,
+            Y_re=y_re[0],
+            Y_im=y_im[0],
+            use_sparse_y=False,
+        )
+        coo = pfmod._dense_y_to_coo(y_re[0], y_im[0])
+        i_sparse_re, i_sparse_im = pfmod._yv_from_line_coo(v_re, v_im, coo)
+        assert torch.allclose(i_dense_re, i_sparse_re, atol=1e-3, rtol=1e-4)
+        assert torch.allclose(i_dense_im, i_sparse_im, atol=1e-3, rtol=1e-4)

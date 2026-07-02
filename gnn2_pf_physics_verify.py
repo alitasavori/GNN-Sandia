@@ -101,24 +101,41 @@ def nodal_power_kw_from_yv(
     *,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
     v_scale_volts: np.ndarray | None = None,
+    use_sparse_y: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``S = V · conj(Y V)`` → (P_kW, Q_kvar).
 
     Physical: pass ``v_scale_volts`` to convert pu ``V`` to volts; ``Y`` in Siemens; divide by 1000.
     Legacy: per-unit ``V`` and ``Y``; multiply by ``s_base_kva``.
     """
+    import torch
+
+    pfmod = _get_pfmod()
+    v_re_t = torch.as_tensor(v_re, dtype=torch.float32).reshape(1, -1)
+    v_im_t = torch.as_tensor(v_im, dtype=torch.float32).reshape(1, -1)
     if v_scale_volts is not None:
-        vs = np.asarray(v_scale_volts, dtype=np.float64).reshape(-1)
-        v_re = v_re * vs
-        v_im = v_im * vs
-    i_re = v_re @ y_re.T - v_im @ y_im.T
-    i_im = v_re @ y_im.T + v_im @ y_re.T
-    s_re = v_re * i_re + v_im * i_im
-    s_im = v_im * i_re - v_re * i_im
+        vs = torch.as_tensor(v_scale_volts, dtype=torch.float32).reshape(1, -1)
+        v_re_t = v_re_t * vs
+        v_im_t = v_im_t * vs
+    y_re_t = torch.as_tensor(y_re, dtype=torch.float32)
+    y_im_t = torch.as_tensor(y_im, dtype=torch.float32)
+    if use_sparse_y:
+        coo = pfmod._dense_y_to_coo(y_re_t, y_im_t)
+        i_re, i_im = pfmod._yv_from_line_coo(v_re_t, v_im_t, coo)
+    else:
+        i_re, i_im = pfmod._compute_yv_current(
+            v_re_t,
+            v_im_t,
+            Y_re=y_re_t,
+            Y_im=y_im_t,
+            use_sparse_y=False,
+        )
+    s_re = v_re_t * i_re + v_im_t * i_im
+    s_im = v_im_t * i_re - v_re_t * i_im
     if v_scale_volts is not None:
-        return s_re / 1000.0, s_im / 1000.0
+        return s_re[0].detach().cpu().numpy() / 1000.0, s_im[0].detach().cpu().numpy() / 1000.0
     s_base = float(s_base_kva)
-    return s_re * s_base, s_im * s_base
+    return (s_re[0] * s_base).detach().cpu().numpy(), (s_im[0] * s_base).detach().cpu().numpy()
 
 
 def balance_residual_kw(
