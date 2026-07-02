@@ -186,6 +186,8 @@ def load_snapshot_state(
     kv_base: float = KV_BASE_DEFAULT,
     use_physical_units: bool = True,
     pf_bus_kv_base_csv: Path | None = None,
+    exclude_interface_buses: bool = True,
+    hetero_y_neighbors_only: bool = True,
 ) -> SnapshotState:
     """Load one dailyagg snapshot into numpy arrays (label V, controls, feature injections)."""
     import pandas as pd
@@ -306,6 +308,20 @@ def load_snapshot_state(
             continue
         if float(row["electrical_distance_ohm"]) > 1e-9:
             mask[int(ntl[node])] = True
+
+    if exclude_interface_buses or hetero_y_neighbors_only:
+        hetero_nodes = pfmod._load_pf_hetero_node_indices(data_root)
+        if hetero_nodes:
+            mask_t = pfmod._refine_pf_mv_balance_mask(
+                torch.tensor(mask, dtype=torch.bool),
+                ntl,
+                hetero_nodes,
+                y_re_b,
+                y_im_b,
+                exclude_interface=exclude_interface_buses,
+                hetero_y_neighbors_only=hetero_y_neighbors_only,
+            )
+            mask = mask_t.numpy()
 
     return SnapshotState(
         sample_id=int(sample_id),
@@ -675,6 +691,150 @@ def compare_pytorch_opendss(
     }
 
 
+def _legacy_mv_mask_from_distance(
+    snap: SnapshotState,
+) -> np.ndarray:
+    """Distance-only MV mask (pre-refinement) for before/after reporting."""
+    import pandas as pd
+
+    from train_da_gps_multitask_complex_voltage_gine import _is_pf_slack_source_node
+
+    mask = np.zeros(snap.n_nodes, dtype=bool)
+    dist = pd.read_csv(snap.pf_data_root / "electrical_distance_from_substation.csv")
+    for _, row in dist.iterrows():
+        node = str(row["node"]).strip().lower()
+        if node not in snap.node_to_local or _is_pf_slack_source_node(node):
+            continue
+        if float(row["electrical_distance_ohm"]) > 1e-9:
+            mask[int(snap.node_to_local[node])] = True
+    return mask
+
+
+def classify_outlier_node(
+    node: str,
+    *,
+    hetero_nodes: set[int],
+    cap_nodes: set[int],
+    reg_nodes: set[int],
+    edge_nodes: set[int],
+    node_to_local: dict[str, int],
+) -> str:
+    """Human-readable outlier category for diagnostics tables."""
+    from train_da_gps_multitask_complex_voltage_gine import _is_pf_interface_node, _is_pf_slack_source_node
+
+    li = node_to_local.get(str(node).strip().lower())
+    if li is None:
+        return "missing_from_index"
+    if _is_pf_slack_source_node(node):
+        return "slack"
+    if _is_pf_interface_node(node):
+        bus = node.split(".")[0].lower()
+        if bus.startswith("regxfmr"):
+            return "regxfmr_interface"
+        if bus.startswith("190-"):
+            return "mv_reg_bus"
+        if bus and bus[0] == "m":
+            return "monitor_bus"
+        if bus and bus[0] == "p":
+            return "cap_feeder"
+        if bus and bus[0] == "n":
+            return "cap_feeder_n"
+        return "interface"
+    if li in cap_nodes:
+        return "cap_bank_bus"
+    if li in reg_nodes:
+        return "regulator_bus"
+    if li not in hetero_nodes:
+        return "not_in_hetero"
+    if li not in edge_nodes:
+        return "missing_from_line_edges"
+    return "hetero_load"
+
+
+def diagnose_residual_outliers(
+    snap: SnapshotState,
+    cmp: dict[str, Any],
+    *,
+    top_n: int = 20,
+):
+    """Top-N MV nodes by ``|r_py - r_dss|`` with bus class and proximity flags."""
+    import pandas as pd
+
+    pfmod = _get_pfmod()
+    if "r_dss_kw" not in cmp:
+        raise ValueError("compare_physical_opendss with run_opendss=True required")
+
+    gap = np.abs(cmp["r_py_kw"] - cmp["r_dss_kw"])
+    m = cmp.get("mask_mv_effective", snap.mask_mv)
+    idx_to_node = {int(v): str(k) for k, v in snap.node_to_local.items()}
+
+    hetero_nodes = pfmod._load_pf_hetero_node_indices(snap.pf_data_root)
+    cap_banks = pfmod._resolve_cap_bus_nodes(
+        list(TARGET_CAP_COLS),
+        snap.node_to_local,
+        cap_nodes_csv=snap.pf_data_root / "capacitor_involved_nodes.csv",
+        meta_csv=snap.pf_data_root / "gnn_sample_meta.csv",
+        capacitors_dss=REPO / "8500-node" / "Capacitors.dss",
+    )
+    cap_nodes = {int(b[0]) for b in cap_banks}
+    reg_edges = pfmod._load_regulator_edges_for_pf(
+        snap.pf_data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
+        snap.node_to_local,
+        list(TARGET_REG_COLS),
+        None,
+    )
+    reg_nodes = set()
+    for iu, iv, _, _, _ in reg_edges:
+        reg_nodes.add(int(iu))
+        reg_nodes.add(int(iv))
+
+    edges = pd.read_csv(snap.pf_data_root / "gnn_edges_phase_static.csv")
+    edge_nodes: set[int] = set()
+    for _, row in edges.iterrows():
+        for col in ("from_node", "to_node"):
+            key = str(row[col]).strip().lower()
+            if key in snap.node_to_local:
+                edge_nodes.add(int(snap.node_to_local[key]))
+
+    dist = pd.read_csv(snap.pf_data_root / "electrical_distance_from_substation.csv")
+    dist_map = {
+        str(r["node"]).strip().lower(): float(r["electrical_distance_ohm"]) for _, r in dist.iterrows()
+    }
+
+    rows: list[dict[str, Any]] = []
+    for li in np.where(m)[0]:
+        li = int(li)
+        node = idx_to_node.get(li, "?")
+        dss = cmp.get("dss_out", {})
+        inj_gap = (
+            abs(float(snap.p_inj_kw[li]) - float(dss["p_inj_kw"][li]))
+            if dss and np.isfinite(dss["p_inj_kw"][li])
+            else float("nan")
+        )
+        rows.append(
+            {
+                "node_idx": li,
+                "node": node,
+                "bus": node.split(".")[0],
+                "gap_kw": float(gap[li]),
+                "r_py_kw": float(cmp["r_py_kw"][li]),
+                "r_dss_kw": float(cmp["r_dss_kw"][li]),
+                "inj_gap_kw": inj_gap,
+                "electrical_distance_ohm": dist_map.get(node, float("nan")),
+                "class": classify_outlier_node(
+                    node,
+                    hetero_nodes=hetero_nodes,
+                    cap_nodes=cap_nodes,
+                    reg_nodes=reg_nodes,
+                    edge_nodes=edge_nodes,
+                    node_to_local=snap.node_to_local,
+                ),
+            }
+        )
+    out = pd.DataFrame(rows).sort_values("gap_kw", ascending=False).head(int(top_n))
+    return out.reset_index(drop=True)
+
+
 def compare_physical_opendss(
     snap: SnapshotState,
     *,
@@ -720,8 +880,8 @@ def compare_physical_opendss(
         return out
 
     m_eff = m.copy()
-    fin = np.isfinite(dss_out["p_inj_kw"][m]) & np.isfinite(dss_out["q_inj_kvar"][m])
-    m_eff[m] = m[m] & fin
+    fin_full = np.isfinite(dss_out["p_inj_kw"]) & np.isfinite(dss_out["q_inj_kvar"])
+    m_eff = m & fin_full
 
     d_p_inj = snap.p_inj_kw - dss_out["p_inj_kw"]
     d_q_inj = snap.q_inj_kvar - dss_out["q_inj_kvar"]
@@ -729,11 +889,16 @@ def compare_physical_opendss(
     gap_p = py_label["dp_kw"] - r_dss_kw
     gap_q = py_label["dq_kvar"] - r_dss_kvar
 
+    legacy_mask = _legacy_mv_mask_from_distance(snap)
+    legacy_eff = legacy_mask & fin_full
+
     out.update(
         {
             "dss_out": dss_out,
             "dss_converged": bool(dss_out.get("converged", False)),
             "mask_mv_effective": m_eff,
+            "mask_mv_legacy": legacy_mask,
+            "mask_mv_legacy_effective": legacy_eff,
             "inj_abs_dp_mv": np.abs(d_p_inj[m_eff]),
             "inj_abs_dq_mv": np.abs(d_q_inj[m_eff]),
             "inj_stats_p": summarize_abs_kw(np.abs(d_p_inj[m_eff])),
@@ -747,6 +912,8 @@ def compare_physical_opendss(
             "residual_gap_abs_dq_mv": np.abs(gap_q[m_eff]),
             "residual_gap_stats_p": summarize_abs_kw(np.abs(gap_p[m_eff])),
             "residual_gap_stats_q": summarize_abs_kw(np.abs(gap_q[m_eff])),
+            "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p[legacy_eff])),
+            "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q[legacy_eff])),
         }
     )
     return out
@@ -768,6 +935,8 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
         print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
         print(_fmt_stats_row("|r_dss| at OpenDSS V", cmp["r_dss_stats_p"]))
         print(_fmt_stats_row("|r_py - r_dss| (backprop gap)", cmp["residual_gap_stats_p"]))
+        if "residual_gap_legacy_stats_p" in cmp:
+            print(_fmt_stats_row("|r_py - r_dss| legacy MV mask", cmp["residual_gap_legacy_stats_p"]))
         print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
     elif cmp.get("opendss_skipped"):
         print(f"\n[OpenDSS] skipped: {cmp['opendss_skipped']}")
@@ -776,9 +945,9 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
 
     print(
         "\nBackprop: train with pf_units=physical; Huber on kW residuals. "
-        "Median |r_py| << max is expected (interface buses). "
-        "|r_py - r_dss| reflects omitted LV xfmr, line charging, and Q_inj recipe — "
-        "acceptable if medians/p95 stay in the kW-few x10 kW band."
+        "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
+        "(excludes regxfmr/190-/m/p/n interface buses). "
+        "Legacy distance-only mask inflates |r_py - r_dss| via zero-V interface neighbors."
     )
 
 

@@ -17,6 +17,8 @@ SAMPLE_ID = 0
 USE_RANDOM_CONTROLS = False  # True: small tap noise + random cap flips
 COMPARE_LEGACY = True        # legacy_pu vs physical side-by-side
 RUN_OPENDSS_VERIFY = True    # False if opendssdirect not installed
+EXCLUDE_INTERFACE_BUSES = True       # regxfmr / 190- / m|p|n interface buses
+HETERO_Y_NEIGHBORS_ONLY = True       # hetero load nodes with hetero-only Y neighbors
 
 
 def _find_repo(explicit: Path | None) -> Path:
@@ -63,6 +65,8 @@ print(f"PF_DATA_ROOT:      {PF_DATA_ROOT}")
 print(f"sample_id:         {SAMPLE_ID}")
 print(f"compare_legacy:    {COMPARE_LEGACY}")
 print(f"opendss_available: {pf_verify.opendss_available()}")
+print(f"exclude_interface: {EXCLUDE_INTERFACE_BUSES}")
+print(f"hetero_y_nbrs:     {HETERO_Y_NEIGHBORS_ONLY}")
 
 snap = pf_verify.load_snapshot_state(
     SAMPLE_ID,
@@ -70,6 +74,8 @@ snap = pf_verify.load_snapshot_state(
     pf_data_root=PF_DATA_ROOT,
     chunk_parent=CHUNK_PARENT,
     use_physical_units=True,
+    exclude_interface_buses=EXCLUDE_INTERFACE_BUSES,
+    hetero_y_neighbors_only=HETERO_Y_NEIGHBORS_ONLY,
 )
 if USE_RANDOM_CONTROLS:
     rng = np.random.default_rng(42)
@@ -88,6 +94,11 @@ cmp = pf_verify.compare_legacy_physical_opendss(
     snap_physical=snap,
 )
 pf_verify.print_legacy_physical_opendss_report(cmp)
+
+if "r_dss_kw" in cmp:
+    outlier_tbl = pf_verify.diagnose_residual_outliers(snap, cmp, top_n=15)
+    print("\n=== Top residual-gap outliers (refined MV mask) ===")
+    print(outlier_tbl.to_string(index=False))
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 axes[0].hist(

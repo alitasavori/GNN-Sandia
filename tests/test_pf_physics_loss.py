@@ -843,6 +843,33 @@ class TestScaleRobustness:
         ),
         reason="local OpenDSS snapshot CSVs not available",
     )
+    def test_real_snapshot_refined_mask_residual_gap_p95_kw(self):
+        """Refined MV mask should keep |r_py - r_dss| p95 in the few-kW band at label V."""
+        pytest.importorskip("opendssdirect")
+        from gnn2_pf_physics_verify import compare_physical_opendss, load_snapshot_state
+
+        snap = load_snapshot_state(0, repo=REPO, use_physical_units=True)
+        cmp = compare_physical_opendss(snap, repo=REPO, run_opendss=True)
+        if cmp.get("opendss_skipped"):
+            pytest.skip(str(cmp["opendss_skipped"]))
+        gap = cmp["residual_gap_stats_p"]
+        assert gap["p95"] < 50.0, f"refined gap p95 too large: {gap['p95']:.4g} kW"
+        assert gap["max"] < 100.0, f"refined gap max too large: {gap['max']:.4g} kW"
+        leg = cmp["residual_gap_legacy_stats_p"]
+        assert leg["p95"] > gap["p95"] * 10.0
+
+    @pytest.mark.skipif(
+        not all(
+            p.is_file()
+            for p in (
+                DATA_DAILYAGG / "gnn_edges_phase_static.csv",
+                HETERO_LOAD_NODES,
+                NODES8500,
+                DATA_DAILYAGG / "electrical_distance_from_substation.csv",
+            )
+        ),
+        reason="local OpenDSS snapshot CSVs not available",
+    )
     def test_real_snapshot_huber_loss_bounded_at_truth(self):
         snap = _real_snapshot_tensors(0)
         v, p_inj, q_inj, mask = snap["v"], snap["p_inj"], snap["q_inj"], snap["mask"]
@@ -854,6 +881,7 @@ class TestScaleRobustness:
         )
         # Raw kW MSE at truth is ~1e14 on this feeder; Huber+pu must stay trainable-scale.
         assert res_huber < 500.0, f"huber loss at truth too large: {res_huber:.4e}"
+
     def test_batch_size_gt_one(self, synthetic_truth):
         res = float(_run_impl_residual(synthetic_truth, batch_size=2).item())
         assert res < TOL_ZERO_F32
@@ -862,6 +890,52 @@ class TestScaleRobustness:
         assert pfmod._is_pf_slack_source_node("sourcebus.1")
         assert pfmod._is_pf_slack_source_node("_hvmv_sub_lsb.1")
         assert not pfmod._is_pf_slack_source_node("l1234567.1")
+
+    def test_interface_node_detection(self):
+        assert pfmod._is_pf_interface_node("regxfmr_190-8581.1")
+        assert pfmod._is_pf_interface_node("190-8581.2")
+        assert pfmod._is_pf_interface_node("m1142828.3")
+        assert pfmod._is_pf_interface_node("p1121282.3")
+        assert pfmod._is_pf_interface_node("n1136366.1")
+        assert not pfmod._is_pf_interface_node("l2674047.3")
+
+    @pytest.mark.skipif(not (DATA_DAILYAGG / "gnn_node_index_master.csv").is_file(), reason="no local dailyagg")
+    def test_mv_mask_refinement_reduces_interface_nodes(self):
+        import pandas as pd
+
+        idx = pd.read_csv(DATA_DAILYAGG / "gnn_node_index_master.csv")
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        dist = pd.read_csv(DATA_DAILYAGG / "electrical_distance_from_substation.csv")
+        mask = torch.zeros(n_nodes, dtype=torch.bool)
+        for _, row in dist.iterrows():
+            node = str(row["node"]).strip().lower()
+            if node not in ntl or pfmod._is_pf_slack_source_node(node):
+                continue
+            if float(row["electrical_distance_ohm"]) > 1e-9:
+                mask[int(ntl[node])] = True
+        reg_edges = pfmod._load_regulator_edges_for_pf(
+            DATA_DAILYAGG / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
+            ntl,
+            list(pfmod.TARGET_REG_COLS),
+            Z_BASE,
+        )
+        skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
+        y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(
+            DATA_DAILYAGG / "gnn_edges_phase_static.csv", ntl, n_nodes, skip_undirected=skip
+        )
+        hetero = pfmod._load_pf_hetero_node_indices(DATA_DAILYAGG)
+        refined = pfmod._refine_pf_mv_balance_mask(
+            mask, ntl, hetero, y_re, y_im, exclude_interface=True, hetero_y_neighbors_only=True
+        )
+        assert int(refined.sum().item()) < int(mask.sum().item())
+        assert int(refined.sum().item()) >= 100
+        idx_to_node = {int(v): k for k, v in ntl.items()}
+        for li in range(n_nodes):
+            if not bool(refined[li].item()):
+                continue
+            assert pfmod._is_pf_interface_node(idx_to_node[li]) is False
+            assert int(li) in hetero
 
     @pytest.mark.skipif(not NODES8500.is_file(), reason="no loadtype_8500 nodes CSV")
     def test_mv_mask_nonempty_excludes_slack(self):

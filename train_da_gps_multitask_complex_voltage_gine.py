@@ -285,6 +285,69 @@ def _is_pf_slack_source_node(node: str) -> bool:
     return False
 
 
+_PF_INTERFACE_BUS_PREFIXES: tuple[str, ...] = ("regxfmr", "190-")
+_PF_INTERFACE_BUS_FIRST_CHARS: frozenset[str] = frozenset("mpn")
+
+
+def _is_pf_interface_node(node: str) -> bool:
+    """MV interface / monitoring / cap-feeder buses omitted from the MV Y-bus subgraph."""
+    bus = str(node).strip().lower().split(".")[0]
+    if any(bus.startswith(p) for p in _PF_INTERFACE_BUS_PREFIXES):
+        return True
+    return len(bus) > 0 and bus[0] in _PF_INTERFACE_BUS_FIRST_CHARS
+
+
+def _load_pf_hetero_node_indices(data_root: Path) -> set[int]:
+    """Local node indices that appear in ``hetero_mv_nodes_load_transformer.csv``."""
+    import pandas as pd
+
+    het_path = data_root / _PF_HETERO_MV_NODES_REL
+    if not het_path.is_file():
+        return set()
+    df = pd.read_csv(het_path, usecols=["node_idx"])
+    return {int(v) for v in df["node_idx"].dropna().unique()}
+
+
+def _refine_pf_mv_balance_mask(
+    mask: torch.Tensor,
+    node_to_local: dict[str, int],
+    hetero_nodes: set[int],
+    y_re: torch.Tensor,
+    y_im: torch.Tensor,
+    *,
+    exclude_interface: bool = True,
+    hetero_y_neighbors_only: bool = True,
+) -> torch.Tensor:
+    """Tighten MV mask: hetero load nodes only, drop interface buses and Y couplings to them."""
+    if not (exclude_interface or hetero_y_neighbors_only):
+        return mask
+    idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
+    out = mask.clone()
+    y_re_np = y_re.detach().cpu().numpy()
+    y_im_np = y_im.detach().cpu().numpy()
+    n_nodes = int(out.numel())
+    for li in range(n_nodes):
+        if not bool(out[li].item()):
+            continue
+        node = idx_to_node.get(li, "")
+        if exclude_interface and _is_pf_interface_node(node):
+            out[li] = False
+            continue
+        if hetero_y_neighbors_only and int(li) not in hetero_nodes:
+            out[li] = False
+            continue
+        if not hetero_y_neighbors_only:
+            continue
+        nbrs = np.where((np.abs(y_re_np[li, :]) + np.abs(y_im_np[li, :])) > 1e-9)[0]
+        nbrs = [int(j) for j in nbrs if int(j) != int(li)]
+        if any(
+            int(j) not in hetero_nodes or (exclude_interface and _is_pf_interface_node(idx_to_node.get(j, "")))
+            for j in nbrs
+        ):
+            out[li] = False
+    return out
+
+
 def _build_ybus_from_edge_csv(
     edge_csv: Path,
     node_to_local: dict[str, int],
@@ -992,6 +1055,34 @@ def _setup_pf_physics(
         mv_fallback_all_non_slack=mv_fallback,
         distance_tried=distance_tried,
     )
+    exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
+    het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
+    if balance_mode.strip().lower() == "mv" and (exclude_iface or het_y_nbrs):
+        hetero_nodes = _load_pf_hetero_node_indices(data_root)
+        if hetero_nodes:
+            n_before = int(pf_mask.sum().item())
+            pf_mask = _refine_pf_mv_balance_mask(
+                pf_mask,
+                node_to_local,
+                hetero_nodes,
+                y_re,
+                y_im,
+                exclude_interface=exclude_iface,
+                hetero_y_neighbors_only=het_y_nbrs,
+            )
+            n_after = int(pf_mask.sum().item())
+            if n_after < n_before:
+                print(
+                    f"PF MV mask refined: {n_before} -> {n_after} nodes "
+                    f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={het_y_nbrs})",
+                    flush=True,
+                )
+        elif exclude_iface or het_y_nbrs:
+            print(
+                "WARNING: PF MV mask refinement requested but hetero_mv_nodes_load_transformer.csv "
+                f"not found under {data_root}; keeping distance-only mask.",
+                flush=True,
+            )
 
     raw_cap = str(getattr(args, "pf_cap_nodes_csv", "") or "").strip()
     if raw_cap:
@@ -3840,6 +3931,20 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Capacitor bus map CSV (default: capacitor_involved_nodes.csv under data_root).",
+    )
+    p.add_argument(
+        "--pf_exclude_interface_buses",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="1=exclude regxfmr/190-/m/p/n interface buses from MV balance mask (default 1).",
+    )
+    p.add_argument(
+        "--pf_hetero_y_neighbors_only",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="1=MV mask only hetero load nodes whose Y-neighbors are also hetero catalog nodes (default 1).",
     )
     return p.parse_args()
 
