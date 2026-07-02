@@ -6,6 +6,7 @@ from pathlib import Path
 
 PF_REG_CATALOG_REL = Path("Heterogenous GNN dataset") / "edges" / "hetero_mv_edge_catalog.csv"
 PF_CAP_NODES_REL = Path("capacitor_involved_nodes.csv")
+REPO_COLAB_PF_REL = Path("colab_pf_data")
 REPO_PF_DATA_REL = Path("datasets_gnn2_from pc") / "loadtype_8500_dailyagg"
 COLAB_DRIVE_PF_DATA = Path("/content/drive/MyDrive/datasets_gnn2/loadtype_8500_dailyagg")
 DATASETS_PC_REL = Path("datasets_gnn2_from pc")
@@ -31,7 +32,8 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 
 
 def _repo_pf_roots(repo: Path) -> list[Path]:
-    return [repo / REPO_PF_DATA_REL]
+    """Repo-bundled PF topology roots (minimal Colab bundle first, then full dailyagg)."""
+    return [repo / REPO_COLAB_PF_REL, repo / REPO_PF_DATA_REL]
 
 
 def candidate_pf_data_roots(
@@ -59,12 +61,15 @@ def _pf_copy_instructions(drive_root: Path = COLAB_DRIVE_PF_DATA) -> str:
     reg_dst = drive_root / PF_REG_CATALOG_REL
     cap_dst = drive_root / PF_CAP_NODES_REL
     return (
-        "Copy these files into Google Drive (create parent folders as needed):\n"
+        "After git pull, physics topology should resolve from repo "
+        f"<repo>/{REPO_COLAB_PF_REL} (bundled ~1.3 MB).\n"
+        "If missing, copy into Google Drive (create parent folders as needed):\n"
         f"  {reg_dst}\n"
         f"  {cap_dst}\n"
         "Source in a full GNN2 clone:\n"
-        f"  <repo>/{REPO_PF_DATA_REL / PF_REG_CATALOG_REL}\n"
-        f"  <repo>/{REPO_PF_DATA_REL / PF_CAP_NODES_REL}"
+        f"  <repo>/{REPO_COLAB_PF_REL / PF_REG_CATALOG_REL}\n"
+        f"  <repo>/{REPO_COLAB_PF_REL / PF_CAP_NODES_REL}\n"
+        f"  (or full dailyagg: <repo>/{REPO_PF_DATA_REL / PF_REG_CATALOG_REL})"
     )
 
 

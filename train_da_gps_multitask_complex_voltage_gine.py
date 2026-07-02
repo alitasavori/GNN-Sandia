@@ -585,6 +585,40 @@ _PF_HETERO_MV_NODES_REL = (
 )
 
 
+def _resolve_pf_data_root_arg(args: argparse.Namespace, repo: Path) -> Path | None:
+    """Explicit --pf_data_root override for mvagg topology CSVs (not chunk run_* dirs)."""
+    raw = str(getattr(args, "pf_data_root", "") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (repo / p).resolve()
+    return p.resolve()
+
+
+def _effective_pf_data_root(
+    *,
+    data_root: Path,
+    args: argparse.Namespace,
+    repo: Path,
+    chunk_parent: Path | None = None,
+) -> Path:
+    """Root for PF catalog / distance / hetero-node lookups (may differ from chunk run_* dir)."""
+    explicit = _resolve_pf_data_root_arg(args, repo)
+    if explicit is not None:
+        return explicit
+    if not data_root.name.startswith("run_"):
+        return data_root
+    from gnn2_pf_data_paths import resolve_pf_catalog_paths
+
+    _, _, root = resolve_pf_catalog_paths(
+        repo=repo,
+        preferred_root=None,
+        chunk_parent=chunk_parent,
+    )
+    return root
+
+
 def _csv_has_columns(csv_path: Path, *cols: str) -> bool:
     import pandas as pd
 
@@ -600,6 +634,7 @@ def _pf_distance_csv_candidates(
     node_pe_csv: Path | None,
     data_root: Path | None,
     repo: Path,
+    pf_preferred: Path | None = None,
 ) -> list[tuple[str, Path]]:
     """Ordered (label, path) candidates that may carry ``electrical_distance_ohm``."""
     out: list[tuple[str, Path]] = [("nodes_csv", nodes_csv)]
@@ -617,8 +652,8 @@ def _pf_distance_csv_candidates(
     from gnn2_pf_data_paths import candidate_pf_data_roots
 
     chunk_parent = nodes_csv.parent.parent if nodes_csv.parent.name.startswith("run_") else None
-    preferred = None
-    if data_root is not None and not data_root.name.startswith("run_"):
+    preferred = pf_preferred
+    if preferred is None and data_root is not None and not data_root.name.startswith("run_"):
         preferred = data_root
     for root in candidate_pf_data_roots(
         repo=repo, preferred=preferred, chunk_parent=chunk_parent
@@ -657,6 +692,7 @@ def _resolve_pf_electrical_distance_csv(
     data_root: Path | None,
     repo: Path,
     mode: str,
+    pf_preferred: Path | None = None,
 ) -> tuple[Path | None, list[str]]:
     """Pick a CSV with ``electrical_distance_ohm`` for ``--pf_balance_nodes mv``."""
     m = str(mode).strip().lower()
@@ -668,6 +704,7 @@ def _resolve_pf_electrical_distance_csv(
         node_pe_csv=node_pe_csv,
         data_root=data_root,
         repo=repo,
+        pf_preferred=pf_preferred,
     ):
         tried.append(f"{label}={path}")
         if _csv_has_columns(path, "node", "electrical_distance_ohm"):
@@ -1099,22 +1136,33 @@ def _pf_loss_if_enabled(
     )
 
 
-def _resolve_pf_reg_catalog(edges_path: Path, data_root: Path, args: argparse.Namespace) -> Path | None:
+def _resolve_pf_reg_catalog(
+    edges_path: Path, data_root: Path, args: argparse.Namespace, repo: Path
+) -> Path | None:
     raw = str(getattr(args, "pf_reg_edge_catalog", "") or "").strip()
     if raw:
+        pf_root = _effective_pf_data_root(
+            data_root=data_root,
+            args=args,
+            repo=repo,
+            chunk_parent=edges_path.parent.parent
+            if edges_path.parent.name.startswith("run_")
+            else None,
+        )
         p = Path(raw)
         if not p.is_absolute():
-            p = (data_root / p).resolve()
+            p = (pf_root / p).resolve()
         return p if p.is_file() else None
     from gnn2_pf_data_paths import resolve_pf_catalog_paths
 
-    repo = Path(__file__).resolve().parent
     chunk_parent = edges_path.parent.parent if edges_path.parent.name.startswith("run_") else None
-    preferred = None if data_root.name.startswith("run_") else data_root
+    pf_root = _effective_pf_data_root(
+        data_root=data_root, args=args, repo=repo, chunk_parent=chunk_parent
+    )
     try:
         reg, _, _ = resolve_pf_catalog_paths(
             repo=repo,
-            preferred_root=preferred,
+            preferred_root=pf_root,
             chunk_parent=chunk_parent,
         )
     except FileNotFoundError:
@@ -1146,7 +1194,13 @@ def _setup_pf_physics(
     detach = bool(getattr(args, "pf_detach_controls", False))
     huber_delta_kw = float(getattr(args, "pf_huber_delta_kw", 10.0) or 10.0)
 
-    reg_catalog = _resolve_pf_reg_catalog(edges_path, data_root, args)
+    repo = Path(__file__).resolve().parent
+    chunk_parent = nodes_path.parent.parent if nodes_path.parent.name.startswith("run_") else None
+    pf_root = _effective_pf_data_root(
+        data_root=data_root, args=args, repo=repo, chunk_parent=chunk_parent
+    )
+
+    reg_catalog = _resolve_pf_reg_catalog(edges_path, data_root, args, repo)
     if reg_catalog is None:
         raise FileNotFoundError(
             "Physics loss enabled but regulator edge catalog not found. "
@@ -1157,7 +1211,6 @@ def _setup_pf_physics(
     y_re, y_im = _build_ybus_siemens_from_edge_csv(
         edges_path, node_to_local, n_nodes, skip_undirected=skip_reg_pairs
     )
-    repo = Path(__file__).resolve().parent
     balance_mode = str(args.pf_balance_nodes)
     distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
         nodes_csv=nodes_path,
@@ -1165,6 +1218,7 @@ def _setup_pf_physics(
         data_root=data_root,
         repo=repo,
         mode=balance_mode,
+        pf_preferred=pf_root,
     )
     use_distance_csv = (
         distance_csv
@@ -1184,7 +1238,7 @@ def _setup_pf_physics(
     exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
     het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
     if balance_mode.strip().lower() == "mv" and (exclude_iface or het_y_nbrs):
-        hetero_nodes = _load_pf_hetero_node_indices(data_root)
+        hetero_nodes = _load_pf_hetero_node_indices(pf_root)
         if hetero_nodes:
             n_before = int(pf_mask.sum().item())
             pf_mask = _refine_pf_mv_balance_mask(
@@ -1206,7 +1260,7 @@ def _setup_pf_physics(
         elif exclude_iface or het_y_nbrs:
             print(
                 "WARNING: PF MV mask refinement requested but hetero_mv_nodes_load_transformer.csv "
-                f"not found under {data_root}; keeping distance-only mask.",
+                f"not found under {pf_root}; keeping distance-only mask.",
                 flush=True,
             )
 
@@ -1214,19 +1268,16 @@ def _setup_pf_physics(
     if raw_cap:
         cap_nodes_csv = Path(raw_cap)
         if not cap_nodes_csv.is_absolute():
-            cap_nodes_csv = (data_root / cap_nodes_csv).resolve()
+            cap_nodes_csv = (pf_root / cap_nodes_csv).resolve()
         if not cap_nodes_csv.is_file():
             raise FileNotFoundError(f"--pf_cap_nodes_csv not found: {cap_nodes_csv}")
     else:
         from gnn2_pf_data_paths import resolve_pf_catalog_paths
 
-        repo = Path(__file__).resolve().parent
-        chunk_parent = nodes_path.parent.parent if nodes_path.parent.name.startswith("run_") else None
-        preferred = None if data_root.name.startswith("run_") else data_root
         try:
             _, cap_nodes_csv, _ = resolve_pf_catalog_paths(
                 repo=repo,
-                preferred_root=preferred,
+                preferred_root=pf_root,
                 chunk_parent=chunk_parent,
             )
         except FileNotFoundError as ex:
@@ -1245,7 +1296,6 @@ def _setup_pf_physics(
         raise ValueError(f"Duplicate or unparseable cap columns in meta: {cap_cols!r}")
 
     meta_csv = nodes_path.parent / str(getattr(args, "meta_csv", "gnn_sample_meta.csv"))
-    repo = Path(__file__).resolve().parent
     cap_dss = repo / "8500-node" / "Capacitors.dss"
     cap_banks = _resolve_cap_bus_nodes(
         cap_cols,
@@ -1266,14 +1316,13 @@ def _setup_pf_physics(
 
     from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
 
-    repo = Path(__file__).resolve().parent
     raw_kv_csv = str(getattr(args, "pf_bus_kv_base_csv", "") or "").strip()
     cache_csv = Path(raw_kv_csv) if raw_kv_csv else None
     if cache_csv is not None and not cache_csv.is_absolute():
-        cache_csv = (data_root / cache_csv).resolve()
+        cache_csv = (pf_root / cache_csv).resolve()
     v_scale_np, _, kv_cache_path = load_or_build_bus_kv_tensors(
         repo=repo,
-        data_root=data_root,
+        data_root=pf_root,
         node_to_local=node_to_local,
         n_nodes=n_nodes,
         cache_csv=cache_csv,
@@ -1286,7 +1335,7 @@ def _setup_pf_physics(
     dense_elems = int(n_nodes) * int(n_nodes)
     print(
         f"Power-balance physics: weight={w}, units=physical (V volts, Y Siemens, kW Huber), "
-        f"nodes={args.pf_balance_nodes}, "
+        f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
         f"huber_delta_kw={huber_delta_kw}, "
         f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
@@ -3999,6 +4048,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Weight for nodal P/Q power-balance physics loss on denormalized voltage (0 = disabled).",
+    )
+    p.add_argument(
+        "--pf_data_root",
+        type=str,
+        default="",
+        help="MVagg PF topology root (hetero_mv_edge_catalog.csv, capacitor_involved_nodes.csv, "
+        "electrical_distance_from_substation.csv). Default: auto (repo colab_pf_data/ or dailyagg).",
     )
     p.add_argument(
         "--pf_balance_nodes",
