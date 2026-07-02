@@ -36,9 +36,11 @@ Z_BASE = (KV_BASE * 1000.0) ** 2 / (S_BASE_KVA * 1000.0)
 LINE_EDGES = [(1, 2, 0.02, 0.04), (2, 3, 0.03, 0.05)]
 _REG_R, _REG_X = 0.01, 0.02
 _REG_Z2 = _REG_R * _REG_R + _REG_X * _REG_X
-_REG_G = (_REG_R / _REG_Z2) * Z_BASE
-_REG_B = (-_REG_X / _REG_Z2) * Z_BASE
+_REG_G = _REG_R / _REG_Z2
+_REG_B = -_REG_X / _REG_Z2
 REG_EDGE = (0, 1, _REG_G, _REG_B, 0)
+KV_LN_SYN = KV_BASE / (3.0 ** 0.5)
+V_SCALE_SYN = KV_LN_SYN * 1000.0
 CAP_BANK = (2, 120.0, 0)
 
 TAP_TRUTH = 1.025
@@ -66,7 +68,7 @@ HETERO_LOAD_NODES = (
 def _stamp_line_ybus(y_re, y_im, iu, iv, rf, xf):
     z2 = rf * rf + xf * xf
     g, b = rf / z2, -xf / z2
-    ylr, yli = g * Z_BASE, b * Z_BASE
+    ylr, yli = g, b
     y_re[iu, iv] -= ylr
     y_re[iv, iu] -= ylr
     y_im[iu, iv] -= yli
@@ -100,17 +102,17 @@ def _build_full_ybus_truth(y_re_base, y_im_base, tap, cap_on):
     y_im[iu, iv] -= b / a
     y_im[iv, iu] -= b / a
     ni, q_nom, _ = CAP_BANK
-    y_im[ni, ni] += cap_on * (q_nom / S_BASE_KVA)
+    y_im[ni, ni] += cap_on * (float(q_nom) * 1000.0) / (V_SCALE_SYN * V_SCALE_SYN)
     return y_re, y_im
 
 
-def _nodal_power_kw_kvar(v_ri, y_re, y_im):
-    v_re, v_im = v_ri[:, 0], v_ri[:, 1]
+def _nodal_power_kw_kvar(v_ri, y_re, y_im, v_scale: float = V_SCALE_SYN):
+    v_re, v_im = v_ri[:, 0] * v_scale, v_ri[:, 1] * v_scale
     i_re = v_re @ y_re.T - v_im @ y_im.T
     i_im = v_re @ y_im.T + v_im @ y_re.T
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
-    return s_re * S_BASE_KVA, s_im * S_BASE_KVA
+    return s_re / 1000.0, s_im / 1000.0
 
 
 def _loads_for_exact_assembly(p_net_kw, q_net_kvar):
@@ -158,6 +160,7 @@ def synthetic_truth():
         "tap": torch.tensor([[TAP_TRUTH]], dtype=torch.float32),
         "cap_on": torch.tensor([[CAP_ON_TRUTH]], dtype=torch.float32),
         "col": col,
+        "v_scale": torch.full((N_NODES,), V_SCALE_SYN, dtype=torch.float32),
     }
 
 
@@ -183,6 +186,7 @@ def _run_impl_residual(
     else:
         v_ri = v_ri if v_ri.dim() == 2 else v_ri
 
+    v_scale = truth["v_scale"].unsqueeze(0).expand(batch_size, -1)
     y_re, y_im = pfmod._ybus_with_predicted_controls(
         truth["y_re_b"],
         truth["y_im_b"],
@@ -192,6 +196,7 @@ def _run_impl_residual(
         cap_on=cap_on,
         s_base_kva=S_BASE_KVA,
         batch_size=batch_size,
+        v_scale_volts=v_scale,
     )
     p_inj, q_inj = pfmod._assemble_pf_injections(
         x_denorm if batch_size > 1 else x_denorm.unsqueeze(0),
@@ -203,8 +208,17 @@ def _run_impl_residual(
         q_inj = q_inj + q_inj_cap_extra
     v_batch = v_ri.unsqueeze(0) if v_ri.dim() == 2 else v_ri
     mask = torch.ones(N_NODES, dtype=torch.bool)
+    v_scale = truth["v_scale"].unsqueeze(0).expand(v_batch.shape[0], -1)
     return pfmod.nodal_power_balance_residual(
-        v_batch, p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA
+        v_batch,
+        p_inj,
+        q_inj,
+        y_re,
+        y_im,
+        mask,
+        S_BASE_KVA,
+        v_scale_volts=v_scale,
+        huber_delta_kw=10.0,
     )
 
 
@@ -240,6 +254,7 @@ class TestSelfConsistency:
             cap_on=synthetic_truth["cap_on"],
             s_base_kva=S_BASE_KVA,
             batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
         )
         p_net, q_net = _nodal_power_kw_kvar(V_TRUTH, y_re[0].numpy(), y_im[0].numpy())
         res = pfmod.nodal_power_balance_residual(
@@ -250,6 +265,8 @@ class TestSelfConsistency:
             y_im,
             None,
             S_BASE_KVA,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+            huber_delta_kw=10.0,
         )
         assert float(res.item()) < TOL_ZERO_F32
 
@@ -296,6 +313,7 @@ class TestWrongPhysics:
             cap_on=synthetic_truth["cap_on"],
             s_base_kva=S_BASE_KVA,
             batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
         )
         p_inj, q_inj = pfmod._assemble_pf_injections(
             synthetic_truth["x_denorm"].unsqueeze(0),
@@ -310,11 +328,18 @@ class TestWrongPhysics:
         q_slack[0, 0] += 5e5
         mask_all = torch.ones(N_NODES, dtype=torch.bool)
         mask_no_slack = torch.tensor([False, True, True, True])
+        v_scale = synthetic_truth["v_scale"].unsqueeze(0)
         res_all = float(
-            pfmod.nodal_power_balance_residual(v, p_slack, q_slack, y_re, y_im, mask_all, S_BASE_KVA).item()
+            pfmod.nodal_power_balance_residual(
+                v, p_slack, q_slack, y_re, y_im, mask_all, S_BASE_KVA,
+                v_scale_volts=v_scale, huber_delta_kw=10.0,
+            ).item()
         )
         res_mv = float(
-            pfmod.nodal_power_balance_residual(v, p_slack, q_slack, y_re, y_im, mask_no_slack, S_BASE_KVA).item()
+            pfmod.nodal_power_balance_residual(
+                v, p_slack, q_slack, y_re, y_im, mask_no_slack, S_BASE_KVA,
+                v_scale_volts=v_scale, huber_delta_kw=10.0,
+            ).item()
         )
         assert res_all > res_mv + 0.05
         assert res_mv < TOL_ZERO_F32 * 10
@@ -410,8 +435,8 @@ class TestApiContract:
                     },
                 ]
             ).to_csv(p, index=False)
-            y_re, y_im = pfmod._build_ybus_pu_from_edge_csv(
-                p, n2l, 3, Z_BASE, skip_undirected=skip
+            y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(
+                p, n2l, 3, skip_undirected=skip
             )
         assert abs(float(y_re[1, 2].item())) > 1e-9
         assert abs(float(y_re[0, 1].item())) < 1e-9
@@ -428,11 +453,10 @@ class TestApiContract:
             reg_csv, ntl, list(pfmod.TARGET_REG_COLS), Z_BASE
         )
         skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-        y_re, _ = pfmod._build_ybus_pu_from_edge_csv(
+        y_re, _ = pfmod._build_ybus_siemens_from_edge_csv(
             DATA_DAILYAGG / "gnn_edges_phase_static.csv",
             ntl,
             n_nodes,
-            Z_BASE,
             skip_undirected=skip,
         )
         iu, iv, _, _, _ = reg_edges[0]
@@ -477,11 +501,11 @@ def _real_snapshot_tensors(sample_id: int = 0):
         DATA_DAILYAGG / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv",
         ntl,
         reg_cols,
-        Z_BASE,
+        None,
     )
     skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-    y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
-        DATA_DAILYAGG / "gnn_edges_phase_static.csv", ntl, n_nodes, Z_BASE, skip_undirected=skip
+    y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
+        DATA_DAILYAGG / "gnn_edges_phase_static.csv", ntl, n_nodes, skip_undirected=skip
     )
 
     meta = pd.read_csv(DATA_DAILYAGG / "gnn_sample_meta.csv")
@@ -495,6 +519,12 @@ def _real_snapshot_tensors(sample_id: int = 0):
         meta_csv=DATA_DAILYAGG / "gnn_sample_meta.csv",
         capacitors_dss=REPO / "8500-node" / "Capacitors.dss",
     )
+    from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
+
+    v_scale_np, _, _ = load_or_build_bus_kv_tensors(
+        repo=REPO, data_root=DATA_DAILYAGG, node_to_local=ntl, n_nodes=n_nodes
+    )
+    v_scale_t = torch.tensor(v_scale_np, dtype=torch.float32)
     y_re, y_im = pfmod._ybus_with_predicted_controls(
         y_re_b,
         y_im_b,
@@ -504,6 +534,7 @@ def _real_snapshot_tensors(sample_id: int = 0):
         cap_on=cap_on,
         s_base_kva=S_BASE_KVA,
         batch_size=1,
+        v_scale_volts=v_scale_t,
     )
 
     het = pd.read_csv(HETERO_LOAD_NODES)
@@ -543,6 +574,18 @@ def _real_snapshot_tensors(sample_id: int = 0):
         if float(row["electrical_distance_ohm"]) > 1e-9:
             mask[int(ntl[node])] = True
 
+    hetero_nodes = pfmod._load_pf_hetero_node_indices(DATA_DAILYAGG)
+    if hetero_nodes:
+        mask = pfmod._refine_pf_mv_balance_mask(
+            mask,
+            ntl,
+            hetero_nodes,
+            y_re_b,
+            y_im_b,
+            exclude_interface=True,
+            hetero_y_neighbors_only=True,
+        )
+
     return {
         "v": torch.tensor(v, dtype=torch.float32).unsqueeze(0),
         "p_inj": torch.tensor(p_inj, dtype=torch.float32).unsqueeze(0),
@@ -550,6 +593,7 @@ def _real_snapshot_tensors(sample_id: int = 0):
         "y_line": (y_re_b.unsqueeze(0), y_im_b.unsqueeze(0)),
         "y_full": (y_re, y_im),
         "mask": mask,
+        "v_scale": v_scale_t,
     }
 
 
@@ -578,42 +622,43 @@ class TestRealSnapshot:
         snap = _real_snapshot_tensors(0)
         v, p_inj, q_inj, mask = snap["v"], snap["p_inj"], snap["q_inj"], snap["mask"]
         y_re, y_im = snap["y_line"]
-        frac_ok = _fraction_within_kw(v, p_inj, q_inj, y_re, y_im, mask, kw=1.0)
+        frac_ok = _fraction_within_kw(v, p_inj, q_inj, y_re, y_im, mask, snap["v_scale"], kw=1.0)
         assert frac_ok["p"] > 0.75
         assert frac_ok["q"] > 0.75
 
     def test_full_y_median_balance(self):
         snap = _real_snapshot_tensors(0)
         v, p_inj, q_inj, mask = snap["v"], snap["p_inj"], snap["q_inj"], snap["mask"]
-        med_line = _median_abs_residual_kw(v, p_inj, q_inj, *snap["y_line"], mask)
-        med_full = _median_abs_residual_kw(v, p_inj, q_inj, *snap["y_full"], mask)
+        med_line = _median_abs_residual_kw(v, p_inj, q_inj, *snap["y_line"], mask, snap["v_scale"])
+        med_full = _median_abs_residual_kw(v, p_inj, q_inj, *snap["y_full"], mask, snap["v_scale"])
         assert med_line["p"] < 50.0
         assert med_line["q"] < 50.0
         assert med_full["p"] <= med_line["p"] * 1.05 + 1.0
         assert med_full["q"] <= med_line["q"] * 1.05 + 1.0
 
 
-def _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask):
+def _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask, v_scale):
     v_np = v[0].numpy()
+    vs = v_scale.numpy()
     yre, yim = y_re[0].numpy(), y_im[0].numpy()
-    vre, vim = v_np[:, 0], v_np[:, 1]
+    vre, vim = v_np[:, 0] * vs, v_np[:, 1] * vs
     ire = vre @ yre.T - vim @ yim.T
     iim = vre @ yim.T + vim @ yre.T
-    p_kw = (vre * ire + vim * iim) * S_BASE_KVA
-    q_kvar = (vim * ire - vre * iim) * S_BASE_KVA
+    p_kw = (vre * ire + vim * iim) / 1000.0
+    q_kvar = (vim * ire - vre * iim) / 1000.0
     m = mask.numpy()
     dp = np.abs(p_inj[0].numpy() - p_kw)[m]
     dq = np.abs(q_inj[0].numpy() - q_kvar)[m]
     return dp, dq
 
 
-def _median_abs_residual_kw(v, p_inj, q_inj, y_re, y_im, mask):
-    dp, dq = _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask)
+def _median_abs_residual_kw(v, p_inj, q_inj, y_re, y_im, mask, v_scale):
+    dp, dq = _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask, v_scale)
     return {"p": float(np.median(dp)), "q": float(np.median(dq))}
 
 
-def _fraction_within_kw(v, p_inj, q_inj, y_re, y_im, mask, *, kw: float):
-    dp, dq = _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask)
+def _fraction_within_kw(v, p_inj, q_inj, y_re, y_im, mask, v_scale, *, kw: float):
+    dp, dq = _nodal_residual_kw(v, p_inj, q_inj, y_re, y_im, mask, v_scale)
     return {"p": float((dp < kw).mean()), "q": float((dq < kw).mean())}
 
 
@@ -644,8 +689,6 @@ class TestGradients:
 # ---------------------------------------------------------------------------
 # H. Physical units (OpenDSS-faithful Siemens path)
 # ---------------------------------------------------------------------------
-KV_LN_DEFAULT = KV_BASE / np.sqrt(3.0)
-V_SCALE_SYN = KV_LN_DEFAULT * 1000.0
 
 
 def _build_synthetic_siemens_ybus_truth(y_re_base, y_im_base, tap, cap_on, v_scale_volts):
@@ -701,11 +744,9 @@ class TestPhysicalUnits:
                 [{"from_node": "a.1", "to_node": "b.1", "R_full": 0.02, "X_full": 0.04, "line_name": "L1", "linecode": "abc"}]
             ).to_csv(p, index=False)
             y_re_s, y_im_s = pfmod._build_ybus_siemens_from_edge_csv(p, n2l, 2)
-            y_re_p, y_im_p = pfmod._build_ybus_pu_from_edge_csv(p, n2l, 2, Z_BASE)
         z2 = 0.02 * 0.02 + 0.04 * 0.04
         g_s = 0.02 / z2
         assert abs(float(y_re_s[0, 1].item()) + g_s) < 1e-9
-        assert abs(float(y_re_p[0, 1].item()) + g_s * Z_BASE) < 1e-6
 
     def test_v_scale_array_per_node(self):
         from gnn2_pf_bus_kv import kv_base_ln_v_array
@@ -743,7 +784,6 @@ class TestPhysicalUnits:
             cap_on=torch.tensor([[CAP_ON_TRUTH]], dtype=torch.float32),
             s_base_kva=S_BASE_KVA,
             batch_size=1,
-            use_physical_units=True,
             v_scale_volts=v_scale,
         )
         p_inj, q_inj = pfmod._assemble_pf_injections(
@@ -760,7 +800,6 @@ class TestPhysicalUnits:
             y_im,
             None,
             S_BASE_KVA,
-            use_physical_units=True,
             v_scale_volts=v_scale,
             huber_delta_kw=10.0,
         )
@@ -848,17 +887,13 @@ class TestScaleRobustness:
         pytest.importorskip("opendssdirect")
         from gnn2_pf_physics_verify import compare_physical_opendss, load_snapshot_state
 
-        snap = load_snapshot_state(0, repo=REPO, use_physical_units=True)
-        cmp = compare_physical_opendss(
-            snap, repo=REPO, run_opendss=True, show_legacy_mask_compare=True
-        )
+        snap = load_snapshot_state(0, repo=REPO)
+        cmp = compare_physical_opendss(snap, repo=REPO, run_opendss=True)
         if cmp.get("opendss_skipped"):
             pytest.skip(str(cmp["opendss_skipped"]))
         gap = cmp["residual_gap_stats_p"]
         assert gap["p95"] < 50.0, f"refined gap p95 too large: {gap['p95']:.4g} kW"
         assert gap["max"] < 100.0, f"refined gap max too large: {gap['max']:.4g} kW"
-        leg = cmp["residual_gap_legacy_stats_p"]
-        assert leg["p95"] > gap["p95"] * 10.0
 
     @pytest.mark.skipif(
         not all(
@@ -878,10 +913,18 @@ class TestScaleRobustness:
         y_re, y_im = snap["y_full"]
         res_huber = float(
             pfmod.nodal_power_balance_residual(
-                v, p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA, huber_delta_pu=0.02
+                v,
+                p_inj,
+                q_inj,
+                y_re,
+                y_im,
+                mask,
+                S_BASE_KVA,
+                v_scale_volts=snap["v_scale"],
+                huber_delta_kw=10.0,
             ).item()
         )
-        # Raw kW MSE at truth is ~1e14 on this feeder; Huber+pu must stay trainable-scale.
+        # Raw kW MSE at truth is huge on this feeder; Huber kW must stay trainable-scale.
         assert res_huber < 500.0, f"huber loss at truth too large: {res_huber:.4e}"
 
     def test_batch_size_gt_one(self, synthetic_truth):
@@ -1080,6 +1123,7 @@ def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1)
         n_nodes=N_NODES,
     )
     mask = torch.ones(N_NODES, dtype=torch.bool)
+    v_scale = truth["v_scale"].unsqueeze(0).expand(v_batch.shape[0], -1)
 
     if use_sparse_y:
         y_coo = pfmod._dense_y_to_coo(truth["y_re_b"], truth["y_im_b"])
@@ -1091,6 +1135,8 @@ def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1)
             None,
             mask,
             S_BASE_KVA,
+            v_scale_volts=v_scale,
+            huber_delta_kw=10.0,
             y_coo=y_coo,
             reg_edges=[REG_EDGE],
             cap_banks=[CAP_BANK],
@@ -1099,6 +1145,7 @@ def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1)
             use_sparse_y=True,
         )
 
+    v_scale = truth["v_scale"].unsqueeze(0).expand(batch_size, -1)
     y_re, y_im = pfmod._ybus_with_predicted_controls(
         truth["y_re_b"],
         truth["y_im_b"],
@@ -1108,6 +1155,7 @@ def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1)
         cap_on=cap_on,
         s_base_kva=S_BASE_KVA,
         batch_size=batch_size,
+        v_scale_volts=v_scale,
     )
     return pfmod.nodal_power_balance_residual(
         v_batch,
@@ -1117,6 +1165,8 @@ def _run_residual_with_y_mode(truth, *, use_sparse_y: bool, batch_size: int = 1)
         y_im,
         mask,
         S_BASE_KVA,
+        v_scale_volts=v_scale,
+        huber_delta_kw=10.0,
         use_sparse_y=False,
     )
 
@@ -1134,6 +1184,7 @@ class TestSparseYParity:
             cap_on=synthetic_truth["cap_on"],
             s_base_kva=S_BASE_KVA,
             batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
         )
         i_dense_re, i_dense_im = pfmod._compute_yv_current(
             v_re,
@@ -1153,6 +1204,7 @@ class TestSparseYParity:
             cap_on=synthetic_truth["cap_on"],
             use_sparse_y=True,
             s_base_kva=S_BASE_KVA,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
         )
         assert torch.allclose(i_dense_re, i_sparse_re, atol=1e-4, rtol=1e-5)
         assert torch.allclose(i_dense_im, i_sparse_im, atol=1e-4, rtol=1e-5)
@@ -1162,14 +1214,14 @@ class TestSparseYParity:
         res_sparse = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=True).item())
         assert res_dense < TOL_ZERO_F32
         assert res_sparse < TOL_ZERO_F32
-        assert abs(res_sparse - res_dense) < 1e-5
+        assert abs(res_sparse - res_dense) < 0.05
 
     def test_sparse_dense_residual_parity_batch_gt_one(self, synthetic_truth):
         res_dense = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=False, batch_size=2).item())
         res_sparse = float(_run_residual_with_y_mode(synthetic_truth, use_sparse_y=True, batch_size=2).item())
         assert res_dense < TOL_ZERO_F32
         assert res_sparse < TOL_ZERO_F32
-        assert abs(res_sparse - res_dense) < 1e-5
+        assert abs(res_sparse - res_dense) < 0.05
 
     def test_sparse_path_gradients_flow(self, synthetic_truth):
         v = synthetic_truth["v_ri"].clone().requires_grad_(True)
@@ -1191,6 +1243,8 @@ class TestSparseYParity:
             None,
             torch.ones(N_NODES, dtype=torch.bool),
             S_BASE_KVA,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+            huber_delta_kw=10.0,
             y_coo=y_coo,
             reg_edges=[REG_EDGE],
             cap_banks=[CAP_BANK],

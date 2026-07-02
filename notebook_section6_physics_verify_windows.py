@@ -71,7 +71,6 @@ snap = pf_verify.load_snapshot_state(
     repo=REPO,
     pf_data_root=PF_DATA_ROOT,
     chunk_parent=CHUNK_PARENT,
-    use_physical_units=True,
     exclude_interface_buses=EXCLUDE_INTERFACE_BUSES,
     hetero_y_neighbors_only=HETERO_Y_NEIGHBORS_ONLY,
 )

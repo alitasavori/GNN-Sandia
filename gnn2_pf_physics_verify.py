@@ -105,18 +105,19 @@ def nodal_power_kw_from_yv(
 ) -> tuple[np.ndarray, np.ndarray]:
     """``S = V · conj(Y V)`` → (P_kW, Q_kvar).
 
-    Physical: pass ``v_scale_volts`` to convert pu ``V`` to volts; ``Y`` in Siemens; divide by 1000.
-    Legacy: per-unit ``V`` and ``Y``; multiply by ``s_base_kva``.
+    Pass ``v_scale_volts`` to convert pu ``V`` to volts; ``Y`` in Siemens; divide by 1000.
     """
     import torch
+
+    if v_scale_volts is None:
+        raise ValueError("nodal_power_kw_from_yv requires v_scale_volts (physical units)")
 
     pfmod = _get_pfmod()
     v_re_t = torch.as_tensor(v_re, dtype=torch.float32).reshape(1, -1)
     v_im_t = torch.as_tensor(v_im, dtype=torch.float32).reshape(1, -1)
-    if v_scale_volts is not None:
-        vs = torch.as_tensor(v_scale_volts, dtype=torch.float32).reshape(1, -1)
-        v_re_t = v_re_t * vs
-        v_im_t = v_im_t * vs
+    vs = torch.as_tensor(v_scale_volts, dtype=torch.float32).reshape(1, -1)
+    v_re_t = v_re_t * vs
+    v_im_t = v_im_t * vs
     y_re_t = torch.as_tensor(y_re, dtype=torch.float32)
     y_im_t = torch.as_tensor(y_im, dtype=torch.float32)
     if use_sparse_y:
@@ -132,10 +133,7 @@ def nodal_power_kw_from_yv(
         )
     s_re = v_re_t * i_re + v_im_t * i_im
     s_im = v_im_t * i_re - v_re_t * i_im
-    if v_scale_volts is not None:
-        return s_re[0].detach().cpu().numpy() / 1000.0, s_im[0].detach().cpu().numpy() / 1000.0
-    s_base = float(s_base_kva)
-    return (s_re[0] * s_base).detach().cpu().numpy(), (s_im[0] * s_base).detach().cpu().numpy()
+    return s_re[0].detach().cpu().numpy() / 1000.0, s_im[0].detach().cpu().numpy() / 1000.0
 
 
 def balance_residual_kw(
@@ -169,8 +167,7 @@ class SnapshotState:
     y_im_full: np.ndarray
     meta_row: dict[str, Any]
     pf_data_root: Path
-    v_scale_volts: np.ndarray | None = None
-    use_physical_units: bool = True
+    v_scale_volts: np.ndarray
 
 
 def resolve_verify_data_roots(
@@ -201,7 +198,6 @@ def load_snapshot_state(
     chunk_parent: Path | None = None,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
     kv_base: float = KV_BASE_DEFAULT,
-    use_physical_units: bool = True,
     pf_bus_kv_base_csv: Path | None = None,
     exclude_interface_buses: bool = True,
     hetero_y_neighbors_only: bool = True,
@@ -231,34 +227,25 @@ def load_snapshot_state(
     idx = pd.read_csv(idx_path)
     ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
     n_nodes = int(idx["node_idx"].max()) + 1
-    z_base = z_base_ohm(s_base_kva=s_base_kva, kv_base=kv_base)
 
-    v_scale: np.ndarray | None = None
-    if use_physical_units:
-        from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
+    from gnn2_pf_bus_kv import load_or_build_bus_kv_tensors
 
-        v_scale, _, _ = load_or_build_bus_kv_tensors(
-            repo=repo,
-            data_root=data_root,
-            node_to_local=ntl,
-            n_nodes=n_nodes,
-            cache_csv=pf_bus_kv_base_csv,
-        )
+    v_scale, _, _ = load_or_build_bus_kv_tensors(
+        repo=repo,
+        data_root=data_root,
+        node_to_local=ntl,
+        n_nodes=n_nodes,
+        cache_csv=pf_bus_kv_base_csv,
+    )
 
-    z_for_reg = None if use_physical_units else z_base
     reg_cols = list(TARGET_REG_COLS)
     cap_cols = list(TARGET_CAP_COLS)
     reg_catalog = data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
-    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, ntl, reg_cols, z_for_reg)
+    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, ntl, reg_cols, None)
     skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-    if use_physical_units:
-        y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
-            edges_path, ntl, n_nodes, skip_undirected=skip
-        )
-    else:
-        y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
-            edges_path, ntl, n_nodes, z_base, skip_undirected=skip
-        )
+    y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
+        edges_path, ntl, n_nodes, skip_undirected=skip
+    )
     cap_banks = pfmod._resolve_cap_bus_nodes(
         cap_cols,
         ntl,
@@ -282,8 +269,7 @@ def load_snapshot_state(
         cap_on=cap_t,
         s_base_kva=float(s_base_kva),
         batch_size=1,
-        use_physical_units=use_physical_units,
-        v_scale_volts=torch.tensor(v_scale, dtype=torch.float32) if v_scale is not None else None,
+        v_scale_volts=torch.tensor(v_scale, dtype=torch.float32),
     )
 
     het = pd.read_csv(het_path)
@@ -360,7 +346,6 @@ def load_snapshot_state(
         y_re_full=y_re_f[0].numpy(),
         y_im_full=y_im_f[0].numpy(),
         v_scale_volts=v_scale,
-        use_physical_units=use_physical_units,
         meta_row={str(k): mrow[k] for k in mrow.index},
         pf_data_root=data_root,
     )
@@ -397,22 +382,15 @@ def apply_random_perturbation(
         cap_on = np.where(flip, 1.0 - cap_on, cap_on)
 
     repo = REPO
-    z_base = z_base_ohm(s_base_kva=s_base_kva, kv_base=kv_base)
     reg_cols = list(TARGET_REG_COLS)
     cap_cols = list(TARGET_CAP_COLS)
     reg_catalog = snap.pf_data_root / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
-    z_for_reg = None if snap.use_physical_units else z_base
-    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, snap.node_to_local, reg_cols, z_for_reg)
+    reg_edges = pfmod._load_regulator_edges_for_pf(reg_catalog, snap.node_to_local, reg_cols, None)
     skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
     edges_path = snap.pf_data_root / "gnn_edges_phase_static.csv"
-    if snap.use_physical_units:
-        y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
-            edges_path, snap.node_to_local, snap.n_nodes, skip_undirected=skip
-        )
-    else:
-        y_re_b, y_im_b = pfmod._build_ybus_pu_from_edge_csv(
-            edges_path, snap.node_to_local, snap.n_nodes, z_base, skip_undirected=skip
-        )
+    y_re_b, y_im_b = pfmod._build_ybus_siemens_from_edge_csv(
+        edges_path, snap.node_to_local, snap.n_nodes, skip_undirected=skip
+    )
     cap_banks = pfmod._resolve_cap_bus_nodes(
         cap_cols,
         snap.node_to_local,
@@ -429,12 +407,7 @@ def apply_random_perturbation(
         cap_on=torch.tensor(cap_on, dtype=torch.float32).unsqueeze(0),
         s_base_kva=float(s_base_kva),
         batch_size=1,
-        use_physical_units=snap.use_physical_units,
-        v_scale_volts=(
-            torch.tensor(snap.v_scale_volts, dtype=torch.float32)
-            if snap.v_scale_volts is not None
-            else None
-        ),
+        v_scale_volts=torch.tensor(snap.v_scale_volts, dtype=torch.float32),
     )
     out = SnapshotState(**{**snap.__dict__})
     out.v_re = v_re
@@ -461,7 +434,7 @@ def pytorch_verify_at_state(
         y_re,
         y_im,
         s_base_kva=s_base_kva,
-        v_scale_volts=snap.v_scale_volts if snap.use_physical_units else None,
+        v_scale_volts=snap.v_scale_volts,
     )
     dp, dq = balance_residual_kw(snap.p_inj_kw, snap.q_inj_kvar, p_yv, q_yv)
     m = snap.mask_mv
@@ -665,7 +638,7 @@ def _dss_residual_at_state(
         snap.y_re_full,
         snap.y_im_full,
         s_base_kva=s_base_kva,
-        v_scale_volts=snap.v_scale_volts if snap.use_physical_units else None,
+        v_scale_volts=snap.v_scale_volts,
     )
     return balance_residual_kw(dss_out["p_inj_kw"], dss_out["q_inj_kvar"], p_yv, q_yv)
 
@@ -706,25 +679,6 @@ def compare_pytorch_opendss(
         "dss_converged": bool(dss_out.get("converged", False)),
         "mask_mv_effective": m_eff,
     }
-
-
-def _legacy_mv_mask_from_distance(
-    snap: SnapshotState,
-) -> np.ndarray:
-    """Distance-only MV mask (pre-refinement) for before/after reporting."""
-    import pandas as pd
-
-    from train_da_gps_multitask_complex_voltage_gine import _is_pf_slack_source_node
-
-    mask = np.zeros(snap.n_nodes, dtype=bool)
-    dist = pd.read_csv(snap.pf_data_root / "electrical_distance_from_substation.csv")
-    for _, row in dist.iterrows():
-        node = str(row["node"]).strip().lower()
-        if node not in snap.node_to_local or _is_pf_slack_source_node(node):
-            continue
-        if float(row["electrical_distance_ohm"]) > 1e-9:
-            mask[int(snap.node_to_local[node])] = True
-    return mask
 
 
 def classify_outlier_node(
@@ -858,7 +812,6 @@ def compare_physical_opendss(
     repo: Path | None = None,
     run_opendss: bool = True,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
-    show_legacy_mask_compare: bool = False,
 ) -> dict[str, Any]:
     """Aligned physical PyTorch vs OpenDSS on one snapshot (MV mask).
 
@@ -868,9 +821,6 @@ def compare_physical_opendss(
     - ``|r_dss|`` = same balance with OpenDSS V and OpenDSS injections
     - ``|r_py − r_dss|`` — what the backprop path misses vs OpenDSS
     """
-    if not snap.use_physical_units:
-        raise ValueError("compare_physical_opendss requires use_physical_units=True (pf_units=physical)")
-
     py_label = pytorch_verify_at_state(snap, use_full_y=True, s_base_kva=s_base_kva)
     m = snap.mask_mv
     out: dict[str, Any] = {
@@ -927,17 +877,6 @@ def compare_physical_opendss(
             "residual_gap_stats_q": summarize_abs_kw(np.abs(gap_q[m_eff])),
         }
     )
-    if show_legacy_mask_compare:
-        legacy_mask = _legacy_mv_mask_from_distance(snap)
-        legacy_eff = legacy_mask & fin_full
-        out.update(
-            {
-                "mask_mv_legacy": legacy_mask,
-                "mask_mv_legacy_effective": legacy_eff,
-                "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p[legacy_eff])),
-                "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q[legacy_eff])),
-            }
-        )
     return out
 
 
@@ -948,11 +887,7 @@ def _fmt_stats_row(label: str, st: dict[str, float]) -> str:
     )
 
 
-def print_physical_opendss_report(
-    cmp: dict[str, Any],
-    *,
-    show_legacy_mask_compare: bool = False,
-) -> None:
+def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
     """Human-readable table for ``compare_physical_opendss`` results."""
     print(f"\n=== Physical PyTorch vs OpenDSS (sample {cmp['sample_id']}, MV mask) ===")
     print(_fmt_stats_row("|r_py| at label V", cmp["r_py_stats_p"]))
@@ -961,128 +896,6 @@ def print_physical_opendss_report(
         print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
         print(_fmt_stats_row("|r_dss| at OpenDSS V", cmp["r_dss_stats_p"]))
         print(_fmt_stats_row("|r_py - r_dss| (backprop gap)", cmp["residual_gap_stats_p"]))
-        if show_legacy_mask_compare and "residual_gap_legacy_stats_p" in cmp:
-            print(_fmt_stats_row("|r_py - r_dss| legacy MV mask", cmp["residual_gap_legacy_stats_p"]))
-        print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
-    elif cmp.get("opendss_skipped"):
-        print(f"\n[OpenDSS] skipped: {cmp['opendss_skipped']}")
-    else:
-        print("\n[OpenDSS] not requested (run_opendss=False).")
-
-    backprop_note = (
-        "\nBackprop: train with pf_units=physical; Huber on kW residuals. "
-        "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
-        "(excludes regxfmr/190-/m/p/n interface buses)."
-    )
-    if show_legacy_mask_compare:
-        backprop_note += (
-            " Legacy distance-only mask inflates |r_py - r_dss| via zero-V interface neighbors."
-        )
-    print(backprop_note)
-
-
-def compare_legacy_physical_opendss(
-    sample_id: int,
-    *,
-    repo: Path | None = None,
-    pf_data_root: Path | None = None,
-    chunk_parent: Path | None = None,
-    s_base_kva: float = S_BASE_KVA_DEFAULT,
-    kv_base: float = KV_BASE_DEFAULT,
-    compare_legacy: bool = True,
-    run_opendss: bool = True,
-    snap_physical: SnapshotState | None = None,
-) -> dict[str, Any]:
-    """Side-by-side **legacy_pu** vs **physical** vs optional **OpenDSS** on one snapshot."""
-    if snap_physical is None:
-        snap_physical = load_snapshot_state(
-            int(sample_id),
-            repo=repo,
-            pf_data_root=pf_data_root,
-            chunk_parent=chunk_parent,
-            s_base_kva=s_base_kva,
-            kv_base=kv_base,
-            use_physical_units=True,
-        )
-    out = compare_physical_opendss(
-        snap_physical,
-        repo=repo,
-        run_opendss=run_opendss,
-        s_base_kva=s_base_kva,
-    )
-    out["physical_abs_dp_mv"] = out["abs_r_py_mv"]
-    out["physical_abs_dq_mv"] = np.abs(out["r_py_kvar"][out["mask_mv"]])
-
-    if not compare_legacy:
-        return out
-
-    snap_legacy = load_snapshot_state(
-        int(sample_id),
-        repo=repo,
-        pf_data_root=pf_data_root or snap_physical.pf_data_root,
-        chunk_parent=chunk_parent,
-        s_base_kva=s_base_kva,
-        kv_base=kv_base,
-        use_physical_units=False,
-    )
-    py_legacy = pytorch_verify_at_state(snap_legacy, use_full_y=True, s_base_kva=s_base_kva)
-    m = out["mask_mv"]
-    abs_dp_leg = np.abs(py_legacy["dp_kw"][m])
-    abs_dp_phys = np.abs(out["r_py_kw"][m])
-    out.update(
-        {
-            "snap_legacy": snap_legacy,
-            "legacy_residual_stats_p": py_legacy["stats_p"],
-            "legacy_residual_stats_q": py_legacy["stats_q"],
-            "legacy_abs_dp_mv": py_legacy["abs_dp_mv"],
-            "legacy_abs_dq_mv": py_legacy["abs_dq_mv"],
-            "legacy_dp_kw": py_legacy["dp_kw"],
-            "n_mv_buses_physical_better_p": int(np.sum(abs_dp_phys < abs_dp_leg)),
-            "n_mv_buses_legacy_better_p": int(np.sum(abs_dp_leg < abs_dp_phys)),
-            "n_mv_buses": int(m.sum()),
-        }
-    )
-
-    if "dss_out" in out:
-        m_eff = out["mask_mv_effective"]
-        dp_dss_leg, dq_dss_leg = _dss_residual_at_state(
-            snap_legacy, out["dss_out"], s_base_kva=s_base_kva
-        )
-        gap_p_leg = py_legacy["dp_kw"] - dp_dss_leg
-        gap_q_leg = py_legacy["dq_kvar"] - dq_dss_leg
-        out.update(
-            {
-                "dss_legacy_residual_stats_p": summarize_abs_kw(np.abs(dp_dss_leg[m_eff])),
-                "dss_legacy_residual_stats_q": summarize_abs_kw(np.abs(dq_dss_leg[m_eff])),
-                "dss_legacy_abs_dp_mv": np.abs(dp_dss_leg[m_eff]),
-                "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p_leg[m_eff])),
-                "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q_leg[m_eff])),
-                "residual_gap_legacy_abs_dp_mv": np.abs(gap_p_leg[m_eff]),
-                "residual_gap_physical_abs_dp_mv": out["residual_gap_abs_dp_mv"],
-                "dss_physical_residual_stats_p": out["r_dss_stats_p"],
-            }
-        )
-    return out
-
-
-def print_legacy_physical_opendss_report(cmp: dict[str, Any]) -> None:
-    """Human-readable table for ``compare_legacy_physical_opendss`` results."""
-    print(f"\n=== Physics path comparison (sample {cmp['sample_id']}, MV mask) ===")
-    print(_fmt_stats_row("|r_py| physical (label V)", cmp["r_py_stats_p"]))
-    if "legacy_residual_stats_p" in cmp:
-        print(_fmt_stats_row("|r_py| legacy_pu (label V)", cmp["legacy_residual_stats_p"]))
-        print(
-            f"  MV buses where |r_py| physical < legacy: "
-            f"{cmp['n_mv_buses_physical_better_p']} / {cmp['n_mv_buses']}"
-        )
-
-    if "inj_stats_p" in cmp:
-        print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
-        print(_fmt_stats_row("|r_dss| physical (OpenDSS V)", cmp["r_dss_stats_p"]))
-        print(_fmt_stats_row("|r_py - r_dss| physical", cmp["residual_gap_stats_p"]))
-        if "dss_legacy_residual_stats_p" in cmp:
-            print(_fmt_stats_row("|r_dss| legacy_pu (OpenDSS V)", cmp["dss_legacy_residual_stats_p"]))
-            print(_fmt_stats_row("|r_py - r_dss| legacy_pu", cmp["residual_gap_legacy_stats_p"]))
         print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
     elif cmp.get("opendss_skipped"):
         print(f"\n[OpenDSS] skipped: {cmp['opendss_skipped']}")
@@ -1090,8 +903,7 @@ def print_legacy_physical_opendss_report(cmp: dict[str, Any]) -> None:
         print("\n[OpenDSS] not requested (run_opendss=False).")
 
     print(
-        "\nBackprop note: train with pf_units=physical; Huber on kW residuals. "
-        "Median |r_py| << max is expected (interface buses). "
-        "Gaps vs OpenDSS reflect omitted LV xfmr, line charging, and Q_inj recipe — "
-        "not a blocker if medians/p95 stay in the kW-few x10 kW band."
+        "\nBackprop: Huber on kW residuals. "
+        "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
+        "(excludes regxfmr/190-/m/p/n interface buses)."
     )
