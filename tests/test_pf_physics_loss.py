@@ -849,7 +849,9 @@ class TestScaleRobustness:
         from gnn2_pf_physics_verify import compare_physical_opendss, load_snapshot_state
 
         snap = load_snapshot_state(0, repo=REPO, use_physical_units=True)
-        cmp = compare_physical_opendss(snap, repo=REPO, run_opendss=True)
+        cmp = compare_physical_opendss(
+            snap, repo=REPO, run_opendss=True, show_legacy_mask_compare=True
+        )
         if cmp.get("opendss_skipped"):
             pytest.skip(str(cmp["opendss_skipped"]))
         gap = cmp["residual_gap_stats_p"]

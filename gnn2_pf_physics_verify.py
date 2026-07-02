@@ -858,6 +858,7 @@ def compare_physical_opendss(
     repo: Path | None = None,
     run_opendss: bool = True,
     s_base_kva: float = S_BASE_KVA_DEFAULT,
+    show_legacy_mask_compare: bool = False,
 ) -> dict[str, Any]:
     """Aligned physical PyTorch vs OpenDSS on one snapshot (MV mask).
 
@@ -906,16 +907,11 @@ def compare_physical_opendss(
     gap_p = py_label["dp_kw"] - r_dss_kw
     gap_q = py_label["dq_kvar"] - r_dss_kvar
 
-    legacy_mask = _legacy_mv_mask_from_distance(snap)
-    legacy_eff = legacy_mask & fin_full
-
     out.update(
         {
             "dss_out": dss_out,
             "dss_converged": bool(dss_out.get("converged", False)),
             "mask_mv_effective": m_eff,
-            "mask_mv_legacy": legacy_mask,
-            "mask_mv_legacy_effective": legacy_eff,
             "inj_abs_dp_mv": np.abs(d_p_inj[m_eff]),
             "inj_abs_dq_mv": np.abs(d_q_inj[m_eff]),
             "inj_stats_p": summarize_abs_kw(np.abs(d_p_inj[m_eff])),
@@ -929,10 +925,19 @@ def compare_physical_opendss(
             "residual_gap_abs_dq_mv": np.abs(gap_q[m_eff]),
             "residual_gap_stats_p": summarize_abs_kw(np.abs(gap_p[m_eff])),
             "residual_gap_stats_q": summarize_abs_kw(np.abs(gap_q[m_eff])),
-            "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p[legacy_eff])),
-            "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q[legacy_eff])),
         }
     )
+    if show_legacy_mask_compare:
+        legacy_mask = _legacy_mv_mask_from_distance(snap)
+        legacy_eff = legacy_mask & fin_full
+        out.update(
+            {
+                "mask_mv_legacy": legacy_mask,
+                "mask_mv_legacy_effective": legacy_eff,
+                "residual_gap_legacy_stats_p": summarize_abs_kw(np.abs(gap_p[legacy_eff])),
+                "residual_gap_legacy_stats_q": summarize_abs_kw(np.abs(gap_q[legacy_eff])),
+            }
+        )
     return out
 
 
@@ -943,7 +948,11 @@ def _fmt_stats_row(label: str, st: dict[str, float]) -> str:
     )
 
 
-def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
+def print_physical_opendss_report(
+    cmp: dict[str, Any],
+    *,
+    show_legacy_mask_compare: bool = False,
+) -> None:
     """Human-readable table for ``compare_physical_opendss`` results."""
     print(f"\n=== Physical PyTorch vs OpenDSS (sample {cmp['sample_id']}, MV mask) ===")
     print(_fmt_stats_row("|r_py| at label V", cmp["r_py_stats_p"]))
@@ -952,7 +961,7 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
         print(_fmt_stats_row("|P_inj feature - OpenDSS|", cmp["inj_stats_p"]))
         print(_fmt_stats_row("|r_dss| at OpenDSS V", cmp["r_dss_stats_p"]))
         print(_fmt_stats_row("|r_py - r_dss| (backprop gap)", cmp["residual_gap_stats_p"]))
-        if "residual_gap_legacy_stats_p" in cmp:
+        if show_legacy_mask_compare and "residual_gap_legacy_stats_p" in cmp:
             print(_fmt_stats_row("|r_py - r_dss| legacy MV mask", cmp["residual_gap_legacy_stats_p"]))
         print(f"  OpenDSS converged: {cmp.get('dss_converged', False)}")
     elif cmp.get("opendss_skipped"):
@@ -960,12 +969,16 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
     else:
         print("\n[OpenDSS] not requested (run_opendss=False).")
 
-    print(
+    backprop_note = (
         "\nBackprop: train with pf_units=physical; Huber on kW residuals. "
         "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
-        "(excludes regxfmr/190-/m/p/n interface buses). "
-        "Legacy distance-only mask inflates |r_py - r_dss| via zero-V interface neighbors."
+        "(excludes regxfmr/190-/m/p/n interface buses)."
     )
+    if show_legacy_mask_compare:
+        backprop_note += (
+            " Legacy distance-only mask inflates |r_py - r_dss| via zero-V interface neighbors."
+        )
+    print(backprop_note)
 
 
 def compare_legacy_physical_opendss(
