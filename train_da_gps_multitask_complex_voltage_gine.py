@@ -288,6 +288,7 @@ class PfPhysicsState:
     detach_controls: bool = False
     node_feature_cols: list[str] = field(default_factory=list)
     pf_debug_nan: bool = False
+    idx_to_node: dict[int, str] = field(default_factory=dict)
 
 
 def _undirected_node_pair(iu: int, iv: int) -> tuple[int, int]:
@@ -913,6 +914,48 @@ def _pf_huber_mean_sq(r: torch.Tensor, *, delta: float) -> torch.Tensor:
     return torch.where(abs_r <= d, quad, lin).mean()
 
 
+def _pf_physics_fp32_ctx():
+    """Disable AMP inside the physics block (Y@V and Huber need fp32)."""
+    if torch.cuda.is_available():
+        return torch.amp.autocast("cuda", enabled=False)
+    return contextlib.nullcontext()
+
+
+_PF_BALANCE_NODE_WARNED: set[int] = set()
+
+
+def _warn_pf_balance_node_issues(
+    mask: torch.Tensor,
+    idx_to_node: dict[int, str],
+    y_re: torch.Tensor,
+    y_im: torch.Tensor,
+    *,
+    hetero_nodes: set[int] | None = None,
+) -> None:
+    """One-shot warnings for explicit balance nodes that may skew physics loss."""
+    y_re_np = y_re.detach().cpu().numpy()
+    y_im_np = y_im.detach().cpu().numpy()
+    for li in range(int(mask.numel())):
+        if not bool(mask[li].item()):
+            continue
+        node = idx_to_node.get(int(li), "")
+        issues: list[str] = []
+        if _is_pf_interface_node(node):
+            issues.append("interface bus")
+        row_norm = float(np.abs(y_re_np[li, :]).sum() + np.abs(y_im_np[li, :]).sum())
+        if row_norm < 1e-9:
+            issues.append("zero Y-bus row")
+        if hetero_nodes is not None and int(li) not in hetero_nodes:
+            issues.append("not in hetero_mv_nodes_load_transformer")
+        if not issues or int(li) in _PF_BALANCE_NODE_WARNED:
+            continue
+        _PF_BALANCE_NODE_WARNED.add(int(li))
+        print(
+            f"WARNING: PF balance node_idx={li} ({node or '?'}) flagged: {', '.join(issues)}",
+            flush=True,
+        )
+
+
 _PF_DEBUG_NAN_EMITTED = False
 
 
@@ -964,6 +1007,7 @@ def _pf_top_residual_nodes(
     mask: torch.Tensor,
     *,
     k: int = 5,
+    idx_to_node: dict[int, str] | None = None,
 ) -> list[str]:
     m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
     score = (r_p.abs() + r_q.abs()).masked_fill(~m, -1.0)
@@ -981,8 +1025,13 @@ def _pf_top_residual_nodes(
         rq = float(r_q[b, ni].item())
         rp_s = "nan" if math.isnan(rp) else f"{rp:.4e}"
         rq_s = "nan" if math.isnan(rq) else f"{rq:.4e}"
+        bus = ""
+        if idx_to_node:
+            bus_name = idx_to_node.get(ni, "")
+            if bus_name:
+                bus = f"  bus={bus_name}"
         lines.append(
-            f"  node_idx={ni} batch={b} |r_p|+|r_q|={v:.4e}  r_p={rp_s} kW  r_q={rq_s} kvar"
+            f"  node_idx={ni}{bus} batch={b} |r_p|+|r_q|={v:.4e}  r_p={rp_s} kW  r_q={rq_s} kvar"
         )
     return lines
 
@@ -1015,13 +1064,13 @@ def _pf_debug_nan_report(
     global _PF_DEBUG_NAN_EMITTED
     _PF_DEBUG_NAN_EMITTED = True
 
-    amp_loss = float(loss_pf.detach().float().item())
-    amp_finite = math.isfinite(amp_loss)
+    pf_loss = float(loss_pf.detach().float().item())
+    pf_finite = math.isfinite(pf_loss)
     lines = [
         "",
         f"=== PF physics debug ({trigger}; epoch {epoch} batch {batch_idx}) ===",
-        f"AMP (autocast) enabled: {use_amp}",
-        f"loss_pf (current dtype, in AMP ctx): {amp_loss:.6e}  finite={amp_finite}",
+        f"AMP (autocast) enabled for model: {use_amp}",
+        f"loss_pf (fp32 physics path): {pf_loss:.6e}  finite={pf_finite}",
         f"use_sparse_y: {bool(pf.use_sparse_y and pf.y_coo is not None)}",
         f"huber_delta_kw: {pf.huber_delta_kw}",
         f"detach_controls: {pf.detach_controls}",
@@ -1126,21 +1175,21 @@ def _pf_debug_nan_report(
             f"  huber_q: {float(hub_q.item()):.6e}  finite={math.isfinite(float(hub_q.item()))}",
             f"  huber_total: {float(hub_tot.item()):.6e}  finite={math.isfinite(float(hub_tot.item()))}",
             "--- Worst masked nodes by |r_p|+|r_q| ---",
-            *_pf_top_residual_nodes(r_p, r_q, mask, k=5),
+            *_pf_top_residual_nodes(r_p, r_q, mask, k=5, idx_to_node=pf.idx_to_node or None),
         ]
     )
 
     if use_amp:
-        with torch.cuda.amp.autocast(enabled=False):
+        with _pf_physics_fp32_ctx():
             loss_fp32 = _power_balance_loss_from_batch(
-                v_n.float(),
+                v_n,
                 batch,
                 n_nodes=n_nodes,
                 y_mean=y_mean,
                 y_std=y_std,
                 pf=pf,
-                cap_logits=cap_logits.float(),
-                reg_pred=reg_pred.float(),
+                cap_logits=cap_logits,
+                reg_pred=reg_pred,
                 x_mean=x_mean,
                 x_std=x_std,
                 reg_loss=reg_loss,
@@ -1150,14 +1199,21 @@ def _pf_debug_nan_report(
                 reg_class_values=reg_class_values,
             )
         fp32_val = float(loss_fp32.item())
-        lines.append("--- FP32 replay (autocast disabled) ---")
+        lines.append("--- FP32 replay sanity check ---")
         lines.append(f"  loss_pf_fp32: {fp32_val:.6e}  finite={math.isfinite(fp32_val)}")
-        if amp_finite and not math.isfinite(fp32_val):
-            lines.append("  NOTE: AMP loss finite but fp32 non-finite (unexpected).")
-        elif not amp_finite and math.isfinite(fp32_val):
-            lines.append("  LIKELY CAUSE: AMP/fp16 overflow in physics block; fp32 path is finite.")
-        elif not amp_finite and not math.isfinite(fp32_val):
-            lines.append("  LIKELY CAUSE: non-finite values in physics tensors (not only AMP).")
+        if pf_finite and math.isfinite(fp32_val) and abs(fp32_val - pf_loss) < max(1e-3, 1e-6 * abs(fp32_val)):
+            lines.append("  OK: physics loss runs in fp32 (matches replay).")
+        elif pf_finite and not math.isfinite(fp32_val):
+            lines.append("  NOTE: reported loss finite but fp32 replay non-finite (unexpected).")
+        elif not pf_finite and math.isfinite(fp32_val):
+            lines.append("  LIKELY CAUSE: non-fp32 physics path or stale loss tensor.")
+        elif not pf_finite and not math.isfinite(fp32_val):
+            lines.append("  LIKELY CAUSE: non-finite values in physics tensors.")
+        if math.isfinite(fp32_val) and fp32_val > 1.0e5:
+            lines.append(
+                f"  NOTE: large fp32 loss ({fp32_val:.3e}); early-epoch V preds or outlier nodes "
+                "can dominate Huber — check worst nodes above."
+            )
 
     lines.append("=== end PF physics debug ===")
     print("\n".join(lines), flush=True)
@@ -1184,9 +1240,12 @@ def nodal_power_balance_residual(
     """Huber-smoothed mean P/Q balance residual (physical units: V volts, Y Siemens, kW/kvar)."""
     if v_scale_volts is None:
         raise ValueError("nodal_power_balance_residual requires v_scale_volts")
+    pred_ri = pred_ri.float()
+    p_inj_kw = p_inj_kw.float()
+    q_inj_kvar = q_inj_kvar.float()
     v_re = pred_ri[..., 0]
     v_im = pred_ri[..., 1]
-    vs = v_scale_volts.to(device=v_re.device, dtype=v_re.dtype)
+    vs = v_scale_volts.to(device=v_re.device, dtype=torch.float32)
     if vs.dim() == 1:
         vs = vs.reshape(1, -1).expand(v_re.shape[0], -1)
     else:
@@ -1303,8 +1362,8 @@ def _denorm_node_features(
     x_mean: torch.Tensor,
     x_std: torch.Tensor,
 ) -> torch.Tensor:
-    xm = x_mean.view(1, 1, -1)
-    xs = x_std.view(1, 1, -1)
+    xm = x_mean.view(1, 1, -1).float()
+    xs = x_std.view(1, 1, -1).float()
     return x_n.view(batch.num_graphs, n_nodes, -1).float() * xs + xm
 
 
@@ -1363,8 +1422,8 @@ def _power_balance_loss_from_batch(
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_values: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    y_mean_ri = y_mean.view(1, n_nodes, 2)
-    y_std_ri = y_std.view(1, n_nodes, 2)
+    y_mean_ri = y_mean.view(1, n_nodes, 2).float()
+    y_std_ri = y_std.view(1, n_nodes, 2).float()
     pred_ri = v_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
     assert pf.Y_re_base is not None and pf.Y_im_base is not None
 
@@ -1386,7 +1445,7 @@ def _power_balance_loss_from_batch(
     )
     if pf.detach_controls:
         tap_pu = tap_pu.detach()
-    x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean, x_std)
+    x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean.float(), x_std.float())
     p_inj, q_inj = _assemble_pf_injections(
         x_den,
         pf.node_feature_cols,
@@ -1449,23 +1508,24 @@ def _pf_loss_if_enabled(
 ) -> torch.Tensor | None:
     if pf.weight <= 0.0 or pf.Y_re_base is None:
         return None
-    return _power_balance_loss_from_batch(
-        v_n,
-        batch,
-        n_nodes=n_nodes,
-        y_mean=y_mean,
-        y_std=y_std,
-        pf=pf,
-        cap_logits=cap_logits,
-        reg_pred=reg_pred,
-        x_mean=x_mean,
-        x_std=x_std,
-        reg_loss=reg_loss,
-        reg_mean=reg_mean,
-        reg_std=reg_std,
-        reg_logits=reg_logits,
-        reg_class_values=reg_class_values,
-    )
+    with _pf_physics_fp32_ctx():
+        return _power_balance_loss_from_batch(
+            v_n,
+            batch,
+            n_nodes=n_nodes,
+            y_mean=y_mean,
+            y_std=y_std,
+            pf=pf,
+            cap_logits=cap_logits,
+            reg_pred=reg_pred,
+            x_mean=x_mean,
+            x_std=x_std,
+            reg_loss=reg_loss,
+            reg_mean=reg_mean,
+            reg_std=reg_std,
+            reg_logits=reg_logits,
+            reg_class_values=reg_class_values,
+        )
 
 
 def _resolve_pf_reg_catalog(
@@ -1557,6 +1617,15 @@ def _setup_pf_physics(
                 explicit_csv = (pf_root / explicit_csv).resolve()
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
+        )
+        idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
+        hetero_nodes = _load_pf_hetero_node_indices(pf_root)
+        _warn_pf_balance_node_issues(
+            pf_mask,
+            idx_to_node,
+            y_re,
+            y_im,
+            hetero_nodes=hetero_nodes or None,
         )
     else:
         distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
@@ -1696,6 +1765,7 @@ def _setup_pf_physics(
         flush=True,
     )
 
+    idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
     return PfPhysicsState(
         weight=w,
         s_base_kva=s_base,
@@ -1711,6 +1781,7 @@ def _setup_pf_physics(
         detach_controls=detach,
         node_feature_cols=list(node_feature_cols),
         pf_debug_nan=pf_debug_nan,
+        idx_to_node=idx_to_node,
     )
 
 
