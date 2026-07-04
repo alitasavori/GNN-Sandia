@@ -16,6 +16,8 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 - Residuals in **kW/kvar**, scaled to per-unit on ``S_base`` before Huber (``--pf_huber_delta_kw`` /
   ``--pf_s_base_kva``, default 10 kW ≈ 0.002 pu at 5000 kVA). Applied on selected nodes (slack excluded).
 - ``--pf_auto_scale_volt``: scale physics term each batch to match voltage MSE magnitude (interpretable weight).
+  Ratio is capped by ``--pf_auto_scale_max`` (default 100) so tiny ``loss_pf`` cannot explode gradients.
+  ``flow_relative`` loss is also scaled by ``1/mean(y_std^2)`` so physical pu Huber matches normalized voltage MSE.
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -280,6 +282,7 @@ class PfPhysicsState:
     weight: float = 0.0
     loss_mode: str = "flow_relative"
     auto_scale_volt: bool = False
+    auto_scale_max: float = 100.0
     s_base_kva: float = 5000.0
     huber_delta_kw: float = 10.0
     v_scale_volts: torch.Tensor | None = None
@@ -1632,7 +1635,7 @@ def _power_balance_loss_from_batch(
             v_scale_volts=pf.v_scale_volts,
         )
 
-    return nodal_power_balance_residual(
+    loss_pf = nodal_power_balance_residual(
         pred_ri,
         p_inj,
         q_inj,
@@ -1651,6 +1654,9 @@ def _power_balance_loss_from_batch(
         cap_on=cap_on if use_sparse else None,
         use_sparse_y=use_sparse,
     )
+    if str(pf.loss_mode).strip().lower() == "flow_relative":
+        loss_pf = loss_pf * _pf_flow_relative_volt_scale(y_std_ri)
+    return loss_pf
 
 
 def _pf_loss_if_enabled(
@@ -1695,6 +1701,12 @@ def _pf_loss_if_enabled(
         )
 
 
+def _pf_flow_relative_volt_scale(y_std_ri: torch.Tensor) -> float:
+    """Map physical pu Huber to normalized-voltage MSE scale (flow_relative only)."""
+    pu_std = y_std_ri.float().reshape(-1).mean().clamp(min=1e-8)
+    return float(1.0 / (pu_std * pu_std))
+
+
 def _pf_effective_weight(
     pf: PfPhysicsState,
     *,
@@ -1705,7 +1717,9 @@ def _pf_effective_weight(
     w = float(pf.weight)
     if not pf.auto_scale_volt:
         return w
-    ratio = loss_v.detach().float() / loss_pf.detach().float().clamp(min=1e-12)
+    max_ratio = max(float(pf.auto_scale_max), 1.0)
+    ratio = loss_v.detach().float() / loss_pf.detach().float().clamp(min=1e-30)
+    ratio = ratio.clamp(max=max_ratio)
     return w * ratio
 
 
@@ -1765,6 +1779,7 @@ def _setup_pf_physics(
     if loss_mode not in ("absolute", "flow_relative"):
         raise ValueError(f"--pf_loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
     auto_scale_volt = bool(getattr(args, "pf_auto_scale_volt", False))
+    auto_scale_max = float(getattr(args, "pf_auto_scale_max", 100.0) or 100.0)
     s_base = float(getattr(args, "pf_s_base_kva", 5000.0))
     kv_base = float(getattr(args, "pf_kv_base", 12.47))
     z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
@@ -1928,7 +1943,11 @@ def _setup_pf_physics(
     pf_debug_nan = _resolve_pf_debug_nan(args)
     print(
         f"Power-balance physics: weight={w}, mode={loss_mode}"
-        + (", auto_scale_volt=1 (physics term scaled to voltage MSE each batch)" if auto_scale_volt else "")
+        + (
+            f", auto_scale_volt=1 (cap={auto_scale_max:.4g} on loss_v/loss_pf ratio)"
+            if auto_scale_volt
+            else ""
+        )
         + f", units=physical (V volts, Y Siemens, Huber on P/Q pu), "
         f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
@@ -1948,6 +1967,7 @@ def _setup_pf_physics(
         weight=w,
         loss_mode=loss_mode,
         auto_scale_volt=auto_scale_volt,
+        auto_scale_max=auto_scale_max,
         s_base_kva=s_base,
         huber_delta_kw=huber_delta_kw,
         v_scale_volts=v_scale_t,
@@ -4853,6 +4873,12 @@ def parse_args() -> argparse.Namespace:
         "--pf_auto_scale_volt",
         action="store_true",
         help="Scale physics loss each batch to match voltage MSE magnitude (weight becomes unitless ratio).",
+    )
+    p.add_argument(
+        "--pf_auto_scale_max",
+        type=float,
+        default=100.0,
+        help="Cap on loss_v/loss_pf ratio when --pf_auto_scale_volt is set (prevents gradient explosion).",
     )
     p.add_argument(
         "--pf_huber_delta_kw",
