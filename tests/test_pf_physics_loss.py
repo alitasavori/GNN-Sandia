@@ -1267,7 +1267,7 @@ class TestScaleRobustness:
                 dist_mask[int(ntl[node])] = True
 
         explicit_mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
-        assert int(explicit_mask.sum().item()) == 185
+        assert int(explicit_mask.sum().item()) == 1177
         assert int(explicit_mask.sum().item()) < int(dist_mask.sum().item())
 
     def test_explicit_balance_list_prefers_node_over_bus_and_node_idx(self, tmp_path):
@@ -1307,7 +1307,7 @@ class TestScaleRobustness:
         list_csv = REPO / "colab_pf_data/pf_balance_nodes_explicit.csv"
         mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
         idx_to_node = {int(v): k for k, v in ntl.items()}
-        assert int(mask.sum().item()) == 185
+        assert int(mask.sum().item()) == 1177
         for li in range(n_nodes):
             if not bool(mask[li].item()):
                 continue
@@ -1424,7 +1424,7 @@ class TestScaleRobustness:
         df = pd.read_csv(list_csv)
         assert "node" in df.columns
         assert "node_idx" in df.columns
-        assert len(df) == 185
+        assert len(df) == 1177
 
     def test_colab_hetero_catalog_maps_on_chunk_subgraph(self):
         import pandas as pd

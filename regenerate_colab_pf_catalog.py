@@ -5,7 +5,8 @@ Updates:
   - Heterogenous GNN dataset/nodes/hetero_mv_nodes_load_transformer.csv
     (adds ``node`` phase names for chunk-safe hetero mapping)
   - pf_balance_nodes_explicit.csv
-    (MV distance mask + interface/hetero/Y-neighbor refinement)
+    (all hetero_mv load_transformer nodes minus slack/interface; was 185 with
+     Y-neighbor-only refinement through 2026-07, now ~1177)
 
 Run from repo root after pulling dailyagg data locally:
   python regenerate_colab_pf_catalog.py
@@ -17,7 +18,6 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 import train_da_gps_multitask_complex_voltage_gine as pfmod
 
@@ -25,9 +25,6 @@ REPO = Path(__file__).resolve().parent
 DATA_DAILYAGG = REPO / "datasets_gnn2_from pc" / "loadtype_8500_dailyagg"
 COLAB_PF = REPO / "colab_pf_data"
 HETERO_REL = Path("Heterogenous GNN dataset") / "nodes" / "hetero_mv_nodes_load_transformer.csv"
-KV_BASE = 12.47
-S_BASE_KVA = 5000.0
-Z_BASE = (KV_BASE * 1000.0) ** 2 / (S_BASE_KVA * 1000.0)
 
 
 def _master_index(colab_pf: Path) -> tuple[dict[str, int], int]:
@@ -53,48 +50,21 @@ def regenerate_hetero_mv_nodes(*, dailyagg: Path, colab_pf: Path) -> int:
 
 
 def regenerate_balance_nodes_explicit(*, dailyagg: Path, colab_pf: Path) -> int:
-    ntl, n_nodes = _master_index(colab_pf)
-    dist_path = colab_pf / "electrical_distance_from_substation.csv"
-    if not dist_path.is_file():
-        dist_path = dailyagg / "electrical_distance_from_substation.csv"
-    dist = pd.read_csv(dist_path)
-
-    mask = torch.zeros(n_nodes, dtype=torch.bool)
-    for _, row in dist.iterrows():
-        node = str(row["node"]).strip().lower()
-        if node not in ntl or pfmod._is_pf_slack_source_node(node):
-            continue
-        if float(row["electrical_distance_ohm"]) > 1e-9:
-            mask[int(ntl[node])] = True
-
-    edges = dailyagg / "gnn_edges_phase_static.csv"
-    reg_cat = dailyagg / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
-    reg_edges = pfmod._load_regulator_edges_for_pf(
-        reg_cat, ntl, list(pfmod.TARGET_REG_COLS), Z_BASE
-    )
-    skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
-    y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(
-        edges, ntl, n_nodes, skip_undirected=skip
-    )
+    ntl, _n_nodes = _master_index(colab_pf)
     hetero_nodes = pfmod._load_pf_hetero_node_indices(colab_pf, ntl)
     if not hetero_nodes:
         hetero_nodes = pfmod._load_pf_hetero_node_indices(dailyagg, ntl)
-    refined = pfmod._refine_pf_mv_balance_mask(
-        mask,
-        ntl,
-        hetero_nodes,
-        y_re,
-        y_im,
-        exclude_interface=True,
-        hetero_y_neighbors_only=True,
-    )
+    if not hetero_nodes:
+        raise RuntimeError("hetero_mv_nodes_load_transformer catalog missing or empty")
 
     idx_to_node = {int(li): str(node) for node, li in ntl.items()}
     rows: list[dict[str, str | int]] = []
-    for li in range(n_nodes):
-        if not bool(refined[li].item()):
-            continue
+    for li in sorted(hetero_nodes):
         node = idx_to_node[int(li)]
+        if pfmod._is_pf_slack_source_node(node):
+            continue
+        if pfmod._is_pf_interface_node(node):
+            continue
         rows.append(
             {
                 "node": node,
