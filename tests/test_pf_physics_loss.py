@@ -831,8 +831,175 @@ def _nodal_power_kw_kvar_physical(v_ri, y_re, y_im, v_scale):
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
     return s_re / 1000.0, s_im / 1000.0
+
+
 # ---------------------------------------------------------------------------
-# G. Regulator CE tap expectation (heterogeneous n_classes)
+# I. Flow-relative physics (substantive physics-informed mode)
+# ---------------------------------------------------------------------------
+class TestFlowRelativePhysics:
+    def test_zero_when_v_pred_matches_label(self, synthetic_truth):
+        v = synthetic_truth["v_ri"]
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+        )
+        res = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0),
+                torch.zeros(1, N_NODES),
+                torch.zeros(1, N_NODES),
+                y_re,
+                y_im,
+                torch.ones(N_NODES, dtype=torch.bool),
+                S_BASE_KVA,
+                v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+                huber_delta_kw=10.0,
+                loss_mode="flow_relative",
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        assert res < TOL_ZERO_F32
+
+    def test_insensitive_to_p_inj_error_at_label_v(self, synthetic_truth):
+        """flow_relative ignores feature P_inj errors; absolute does not."""
+        v = synthetic_truth["v_ri"]
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+        )
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            synthetic_truth["x_denorm"].unsqueeze(0),
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(synthetic_truth["x_denorm"]),
+            n_nodes=N_NODES,
+        )
+        p_bad = p_inj.clone()
+        p_bad[0, 1] += 500.0
+        mask = torch.ones(N_NODES, dtype=torch.bool)
+        v_scale = synthetic_truth["v_scale"].unsqueeze(0)
+        res_rel = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0),
+                p_bad,
+                q_inj,
+                y_re,
+                y_im,
+                mask,
+                S_BASE_KVA,
+                v_scale_volts=v_scale,
+                huber_delta_kw=10.0,
+                loss_mode="flow_relative",
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        res_abs = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0),
+                p_bad,
+                q_inj,
+                y_re,
+                y_im,
+                mask,
+                S_BASE_KVA,
+                v_scale_volts=v_scale,
+                huber_delta_kw=10.0,
+                loss_mode="absolute",
+            ).item()
+        )
+        assert res_rel < TOL_ZERO_F32
+        assert res_abs > res_rel * 50.0
+
+    def test_nonzero_when_v_pred_perturbed(self, synthetic_truth):
+        v = synthetic_truth["v_ri"]
+        v_bad = v.clone()
+        v_bad[:, 0] += 0.05
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+        )
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            synthetic_truth["x_denorm"].unsqueeze(0),
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(synthetic_truth["x_denorm"]),
+            n_nodes=N_NODES,
+        )
+        res = float(
+            pfmod.nodal_power_balance_residual(
+                v_bad.unsqueeze(0),
+                p_inj,
+                q_inj,
+                y_re,
+                y_im,
+                torch.ones(N_NODES, dtype=torch.bool),
+                S_BASE_KVA,
+                v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+                huber_delta_kw=10.0,
+                loss_mode="flow_relative",
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        assert res > 1e-4
+
+    def test_flow_relative_grad_aligns_with_voltage_error(self, synthetic_truth):
+        v_lbl = synthetic_truth["v_ri"]
+        v_var = v_lbl.clone().requires_grad_(True)
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+        )
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            synthetic_truth["x_denorm"].unsqueeze(0),
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(synthetic_truth["x_denorm"]),
+            n_nodes=N_NODES,
+        )
+        loss = pfmod.nodal_power_balance_residual(
+            v_var.unsqueeze(0),
+            p_inj,
+            q_inj,
+            y_re,
+            y_im,
+            torch.ones(N_NODES, dtype=torch.bool),
+            S_BASE_KVA,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+            huber_delta_kw=10.0,
+            loss_mode="flow_relative",
+            label_ri=v_lbl.unsqueeze(0),
+        )
+        loss.backward()
+        assert v_var.grad is not None and float(v_var.grad.abs().sum()) > 0
+
+
+# ---------------------------------------------------------------------------
+# J. Regulator CE tap expectation (heterogeneous n_classes)
 # ---------------------------------------------------------------------------
 class TestExpectedRegTapPu:
     def test_heterogeneous_n_classes_batch_matmul(self):

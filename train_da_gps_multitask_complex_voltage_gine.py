@@ -10,10 +10,12 @@ v2 alignment:
 - Aux targets are hardcoded in-script (old aux-trainer style).
 
 Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent physics fallbacks):
-- After denormalizing predicted complex voltage (Re/Im head), penalize nodal P/Q balance residuals
-  in **kW/kvar**, scaled to per-unit on ``S_base`` before Huber (``--pf_huber_delta_kw`` / ``--pf_s_base_kva``,
-  default 10 kW ≈ 0.002 pu at 5000 kVA) so early-epoch voltage error does not explode the loss. Applied on
-  selected nodes (slack/source excluded).
+- **flow_relative** (default): Huber on nodal power from ``Y@V_pred`` vs ``Y@V_label`` (label detached).
+  Injection ``P_inj`` cancels — penalizes network power-flow inconsistency, not feature-injection mismatch.
+- **absolute** (legacy): Huber on ``P_inj - Re(V Y V)`` at predicted ``V`` only.
+- Residuals in **kW/kvar**, scaled to per-unit on ``S_base`` before Huber (``--pf_huber_delta_kw`` /
+  ``--pf_s_base_kva``, default 10 kW ≈ 0.002 pu at 5000 kVA). Applied on selected nodes (slack excluded).
+- ``--pf_auto_scale_volt``: scale physics term each batch to match voltage MSE magnitude (interpretable weight).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -276,6 +278,8 @@ class PfYbusCoo:
 @dataclass
 class PfPhysicsState:
     weight: float = 0.0
+    loss_mode: str = "flow_relative"
+    auto_scale_volt: bool = False
     s_base_kva: float = 5000.0
     huber_delta_kw: float = 10.0
     v_scale_volts: torch.Tensor | None = None
@@ -1314,39 +1318,37 @@ def _pf_debug_nan_report(
     print("\n".join(lines), flush=True)
 
 
-def nodal_power_balance_residual(
+def _pf_v_ri_to_phys_volts(
     pred_ri: torch.Tensor,
-    p_inj_kw: torch.Tensor,
-    q_inj_kvar: torch.Tensor,
+    v_scale_volts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert pu complex ``V`` to physical volts (batch ``(B,N)``)."""
+    v_re = pred_ri[..., 0].float()
+    v_im = pred_ri[..., 1].float()
+    vs = v_scale_volts.to(device=v_re.device, dtype=torch.float32)
+    if vs.dim() == 1:
+        vs = vs.reshape(1, -1).expand(v_re.shape[0], -1)
+    else:
+        vs = vs.reshape(v_re.shape[0], -1)
+    return v_re * vs, v_im * vs
+
+
+def _pf_nodal_power_kw_from_v_ri(
+    pred_ri: torch.Tensor,
+    *,
     Y_re: torch.Tensor | None,
     Y_im: torch.Tensor | None,
-    node_mask: torch.Tensor | None,
-    s_base_kva: float = 5000.0,
-    *,
-    v_scale_volts: torch.Tensor | None = None,
-    huber_delta_kw: float = 10.0,
+    v_scale_volts: torch.Tensor,
+    s_base_kva: float,
     y_coo: PfYbusCoo | None = None,
     reg_edges: list[tuple[int, int, float, float, int]] | None = None,
     cap_banks: list[tuple[int, float, int]] | None = None,
     tap_pu: torch.Tensor | None = None,
     cap_on: torch.Tensor | None = None,
     use_sparse_y: bool = True,
-) -> torch.Tensor:
-    """Huber-smoothed mean P/Q balance residual (physical units: V volts, Y Siemens, kW/kvar)."""
-    if v_scale_volts is None:
-        raise ValueError("nodal_power_balance_residual requires v_scale_volts")
-    pred_ri = pred_ri.float()
-    p_inj_kw = p_inj_kw.float()
-    q_inj_kvar = q_inj_kvar.float()
-    v_re = pred_ri[..., 0]
-    v_im = pred_ri[..., 1]
-    vs = v_scale_volts.to(device=v_re.device, dtype=torch.float32)
-    if vs.dim() == 1:
-        vs = vs.reshape(1, -1).expand(v_re.shape[0], -1)
-    else:
-        vs = vs.reshape(v_re.shape[0], -1)
-    v_re = v_re * vs
-    v_im = v_im * vs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nodal ``S = V·conj(YV)`` power in kW/kvar from pu complex voltage."""
+    v_re, v_im = _pf_v_ri_to_phys_volts(pred_ri, v_scale_volts)
     i_re, i_im = _compute_yv_current(
         v_re,
         v_im,
@@ -1363,10 +1365,68 @@ def nodal_power_balance_residual(
     )
     s_re = v_re * i_re + v_im * i_im
     s_im = v_im * i_re - v_re * i_im
-    p_yv_kw = s_re / 1000.0
-    q_yv_kvar = s_im / 1000.0
-    r_p = p_inj_kw - p_yv_kw
-    r_q = q_inj_kvar - q_yv_kvar
+    return s_re / 1000.0, s_im / 1000.0
+
+
+def nodal_power_balance_residual(
+    pred_ri: torch.Tensor,
+    p_inj_kw: torch.Tensor,
+    q_inj_kvar: torch.Tensor,
+    Y_re: torch.Tensor | None,
+    Y_im: torch.Tensor | None,
+    node_mask: torch.Tensor | None,
+    s_base_kva: float = 5000.0,
+    *,
+    v_scale_volts: torch.Tensor | None = None,
+    huber_delta_kw: float = 10.0,
+    loss_mode: str = "absolute",
+    label_ri: torch.Tensor | None = None,
+    y_coo: PfYbusCoo | None = None,
+    reg_edges: list[tuple[int, int, float, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int]] | None = None,
+    tap_pu: torch.Tensor | None = None,
+    cap_on: torch.Tensor | None = None,
+    use_sparse_y: bool = True,
+) -> torch.Tensor:
+    """Huber-smoothed physics loss on nodal P/Q (physical units: V volts, Y Siemens, kW/kvar).
+
+    ``flow_relative`` (default): ``Huber(S(Y,V_label) - S(Y,V_pred))`` — label power flow detached.
+    ``absolute``: ``Huber(P_inj - S(Y,V_pred))`` — legacy injection-mismatch form.
+    """
+    if v_scale_volts is None:
+        raise ValueError("nodal_power_balance_residual requires v_scale_volts")
+    mode = str(loss_mode or "absolute").strip().lower()
+    if mode not in ("absolute", "flow_relative"):
+        raise ValueError(f"pf loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
+
+    pred_ri = pred_ri.float()
+    p_inj_kw = p_inj_kw.float()
+    q_inj_kvar = q_inj_kvar.float()
+    y_kw_args = dict(
+        Y_re=Y_re,
+        Y_im=Y_im,
+        v_scale_volts=v_scale_volts,
+        s_base_kva=s_base_kva,
+        y_coo=y_coo,
+        reg_edges=reg_edges,
+        cap_banks=cap_banks,
+        tap_pu=tap_pu,
+        cap_on=cap_on,
+        use_sparse_y=use_sparse_y,
+    )
+    p_yv_kw, q_yv_kvar = _pf_nodal_power_kw_from_v_ri(pred_ri, **y_kw_args)
+
+    if mode == "flow_relative":
+        if label_ri is None:
+            raise ValueError("flow_relative physics loss requires label_ri (denormalized targets)")
+        with torch.no_grad():
+            p_yv_lbl, q_yv_lbl = _pf_nodal_power_kw_from_v_ri(label_ri.float(), **y_kw_args)
+        r_p = p_yv_lbl - p_yv_kw
+        r_q = q_yv_lbl - q_yv_kvar
+    else:
+        r_p = p_inj_kw - p_yv_kw
+        r_q = q_inj_kvar - q_yv_kvar
+
     s_base = max(float(s_base_kva), 1e-12)
     delta_pu = _pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base_kva)
     if node_mask is not None:
@@ -1517,6 +1577,7 @@ def _power_balance_loss_from_batch(
     reg_std: torch.Tensor | None = None,
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_values: torch.Tensor | None = None,
+    label_y_n: torch.Tensor | None = None,
 ) -> torch.Tensor:
     y_mean_ri = y_mean.view(1, n_nodes, 2).float()
     y_std_ri = y_std.view(1, n_nodes, 2).float()
@@ -1549,6 +1610,12 @@ def _power_balance_loss_from_batch(
         n_nodes=n_nodes,
     )
 
+    label_ri = None
+    if str(pf.loss_mode).strip().lower() == "flow_relative":
+        if label_y_n is None:
+            raise ValueError("flow_relative physics loss requires label_y_n (normalized voltage targets)")
+        label_ri = label_y_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
+
     use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
     if use_sparse:
         y_re, y_im = None, None
@@ -1575,6 +1642,8 @@ def _power_balance_loss_from_batch(
         pf.s_base_kva,
         v_scale_volts=pf.v_scale_volts,
         huber_delta_kw=pf.huber_delta_kw,
+        loss_mode=pf.loss_mode,
+        label_ri=label_ri,
         y_coo=pf.y_coo if use_sparse else None,
         reg_edges=pf.reg_edges if use_sparse else None,
         cap_banks=pf.cap_banks if use_sparse else None,
@@ -1601,6 +1670,7 @@ def _pf_loss_if_enabled(
     reg_std: torch.Tensor | None,
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_values: torch.Tensor | None = None,
+    label_y_n: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if pf.weight <= 0.0 or pf.Y_re_base is None:
         return None
@@ -1621,7 +1691,22 @@ def _pf_loss_if_enabled(
             reg_std=reg_std,
             reg_logits=reg_logits,
             reg_class_values=reg_class_values,
+            label_y_n=label_y_n,
         )
+
+
+def _pf_effective_weight(
+    pf: PfPhysicsState,
+    *,
+    loss_v: torch.Tensor,
+    loss_pf: torch.Tensor,
+) -> torch.Tensor | float:
+    """Return scalar multiplier for physics loss (auto-scale to voltage MSE when enabled)."""
+    w = float(pf.weight)
+    if not pf.auto_scale_volt:
+        return w
+    ratio = loss_v.detach().float() / loss_pf.detach().float().clamp(min=1e-12)
+    return w * ratio
 
 
 def _resolve_pf_reg_catalog(
@@ -1676,6 +1761,10 @@ def _setup_pf_physics(
     w = float(getattr(args, "loss_power_balance_weight", 0.0) or 0.0)
     if w <= 0.0:
         return PfPhysicsState(weight=0.0)
+    loss_mode = str(getattr(args, "pf_loss_mode", "flow_relative") or "flow_relative").strip().lower()
+    if loss_mode not in ("absolute", "flow_relative"):
+        raise ValueError(f"--pf_loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
+    auto_scale_volt = bool(getattr(args, "pf_auto_scale_volt", False))
     s_base = float(getattr(args, "pf_s_base_kva", 5000.0))
     kv_base = float(getattr(args, "pf_kv_base", 12.47))
     z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
@@ -1838,7 +1927,9 @@ def _setup_pf_physics(
     dense_elems = int(n_nodes) * int(n_nodes)
     pf_debug_nan = _resolve_pf_debug_nan(args)
     print(
-        f"Power-balance physics: weight={w}, units=physical (V volts, Y Siemens, Huber on P/Q pu), "
+        f"Power-balance physics: weight={w}, mode={loss_mode}"
+        + (", auto_scale_volt=1 (physics term scaled to voltage MSE each batch)" if auto_scale_volt else "")
+        + f", units=physical (V volts, Y Siemens, Huber on P/Q pu), "
         f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
         f"huber_delta_kw={huber_delta_kw} ({_pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base):.4g} pu), "
@@ -1855,6 +1946,8 @@ def _setup_pf_physics(
     idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
     return PfPhysicsState(
         weight=w,
+        loss_mode=loss_mode,
+        auto_scale_volt=auto_scale_volt,
         s_base_kva=s_base,
         huber_delta_kw=huber_delta_kw,
         v_scale_volts=v_scale_t,
@@ -4175,6 +4268,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_std=reg_std_d,
                         reg_logits=reg_logits,
                         reg_class_values=reg_class_values_d,
+                        label_y_n=yb_n,
                     )
                     if loss_pf is not None:
                         if _pf_should_emit_debug(
@@ -4210,7 +4304,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                                 ),
                             )
                             pf_dbg_first_batch = False
-                        loss = loss + pf_state.weight * loss_pf
+                        pf_w = _pf_effective_weight(pf_state, loss_v=loss_v, loss_pf=loss_pf)
+                        loss = loss + pf_w * loss_pf
                         train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
@@ -4336,9 +4431,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             reg_std=reg_std_d,
                             reg_logits=reg_logits_v,
                             reg_class_values=reg_class_values_d,
+                            label_y_n=yb_n,
                         )
                         if lpf is not None:
-                            lt = lt + pf_state.weight * lpf
+                            pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf)
+                            lt = lt + pf_w * lpf
                             val_pf_sum += float(lpf.item()) * batch.num_graphs
                         if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                             lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
@@ -4743,6 +4840,19 @@ def parse_args() -> argparse.Namespace:
         "--pf_detach_controls",
         action="store_true",
         help="Stop gradients through predicted taps/cap states inside physics loss (stability).",
+    )
+    p.add_argument(
+        "--pf_loss_mode",
+        type=str,
+        default="flow_relative",
+        choices=("flow_relative", "absolute"),
+        help="Physics loss form: flow_relative=Huber(S(Y,V_label)-S(Y,V_pred)) (default); "
+        "absolute=Huber(P_inj-S(Y,V_pred)) legacy injection mismatch.",
+    )
+    p.add_argument(
+        "--pf_auto_scale_volt",
+        action="store_true",
+        help="Scale physics loss each batch to match voltage MSE magnitude (weight becomes unitless ratio).",
     )
     p.add_argument(
         "--pf_huber_delta_kw",
@@ -5150,6 +5260,7 @@ def main() -> None:
                     reg_std=reg_std_d,
                     reg_logits=None,
                     reg_class_values=reg_class_values_d,
+                    label_y_n=yb_n,
                 )
                 if loss_pf is not None:
                     if _pf_should_emit_debug(
@@ -5185,7 +5296,8 @@ def main() -> None:
                             ),
                         )
                         pf_dbg_first_batch = False
-                    loss = loss + pf_state.weight * loss_pf
+                    pf_w = _pf_effective_weight(pf_state, loss_v=loss_v, loss_pf=loss_pf)
+                    loss = loss + pf_w * loss_pf
                     train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                     loss_pv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
@@ -5254,9 +5366,11 @@ def main() -> None:
                         reg_std=reg_std_d,
                         reg_logits=None,
                         reg_class_values=reg_class_values_d,
+                        label_y_n=yb_n,
                     )
                     if lpf is not None:
-                        lt = lt + pf_state.weight * lpf
+                        pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf)
+                        lt = lt + pf_w * lpf
                         val_pf_sum += float(lpf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))

@@ -923,6 +923,8 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
 
     print(
         "\nBackprop: Huber on S_base-normalized P/Q residuals (pu). "
+        "Training default mode is flow_relative: Huber(S(Y,V_label)-S(Y,V_pred)) — "
+        "injection P_inj cancels; absolute legacy mode uses P_inj-Y@V_pred. "
         "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
         "(excludes regxfmr/190-/m/p/n interface buses)."
     )
