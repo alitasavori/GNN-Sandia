@@ -4686,9 +4686,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
             if pf_state.weight > 0:
-                _wt = f" pf_wt_effective={pf_state.weight:g}"
+                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+                _w_eff = float(pf_state.weight) * _sched
+                _wt = f" pf_wt_effective={_w_eff:g}"
                 if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
                     _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+                if _sched < 1.0 - 1e-12:
+                    _wt += f" (schedule×{_sched:.3g})"
                 _log += (
                     f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
                     f"{_wt}"
@@ -4730,7 +4734,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
-        if bad >= args.patience:
+        if not args.no_early_stop and bad >= args.patience:
             print(f"[da_gps chunk_parent] early stop at epoch {ep}", flush=True)
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
@@ -4876,6 +4880,11 @@ def parse_args() -> argparse.Namespace:
         "classes (rounded unique tap_pu per reg column, requires --per_device_reg_head). Caps use BCE.",
     )
     p.add_argument("--patience", type=int, default=30)
+    p.add_argument(
+        "--no_early_stop",
+        action="store_true",
+        help="Train for all --epochs; still track best checkpoint by --early_stop_on metric.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--train_frac", type=float, default=0.8)
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -5682,9 +5691,13 @@ def main() -> None:
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
             if pf_state.weight > 0:
-                _wt = f" pf_wt_effective={pf_state.weight:g}"
+                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+                _w_eff = float(pf_state.weight) * _sched
+                _wt = f" pf_wt_effective={_w_eff:g}"
                 if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
                     _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+                if _sched < 1.0 - 1e-12:
+                    _wt += f" (schedule×{_sched:.3g})"
                 _log += (
                     f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
                     f"{_wt}"
@@ -5719,7 +5732,7 @@ def main() -> None:
                 best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
-        if bad >= args.patience:
+        if not args.no_early_stop and bad >= args.patience:
             print(f"[da_gps] early stop at epoch {ep}", flush=True)
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
