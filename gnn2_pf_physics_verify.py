@@ -319,22 +319,7 @@ def load_snapshot_state(
         list_path = Path(pf_balance_node_list_csv)
         if not list_path.is_absolute():
             list_path = (data_root / list_path).resolve()
-        mask_t = pfmod._load_pf_balance_mask_from_explicit_list(list_path, ntl, n_nodes)
-        if exclude_interface_buses or hetero_y_neighbors_only:
-            class _PfRefineArgs:
-                pf_exclude_interface_buses = int(exclude_interface_buses)
-                pf_hetero_y_neighbors_only = int(hetero_y_neighbors_only)
-
-            mask_t = pfmod._apply_pf_balance_mask_refinement(
-                mask_t,
-                ntl,
-                data_root,
-                y_re_b,
-                y_im_b,
-                _PfRefineArgs(),
-                label="PF explicit balance",
-            )
-        mask = mask_t.numpy()
+        mask = pfmod._load_pf_balance_mask_from_explicit_list(list_path, ntl, n_nodes).numpy()
     else:
         dist_path = data_root / "electrical_distance_from_substation.csv"
         mask = np.zeros(n_nodes, dtype=bool)

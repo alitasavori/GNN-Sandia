@@ -940,7 +940,14 @@ def _load_pf_balance_mask_from_explicit_list(
         mask[int(li)] = True
 
     for _, row in df.iterrows():
-        # Prefer bus/node names over node_idx: chunk subgraphs reuse indices for different buses.
+        # Prefer exact phase node names (chunk-safe), then bus (all phases), then node_idx.
+        if "node" in id_cols and pd.notna(row.get("node")):
+            key = str(row["node"]).strip().lower()
+            if key in node_to_local:
+                _stamp_local(int(node_to_local[key]))
+            else:
+                n_unknown += 1
+            continue
         if "bus" in id_cols and pd.notna(row.get("bus")):
             bus = str(row["bus"]).strip().lower()
             hits = bus_to_nodes.get(bus, [])
@@ -949,13 +956,6 @@ def _load_pf_balance_mask_from_explicit_list(
                 continue
             for node in hits:
                 _stamp_local(int(node_to_local[node]))
-            continue
-        if "node" in id_cols and pd.notna(row.get("node")):
-            key = str(row["node"]).strip().lower()
-            if key in node_to_local:
-                _stamp_local(int(node_to_local[key]))
-            else:
-                n_unknown += 1
             continue
         if "node_idx" in id_cols and pd.notna(row.get("node_idx")):
             _stamp_local(int(row["node_idx"]))
@@ -1703,15 +1703,6 @@ def _setup_pf_physics(
                 explicit_csv = (pf_root / explicit_csv).resolve()
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
-        )
-        pf_mask = _apply_pf_balance_mask_refinement(
-            pf_mask,
-            node_to_local,
-            pf_root,
-            y_re,
-            y_im,
-            args,
-            label="PF explicit balance",
         )
         idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
         hetero_nodes = _load_pf_hetero_node_indices(pf_root, node_to_local)
@@ -4696,8 +4687,8 @@ def parse_args() -> argparse.Namespace:
         "--pf_balance_node_list_csv",
         type=str,
         default="",
-        help="Optional CSV of explicit balance nodes (columns: bus and/or node and/or node_idx; "
-        "bus preferred when present). Applies interface/hetero refinement like --pf_balance_nodes mv.",
+        help="Optional CSV of explicit balance nodes (columns: node and/or bus and/or node_idx; "
+        "node preferred when present). Used as-is; only slack/source nodes are excluded.",
     )
     p.add_argument(
         "--pf_s_base_kva",
