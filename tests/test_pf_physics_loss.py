@@ -1013,6 +1013,47 @@ class TestPfAutoScale:
         w = pfmod._pf_effective_weight(pf, loss_v=loss_v, loss_pf=loss_pf)
         assert float(w) == pytest.approx(0.5)
 
+
+class TestPfNodeCountWeightScale:
+    def test_sqrt_scale_1177_to_185_ref(self):
+        w, scale = pfmod._pf_node_count_weight_scale(
+            0.05, 1177, ref_nodes=185.0, alpha=0.5
+        )
+        assert scale == pytest.approx((185.0 / 1177.0) ** 0.5, rel=1e-6)
+        assert w == pytest.approx(0.05 * scale, rel=1e-6)
+        assert w == pytest.approx(0.0197, rel=0.02)
+
+    def test_disabled_when_ref_zero(self):
+        w, scale = pfmod._pf_node_count_weight_scale(0.05, 1177, ref_nodes=0.0, alpha=0.5)
+        assert w == pytest.approx(0.05)
+        assert scale == pytest.approx(1.0)
+
+    def test_linear_alpha_one(self):
+        w, scale = pfmod._pf_node_count_weight_scale(0.05, 1177, ref_nodes=185.0, alpha=1.0)
+        assert scale == pytest.approx(185.0 / 1177.0, rel=1e-6)
+
+
+class TestPfHardNodeTopk:
+    def test_topk_selects_worst_voltage_nodes(self):
+        base = torch.zeros(6, dtype=torch.bool)
+        base[[1, 2, 3, 4]] = True
+        pred = torch.zeros(2, 6, 2)
+        label = torch.zeros(2, 6, 2)
+        pred[0, 2] = torch.tensor([0.5, 0.0])
+        pred[1, 4] = torch.tensor([0.0, 0.8])
+        m = pfmod._pf_topk_voltage_error_mask(base, pred, label, k=2)
+        assert bool(m[0, 2].item())
+        assert int(m[0].sum().item()) == 2
+        assert bool(m[1, 4].item())
+
+    def test_topk_zero_returns_base_mask(self):
+        base = torch.tensor([False, True, True])
+        pred = torch.zeros(1, 3, 2)
+        label = torch.zeros(1, 3, 2)
+        m = pfmod._pf_topk_voltage_error_mask(base, pred, label, k=0)
+        assert m.shape == base.shape
+        assert bool(m[1].item()) and bool(m[2].item())
+
     def test_flow_relative_volt_scale_raises_magnitude(self, synthetic_truth):
         v_lbl = synthetic_truth["v_ri"]
         v_bad = v_lbl.clone()
@@ -1487,6 +1528,18 @@ class TestScaleRobustness:
         assert "node" in df.columns
         assert "node_idx" in df.columns
         assert len(df) == 1177
+
+    @pytest.mark.skipif(
+        not (REPO / "colab_pf_data/pf_balance_nodes_refined.csv").is_file(),
+        reason="no colab_pf_data/pf_balance_nodes_refined.csv",
+    )
+    def test_colab_refined_balance_list_has_expected_count(self):
+        import pandas as pd
+
+        list_csv = REPO / "colab_pf_data/pf_balance_nodes_refined.csv"
+        df = pd.read_csv(list_csv)
+        assert "node" in df.columns
+        assert len(df) == 185
 
     def test_colab_hetero_catalog_maps_on_chunk_subgraph(self):
         import pandas as pd

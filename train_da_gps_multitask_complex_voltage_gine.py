@@ -18,6 +18,9 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 - ``--pf_auto_scale_volt``: scale physics term each batch to match voltage MSE magnitude (interpretable weight).
   Ratio is capped by ``--pf_auto_scale_max`` (default 100) so tiny ``loss_pf`` cannot explode gradients.
   ``flow_relative`` loss is also scaled by ``1/mean(y_std^2)`` so physical pu Huber matches normalized voltage MSE.
+- ``--pf_weight_scale_ref_nodes`` / ``--pf_weight_scale_alpha``: scale ``--loss_power_balance_weight`` by
+  ``(N_ref/N_balance)^alpha`` when the balance mask has more nodes (default alpha=0.5).
+- ``--pf_hard_node_topk``: apply physics only on top-k balance nodes per graph by ``|V_pred-V_label|`` (0=off).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -280,6 +283,8 @@ class PfYbusCoo:
 @dataclass
 class PfPhysicsState:
     weight: float = 0.0
+    weight_base: float = 0.0
+    weight_node_scale: float = 1.0
     loss_mode: str = "flow_relative"
     auto_scale_volt: bool = False
     auto_scale_max: float = 100.0
@@ -291,6 +296,8 @@ class PfPhysicsState:
     y_coo: PfYbusCoo | None = None
     use_sparse_y: bool = True
     mask: torch.Tensor | None = None
+    n_balance_nodes: int = 0
+    hard_node_topk: int = 0
     reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
     cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
     detach_controls: bool = False
@@ -1441,7 +1448,11 @@ def nodal_power_balance_residual(
     s_base = max(float(s_base_kva), 1e-12)
     delta_pu = _pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base_kva)
     if node_mask is not None:
-        m = node_mask.to(device=pred_ri.device, dtype=torch.bool).view(1, -1)
+        m = node_mask.to(device=pred_ri.device, dtype=torch.bool)
+        if m.dim() == 1:
+            m = m.view(1, -1).expand_as(r_p)
+        elif m.shape != r_p.shape:
+            raise ValueError(f"node_mask shape {tuple(m.shape)} != residual shape {tuple(r_p.shape)}")
         r_p = r_p.masked_select(m)
         r_q = r_q.masked_select(m)
     return _pf_huber_mean_sq(r_p / s_base, delta=delta_pu) + _pf_huber_mean_sq(r_q / s_base, delta=delta_pu)
@@ -1643,13 +1654,24 @@ def _power_balance_loss_from_batch(
             v_scale_volts=pf.v_scale_volts,
         )
 
+    node_mask = pf.mask
+    if int(pf.hard_node_topk) > 0:
+        if label_ri is None:
+            raise ValueError("--pf_hard_node_topk requires flow_relative mode with label voltages")
+        node_mask = _pf_topk_voltage_error_mask(
+            pf.mask,
+            pred_ri,
+            label_ri,
+            k=int(pf.hard_node_topk),
+        )
+
     loss_pf = nodal_power_balance_residual(
         pred_ri,
         p_inj,
         q_inj,
         y_re,
         y_im,
-        pf.mask,
+        node_mask,
         pf.s_base_kva,
         v_scale_volts=pf.v_scale_volts,
         huber_delta_kw=pf.huber_delta_kw,
@@ -1713,6 +1735,49 @@ def _pf_flow_relative_volt_scale(y_std_ri: torch.Tensor) -> float:
     """Map physical pu Huber to normalized-voltage MSE scale (flow_relative only)."""
     pu_std = y_std_ri.float().reshape(-1).mean().clamp(min=1e-8)
     return float(1.0 / (pu_std * pu_std))
+
+
+def _pf_node_count_weight_scale(
+    base_weight: float,
+    n_balance_nodes: int,
+    *,
+    ref_nodes: float,
+    alpha: float,
+) -> tuple[float, float]:
+    """Scale physics weight by ``(N_ref / N_nodes)^alpha`` when ``ref_nodes > 0``."""
+    w_base = float(base_weight)
+    if w_base <= 0.0 or ref_nodes <= 0.0 or n_balance_nodes <= 0:
+        return w_base, 1.0
+    scale = (float(ref_nodes) / float(n_balance_nodes)) ** float(alpha)
+    return w_base * scale, scale
+
+
+def _pf_topk_voltage_error_mask(
+    base_mask: torch.Tensor,
+    pred_ri: torch.Tensor,
+    label_ri: torch.Tensor,
+    *,
+    k: int,
+) -> torch.Tensor:
+    """Per-graph top-k balance nodes by ``|V_pred - V_label|`` (batch ``(B,N,2)``)."""
+    k = int(k)
+    if k <= 0:
+        return base_mask
+    bsz, n_nodes, _ = pred_ri.shape
+    m_base = base_mask.to(device=pred_ri.device, dtype=torch.bool).view(-1)
+    if m_base.numel() != n_nodes:
+        raise ValueError(f"base_mask length {m_base.numel()} != n_nodes {n_nodes}")
+    err = (pred_ri.float() - label_ri.float()).norm(dim=-1)
+    err = err.masked_fill(~m_base.view(1, -1), float("-inf"))
+    out = torch.zeros(bsz, n_nodes, dtype=torch.bool, device=pred_ri.device)
+    for b in range(bsz):
+        n_valid = int(m_base.sum().item())
+        if n_valid <= 0:
+            continue
+        kb = min(k, n_valid)
+        _, idx = torch.topk(err[b], kb)
+        out[b, idx] = True
+    return out
 
 
 def _pf_effective_weight(
@@ -1780,9 +1845,10 @@ def _setup_pf_physics(
     node_feature_cols: list[str],
     node_pe_csv: Path | None = None,
 ) -> PfPhysicsState:
-    w = float(getattr(args, "loss_power_balance_weight", 0.0) or 0.0)
-    if w <= 0.0:
+    w_base = float(getattr(args, "loss_power_balance_weight", 0.0) or 0.0)
+    if w_base <= 0.0:
         return PfPhysicsState(weight=0.0)
+    hard_node_topk = int(getattr(args, "pf_hard_node_topk", 0) or 0)
     loss_mode = str(getattr(args, "pf_loss_mode", "flow_relative") or "flow_relative").strip().lower()
     if loss_mode not in ("absolute", "flow_relative"):
         raise ValueError(f"--pf_loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
@@ -1956,9 +2022,26 @@ def _setup_pf_physics(
     y_coo = _dense_y_to_coo(y_re, y_im).to(device) if use_sparse_y else None
     nnz = int(y_coo.row.numel()) if y_coo is not None else 0
     dense_elems = int(n_nodes) * int(n_nodes)
+    n_balance = int(pf_mask.sum().item())
+    ref_nodes = float(getattr(args, "pf_weight_scale_ref_nodes", 0.0) or 0.0)
+    alpha = float(getattr(args, "pf_weight_scale_alpha", 0.5) or 0.5)
+    w, node_scale = _pf_node_count_weight_scale(
+        w_base, n_balance, ref_nodes=ref_nodes, alpha=alpha
+    )
     pf_debug_nan = _resolve_pf_debug_nan(args)
+    wt_scale_msg = ""
+    if ref_nodes > 0.0 and abs(node_scale - 1.0) > 1e-12:
+        wt_scale_msg = (
+            f", pf_wt_base={w_base:g}, pf_wt_effective={w:g} "
+            f"(node_scale={node_scale:.4g} from N_ref={ref_nodes:g}, alpha={alpha:g}, N={n_balance})"
+        )
+    elif ref_nodes > 0.0:
+        wt_scale_msg = f", pf_wt_effective={w:g} (N={n_balance}, N_ref={ref_nodes:g}, no scale)"
+    hard_topk_msg = f", hard_node_topk={hard_node_topk}" if hard_node_topk > 0 else ""
     print(
-        f"Power-balance physics: weight={w}, mode={loss_mode}"
+        f"Power-balance physics: weight={w:g}, mode={loss_mode}"
+        + wt_scale_msg
+        + hard_topk_msg
         + (
             f", auto_scale_volt=1 (cap={auto_scale_max:.4g} on loss_v/loss_pf ratio)"
             if auto_scale_volt
@@ -1968,7 +2051,7 @@ def _setup_pf_physics(
         f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
         f"huber_delta_kw={huber_delta_kw} ({_pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base):.4g} pu), "
-        f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
+        f"masked_nodes={n_balance}/{n_nodes} (slack excluded), "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
         f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}, "
         f"sparse_y={use_sparse_y} (nnz={nnz} vs dense {dense_elems}, "
@@ -1981,6 +2064,8 @@ def _setup_pf_physics(
     idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
     return PfPhysicsState(
         weight=w,
+        weight_base=w_base,
+        weight_node_scale=node_scale,
         loss_mode=loss_mode,
         auto_scale_volt=auto_scale_volt,
         auto_scale_max=auto_scale_max,
@@ -1992,6 +2077,8 @@ def _setup_pf_physics(
         y_coo=y_coo,
         use_sparse_y=use_sparse_y,
         mask=pf_mask.to(device),
+        n_balance_nodes=n_balance,
+        hard_node_topk=hard_node_topk,
         reg_edges=reg_edges,
         cap_banks=cap_banks,
         detach_controls=detach,
@@ -4565,9 +4652,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
             if pf_state.weight > 0:
+                _wt = f" pf_wt_effective={pf_state.weight:g}"
+                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
                 _log += (
                     f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                    f" pf_wt={pf_state.weight:g}"
+                    f"{_wt}"
                 )
             _log += (
                 f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
@@ -4975,6 +5065,25 @@ def parse_args() -> argparse.Namespace:
         choices=(0, 1),
         help="1=print one-shot PF physics diagnostics on epoch-1 first train batch and when loss_pf is non-finite "
         "(also GNN2_PF_DEBUG_NAN=1).",
+    )
+    p.add_argument(
+        "--pf_weight_scale_ref_nodes",
+        type=float,
+        default=0.0,
+        help="When >0, scale --loss_power_balance_weight by (N_ref/N_balance)^alpha so larger node lists "
+        "do not dilute the physics term (default 0=off; smoke uses 185 with alpha 0.5).",
+    )
+    p.add_argument(
+        "--pf_weight_scale_alpha",
+        type=float,
+        default=0.5,
+        help="Exponent for --pf_weight_scale_ref_nodes scaling (0.5=sqrt, 1.0=linear).",
+    )
+    p.add_argument(
+        "--pf_hard_node_topk",
+        type=int,
+        default=0,
+        help="When >0, apply physics loss only on top-k balance nodes per graph by |V_pred-V_label| (0=off).",
     )
     return p.parse_args()
 
@@ -5519,9 +5628,12 @@ def main() -> None:
             if n_pv_aux > 0:
                 _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
             if pf_state.weight > 0:
+                _wt = f" pf_wt_effective={pf_state.weight:g}"
+                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
                 _log += (
                     f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                    f" pf_wt={pf_state.weight:g}"
+                    f"{_wt}"
                 )
             _log += (
                 f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "

@@ -50,31 +50,16 @@ def regenerate_hetero_mv_nodes(*, dailyagg: Path, colab_pf: Path) -> int:
 
 
 def regenerate_balance_nodes_explicit(*, dailyagg: Path, colab_pf: Path) -> int:
-    ntl, _n_nodes = _master_index(colab_pf)
-    hetero_nodes = pfmod._load_pf_hetero_node_indices(colab_pf, ntl)
-    if not hetero_nodes:
-        hetero_nodes = pfmod._load_pf_hetero_node_indices(dailyagg, ntl)
-    if not hetero_nodes:
-        raise RuntimeError("hetero_mv_nodes_load_transformer catalog missing or empty")
+    from build_pf_balance_nodes_explicit import build_expanded_balance_list, build_refined_balance_list
 
-    idx_to_node = {int(li): str(node) for node, li in ntl.items()}
-    rows: list[dict[str, str | int]] = []
-    for li in sorted(hetero_nodes):
-        node = idx_to_node[int(li)]
-        if pfmod._is_pf_slack_source_node(node):
-            continue
-        if pfmod._is_pf_interface_node(node):
-            continue
-        rows.append(
-            {
-                "node": node,
-                "bus": str(node).strip().lower().split(".")[0],
-                "node_idx": int(li),
-            }
-        )
+    expanded = build_expanded_balance_list(dailyagg)
     out = colab_pf / "pf_balance_nodes_explicit.csv"
-    pd.DataFrame(rows).to_csv(out, index=False)
-    return len(rows)
+    expanded.to_csv(out, index=False)
+    refined = build_refined_balance_list(dailyagg=dailyagg, pf_root=colab_pf, expanded=expanded)
+    refined_out = colab_pf / "pf_balance_nodes_refined.csv"
+    refined.to_csv(refined_out, index=False)
+    print(f"wrote {refined_out} ({len(refined)} refined balance nodes)")
+    return len(expanded)
 
 
 def main() -> None:
