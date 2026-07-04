@@ -1004,8 +1004,66 @@ class TestScaleRobustness:
                 dist_mask[int(ntl[node])] = True
 
         explicit_mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
-        assert int(explicit_mask.sum().item()) == 185
-        assert int(explicit_mask.sum().item()) < int(dist_mask.sum().item())
+        assert int(explicit_mask.sum().item()) == 187  # bus-first stamps all phases for listed buses
+        edges = DATA_DAILYAGG / "gnn_edges_phase_static.csv"
+        reg_cat = DATA_DAILYAGG / "Heterogenous GNN dataset" / "edges" / "hetero_mv_edge_catalog.csv"
+        reg_edges = pfmod._load_regulator_edges_for_pf(reg_cat, ntl, list(pfmod.TARGET_REG_COLS), None)
+        skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
+        y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(edges, ntl, n_nodes, skip_undirected=skip)
+
+        class _PfRefineArgs:
+            pf_exclude_interface_buses = 1
+            pf_hetero_y_neighbors_only = 1
+
+        refined = pfmod._apply_pf_balance_mask_refinement(
+            explicit_mask, ntl, DATA_DAILYAGG, y_re, y_im, _PfRefineArgs(), label="test"
+        )
+        assert int(refined.sum().item()) == 185
+        assert int(refined.sum().item()) < int(dist_mask.sum().item())
+
+    def test_explicit_balance_list_prefers_bus_over_node_idx(self, tmp_path):
+        import pandas as pd
+
+        ntl = {"l3141395.3": 100, "190-7361.1": 200}
+        list_csv = tmp_path / "pf_balance_nodes_explicit.csv"
+        pd.DataFrame({"node_idx": [200], "bus": ["l3141395"]}).to_csv(list_csv, index=False)
+        mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, 300)
+        assert bool(mask[100].item())
+        assert not bool(mask[200].item())
+
+    @pytest.mark.skipif(
+        not (REPO / "datasets_gnn2_from pc/loadtype_8500_dailyagg_full_mv/gnn_node_index_full_mv.csv").is_file(),
+        reason="no full_mv subgraph node index",
+    )
+    def test_explicit_balance_list_refined_excludes_interfaces_on_full_mv(self):
+        import pandas as pd
+
+        data = REPO / "datasets_gnn2_from pc/loadtype_8500_dailyagg_full_mv"
+        idx = pd.read_csv(data / "gnn_node_index_full_mv.csv")
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        list_csv = REPO / "colab_pf_data/pf_balance_nodes_explicit.csv"
+        raw = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
+        idx_to_node = {int(v): k for k, v in ntl.items()}
+        iface_raw = sum(
+            1 for li in range(n_nodes) if raw[li] and pfmod._is_pf_interface_node(idx_to_node.get(li, ""))
+        )
+        assert iface_raw == 0
+        edges = data / "gnn_edges_phase_static_full_mv.csv"
+        y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(edges, ntl, n_nodes, skip_undirected=set())
+
+        class _PfRefineArgs:
+            pf_exclude_interface_buses = 1
+            pf_hetero_y_neighbors_only = 1
+
+        refined = pfmod._apply_pf_balance_mask_refinement(
+            raw, ntl, DATA_DAILYAGG, y_re, y_im, _PfRefineArgs(), label="test"
+        )
+        assert int(refined.sum().item()) == 185
+        for li in range(n_nodes):
+            if not bool(refined[li].item()):
+                continue
+            assert not pfmod._is_pf_interface_node(idx_to_node[li])
 
     @pytest.mark.skipif(not NODES8500.is_file(), reason="no loadtype_8500 nodes CSV")
     def test_mv_mask_nonempty_excludes_slack(self):

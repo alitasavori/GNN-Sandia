@@ -320,6 +320,20 @@ def load_snapshot_state(
         if not list_path.is_absolute():
             list_path = (data_root / list_path).resolve()
         mask_t = pfmod._load_pf_balance_mask_from_explicit_list(list_path, ntl, n_nodes)
+        if exclude_interface_buses or hetero_y_neighbors_only:
+            class _PfRefineArgs:
+                pf_exclude_interface_buses = int(exclude_interface_buses)
+                pf_hetero_y_neighbors_only = int(hetero_y_neighbors_only)
+
+            mask_t = pfmod._apply_pf_balance_mask_refinement(
+                mask_t,
+                ntl,
+                data_root,
+                y_re_b,
+                y_im_b,
+                _PfRefineArgs(),
+                label="PF explicit balance",
+            )
         mask = mask_t.numpy()
     else:
         dist_path = data_root / "electrical_distance_from_substation.csv"
@@ -333,7 +347,7 @@ def load_snapshot_state(
                 mask[int(ntl[node])] = True
 
         if exclude_interface_buses or hetero_y_neighbors_only:
-            hetero_nodes = pfmod._load_pf_hetero_node_indices(data_root)
+            hetero_nodes = pfmod._load_pf_hetero_node_indices(data_root, ntl)
             if hetero_nodes:
                 mask_t = pfmod._refine_pf_mv_balance_mask(
                     torch.tensor(mask, dtype=torch.bool),

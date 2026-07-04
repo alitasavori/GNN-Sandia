@@ -318,14 +318,36 @@ def _is_pf_interface_node(node: str) -> bool:
     return len(bus) > 0 and bus[0] in _PF_INTERFACE_BUS_FIRST_CHARS
 
 
-def _load_pf_hetero_node_indices(data_root: Path) -> set[int]:
-    """Local node indices that appear in ``hetero_mv_nodes_load_transformer.csv``."""
+def _load_pf_hetero_node_indices(
+    data_root: Path,
+    node_to_local: dict[str, int] | None = None,
+) -> set[int]:
+    """Local indices for nodes in ``hetero_mv_nodes_load_transformer.csv``.
+
+    When ``node_to_local`` is set, map catalog ``node`` names to the training graph
+    (required for chunk/subgraph runs where global ``node_idx`` values differ).
+    """
     import pandas as pd
 
     het_path = data_root / _PF_HETERO_MV_NODES_REL
     if not het_path.is_file():
         return set()
-    df = pd.read_csv(het_path, usecols=["node_idx"])
+    if node_to_local is not None:
+        try:
+            df = pd.read_csv(het_path, usecols=["node", "node_idx"])
+        except ValueError:
+            df = pd.read_csv(het_path, usecols=["node_idx"])
+        else:
+            if "node" in df.columns:
+                out: set[int] = set()
+                for raw in df["node"].dropna().unique():
+                    key = str(raw).strip().lower()
+                    if key in node_to_local:
+                        out.add(int(node_to_local[key]))
+                if out:
+                    return out
+    else:
+        df = pd.read_csv(het_path, usecols=["node_idx"])
     return {int(v) for v in df["node_idx"].dropna().unique()}
 
 
@@ -367,6 +389,57 @@ def _refine_pf_mv_balance_mask(
         ):
             out[li] = False
     return out
+
+
+def _apply_pf_balance_mask_refinement(
+    mask: torch.Tensor,
+    node_to_local: dict[str, int],
+    pf_root: Path,
+    y_re: torch.Tensor,
+    y_im: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    label: str = "PF",
+) -> torch.Tensor:
+    """Drop interface / non-hetero balance nodes (shared by MV distance and explicit lists)."""
+    exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
+    het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
+    if not (exclude_iface or het_y_nbrs):
+        return mask
+    hetero_nodes = _load_pf_hetero_node_indices(pf_root, node_to_local)
+    effective_het_y = het_y_nbrs and bool(hetero_nodes)
+    if het_y_nbrs and not hetero_nodes:
+        print(
+            f"WARNING: {label} mask refinement (hetero_y_neighbors_only) skipped — "
+            f"hetero_mv_nodes_load_transformer.csv not found under {pf_root}; "
+            "applying interface exclusion only.",
+            flush=True,
+        )
+    if not exclude_iface and not effective_het_y:
+        return mask
+    n_before = int(mask.sum().item())
+    mask = _refine_pf_mv_balance_mask(
+        mask,
+        node_to_local,
+        hetero_nodes,
+        y_re,
+        y_im,
+        exclude_interface=exclude_iface,
+        hetero_y_neighbors_only=effective_het_y,
+    )
+    n_after = int(mask.sum().item())
+    if n_after < n_before:
+        print(
+            f"{label} mask refined: {n_before} -> {n_after} nodes "
+            f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={effective_het_y})",
+            flush=True,
+        )
+    if not bool(mask.any()):
+        raise ValueError(
+            f"{label} balance mask empty after refinement "
+            f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={effective_het_y})."
+        )
+    return mask
 
 
 def _build_ybus_from_edge_csv(
@@ -867,16 +940,7 @@ def _load_pf_balance_mask_from_explicit_list(
         mask[int(li)] = True
 
     for _, row in df.iterrows():
-        if "node_idx" in id_cols and pd.notna(row.get("node_idx")):
-            _stamp_local(int(row["node_idx"]))
-            continue
-        if "node" in id_cols and pd.notna(row.get("node")):
-            key = str(row["node"]).strip().lower()
-            if key in node_to_local:
-                _stamp_local(int(node_to_local[key]))
-            else:
-                n_unknown += 1
-            continue
+        # Prefer bus/node names over node_idx: chunk subgraphs reuse indices for different buses.
         if "bus" in id_cols and pd.notna(row.get("bus")):
             bus = str(row["bus"]).strip().lower()
             hits = bus_to_nodes.get(bus, [])
@@ -885,6 +949,16 @@ def _load_pf_balance_mask_from_explicit_list(
                 continue
             for node in hits:
                 _stamp_local(int(node_to_local[node]))
+            continue
+        if "node" in id_cols and pd.notna(row.get("node")):
+            key = str(row["node"]).strip().lower()
+            if key in node_to_local:
+                _stamp_local(int(node_to_local[key]))
+            else:
+                n_unknown += 1
+            continue
+        if "node_idx" in id_cols and pd.notna(row.get("node_idx")):
+            _stamp_local(int(row["node_idx"]))
 
     if n_slack_dropped:
         print(
@@ -1079,88 +1153,93 @@ def _pf_debug_nan_report(
         "--- Per-stage counts on masked nodes (current dtype) ---",
     ]
 
-    y_mean_ri = y_mean.view(1, n_nodes, 2)
-    y_std_ri = y_std.view(1, n_nodes, 2)
-    pred_ri = v_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
-    cap_on = torch.sigmoid(cap_logits.float())
-    tap_pu = _expected_reg_tap_pu(
-        reg_pred.float(),
-        reg_loss=reg_loss,
-        reg_mean=reg_mean,
-        reg_std=reg_std,
-        reg_logits=reg_logits,
-        reg_class_values=reg_class_values,
-    )
-    x_den = _denorm_node_features(batch.x.float(), batch, n_nodes, x_mean, x_std)
-    p_inj, q_inj = _assemble_pf_injections(
-        x_den,
-        pf.node_feature_cols,
-        batch=batch,
-        n_nodes=n_nodes,
-    )
-
-    v_re = pred_ri[..., 0]
-    v_im = pred_ri[..., 1]
-    vs = pf.v_scale_volts.to(device=v_re.device, dtype=v_re.dtype)
-    if vs.dim() == 1:
-        vs_b = vs.reshape(1, -1).expand(v_re.shape[0], -1)
-    else:
-        vs_b = vs.reshape(v_re.shape[0], -1)
-    v_phys_re = v_re * vs_b
-    v_phys_im = v_im * vs_b
-
-    use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
-    if use_sparse:
-        i_re, i_im = _compute_yv_current(
-            v_phys_re,
-            v_phys_im,
-            y_coo=pf.y_coo,
-            reg_edges=pf.reg_edges,
-            cap_banks=pf.cap_banks,
-            tap_pu=tap_pu,
-            cap_on=cap_on,
-            use_sparse_y=True,
-            s_base_kva=pf.s_base_kva,
-            v_scale_volts=pf.v_scale_volts,
+    mask = pf.mask if pf.mask is not None else torch.ones(n_nodes, dtype=torch.bool, device=v_n.device)
+    hub_p_val = hub_q_val = hub_tot_val = float("nan")
+    stage_lines: list[str] = []
+    with _pf_physics_fp32_ctx():
+        y_mean_ri = y_mean.view(1, n_nodes, 2).float()
+        y_std_ri = y_std.view(1, n_nodes, 2).float()
+        pred_ri = v_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
+        cap_on = torch.sigmoid(cap_logits.float())
+        tap_pu = _expected_reg_tap_pu(
+            reg_pred.float(),
+            reg_loss=reg_loss,
+            reg_mean=reg_mean,
+            reg_std=reg_std,
+            reg_logits=reg_logits,
+            reg_class_values=reg_class_values,
         )
-    else:
-        assert pf.Y_re_base is not None and pf.Y_im_base is not None
-        y_re, y_im = _ybus_with_predicted_controls(
-            pf.Y_re_base,
-            pf.Y_im_base,
-            reg_edges=pf.reg_edges,
-            cap_banks=pf.cap_banks,
-            tap_pu=tap_pu,
-            cap_on=cap_on,
-            s_base_kva=pf.s_base_kva,
-            batch_size=int(batch.num_graphs),
-            v_scale_volts=pf.v_scale_volts,
-        )
-        i_re, i_im = _compute_yv_current(
-            v_phys_re,
-            v_phys_im,
-            Y_re=y_re,
-            Y_im=y_im,
-            use_sparse_y=False,
+        x_den = _denorm_node_features(batch.x.float(), batch, n_nodes, x_mean.float(), x_std.float())
+        p_inj, q_inj = _assemble_pf_injections(
+            x_den,
+            pf.node_feature_cols,
+            batch=batch,
+            n_nodes=n_nodes,
         )
 
-    s_re = v_phys_re * i_re + v_phys_im * i_im
-    s_im = v_phys_im * i_re - v_phys_re * i_im
-    p_yv_kw = s_re / 1000.0
-    q_yv_kvar = s_im / 1000.0
-    r_p = p_inj - p_yv_kw
-    r_q = q_inj - q_yv_kvar
+        v_re = pred_ri[..., 0]
+        v_im = pred_ri[..., 1]
+        vs = pf.v_scale_volts.to(device=v_re.device, dtype=torch.float32)
+        if vs.dim() == 1:
+            vs_b = vs.reshape(1, -1).expand(v_re.shape[0], -1)
+        else:
+            vs_b = vs.reshape(v_re.shape[0], -1)
+        v_phys_re = v_re * vs_b
+        v_phys_im = v_im * vs_b
 
-    mask = pf.mask if pf.mask is not None else torch.ones(n_nodes, dtype=torch.bool, device=r_p.device)
-    m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
-    r_p_m = r_p.masked_select(m)
-    r_q_m = r_q.masked_select(m)
-    hub_p = _pf_huber_mean_sq(r_p_m, delta=pf.huber_delta_kw)
-    hub_q = _pf_huber_mean_sq(r_q_m, delta=pf.huber_delta_kw)
-    hub_tot = hub_p + hub_q
+        use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
+        if use_sparse:
+            i_re, i_im = _compute_yv_current(
+                v_phys_re,
+                v_phys_im,
+                y_coo=pf.y_coo,
+                reg_edges=pf.reg_edges,
+                cap_banks=pf.cap_banks,
+                tap_pu=tap_pu,
+                cap_on=cap_on,
+                use_sparse_y=True,
+                s_base_kva=pf.s_base_kva,
+                v_scale_volts=pf.v_scale_volts,
+            )
+        else:
+            assert pf.Y_re_base is not None and pf.Y_im_base is not None
+            y_re, y_im = _ybus_with_predicted_controls(
+                pf.Y_re_base,
+                pf.Y_im_base,
+                reg_edges=pf.reg_edges,
+                cap_banks=pf.cap_banks,
+                tap_pu=tap_pu,
+                cap_on=cap_on,
+                s_base_kva=pf.s_base_kva,
+                batch_size=int(batch.num_graphs),
+                v_scale_volts=pf.v_scale_volts,
+            )
+            i_re, i_im = _compute_yv_current(
+                v_phys_re,
+                v_phys_im,
+                Y_re=y_re,
+                Y_im=y_im,
+                use_sparse_y=False,
+            )
 
-    lines.extend(
-        [
+        s_re = v_phys_re * i_re + v_phys_im * i_im
+        s_im = v_phys_im * i_re - v_phys_re * i_im
+        p_yv_kw = s_re / 1000.0
+        q_yv_kvar = s_im / 1000.0
+        r_p = p_inj - p_yv_kw
+        r_q = q_inj - q_yv_kvar
+
+        m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
+        r_p_m = r_p.masked_select(m)
+        r_q_m = r_q.masked_select(m)
+        hub_p = _pf_huber_mean_sq(r_p_m, delta=pf.huber_delta_kw)
+        hub_q = _pf_huber_mean_sq(r_q_m, delta=pf.huber_delta_kw)
+        hub_tot = hub_p + hub_q
+        hub_p_val = float(hub_p.item())
+        hub_q_val = float(hub_q.item())
+        hub_tot_val = float(hub_tot.item())
+
+        stage_lines = [
             _pf_masked_finite_line("pred_ri (V pu)", pred_ri.norm(dim=-1), mask),
             _pf_masked_finite_line("V_phys (volts, |V|)", torch.sqrt(v_phys_re * v_phys_re + v_phys_im * v_phys_im), mask),
             _pf_masked_finite_line("p_inj_kw", p_inj, mask),
@@ -1171,13 +1250,14 @@ def _pf_debug_nan_report(
             _pf_masked_finite_line("q_yv_kvar (S_im/1e3)", q_yv_kvar, mask),
             _pf_masked_finite_line("r_p residual (kW)", r_p, mask),
             _pf_masked_finite_line("r_q residual (kvar)", r_q, mask),
-            f"  huber_p: {float(hub_p.item()):.6e}  finite={math.isfinite(float(hub_p.item()))}",
-            f"  huber_q: {float(hub_q.item()):.6e}  finite={math.isfinite(float(hub_q.item()))}",
-            f"  huber_total: {float(hub_tot.item()):.6e}  finite={math.isfinite(float(hub_tot.item()))}",
+            f"  huber_p: {hub_p_val:.6e}  finite={math.isfinite(hub_p_val)}",
+            f"  huber_q: {hub_q_val:.6e}  finite={math.isfinite(hub_q_val)}",
+            f"  huber_total: {hub_tot_val:.6e}  finite={math.isfinite(hub_tot_val)}",
             "--- Worst masked nodes by |r_p|+|r_q| ---",
             *_pf_top_residual_nodes(r_p, r_q, mask, k=5, idx_to_node=pf.idx_to_node or None),
         ]
-    )
+
+    lines.extend(stage_lines)
 
     if use_amp:
         with _pf_physics_fp32_ctx():
@@ -1203,6 +1283,12 @@ def _pf_debug_nan_report(
         lines.append(f"  loss_pf_fp32: {fp32_val:.6e}  finite={math.isfinite(fp32_val)}")
         if pf_finite and math.isfinite(fp32_val) and abs(fp32_val - pf_loss) < max(1e-3, 1e-6 * abs(fp32_val)):
             lines.append("  OK: physics loss runs in fp32 (matches replay).")
+        elif (
+            math.isfinite(hub_tot_val)
+            and math.isfinite(fp32_val)
+            and abs(fp32_val - hub_tot_val) < max(1e-3, 1e-6 * abs(fp32_val))
+        ):
+            lines.append("  OK: huber_total matches fp32 replay (debug aligned with loss).")
         elif pf_finite and not math.isfinite(fp32_val):
             lines.append("  NOTE: reported loss finite but fp32 replay non-finite (unexpected).")
         elif not pf_finite and math.isfinite(fp32_val):
@@ -1618,8 +1704,17 @@ def _setup_pf_physics(
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
         )
+        pf_mask = _apply_pf_balance_mask_refinement(
+            pf_mask,
+            node_to_local,
+            pf_root,
+            y_re,
+            y_im,
+            args,
+            label="PF explicit balance",
+        )
         idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
-        hetero_nodes = _load_pf_hetero_node_indices(pf_root)
+        hetero_nodes = _load_pf_hetero_node_indices(pf_root, node_to_local)
         _warn_pf_balance_node_issues(
             pf_mask,
             idx_to_node,
@@ -1651,34 +1746,16 @@ def _setup_pf_physics(
             mv_fallback_all_non_slack=mv_fallback,
             distance_tried=distance_tried,
         )
-        exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
-        het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
-        if balance_mode.strip().lower() == "mv" and (exclude_iface or het_y_nbrs):
-            hetero_nodes = _load_pf_hetero_node_indices(pf_root)
-            if hetero_nodes:
-                n_before = int(pf_mask.sum().item())
-                pf_mask = _refine_pf_mv_balance_mask(
-                    pf_mask,
-                    node_to_local,
-                    hetero_nodes,
-                    y_re,
-                    y_im,
-                    exclude_interface=exclude_iface,
-                    hetero_y_neighbors_only=het_y_nbrs,
-                )
-                n_after = int(pf_mask.sum().item())
-                if n_after < n_before:
-                    print(
-                        f"PF MV mask refined: {n_before} -> {n_after} nodes "
-                        f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={het_y_nbrs})",
-                        flush=True,
-                    )
-            elif exclude_iface or het_y_nbrs:
-                print(
-                    "WARNING: PF MV mask refinement requested but hetero_mv_nodes_load_transformer.csv "
-                    f"not found under {pf_root}; keeping distance-only mask.",
-                    flush=True,
-                )
+        if balance_mode.strip().lower() == "mv":
+            pf_mask = _apply_pf_balance_mask_refinement(
+                pf_mask,
+                node_to_local,
+                pf_root,
+                y_re,
+                y_im,
+                args,
+                label="PF MV",
+            )
 
     raw_cap = str(getattr(args, "pf_cap_nodes_csv", "") or "").strip()
     if raw_cap:
@@ -4619,8 +4696,8 @@ def parse_args() -> argparse.Namespace:
         "--pf_balance_node_list_csv",
         type=str,
         default="",
-        help="Optional CSV of explicit balance nodes (columns: node_idx and/or bus and/or node). "
-        "When set, builds the mask only from listed nodes and skips MV distance/hetero refinement.",
+        help="Optional CSV of explicit balance nodes (columns: bus and/or node and/or node_idx; "
+        "bus preferred when present). Applies interface/hetero refinement like --pf_balance_nodes mv.",
     )
     p.add_argument(
         "--pf_s_base_kva",
