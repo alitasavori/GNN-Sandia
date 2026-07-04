@@ -982,6 +982,31 @@ class TestScaleRobustness:
             assert pfmod._is_pf_interface_node(idx_to_node[li]) is False
             assert int(li) in hetero
 
+    @pytest.mark.skipif(
+        not (REPO / "colab_pf_data" / "pf_balance_nodes_explicit.csv").is_file(),
+        reason="no explicit PF balance node list CSV",
+    )
+    def test_explicit_balance_list_overrides_mask_count(self):
+        import pandas as pd
+
+        idx = pd.read_csv(REPO / "colab_pf_data" / "gnn_node_index_master.csv")
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        list_csv = REPO / "colab_pf_data" / "pf_balance_nodes_explicit.csv"
+
+        dist = pd.read_csv(REPO / "colab_pf_data" / "electrical_distance_from_substation.csv")
+        dist_mask = torch.zeros(n_nodes, dtype=torch.bool)
+        for _, row in dist.iterrows():
+            node = str(row["node"]).strip().lower()
+            if node not in ntl or pfmod._is_pf_slack_source_node(node):
+                continue
+            if float(row["electrical_distance_ohm"]) > 1e-9:
+                dist_mask[int(ntl[node])] = True
+
+        explicit_mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
+        assert int(explicit_mask.sum().item()) == 185
+        assert int(explicit_mask.sum().item()) < int(dist_mask.sum().item())
+
     @pytest.mark.skipif(not NODES8500.is_file(), reason="no loadtype_8500 nodes CSV")
     def test_mv_mask_nonempty_excludes_slack(self):
         import pandas as pd
@@ -1072,6 +1097,27 @@ class TestScaleRobustness:
                 "mv",
                 distance_tried=["nodes_csv=" + str(nodes_path)],
             )
+
+    def test_explicit_balance_list_mask_count(self, tmp_path):
+        import pandas as pd
+
+        list_csv = tmp_path / "pf_balance_nodes_explicit.csv"
+        pd.DataFrame({"node_idx": [1, 2, 3]}).to_csv(list_csv, index=False)
+        ntl = {f"n{i}.1": i for i in range(5)}
+        mask = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, 5)
+        assert int(mask.sum().item()) == 3
+
+    @pytest.mark.skipif(
+        not (REPO / "colab_pf_data/pf_balance_nodes_explicit.csv").is_file(),
+        reason="no colab_pf_data/pf_balance_nodes_explicit.csv",
+    )
+    def test_colab_explicit_balance_list_has_expected_count(self):
+        import pandas as pd
+
+        list_csv = REPO / "colab_pf_data/pf_balance_nodes_explicit.csv"
+        df = pd.read_csv(list_csv)
+        assert "node_idx" in df.columns
+        assert len(df) == 185
 
     def test_mv_mask_fallback_all_non_slack_warns(self, tmp_path, capsys):
         import pandas as pd

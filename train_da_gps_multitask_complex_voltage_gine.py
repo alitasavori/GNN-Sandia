@@ -822,6 +822,86 @@ def _load_pf_balance_mask(
     return mask
 
 
+def _load_pf_balance_mask_from_explicit_list(
+    list_csv: Path,
+    node_to_local: dict[str, int],
+    n_nodes: int,
+) -> torch.Tensor:
+    """Build balance mask from an explicit node list CSV (``node_idx``, ``bus``, and/or ``node``)."""
+    import pandas as pd
+
+    path = Path(list_csv).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"--pf_balance_node_list_csv not found: {path}")
+    df = pd.read_csv(path)
+    cols = {str(c).strip().lower() for c in df.columns}
+    id_cols = {"node_idx", "bus", "node"} & cols
+    if not id_cols:
+        raise ValueError(
+            f"--pf_balance_node_list_csv {path} must include at least one of: node_idx, bus, node "
+            f"(found columns: {list(df.columns)!r})"
+        )
+
+    bus_to_nodes: dict[str, list[str]] = {}
+    for node in node_to_local:
+        bus = str(node).strip().lower().split(".")[0]
+        bus_to_nodes.setdefault(bus, []).append(node)
+
+    mask = torch.zeros(n_nodes, dtype=torch.bool)
+    n_slack_dropped = 0
+    n_unknown = 0
+    idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
+
+    def _stamp_local(li: int) -> None:
+        nonlocal n_slack_dropped, n_unknown
+        if li < 0 or li >= n_nodes:
+            n_unknown += 1
+            return
+        node = idx_to_node.get(int(li), "")
+        if node and _is_pf_slack_source_node(node):
+            n_slack_dropped += 1
+            return
+        mask[int(li)] = True
+
+    for _, row in df.iterrows():
+        if "node_idx" in id_cols and pd.notna(row.get("node_idx")):
+            _stamp_local(int(row["node_idx"]))
+            continue
+        if "node" in id_cols and pd.notna(row.get("node")):
+            key = str(row["node"]).strip().lower()
+            if key in node_to_local:
+                _stamp_local(int(node_to_local[key]))
+            else:
+                n_unknown += 1
+            continue
+        if "bus" in id_cols and pd.notna(row.get("bus")):
+            bus = str(row["bus"]).strip().lower()
+            hits = bus_to_nodes.get(bus, [])
+            if not hits:
+                n_unknown += 1
+                continue
+            for node in hits:
+                _stamp_local(int(node_to_local[node]))
+
+    if n_slack_dropped:
+        print(
+            f"WARNING: PF explicit balance list dropped {n_slack_dropped} slack/source node(s) from {path.name}",
+            flush=True,
+        )
+    if n_unknown:
+        print(
+            f"WARNING: PF explicit balance list skipped {n_unknown} row(s) not mapped to training graph",
+            flush=True,
+        )
+    if not bool(mask.any()):
+        raise ValueError(
+            f"--pf_balance_node_list_csv {path} produced empty mask after slack exclusion "
+            "and node index mapping."
+        )
+    print(f"PF explicit balance nodes: {int(mask.sum().item())} from {path}", flush=True)
+    return mask
+
+
 def _pf_huber_mean_sq(r: torch.Tensor, *, delta: float) -> torch.Tensor:
     """Huber on residuals; ``delta`` is in the same units as ``r`` (kW/kvar)."""
     d = max(float(delta), 1e-12)
@@ -1212,57 +1292,66 @@ def _setup_pf_physics(
         edges_path, node_to_local, n_nodes, skip_undirected=skip_reg_pairs
     )
     balance_mode = str(args.pf_balance_nodes)
-    distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
-        nodes_csv=nodes_path,
-        node_pe_csv=node_pe_csv,
-        data_root=data_root,
-        repo=repo,
-        mode=balance_mode,
-        pf_preferred=pf_root,
-    )
-    use_distance_csv = (
-        distance_csv
-        if distance_csv is not None and distance_csv != nodes_path
-        else None
-    )
-    mv_fallback = balance_mode.strip().lower() == "mv" and distance_csv is None
-    pf_mask = _load_pf_balance_mask(
-        nodes_path,
-        node_to_local,
-        n_nodes,
-        balance_mode,
-        distance_csv=use_distance_csv,
-        mv_fallback_all_non_slack=mv_fallback,
-        distance_tried=distance_tried,
-    )
-    exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
-    het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
-    if balance_mode.strip().lower() == "mv" and (exclude_iface or het_y_nbrs):
-        hetero_nodes = _load_pf_hetero_node_indices(pf_root)
-        if hetero_nodes:
-            n_before = int(pf_mask.sum().item())
-            pf_mask = _refine_pf_mv_balance_mask(
-                pf_mask,
-                node_to_local,
-                hetero_nodes,
-                y_re,
-                y_im,
-                exclude_interface=exclude_iface,
-                hetero_y_neighbors_only=het_y_nbrs,
-            )
-            n_after = int(pf_mask.sum().item())
-            if n_after < n_before:
+    raw_explicit = str(getattr(args, "pf_balance_node_list_csv", "") or "").strip()
+    if raw_explicit:
+        explicit_csv = Path(raw_explicit)
+        if not explicit_csv.is_absolute():
+            explicit_csv = (pf_root / explicit_csv).resolve()
+        pf_mask = _load_pf_balance_mask_from_explicit_list(
+            explicit_csv, node_to_local, n_nodes
+        )
+    else:
+        distance_csv, distance_tried = _resolve_pf_electrical_distance_csv(
+            nodes_csv=nodes_path,
+            node_pe_csv=node_pe_csv,
+            data_root=data_root,
+            repo=repo,
+            mode=balance_mode,
+            pf_preferred=pf_root,
+        )
+        use_distance_csv = (
+            distance_csv
+            if distance_csv is not None and distance_csv != nodes_path
+            else None
+        )
+        mv_fallback = balance_mode.strip().lower() == "mv" and distance_csv is None
+        pf_mask = _load_pf_balance_mask(
+            nodes_path,
+            node_to_local,
+            n_nodes,
+            balance_mode,
+            distance_csv=use_distance_csv,
+            mv_fallback_all_non_slack=mv_fallback,
+            distance_tried=distance_tried,
+        )
+        exclude_iface = bool(getattr(args, "pf_exclude_interface_buses", True))
+        het_y_nbrs = bool(getattr(args, "pf_hetero_y_neighbors_only", True))
+        if balance_mode.strip().lower() == "mv" and (exclude_iface or het_y_nbrs):
+            hetero_nodes = _load_pf_hetero_node_indices(pf_root)
+            if hetero_nodes:
+                n_before = int(pf_mask.sum().item())
+                pf_mask = _refine_pf_mv_balance_mask(
+                    pf_mask,
+                    node_to_local,
+                    hetero_nodes,
+                    y_re,
+                    y_im,
+                    exclude_interface=exclude_iface,
+                    hetero_y_neighbors_only=het_y_nbrs,
+                )
+                n_after = int(pf_mask.sum().item())
+                if n_after < n_before:
+                    print(
+                        f"PF MV mask refined: {n_before} -> {n_after} nodes "
+                        f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={het_y_nbrs})",
+                        flush=True,
+                    )
+            elif exclude_iface or het_y_nbrs:
                 print(
-                    f"PF MV mask refined: {n_before} -> {n_after} nodes "
-                    f"(exclude_interface={exclude_iface}, hetero_y_neighbors_only={het_y_nbrs})",
+                    "WARNING: PF MV mask refinement requested but hetero_mv_nodes_load_transformer.csv "
+                    f"not found under {pf_root}; keeping distance-only mask.",
                     flush=True,
                 )
-        elif exclude_iface or het_y_nbrs:
-            print(
-                "WARNING: PF MV mask refinement requested but hetero_mv_nodes_load_transformer.csv "
-                f"not found under {pf_root}; keeping distance-only mask.",
-                flush=True,
-            )
 
     raw_cap = str(getattr(args, "pf_cap_nodes_csv", "") or "").strip()
     if raw_cap:
@@ -4062,6 +4151,13 @@ def parse_args() -> argparse.Namespace:
         default="mv",
         choices=("mv", "all"),
         help="Nodes included in power-balance residual: mv=electrical_distance>0 (from nodes CSV, else --node_pe_csv / PF_DATA_ROOT), all=every node.",
+    )
+    p.add_argument(
+        "--pf_balance_node_list_csv",
+        type=str,
+        default="",
+        help="Optional CSV of explicit balance nodes (columns: node_idx and/or bus and/or node). "
+        "When set, builds the mask only from listed nodes and skips MV distance/hetero refinement.",
     )
     p.add_argument(
         "--pf_s_base_kva",

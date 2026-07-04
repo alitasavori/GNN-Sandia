@@ -201,6 +201,7 @@ def load_snapshot_state(
     pf_bus_kv_base_csv: Path | None = None,
     exclude_interface_buses: bool = True,
     hetero_y_neighbors_only: bool = True,
+    pf_balance_node_list_csv: Path | None = None,
 ) -> SnapshotState:
     """Load one dailyagg snapshot into numpy arrays (label V, controls, feature injections)."""
     import pandas as pd
@@ -302,29 +303,36 @@ def load_snapshot_state(
     p_inj = p_pv - p_load
     q_inj = -q_pv - q_load
 
-    dist_path = data_root / "electrical_distance_from_substation.csv"
-    mask = np.zeros(n_nodes, dtype=bool)
-    dist = pd.read_csv(dist_path)
-    for _, row in dist.iterrows():
-        node = str(row["node"]).strip().lower()
-        if node not in ntl or pfmod._is_pf_slack_source_node(node):
-            continue
-        if float(row["electrical_distance_ohm"]) > 1e-9:
-            mask[int(ntl[node])] = True
+    if pf_balance_node_list_csv is not None:
+        list_path = Path(pf_balance_node_list_csv)
+        if not list_path.is_absolute():
+            list_path = (data_root / list_path).resolve()
+        mask_t = pfmod._load_pf_balance_mask_from_explicit_list(list_path, ntl, n_nodes)
+        mask = mask_t.numpy()
+    else:
+        dist_path = data_root / "electrical_distance_from_substation.csv"
+        mask = np.zeros(n_nodes, dtype=bool)
+        dist = pd.read_csv(dist_path)
+        for _, row in dist.iterrows():
+            node = str(row["node"]).strip().lower()
+            if node not in ntl or pfmod._is_pf_slack_source_node(node):
+                continue
+            if float(row["electrical_distance_ohm"]) > 1e-9:
+                mask[int(ntl[node])] = True
 
-    if exclude_interface_buses or hetero_y_neighbors_only:
-        hetero_nodes = pfmod._load_pf_hetero_node_indices(data_root)
-        if hetero_nodes:
-            mask_t = pfmod._refine_pf_mv_balance_mask(
-                torch.tensor(mask, dtype=torch.bool),
-                ntl,
-                hetero_nodes,
-                y_re_b,
-                y_im_b,
-                exclude_interface=exclude_interface_buses,
-                hetero_y_neighbors_only=hetero_y_neighbors_only,
-            )
-            mask = mask_t.numpy()
+        if exclude_interface_buses or hetero_y_neighbors_only:
+            hetero_nodes = pfmod._load_pf_hetero_node_indices(data_root)
+            if hetero_nodes:
+                mask_t = pfmod._refine_pf_mv_balance_mask(
+                    torch.tensor(mask, dtype=torch.bool),
+                    ntl,
+                    hetero_nodes,
+                    y_re_b,
+                    y_im_b,
+                    exclude_interface=exclude_interface_buses,
+                    hetero_y_neighbors_only=hetero_y_neighbors_only,
+                )
+                mask = mask_t.numpy()
 
     return SnapshotState(
         sample_id=int(sample_id),
