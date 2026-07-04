@@ -30,6 +30,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -286,6 +287,7 @@ class PfPhysicsState:
     cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
     detach_controls: bool = False
     node_feature_cols: list[str] = field(default_factory=list)
+    pf_debug_nan: bool = False
 
 
 def _undirected_node_pair(iu: int, iv: int) -> tuple[int, int]:
@@ -911,6 +913,256 @@ def _pf_huber_mean_sq(r: torch.Tensor, *, delta: float) -> torch.Tensor:
     return torch.where(abs_r <= d, quad, lin).mean()
 
 
+_PF_DEBUG_NAN_EMITTED = False
+
+
+def _resolve_pf_debug_nan(args: argparse.Namespace) -> bool:
+    if bool(int(getattr(args, "pf_debug_nan", 0) or 0)):
+        return True
+    env = str(os.environ.get("GNN2_PF_DEBUG_NAN", "")).strip().lower()
+    return env in ("1", "true", "yes", "on")
+
+
+def _pf_should_emit_debug(
+    pf: PfPhysicsState,
+    *,
+    epoch: int,
+    first_batch_of_epoch: bool,
+    loss_pf: torch.Tensor | None,
+) -> bool:
+    global _PF_DEBUG_NAN_EMITTED
+    if _PF_DEBUG_NAN_EMITTED or loss_pf is None:
+        return False
+    if not torch.isfinite(loss_pf).all():
+        return True
+    return bool(pf.pf_debug_nan and epoch == 1 and first_batch_of_epoch)
+
+
+def _pf_masked_finite_line(name: str, t: torch.Tensor, mask: torch.Tensor) -> str:
+    """One-line nan/inf/range summary for ``t`` shaped ``(B, N)`` on boolean ``mask`` ``(N,)``."""
+    m = mask.to(device=t.device, dtype=torch.bool).view(1, -1).expand_as(t)
+    sel = t.masked_select(m)
+    n = int(sel.numel())
+    if n == 0:
+        return f"  {name}: (no masked elements)"
+    nan_c = int(torch.isnan(sel).sum().item())
+    inf_c = int(torch.isinf(sel).sum().item())
+    fin = sel[torch.isfinite(sel)]
+    if fin.numel() == 0:
+        stats = "all non-finite"
+    else:
+        stats = (
+            f"min={float(fin.min()):.4e} max={float(fin.max()):.4e} "
+            f"mean={float(fin.mean()):.4e} std={float(fin.std(unbiased=False)):.4e}"
+        )
+    return f"  {name}: nan={nan_c} inf={inf_c} of {n} | {stats}"
+
+
+def _pf_top_residual_nodes(
+    r_p: torch.Tensor,
+    r_q: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    k: int = 5,
+) -> list[str]:
+    m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
+    score = (r_p.abs() + r_q.abs()).masked_fill(~m, -1.0)
+    flat = score.reshape(-1)
+    n_pick = min(int(k), int((flat >= 0).sum().item()))
+    if n_pick <= 0:
+        return ["  (no masked nodes)"]
+    vals, idx = torch.topk(flat, k=n_pick)
+    n_nodes = int(r_p.shape[-1])
+    lines: list[str] = []
+    for v, fi in zip(vals.tolist(), idx.tolist()):
+        b = int(fi // n_nodes)
+        ni = int(fi % n_nodes)
+        rp = float(r_p[b, ni].item())
+        rq = float(r_q[b, ni].item())
+        rp_s = "nan" if math.isnan(rp) else f"{rp:.4e}"
+        rq_s = "nan" if math.isnan(rq) else f"{rq:.4e}"
+        lines.append(
+            f"  node_idx={ni} batch={b} |r_p|+|r_q|={v:.4e}  r_p={rp_s} kW  r_q={rq_s} kvar"
+        )
+    return lines
+
+
+@torch.no_grad()
+def _pf_debug_nan_report(
+    *,
+    loss_pf: torch.Tensor,
+    v_n: torch.Tensor,
+    batch: Data,
+    n_nodes: int,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    pf: PfPhysicsState,
+    cap_logits: torch.Tensor,
+    reg_pred: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    reg_loss: str,
+    reg_mean: torch.Tensor | None,
+    reg_std: torch.Tensor | None,
+    reg_logits: list[torch.Tensor] | None,
+    reg_class_values: torch.Tensor | None,
+    use_amp: bool,
+    epoch: int,
+    batch_idx: int,
+    trigger: str,
+) -> None:
+    """Print one-shot diagnostics for physics loss NaN / first-batch smoke (Colab-friendly)."""
+    global _PF_DEBUG_NAN_EMITTED
+    _PF_DEBUG_NAN_EMITTED = True
+
+    amp_loss = float(loss_pf.detach().float().item())
+    amp_finite = math.isfinite(amp_loss)
+    lines = [
+        "",
+        f"=== PF physics debug ({trigger}; epoch {epoch} batch {batch_idx}) ===",
+        f"AMP (autocast) enabled: {use_amp}",
+        f"loss_pf (current dtype, in AMP ctx): {amp_loss:.6e}  finite={amp_finite}",
+        f"use_sparse_y: {bool(pf.use_sparse_y and pf.y_coo is not None)}",
+        f"huber_delta_kw: {pf.huber_delta_kw}",
+        f"detach_controls: {pf.detach_controls}",
+        f"masked balance nodes: {int(pf.mask.sum().item()) if pf.mask is not None else 0} / {n_nodes}",
+        f"batch graphs: {int(batch.num_graphs)}",
+        "--- Per-stage counts on masked nodes (current dtype) ---",
+    ]
+
+    y_mean_ri = y_mean.view(1, n_nodes, 2)
+    y_std_ri = y_std.view(1, n_nodes, 2)
+    pred_ri = v_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
+    cap_on = torch.sigmoid(cap_logits.float())
+    tap_pu = _expected_reg_tap_pu(
+        reg_pred.float(),
+        reg_loss=reg_loss,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        reg_logits=reg_logits,
+        reg_class_values=reg_class_values,
+    )
+    x_den = _denorm_node_features(batch.x.float(), batch, n_nodes, x_mean, x_std)
+    p_inj, q_inj = _assemble_pf_injections(
+        x_den,
+        pf.node_feature_cols,
+        batch=batch,
+        n_nodes=n_nodes,
+    )
+
+    v_re = pred_ri[..., 0]
+    v_im = pred_ri[..., 1]
+    vs = pf.v_scale_volts.to(device=v_re.device, dtype=v_re.dtype)
+    if vs.dim() == 1:
+        vs_b = vs.reshape(1, -1).expand(v_re.shape[0], -1)
+    else:
+        vs_b = vs.reshape(v_re.shape[0], -1)
+    v_phys_re = v_re * vs_b
+    v_phys_im = v_im * vs_b
+
+    use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
+    if use_sparse:
+        i_re, i_im = _compute_yv_current(
+            v_phys_re,
+            v_phys_im,
+            y_coo=pf.y_coo,
+            reg_edges=pf.reg_edges,
+            cap_banks=pf.cap_banks,
+            tap_pu=tap_pu,
+            cap_on=cap_on,
+            use_sparse_y=True,
+            s_base_kva=pf.s_base_kva,
+            v_scale_volts=pf.v_scale_volts,
+        )
+    else:
+        assert pf.Y_re_base is not None and pf.Y_im_base is not None
+        y_re, y_im = _ybus_with_predicted_controls(
+            pf.Y_re_base,
+            pf.Y_im_base,
+            reg_edges=pf.reg_edges,
+            cap_banks=pf.cap_banks,
+            tap_pu=tap_pu,
+            cap_on=cap_on,
+            s_base_kva=pf.s_base_kva,
+            batch_size=int(batch.num_graphs),
+            v_scale_volts=pf.v_scale_volts,
+        )
+        i_re, i_im = _compute_yv_current(
+            v_phys_re,
+            v_phys_im,
+            Y_re=y_re,
+            Y_im=y_im,
+            use_sparse_y=False,
+        )
+
+    s_re = v_phys_re * i_re + v_phys_im * i_im
+    s_im = v_phys_im * i_re - v_phys_re * i_im
+    p_yv_kw = s_re / 1000.0
+    q_yv_kvar = s_im / 1000.0
+    r_p = p_inj - p_yv_kw
+    r_q = q_inj - q_yv_kvar
+
+    mask = pf.mask if pf.mask is not None else torch.ones(n_nodes, dtype=torch.bool, device=r_p.device)
+    m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
+    r_p_m = r_p.masked_select(m)
+    r_q_m = r_q.masked_select(m)
+    hub_p = _pf_huber_mean_sq(r_p_m, delta=pf.huber_delta_kw)
+    hub_q = _pf_huber_mean_sq(r_q_m, delta=pf.huber_delta_kw)
+    hub_tot = hub_p + hub_q
+
+    lines.extend(
+        [
+            _pf_masked_finite_line("pred_ri (V pu)", pred_ri.norm(dim=-1), mask),
+            _pf_masked_finite_line("V_phys (volts, |V|)", torch.sqrt(v_phys_re * v_phys_re + v_phys_im * v_phys_im), mask),
+            _pf_masked_finite_line("p_inj_kw", p_inj, mask),
+            _pf_masked_finite_line("q_inj_kvar", q_inj, mask),
+            _pf_masked_finite_line("i_re (Y@V, A)", i_re, mask),
+            _pf_masked_finite_line("i_im (Y@V, A)", i_im, mask),
+            _pf_masked_finite_line("p_yv_kw (S_re/1e3)", p_yv_kw, mask),
+            _pf_masked_finite_line("q_yv_kvar (S_im/1e3)", q_yv_kvar, mask),
+            _pf_masked_finite_line("r_p residual (kW)", r_p, mask),
+            _pf_masked_finite_line("r_q residual (kvar)", r_q, mask),
+            f"  huber_p: {float(hub_p.item()):.6e}  finite={math.isfinite(float(hub_p.item()))}",
+            f"  huber_q: {float(hub_q.item()):.6e}  finite={math.isfinite(float(hub_q.item()))}",
+            f"  huber_total: {float(hub_tot.item()):.6e}  finite={math.isfinite(float(hub_tot.item()))}",
+            "--- Worst masked nodes by |r_p|+|r_q| ---",
+            *_pf_top_residual_nodes(r_p, r_q, mask, k=5),
+        ]
+    )
+
+    if use_amp:
+        with torch.cuda.amp.autocast(enabled=False):
+            loss_fp32 = _power_balance_loss_from_batch(
+                v_n.float(),
+                batch,
+                n_nodes=n_nodes,
+                y_mean=y_mean,
+                y_std=y_std,
+                pf=pf,
+                cap_logits=cap_logits.float(),
+                reg_pred=reg_pred.float(),
+                x_mean=x_mean,
+                x_std=x_std,
+                reg_loss=reg_loss,
+                reg_mean=reg_mean,
+                reg_std=reg_std,
+                reg_logits=reg_logits,
+                reg_class_values=reg_class_values,
+            )
+        fp32_val = float(loss_fp32.item())
+        lines.append("--- FP32 replay (autocast disabled) ---")
+        lines.append(f"  loss_pf_fp32: {fp32_val:.6e}  finite={math.isfinite(fp32_val)}")
+        if amp_finite and not math.isfinite(fp32_val):
+            lines.append("  NOTE: AMP loss finite but fp32 non-finite (unexpected).")
+        elif not amp_finite and math.isfinite(fp32_val):
+            lines.append("  LIKELY CAUSE: AMP/fp16 overflow in physics block; fp32 path is finite.")
+        elif not amp_finite and not math.isfinite(fp32_val):
+            lines.append("  LIKELY CAUSE: non-finite values in physics tensors (not only AMP).")
+
+    lines.append("=== end PF physics debug ===")
+    print("\n".join(lines), flush=True)
+
+
 def nodal_power_balance_residual(
     pred_ri: torch.Tensor,
     p_inj_kw: torch.Tensor,
@@ -1428,6 +1680,7 @@ def _setup_pf_physics(
     y_coo = _dense_y_to_coo(y_re, y_im).to(device) if use_sparse_y else None
     nnz = int(y_coo.row.numel()) if y_coo is not None else 0
     dense_elems = int(n_nodes) * int(n_nodes)
+    pf_debug_nan = _resolve_pf_debug_nan(args)
     print(
         f"Power-balance physics: weight={w}, units=physical (V volts, Y Siemens, kW Huber), "
         f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
@@ -1438,7 +1691,8 @@ def _setup_pf_physics(
         f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}, "
         f"sparse_y={use_sparse_y} (nnz={nnz} vs dense {dense_elems}, "
         f"~{100.0 * (1.0 - nnz / max(dense_elems, 1)):.2f}% zero skip)"
-        + (f", kv_cache={kv_cache_path}" if kv_cache_path else ""),
+        + (f", kv_cache={kv_cache_path}" if kv_cache_path else "")
+        + (", pf_debug_nan=1 (epoch-1 first train batch + any non-finite loss)" if pf_debug_nan else ""),
         flush=True,
     )
 
@@ -1456,6 +1710,7 @@ def _setup_pf_physics(
         cap_banks=cap_banks,
         detach_controls=detach,
         node_feature_cols=list(node_feature_cols),
+        pf_debug_nan=pf_debug_nan,
     )
 
 
@@ -3661,6 +3916,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         val_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
         val_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
         val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
+        pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
+        train_batch_idx = 0
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
@@ -3707,6 +3964,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             for batch in dl_tr:
                 batch = batch.to(device)
                 batch = _cast_batch_float_tensors(batch)
+                train_batch_idx += 1
                 yb = batch.y.view(batch.num_graphs, -1)
                 y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
                 y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
@@ -3743,6 +4001,39 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_class_values=reg_class_values_d,
                     )
                     if loss_pf is not None:
+                        if _pf_should_emit_debug(
+                            pf_state,
+                            epoch=ep,
+                            first_batch_of_epoch=pf_dbg_first_batch,
+                            loss_pf=loss_pf,
+                        ):
+                            _pf_debug_nan_report(
+                                loss_pf=loss_pf,
+                                v_n=v_n,
+                                batch=batch,
+                                n_nodes=n_nodes,
+                                y_mean=y_mean_d,
+                                y_std=y_std_d,
+                                pf=pf_state,
+                                cap_logits=c_log,
+                                reg_pred=r_p,
+                                x_mean=x_mean_d,
+                                x_std=x_std_d,
+                                reg_loss=reg_loss,
+                                reg_mean=reg_mean_d,
+                                reg_std=reg_std_d,
+                                reg_logits=reg_logits,
+                                reg_class_values=reg_class_values_d,
+                                use_amp=use_amp,
+                                epoch=ep,
+                                batch_idx=train_batch_idx,
+                                trigger=(
+                                    "non-finite loss_pf"
+                                    if not torch.isfinite(loss_pf).all()
+                                    else "pf_debug_nan epoch-1 first train batch"
+                                ),
+                            )
+                            pf_dbg_first_batch = False
                         loss = loss + pf_state.weight * loss_pf
                         train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
@@ -4322,6 +4613,14 @@ def parse_args() -> argparse.Namespace:
         choices=(0, 1),
         help="1=O(E) sparse edge-local Y@V for physics loss (default). 0=dense (B,N,N) debug path.",
     )
+    p.add_argument(
+        "--pf_debug_nan",
+        type=int,
+        default=0,
+        choices=(0, 1),
+        help="1=print one-shot PF physics diagnostics on epoch-1 first train batch and when loss_pf is non-finite "
+        "(also GNN2_PF_DEBUG_NAN=1).",
+    )
     return p.parse_args()
 
 
@@ -4642,9 +4941,12 @@ def main() -> None:
         val_cap_dim = torch.zeros(n_cap, dtype=torch.float64)
         val_reg_dim = torch.zeros(n_reg, dtype=torch.float64)
         val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
+        pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
+        train_batch_idx = 0
         for batch in dl_tr:
             batch = batch.to(device)
             batch = _cast_batch_float_tensors(batch)
+            train_batch_idx += 1
             yb = batch.y.view(batch.num_graphs, -1)
             y_cap = batch.y_cap.view(batch.num_graphs, -1)
             y_reg = batch.y_reg.view(batch.num_graphs, -1)
@@ -4674,6 +4976,39 @@ def main() -> None:
                     reg_class_values=reg_class_values_d,
                 )
                 if loss_pf is not None:
+                    if _pf_should_emit_debug(
+                        pf_state,
+                        epoch=ep,
+                        first_batch_of_epoch=pf_dbg_first_batch,
+                        loss_pf=loss_pf,
+                    ):
+                        _pf_debug_nan_report(
+                            loss_pf=loss_pf,
+                            v_n=v_n,
+                            batch=batch,
+                            n_nodes=n_nodes,
+                            y_mean=y_mean_d,
+                            y_std=y_std_d,
+                            pf=pf_state,
+                            cap_logits=c_log,
+                            reg_pred=r_p,
+                            x_mean=x_mean_d,
+                            x_std=x_std_d,
+                            reg_loss=reg_loss,
+                            reg_mean=reg_mean_d,
+                            reg_std=reg_std_d,
+                            reg_logits=None,
+                            reg_class_values=reg_class_values_d,
+                            use_amp=use_amp,
+                            epoch=ep,
+                            batch_idx=train_batch_idx,
+                            trigger=(
+                                "non-finite loss_pf"
+                                if not torch.isfinite(loss_pf).all()
+                                else "pf_debug_nan epoch-1 first train batch"
+                            ),
+                        )
+                        pf_dbg_first_batch = False
                     loss = loss + pf_state.weight * loss_pf
                     train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
