@@ -180,6 +180,18 @@ def resolve_verify_data_roots(
     repo = (repo or REPO).resolve()
     if pf_data_root is not None and pf_data_root.is_dir():
         return repo, pf_data_root.resolve()
+
+    from gnn2_pf_data_paths import candidate_pf_data_roots
+
+    snapshot_files = (
+        "gnn_edges_phase_static.csv",
+        "gnn_sample_meta.csv",
+        "gnn_node_index_master.csv",
+    )
+    for root in candidate_pf_data_roots(repo=repo, chunk_parent=chunk_parent):
+        if all((root / name).is_file() for name in snapshot_files):
+            return repo, root.resolve()
+
     from gnn2_pf_data_paths import resolve_pf_catalog_paths
 
     _, _, root = resolve_pf_catalog_paths(

@@ -1296,7 +1296,13 @@ def _setup_pf_physics(
     if raw_explicit:
         explicit_csv = Path(raw_explicit)
         if not explicit_csv.is_absolute():
-            explicit_csv = (pf_root / explicit_csv).resolve()
+            for base in (pf_root, repo):
+                candidate = (base / explicit_csv).resolve()
+                if candidate.is_file():
+                    explicit_csv = candidate
+                    break
+            else:
+                explicit_csv = (pf_root / explicit_csv).resolve()
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
         )
