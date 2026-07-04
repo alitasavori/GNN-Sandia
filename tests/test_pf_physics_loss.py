@@ -1056,6 +1056,118 @@ class TestPfWeightSchedule:
         assert pfmod._pf_effective_weight(pf, loss_v=lv, loss_pf=lpf, epoch=3) == pytest.approx(0.025)
         assert pfmod._pf_effective_weight(pf, loss_v=lv, loss_pf=lpf, epoch=4) == pytest.approx(0.05)
 
+    def test_curriculum_matches_aux_lambda_scale(self):
+        for warmup, ramp in ((0, 0), (3, 2), (5, 5)):
+            pf = self._pf(warmup=warmup, ramp=ramp)
+            for ep in range(1, 12):
+                assert pfmod._pf_weight_schedule_multiplier(pf, epoch=ep) == pytest.approx(
+                    pfmod._curriculum_lambda_scale(ep, warmup, ramp)
+                )
+
+    def test_pf_loss_skipped_during_warmup(self, synthetic_truth):
+        pf = pfmod.PfPhysicsState(
+            weight=0.05,
+            weight_warmup_epochs=3,
+            weight_ramp_epochs=2,
+            Y_re_base=synthetic_truth["y_re_b"],
+            Y_im_base=synthetic_truth["y_im_b"],
+            v_scale_volts=synthetic_truth["v_scale"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            node_feature_cols=NODE_FEATURE_COLS,
+            mask=torch.ones(N_NODES, dtype=torch.bool),
+        )
+        batch = _make_synthetic_batch(synthetic_truth["x_denorm"])
+        v_n = synthetic_truth["v_ri"].reshape(-1)
+        y_mean = torch.zeros(N_NODES * 2)
+        y_std = torch.ones(N_NODES * 2)
+        x_mean = torch.zeros(4)
+        x_std = torch.ones(4)
+        assert (
+            pfmod._pf_loss_if_enabled(
+                pf,
+                v_n,
+                batch,
+                n_nodes=N_NODES,
+                y_mean=y_mean,
+                y_std=y_std,
+                x_mean=x_mean,
+                x_std=x_std,
+                cap_logits=torch.zeros(1, 1),
+                reg_pred=synthetic_truth["tap"],
+                reg_loss="mse",
+                reg_mean=None,
+                reg_std=None,
+                epoch=2,
+            )
+            is None
+        )
+
+
+class TestPfLabelControls:
+    def test_label_controls_use_truth_y_at_perturbed_v(self, synthetic_truth):
+        """Wrong predicted tap inflates flow_relative loss; label controls keep truth Y."""
+        pf_pred = pfmod.PfPhysicsState(
+            weight=1.0,
+            use_label_controls=False,
+            loss_mode="flow_relative",
+            Y_re_base=synthetic_truth["y_re_b"],
+            Y_im_base=synthetic_truth["y_im_b"],
+            v_scale_volts=synthetic_truth["v_scale"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            detach_controls=True,
+            node_feature_cols=NODE_FEATURE_COLS,
+            mask=torch.ones(N_NODES, dtype=torch.bool),
+        )
+        pf_lbl = pfmod.PfPhysicsState(
+            weight=1.0,
+            use_label_controls=True,
+            loss_mode="flow_relative",
+            Y_re_base=synthetic_truth["y_re_b"],
+            Y_im_base=synthetic_truth["y_im_b"],
+            v_scale_volts=synthetic_truth["v_scale"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            detach_controls=True,
+            node_feature_cols=NODE_FEATURE_COLS,
+            mask=torch.ones(N_NODES, dtype=torch.bool),
+        )
+        bad_tap = torch.tensor([[0.95]], dtype=torch.float32)
+        good_tap = synthetic_truth["tap"]
+        cap_logits = torch.full((1, 1), -10.0)
+        y_cap = synthetic_truth["cap_on"]
+        v_lbl = synthetic_truth["v_ri"]
+        v_bad = v_lbl.clone()
+        v_bad[:, 0] += 0.05
+        v_n = v_bad.reshape(-1)
+        y_mean = torch.zeros(N_NODES * 2)
+        y_std = torch.ones(N_NODES * 2)
+        x_mean = torch.zeros(4)
+        x_std = torch.ones(4)
+        batch = _make_synthetic_batch(synthetic_truth["x_denorm"])
+        yb_n = (v_lbl.reshape(-1) - y_mean) / y_std
+        kwargs = dict(
+            n_nodes=N_NODES,
+            y_mean=y_mean,
+            y_std=y_std,
+            cap_logits=cap_logits,
+            reg_pred=bad_tap,
+            x_mean=x_mean,
+            x_std=x_std,
+            reg_loss="mse",
+            reg_mean=None,
+            reg_std=None,
+            label_y_n=yb_n,
+        )
+        loss_bad = pfmod._power_balance_loss_from_batch(v_n, batch, pf=pf_pred, **kwargs)
+        loss_lbl = pfmod._power_balance_loss_from_batch(
+            v_n, batch, pf=pf_lbl, y_cap_label=y_cap, y_reg_label=good_tap, **kwargs
+        )
+        assert float(loss_bad.item()) > 1e-4
+        assert float(loss_lbl.item()) > 1e-4
+        assert float(loss_bad.item()) > float(loss_lbl.item()) * 1.5
+
 
 class TestPfHardNodeTopk:
     def test_topk_selects_worst_voltage_nodes(self):

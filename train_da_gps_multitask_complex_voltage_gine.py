@@ -26,7 +26,9 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
-  (``--pf_detach_controls`` optionally stops gradients through controls). Caps are **not** added to ``Q_inj``.
+  (``--pf_detach_controls`` optionally stops gradients through controls). By default
+  ``--pf_use_label_controls`` stamps Y with ground-truth cap/reg targets (not model predictions).
+  Caps are **not** added to ``Q_inj``.
 - ``P_inj``/``Q_inj`` use **known** denormalized node features only (OpenDSS convention:
   ``P_inj = P_pv - P_load``, ``Q_inj = -Q_pv - Q_load``). Meta-aux PV predictions are supervised separately and
   are **not** used in the physics residual. Missing catalog/mapping/normalization → error.
@@ -305,6 +307,7 @@ class PfPhysicsState:
     reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
     cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
     detach_controls: bool = False
+    use_label_controls: bool = True
     node_feature_cols: list[str] = field(default_factory=list)
     pf_debug_nan: bool = False
     idx_to_node: dict[int, str] = field(default_factory=dict)
@@ -1462,6 +1465,22 @@ def nodal_power_balance_residual(
     return _pf_huber_mean_sq(r_p / s_base, delta=delta_pu) + _pf_huber_mean_sq(r_q / s_base, delta=delta_pu)
 
 
+def _curriculum_lambda_scale(epoch_1based: int, warmup_epochs: int, ramp_epochs: int) -> float:
+    """Aux-style epoch curriculum multiplier in [0, 1] (epochs are 1-based)."""
+    warmup_epochs = max(int(warmup_epochs), 0)
+    ramp_epochs = max(int(ramp_epochs), 0)
+    if warmup_epochs <= 0 and ramp_epochs <= 0:
+        return 1.0
+    if int(epoch_1based) <= warmup_epochs:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    t = int(epoch_1based) - warmup_epochs
+    if t > ramp_epochs:
+        return 1.0
+    return float(t) / float(ramp_epochs)
+
+
 def _expected_reg_tap_pu(
     reg_pred: torch.Tensor,
     *,
@@ -1485,6 +1504,50 @@ def _expected_reg_tap_pu(
     if reg_mean is not None and reg_std is not None:
         return reg_pred.float() * reg_std.view(1, -1) + reg_mean.view(1, -1)
     return reg_pred.float()
+
+
+def _pf_ybus_controls(
+    *,
+    cap_logits: torch.Tensor,
+    reg_pred: torch.Tensor,
+    y_cap_label: torch.Tensor | None,
+    y_reg_label: torch.Tensor | None,
+    pf: PfPhysicsState,
+    reg_loss: str,
+    reg_mean: torch.Tensor | None,
+    reg_std: torch.Tensor | None,
+    reg_logits: list[torch.Tensor] | None,
+    reg_class_values: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tap/cap fractions for Y-bus stamping (ground-truth controls when enabled)."""
+    if pf.use_label_controls and y_cap_label is not None and y_reg_label is not None:
+        cap_on = y_cap_label.float()
+        if reg_loss == "ce":
+            if reg_class_values is None:
+                raise ValueError("pf_use_label_controls with reg_loss=ce requires reg_class_values")
+            _, tap_pu = _reg_indices_to_tap_pu(
+                y_reg_label.long(),
+                y_reg_label.long(),
+                reg_class_values,
+            )
+        elif reg_mean is not None and reg_std is not None:
+            tap_pu = y_reg_label.float() * reg_std.view(1, -1) + reg_mean.view(1, -1)
+        else:
+            tap_pu = y_reg_label.float()
+    else:
+        cap_on = torch.sigmoid(cap_logits.float())
+        tap_pu = _expected_reg_tap_pu(
+            reg_pred,
+            reg_loss=reg_loss,
+            reg_mean=reg_mean,
+            reg_std=reg_std,
+            reg_logits=reg_logits,
+            reg_class_values=reg_class_values,
+        )
+    if pf.detach_controls:
+        cap_on = cap_on.detach()
+        tap_pu = tap_pu.detach()
+    return cap_on, tap_pu
 
 
 def _stamp_reg_branch_ybus(
@@ -1604,6 +1667,8 @@ def _power_balance_loss_from_batch(
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_values: torch.Tensor | None = None,
     label_y_n: torch.Tensor | None = None,
+    y_cap_label: torch.Tensor | None = None,
+    y_reg_label: torch.Tensor | None = None,
 ) -> torch.Tensor:
     y_mean_ri = y_mean.view(1, n_nodes, 2).float()
     y_std_ri = y_std.view(1, n_nodes, 2).float()
@@ -1615,19 +1680,18 @@ def _power_balance_loss_from_batch(
     if x_mean is None or x_std is None:
         raise ValueError("Power-balance loss requires x_mean and x_std for node-feature denormalization.")
 
-    cap_on = torch.sigmoid(cap_logits.float())
-    if pf.detach_controls:
-        cap_on = cap_on.detach()
-    tap_pu = _expected_reg_tap_pu(
-        reg_pred,
+    cap_on, tap_pu = _pf_ybus_controls(
+        cap_logits=cap_logits,
+        reg_pred=reg_pred,
+        y_cap_label=y_cap_label,
+        y_reg_label=y_reg_label,
+        pf=pf,
         reg_loss=reg_loss,
         reg_mean=reg_mean,
         reg_std=reg_std,
         reg_logits=reg_logits,
         reg_class_values=reg_class_values,
     )
-    if pf.detach_controls:
-        tap_pu = tap_pu.detach()
     x_den = _denorm_node_features(batch.x, batch, n_nodes, x_mean.float(), x_std.float())
     p_inj, q_inj = _assemble_pf_injections(
         x_den,
@@ -1711,8 +1775,13 @@ def _pf_loss_if_enabled(
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_values: torch.Tensor | None = None,
     label_y_n: torch.Tensor | None = None,
+    y_cap_label: torch.Tensor | None = None,
+    y_reg_label: torch.Tensor | None = None,
+    epoch: int | None = None,
 ) -> torch.Tensor | None:
     if pf.weight <= 0.0 or pf.Y_re_base is None:
+        return None
+    if epoch is not None and _pf_weight_schedule_multiplier(pf, epoch=int(epoch)) <= 0.0:
         return None
     with _pf_physics_fp32_ctx():
         return _power_balance_loss_from_batch(
@@ -1732,6 +1801,8 @@ def _pf_loss_if_enabled(
             reg_logits=reg_logits,
             reg_class_values=reg_class_values,
             label_y_n=label_y_n,
+            y_cap_label=y_cap_label,
+            y_reg_label=y_reg_label,
         )
 
 
@@ -1786,15 +1857,7 @@ def _pf_topk_voltage_error_mask(
 
 def _pf_weight_schedule_multiplier(pf: PfPhysicsState, *, epoch: int) -> float:
     """Curriculum multiplier in [0, 1]: zero during warmup, linear ramp, then 1."""
-    warmup = max(int(pf.weight_warmup_epochs), 0)
-    ramp = max(int(pf.weight_ramp_epochs), 0)
-    ep = int(epoch)
-    if warmup > 0 and ep <= warmup:
-        return 0.0
-    if ramp <= 0:
-        return 1.0
-    progress = ep - warmup
-    return min(1.0, max(0.0, float(progress) / float(ramp)))
+    return _curriculum_lambda_scale(int(epoch), pf.weight_warmup_epochs, pf.weight_ramp_epochs)
 
 
 def _pf_effective_weight(
@@ -1880,6 +1943,7 @@ def _setup_pf_physics(
     kv_base = float(getattr(args, "pf_kv_base", 12.47))
     z_base = (kv_base * 1000.0) ** 2 / (s_base * 1000.0)
     detach = bool(getattr(args, "pf_detach_controls", False))
+    use_label_controls = bool(getattr(args, "pf_use_label_controls", True))
     huber_delta_kw = float(getattr(args, "pf_huber_delta_kw", 10.0) or 10.0)
 
     repo = Path(__file__).resolve().parent
@@ -2080,6 +2144,7 @@ def _setup_pf_physics(
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
         f"huber_delta_kw={huber_delta_kw} ({_pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base):.4g} pu), "
         f"masked_nodes={n_balance}/{n_nodes} (slack excluded), "
+        f"label_controls={int(use_label_controls)}, detach_controls={int(detach)}, "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
         f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}, "
         f"sparse_y={use_sparse_y} (nnz={nnz} vs dense {dense_elems}, "
@@ -2112,6 +2177,7 @@ def _setup_pf_physics(
         reg_edges=reg_edges,
         cap_banks=cap_banks,
         detach_controls=detach,
+        use_label_controls=use_label_controls,
         node_feature_cols=list(node_feature_cols),
         pf_debug_nan=pf_debug_nan,
         idx_to_node=idx_to_node,
@@ -4431,6 +4497,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_logits=reg_logits,
                         reg_class_values=reg_class_values_d,
                         label_y_n=yb_n,
+                        y_cap_label=y_cap_b,
+                        y_reg_label=y_reg_b,
+                        epoch=ep,
                     )
                     if loss_pf is not None:
                         if _pf_should_emit_debug(
@@ -5042,6 +5111,13 @@ def parse_args() -> argparse.Namespace:
         help="Stop gradients through predicted taps/cap states inside physics loss (stability).",
     )
     p.add_argument(
+        "--pf_use_label_controls",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stamp Y-bus with ground-truth cap/reg targets for physics (default: on). "
+        "Use --no-pf_use_label_controls for model-predicted controls.",
+    )
+    p.add_argument(
         "--pf_loss_mode",
         type=str,
         default="flow_relative",
@@ -5501,6 +5577,9 @@ def main() -> None:
                     reg_logits=None,
                     reg_class_values=reg_class_values_d,
                     label_y_n=yb_n,
+                    y_cap_label=y_cap,
+                    y_reg_label=y_reg,
+                    epoch=ep,
                 )
                 if loss_pf is not None:
                     if _pf_should_emit_debug(
@@ -5609,6 +5688,9 @@ def main() -> None:
                         reg_logits=None,
                         reg_class_values=reg_class_values_d,
                         label_y_n=yb_n,
+                        y_cap_label=y_cap_b,
+                        y_reg_label=y_reg_b,
+                        epoch=ep,
                     )
                     if lpf is not None:
                         pf_w = _pf_effective_weight(
