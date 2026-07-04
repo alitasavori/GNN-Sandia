@@ -924,8 +924,8 @@ class TestScaleRobustness:
                 huber_delta_kw=10.0,
             ).item()
         )
-        # Raw kW MSE at truth is huge on this feeder; Huber kW must stay trainable-scale.
-        assert res_huber < 500.0, f"huber loss at truth too large: {res_huber:.4e}"
+        # Raw kW Huber at truth is huge on this feeder; pu-scaled Huber must stay trainable-scale.
+        assert res_huber < 1.0, f"huber loss at truth too large: {res_huber:.4e}"
 
     def test_batch_size_gt_one(self, synthetic_truth):
         res = float(_run_impl_residual(synthetic_truth, batch_size=2).item())
@@ -1159,8 +1159,32 @@ class TestScaleRobustness:
 
         list_csv = REPO / "colab_pf_data/pf_balance_nodes_explicit.csv"
         df = pd.read_csv(list_csv)
+        assert "node" in df.columns
         assert "node_idx" in df.columns
         assert len(df) == 185
+
+    def test_colab_hetero_catalog_maps_on_chunk_subgraph(self):
+        import pandas as pd
+
+        het_path = REPO / "colab_pf_data" / "Heterogenous GNN dataset" / "nodes" / "hetero_mv_nodes_load_transformer.csv"
+        chunk_idx = (
+            REPO
+            / "datasets_gnn2_from pc/original_8500_unbalanced/run_001_scen_0000_0049_seed_20360133/gnn_node_index_master.csv"
+        )
+        if not het_path.is_file() or not chunk_idx.is_file():
+            pytest.skip("no colab hetero catalog or chunk node index")
+        het = pd.read_csv(het_path)
+        assert "node" in het.columns, "colab hetero must include node names for chunk-safe mapping"
+        idx = pd.read_csv(chunk_idx)
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        het_root = REPO / "colab_pf_data"
+        hetero = pfmod._load_pf_hetero_node_indices(het_root, ntl)
+        explicit_mask = pfmod._load_pf_balance_mask_from_explicit_list(
+            REPO / "colab_pf_data/pf_balance_nodes_explicit.csv", ntl, n_nodes
+        )
+        bad = sum(1 for li in range(n_nodes) if explicit_mask[li] and int(li) not in hetero)
+        assert bad == 0, f"{bad} balance nodes not in hetero on chunk subgraph"
 
     def test_mv_mask_fallback_all_non_slack_warns(self, tmp_path, capsys):
         import pandas as pd
