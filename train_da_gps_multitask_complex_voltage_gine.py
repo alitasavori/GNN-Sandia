@@ -3635,6 +3635,27 @@ def _save_periodic_training_checkpoint(
     tmp.replace(path)
 
 
+
+def _chunk_dirs_from_subdir_glob(chunk_parent: Path, glob_pat: str) -> list[Path]:
+    """Resolve chunk folders: fnmatch pattern or comma-separated exact names."""
+    glob_pat = str(glob_pat).strip()
+    if "," in glob_pat:
+        allowed = {s.strip() for s in glob_pat.split(",") if s.strip()}
+        chunk_dirs = sorted(
+            [p for p in chunk_parent.iterdir() if p.is_dir() and p.name in allowed],
+            key=lambda p: p.name,
+        )
+        missing = allowed - {p.name for p in chunk_dirs}
+        if missing:
+            raise FileNotFoundError(
+                f"--chunk_subdir_glob comma-list missing under {chunk_parent}: {sorted(missing)}"
+            )
+        return chunk_dirs
+    return sorted(
+        [p for p in chunk_parent.iterdir() if p.is_dir() and fnmatch.fnmatch(p.name, glob_pat)],
+        key=lambda p: p.name,
+    )
+
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
     _set_seed(args.seed)
@@ -3655,10 +3676,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         raise FileNotFoundError(chunk_parent)
 
     glob_pat = str(args.chunk_subdir_glob)
-    chunk_dirs = sorted(
-        [p for p in chunk_parent.iterdir() if p.is_dir() and fnmatch.fnmatch(p.name, glob_pat)],
-        key=lambda p: p.name,
-    )
+    chunk_dirs = _chunk_dirs_from_subdir_glob(chunk_parent, glob_pat)
     if not chunk_dirs:
         raise FileNotFoundError(f"No subdirs matching {glob_pat!r} under {chunk_parent}")
 
@@ -4636,7 +4654,7 @@ def parse_args() -> argparse.Namespace:
         "--chunk_subdir_glob",
         type=str,
         default="run_*",
-        help="Only used with --chunk_parent: fnmatch pattern for subdirectory names (e.g. run_*).",
+        help="Only used with --chunk_parent: fnmatch pattern (e.g. run_*) or comma-separated exact folder names for smoke subsets (e.g. run_001_...,run_002_...).",
     )
     p.add_argument(
         "--exclude_bess_features",
