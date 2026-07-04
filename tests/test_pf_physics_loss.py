@@ -1033,6 +1033,30 @@ class TestPfNodeCountWeightScale:
         assert scale == pytest.approx(185.0 / 1177.0, rel=1e-6)
 
 
+class TestPfWeightSchedule:
+    def _pf(self, *, warmup: int, ramp: int) -> pfmod.PfPhysicsState:
+        return pfmod.PfPhysicsState(weight=0.05, weight_warmup_epochs=warmup, weight_ramp_epochs=ramp)
+
+    def test_warmup_zero(self):
+        pf = self._pf(warmup=5, ramp=5)
+        for ep in range(1, 6):
+            assert pfmod._pf_weight_schedule_multiplier(pf, epoch=ep) == 0.0
+
+    def test_ramp_linear(self):
+        pf = self._pf(warmup=5, ramp=5)
+        assert pfmod._pf_weight_schedule_multiplier(pf, epoch=6) == pytest.approx(0.2)
+        assert pfmod._pf_weight_schedule_multiplier(pf, epoch=10) == pytest.approx(1.0)
+        assert pfmod._pf_weight_schedule_multiplier(pf, epoch=15) == pytest.approx(1.0)
+
+    def test_effective_weight_applies_schedule(self):
+        pf = self._pf(warmup=2, ramp=2)
+        lv = torch.tensor(1.0)
+        lpf = torch.tensor(1.0)
+        assert pfmod._pf_effective_weight(pf, loss_v=lv, loss_pf=lpf, epoch=1) == pytest.approx(0.0)
+        assert pfmod._pf_effective_weight(pf, loss_v=lv, loss_pf=lpf, epoch=3) == pytest.approx(0.025)
+        assert pfmod._pf_effective_weight(pf, loss_v=lv, loss_pf=lpf, epoch=4) == pytest.approx(0.05)
+
+
 class TestPfHardNodeTopk:
     def test_topk_selects_worst_voltage_nodes(self):
         base = torch.zeros(6, dtype=torch.bool)

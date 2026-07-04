@@ -21,6 +21,8 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 - ``--pf_weight_scale_ref_nodes`` / ``--pf_weight_scale_alpha``: scale ``--loss_power_balance_weight`` by
   ``(N_ref/N_balance)^alpha`` when the balance mask has more nodes (default alpha=0.5).
 - ``--pf_hard_node_topk``: apply physics only on top-k balance nodes per graph by ``|V_pred-V_label|`` (0=off).
+- ``--pf_weight_warmup_epochs`` / ``--pf_weight_ramp_epochs``: curriculum — zero physics for warmup epochs,
+  then linear ramp to full ``--loss_power_balance_weight`` (smoke: 5+5 avoids early interference).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -298,6 +300,8 @@ class PfPhysicsState:
     mask: torch.Tensor | None = None
     n_balance_nodes: int = 0
     hard_node_topk: int = 0
+    weight_warmup_epochs: int = 0
+    weight_ramp_epochs: int = 0
     reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
     cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
     detach_controls: bool = False
@@ -1780,14 +1784,30 @@ def _pf_topk_voltage_error_mask(
     return out
 
 
+def _pf_weight_schedule_multiplier(pf: PfPhysicsState, *, epoch: int) -> float:
+    """Curriculum multiplier in [0, 1]: zero during warmup, linear ramp, then 1."""
+    warmup = max(int(pf.weight_warmup_epochs), 0)
+    ramp = max(int(pf.weight_ramp_epochs), 0)
+    ep = int(epoch)
+    if warmup > 0 and ep <= warmup:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    progress = ep - warmup
+    return min(1.0, max(0.0, float(progress) / float(ramp)))
+
+
 def _pf_effective_weight(
     pf: PfPhysicsState,
     *,
     loss_v: torch.Tensor,
     loss_pf: torch.Tensor,
+    epoch: int | None = None,
 ) -> torch.Tensor | float:
     """Return scalar multiplier for physics loss (auto-scale to voltage MSE when enabled)."""
     w = float(pf.weight)
+    if epoch is not None:
+        w *= _pf_weight_schedule_multiplier(pf, epoch=int(epoch))
     if not pf.auto_scale_volt:
         return w
     max_ratio = max(float(pf.auto_scale_max), 1.0)
@@ -1849,6 +1869,8 @@ def _setup_pf_physics(
     if w_base <= 0.0:
         return PfPhysicsState(weight=0.0)
     hard_node_topk = int(getattr(args, "pf_hard_node_topk", 0) or 0)
+    weight_warmup_epochs = max(int(getattr(args, "pf_weight_warmup_epochs", 0) or 0), 0)
+    weight_ramp_epochs = max(int(getattr(args, "pf_weight_ramp_epochs", 0) or 0), 0)
     loss_mode = str(getattr(args, "pf_loss_mode", "flow_relative") or "flow_relative").strip().lower()
     if loss_mode not in ("absolute", "flow_relative"):
         raise ValueError(f"--pf_loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
@@ -2038,10 +2060,16 @@ def _setup_pf_physics(
     elif ref_nodes > 0.0:
         wt_scale_msg = f", pf_wt_effective={w:g} (N={n_balance}, N_ref={ref_nodes:g}, no scale)"
     hard_topk_msg = f", hard_node_topk={hard_node_topk}" if hard_node_topk > 0 else ""
+    schedule_msg = ""
+    if weight_warmup_epochs > 0 or weight_ramp_epochs > 0:
+        schedule_msg = (
+            f", weight_schedule=warmup={weight_warmup_epochs}+ramp={weight_ramp_epochs}"
+        )
     print(
         f"Power-balance physics: weight={w:g}, mode={loss_mode}"
         + wt_scale_msg
         + hard_topk_msg
+        + schedule_msg
         + (
             f", auto_scale_volt=1 (cap={auto_scale_max:.4g} on loss_v/loss_pf ratio)"
             if auto_scale_volt
@@ -2079,6 +2107,8 @@ def _setup_pf_physics(
         mask=pf_mask.to(device),
         n_balance_nodes=n_balance,
         hard_node_topk=hard_node_topk,
+        weight_warmup_epochs=weight_warmup_epochs,
+        weight_ramp_epochs=weight_ramp_epochs,
         reg_edges=reg_edges,
         cap_banks=cap_banks,
         detach_controls=detach,
@@ -4436,7 +4466,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                                 ),
                             )
                             pf_dbg_first_batch = False
-                        pf_w = _pf_effective_weight(pf_state, loss_v=loss_v, loss_pf=loss_pf)
+                        pf_w = _pf_effective_weight(
+                            pf_state, loss_v=loss_v, loss_pf=loss_pf, epoch=ep
+                        )
                         loss = loss + pf_w * loss_pf
                         train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
@@ -4566,7 +4598,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             label_y_n=yb_n,
                         )
                         if lpf is not None:
-                            pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf)
+                            pf_w = _pf_effective_weight(
+                                pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
+                            )
                             lt = lt + pf_w * lpf
                             val_pf_sum += float(lpf.item()) * batch.num_graphs
                         if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
@@ -5085,6 +5119,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="When >0, apply physics loss only on top-k balance nodes per graph by |V_pred-V_label| (0=off).",
     )
+    p.add_argument(
+        "--pf_weight_warmup_epochs",
+        type=int,
+        default=0,
+        help="Curriculum: zero physics weight for epochs 1..N (0=off).",
+    )
+    p.add_argument(
+        "--pf_weight_ramp_epochs",
+        type=int,
+        default=0,
+        help="After warmup, linearly ramp physics weight to full over N epochs (0=immediate full weight).",
+    )
     return p.parse_args()
 
 
@@ -5477,7 +5523,9 @@ def main() -> None:
                             ),
                         )
                         pf_dbg_first_batch = False
-                    pf_w = _pf_effective_weight(pf_state, loss_v=loss_v, loss_pf=loss_pf)
+                    pf_w = _pf_effective_weight(
+                        pf_state, loss_v=loss_v, loss_pf=loss_pf, epoch=ep
+                    )
                     loss = loss + pf_w * loss_pf
                     train_pf_sum += float(loss_pf.item()) * batch.num_graphs
                 if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
@@ -5550,7 +5598,9 @@ def main() -> None:
                         label_y_n=yb_n,
                     )
                     if lpf is not None:
-                        pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf)
+                        pf_w = _pf_effective_weight(
+                            pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
+                        )
                         lt = lt + pf_w * lpf
                         val_pf_sum += float(lpf.item()) * batch.num_graphs
                     if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
