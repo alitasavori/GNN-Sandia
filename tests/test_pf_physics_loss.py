@@ -1249,6 +1249,68 @@ class TestScaleRobustness:
         not (REPO / "colab_pf_data" / "pf_balance_nodes_explicit.csv").is_file(),
         reason="no explicit PF balance node list CSV",
     )
+    def test_should_skip_refinement_auto_with_explicit_csv(self):
+        import argparse
+
+        args = argparse.Namespace(
+            pf_balance_node_list_csv="colab_pf_data/pf_balance_nodes_explicit.csv",
+            pf_skip_balance_refinement=-1,
+        )
+        assert pfmod._should_skip_pf_balance_refinement(args)
+
+    def test_should_skip_refinement_respects_override(self):
+        import argparse
+
+        args = argparse.Namespace(
+            pf_balance_node_list_csv="list.csv",
+            pf_skip_balance_refinement=0,
+        )
+        assert not pfmod._should_skip_pf_balance_refinement(args)
+        args.pf_skip_balance_refinement = 1
+        assert pfmod._should_skip_pf_balance_refinement(args)
+
+    @pytest.mark.skipif(
+        not (REPO / "colab_pf_data" / "pf_balance_nodes_explicit.csv").is_file(),
+        reason="no explicit PF balance node list CSV",
+    )
+    def test_explicit_csv_refinement_shrinks_1177_to_fewer(self):
+        import argparse
+        import pandas as pd
+
+        chunk_idx = (
+            REPO
+            / "datasets_gnn2_from pc/original_8500_unbalanced/run_001_scen_0000_0049_seed_20360133/gnn_node_index_master.csv"
+        )
+        if not chunk_idx.is_file():
+            pytest.skip("no chunk node index")
+        idx = pd.read_csv(chunk_idx)
+        ntl = {str(r["node"]).strip().lower(): int(r["node_idx"]) for _, r in idx.iterrows()}
+        n_nodes = int(idx["node_idx"].max()) + 1
+        list_csv = REPO / "colab_pf_data/pf_balance_nodes_explicit.csv"
+        explicit = pfmod._load_pf_balance_mask_from_explicit_list(list_csv, ntl, n_nodes)
+        assert int(explicit.sum().item()) == 1177
+        pf_root = REPO / "colab_pf_data"
+        edges = chunk_idx.parent / "gnn_edges_phase_static.csv"
+        reg_edges = pfmod._load_regulator_edges_for_pf(
+            pf_root / "Heterogenous GNN dataset/edges/hetero_mv_edge_catalog.csv",
+            ntl,
+            list(pfmod.TARGET_REG_COLS),
+            Z_BASE,
+        )
+        skip = {pfmod._undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
+        y_re, y_im = pfmod._build_ybus_siemens_from_edge_csv(edges, ntl, n_nodes, skip_undirected=skip)
+        hetero = pfmod._load_pf_hetero_node_indices(pf_root, ntl)
+        args = argparse.Namespace(pf_exclude_interface_buses=True, pf_hetero_y_neighbors_only=True)
+        refined = pfmod._apply_pf_balance_mask_refinement(
+            explicit, ntl, pf_root, y_re, y_im, args, label="PF explicit"
+        )
+        assert int(refined.sum().item()) < int(explicit.sum().item())
+        assert int(refined.sum().item()) == 185
+
+    @pytest.mark.skipif(
+        not (REPO / "colab_pf_data" / "pf_balance_nodes_explicit.csv").is_file(),
+        reason="no explicit PF balance node list CSV",
+    )
     def test_explicit_balance_list_overrides_mask_count(self):
         import pandas as pd
 

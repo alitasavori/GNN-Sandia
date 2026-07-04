@@ -399,6 +399,14 @@ def _refine_pf_mv_balance_mask(
     return out
 
 
+def _should_skip_pf_balance_refinement(args: argparse.Namespace) -> bool:
+    """Auto-skip runtime hetero/interface refinement when an explicit balance CSV is provided."""
+    flag = int(getattr(args, "pf_skip_balance_refinement", -1))
+    if flag >= 0:
+        return bool(flag)
+    return bool(str(getattr(args, "pf_balance_node_list_csv", "") or "").strip())
+
+
 def _apply_pf_balance_mask_refinement(
     mask: torch.Tensor,
     node_to_local: dict[str, int],
@@ -1818,15 +1826,23 @@ def _setup_pf_physics(
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
         )
-        pf_mask = _apply_pf_balance_mask_refinement(
-            pf_mask,
-            node_to_local,
-            pf_root,
-            y_re,
-            y_im,
-            args,
-            label="PF explicit",
-        )
+        if not _should_skip_pf_balance_refinement(args):
+            pf_mask = _apply_pf_balance_mask_refinement(
+                pf_mask,
+                node_to_local,
+                pf_root,
+                y_re,
+                y_im,
+                args,
+                label="PF explicit",
+            )
+        else:
+            print(
+                "PF explicit balance list: skipping runtime mask refinement "
+                f"(pf_skip_balance_refinement={int(getattr(args, 'pf_skip_balance_refinement', -1))}, "
+                f"masked_nodes={int(pf_mask.sum().item())}/{n_nodes})",
+                flush=True,
+            )
         idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
         hetero_nodes = _load_pf_hetero_node_indices(pf_root, node_to_local)
         _warn_pf_balance_node_issues(
@@ -1860,7 +1876,7 @@ def _setup_pf_physics(
             mv_fallback_all_non_slack=mv_fallback,
             distance_tried=distance_tried,
         )
-        if balance_mode.strip().lower() == "mv":
+        if balance_mode.strip().lower() == "mv" and not _should_skip_pf_balance_refinement(args):
             pf_mask = _apply_pf_balance_mask_refinement(
                 pf_mask,
                 node_to_local,
@@ -3745,6 +3761,9 @@ def _save_periodic_training_checkpoint(
     bad: int,
     best_val: float,
     best_state: dict[str, torch.Tensor] | None,
+    best_epoch: int | None = None,
+    best_val_r2_mean: float | None = None,
+    best_val_r2_min: float | None = None,
 ) -> None:
     """Atomic write: same architecture metadata as ``da_gps_multitask_best.pt`` plus resume fields."""
     payload: dict[str, object] = {
@@ -3753,6 +3772,9 @@ def _save_periodic_training_checkpoint(
         "epoch": int(epoch),
         "bad": int(bad),
         "best_val": float(best_val),
+        "best_epoch": int(best_epoch) if best_epoch is not None else int(epoch),
+        "best_val_r2_mean": float(best_val_r2_mean) if best_val_r2_mean is not None else None,
+        "best_val_r2_min": float(best_val_r2_min) if best_val_r2_min is not None else None,
         "optimizer_state_dict": opt.state_dict(),
         "scheduler_state_dict": sch.state_dict(),
         "best_model_state_dict": (
@@ -4193,6 +4215,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     best_val = float("inf")
     best_state = None
     bad = 0
+    best_epoch = 0
+    best_val_r2_mean = float("nan")
+    best_val_r2_min = float("nan")
     t0 = time.perf_counter()
 
     for ep in range(1, args.epochs + 1):
@@ -4526,6 +4551,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         if crit < best_val:
             best_val = crit
             best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            best_epoch = ep
+            best_val_r2_mean = val_r2_mean
+            best_val_r2_min = val_r2_min
             bad = 0
         else:
             bad += 1
@@ -4573,6 +4601,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 bad=bad,
                 best_val=best_val,
                 best_state=best_state,
+                best_epoch=best_epoch,
+                best_val_r2_mean=best_val_r2_mean,
+                best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
@@ -4590,6 +4621,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     bad=bad,
                     best_val=best_val,
                     best_state=best_state,
+                    best_epoch=best_epoch,
+                    best_val_r2_mean=best_val_r2_mean,
+                    best_val_r2_min=best_val_r2_min,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
@@ -4842,7 +4876,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional CSV of explicit balance nodes (columns: node and/or bus and/or node_idx; "
-        "node preferred when present). Slack/source excluded; interface/hetero refinement still applied.",
+        "node preferred when present). Slack/source excluded. Runtime hetero/interface refinement "
+        "is skipped by default (offline-cleaned list); pass --pf_skip_balance_refinement 0 to re-enable.",
+    )
+    p.add_argument(
+        "--pf_skip_balance_refinement",
+        type=int,
+        default=-1,
+        choices=(-1, 0, 1),
+        help="-1=auto (skip refinement when --pf_balance_node_list_csv is set; default), "
+        "0=always apply hetero/interface refinement, 1=never apply refinement.",
     )
     p.add_argument(
         "--pf_s_base_kva",
@@ -5241,6 +5284,9 @@ def main() -> None:
     best_val = float("inf")
     best_state = None
     bad = 0
+    best_epoch = 0
+    best_val_r2_mean = float("nan")
+    best_val_r2_min = float("nan")
     t0 = time.perf_counter()
 
     for ep in range(1, args.epochs + 1):
@@ -5459,6 +5505,9 @@ def main() -> None:
         if crit < best_val:
             best_val = crit
             best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            best_epoch = ep
+            best_val_r2_mean = val_r2_mean
+            best_val_r2_min = val_r2_min
             bad = 0
         else:
             bad += 1
@@ -5499,6 +5548,9 @@ def main() -> None:
                 bad=bad,
                 best_val=best_val,
                 best_state=best_state,
+                best_epoch=best_epoch,
+                best_val_r2_mean=best_val_r2_mean,
+                best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if bad >= args.patience:
@@ -5516,6 +5568,9 @@ def main() -> None:
                     bad=bad,
                     best_val=best_val,
                     best_state=best_state,
+                    best_epoch=best_epoch,
+                    best_val_r2_mean=best_val_r2_mean,
+                    best_val_r2_min=best_val_r2_min,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
