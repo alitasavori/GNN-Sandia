@@ -1536,6 +1536,57 @@ def _build_reg_class_tables(reg_cols: list[str], reg_raw: np.ndarray) -> list[di
     return tables
 
 
+def _reg_class_tables_digest(reg_class_tables: list[dict]) -> str:
+    """Stable short hash of per-regulator tap class lists (for CE cache keys)."""
+    payload = [
+        {"col": str(t["col"]), "classes": [float(c) for c in t["classes"]], "n_classes": int(t["n_classes"])}
+        for t in reg_class_tables
+    ]
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()[:10]
+
+
+def _reg_ce_targets_in_range(y_reg: torch.Tensor, reg_class_tables: list[dict]) -> bool:
+    if y_reg.dim() != 2 or int(y_reg.shape[1]) != len(reg_class_tables):
+        return False
+    y = y_reg.detach().cpu()
+    for j, tab in enumerate(reg_class_tables):
+        nc = int(tab["n_classes"])
+        col = y[:, j]
+        if col.numel() == 0:
+            continue
+        lo = int(col.min().item())
+        hi = int(col.max().item())
+        if lo < 0 or hi >= nc:
+            return False
+    return True
+
+
+def _validate_reg_ce_targets(
+    target: torch.Tensor,
+    reg_logits: list[torch.Tensor],
+    *,
+    reg_class_tables: list[dict] | None = None,
+) -> None:
+    """Fail fast before CUDA CE when cached/stale class indices exceed head width."""
+    for j, logits in enumerate(reg_logits):
+        nc = int(logits.shape[1])
+        col = target[:, j].long()
+        if col.numel() == 0:
+            continue
+        lo = int(col.min().item())
+        hi = int(col.max().item())
+        if lo < 0 or hi >= nc:
+            col_name = reg_class_tables[j]["col"] if reg_class_tables and j < len(reg_class_tables) else f"reg#{j}"
+            raise ValueError(
+                f"Regulator CE target out of range for {col_name!r}: "
+                f"min={lo}, max={hi}, n_classes={nc}. "
+                "Chunk tensor caches for reg_loss=ce are keyed by the global tap-class table "
+                "(all visible chunks). Re-run with a fresh --cache_dir or delete stale "
+                "*__regce__*.pt caches when changing --chunk_subdir_glob or chunk set."
+            )
+
+
 def _encode_reg_class_indices(reg_raw: np.ndarray, reg_class_tables: list[dict]) -> np.ndarray:
     out = np.zeros((reg_raw.shape[0], len(reg_class_tables)), dtype=np.int64)
     for j, tab in enumerate(reg_class_tables):
@@ -1611,10 +1662,12 @@ def _reg_loss_scalar(
     reg_loss: str,
     *,
     reg_logits: list[torch.Tensor] | None = None,
+    reg_class_tables: list[dict] | None = None,
 ) -> torch.Tensor:
     if reg_loss == "ce":
         if not reg_logits:
             raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
+        _validate_reg_ce_targets(target, reg_logits, reg_class_tables=reg_class_tables)
         losses = [F.cross_entropy(reg_logits[j], target[:, j].long()) for j in range(len(reg_logits))]
         return torch.stack(losses).mean()
     assert pred is not None
@@ -2716,6 +2769,7 @@ def _chunk_cache_path(
     feat_slug: str = "",
     meta_aux_slug: str = "",
     reg_slug: str = "",
+    reg_classes_digest: str = "",
 ) -> Path:
     if float(sample_frac) >= 1.0:
         tag = "full"
@@ -2726,6 +2780,8 @@ def _chunk_cache_path(
         base = f"{base}__{str(feat_slug).strip()}"
     if str(reg_slug).strip():
         base = f"{base}__{str(reg_slug).strip()}"
+    if str(reg_classes_digest).strip():
+        base = f"{base}__rc{str(reg_classes_digest).strip()}"
     if str(meta_aux_slug).strip():
         base = f"{base}__maux{str(meta_aux_slug).strip()}"
     return cache_dir / f"{base}.pt"
@@ -2763,6 +2819,7 @@ def _ensure_chunk_tensor_cache(
     pv_aux_cols: list[str] | None = None,
     reg_class_tables: list[dict] | None = None,
     reg_target_mode: str = "regression",
+    reg_classes_digest: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], dict[str, int]]:
     np_ = chunk_dir / nodes_name
     mp_ = chunk_dir / meta_name
@@ -2793,16 +2850,39 @@ def _ensure_chunk_tensor_cache(
         return y_pv.to(dtype=torch.float32)
 
     want_reg_mode = str(reg_target_mode).strip().lower()
+    want_reg_digest = ""
+    if want_reg_mode == "class":
+        if reg_class_tables is None:
+            raise ValueError("reg_target_mode=class requires reg_class_tables.")
+        want_reg_digest = str(reg_classes_digest or _reg_class_tables_digest(reg_class_tables)).strip()
 
     if cache_pt.is_file():
         z = torch.load(cache_pt, map_location="cpu", weights_only=False)
-        if str(z.get("reg_target_mode", "regression")).lower() != want_reg_mode:
+        cache_ok = str(z.get("reg_target_mode", "regression")).lower() == want_reg_mode
+        if cache_ok and want_reg_mode == "class":
+            stored_digest = str(z.get("reg_class_tables_digest", "") or "").strip()
+            y_reg_cached = z.get("y_reg")
+            if stored_digest != want_reg_digest:
+                cache_ok = False
+                print(
+                    f"chunk cache reg_class_tables_digest mismatch "
+                    f"({stored_digest!r} != {want_reg_digest!r}); rebuilding: {cache_pt}",
+                    flush=True,
+                )
+            elif y_reg_cached is None or not _reg_ce_targets_in_range(y_reg_cached, reg_class_tables):
+                cache_ok = False
+                print(
+                    f"chunk cache y_reg class indices out of range for current tap tables; "
+                    f"rebuilding: {cache_pt}",
+                    flush=True,
+                )
+        elif not cache_ok:
             print(
                 f"chunk cache reg_target_mode={z.get('reg_target_mode')!r} != {want_reg_mode!r}; "
                 f"rebuilding: {cache_pt}",
                 flush=True,
             )
-        else:
+        if cache_ok:
             ntl = z["node_to_local"]
             if ref_ntl is not None and ntl != ref_ntl:
                 raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
@@ -2869,6 +2949,8 @@ def _ensure_chunk_tensor_cache(
                 "node_to_local": node_to_local,
                 "reg_target_mode": want_reg_mode,
             }
+            if want_reg_digest:
+                row["reg_class_tables_digest"] = want_reg_digest
             if y_pv is not None:
                 row["y_pv"] = y_pv
                 row["meta_aux_cols"] = list(pv_cols)
@@ -2906,6 +2988,8 @@ def _ensure_chunk_tensor_cache(
         "node_to_local": node_to_local,
         "reg_target_mode": want_reg_mode,
     }
+    if want_reg_digest:
+        row["reg_class_tables_digest"] = want_reg_digest
     if y_pv is not None:
         row["y_pv"] = y_pv
         row["meta_aux_cols"] = list(pv_cols)
@@ -2947,6 +3031,7 @@ def _evaluate_multi_chunks(
     reg_loss: str = "mse",
     reg_class_tables: list[dict] | None = None,
     reg_target_mode: str = "regression",
+    reg_classes_digest: str = "",
     reg_class_values: torch.Tensor | None = None,
     base_model: nn.Module | None = None,
 ) -> dict[str, float]:
@@ -2973,6 +3058,7 @@ def _evaluate_multi_chunks(
             pv_aux_cols=pv_aux_cols,
             reg_class_tables=reg_class_tables,
             reg_target_mode=reg_target_mode,
+            reg_classes_digest=reg_classes_digest,
         )
         if reg_loss == "ce":
             y_reg_n = y_reg.to(dtype=torch.long)
@@ -3282,6 +3368,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         for tab in reg_class_tables:
             print(f"  {tab['col']}: n_classes={tab['n_classes']}", flush=True)
 
+    reg_classes_digest = _reg_class_tables_digest(reg_class_tables) if reg_class_tables else ""
+
     idx_train_list: list[np.ndarray] = []
     idx_val_list: list[np.ndarray] = []
     idx_test_list: list[np.ndarray] = []
@@ -3321,6 +3409,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             feat_slug=feat_slug,
             meta_aux_slug=maux_slug,
             reg_slug=reg_slug,
+            reg_classes_digest=reg_classes_digest,
         )
         cache_pts.append(da_pt)
         if bootstrap_gnn_cache_dir is not None:
@@ -3347,6 +3436,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
             reg_class_tables=reg_class_tables,
             reg_target_mode=reg_target_mode,
+            reg_classes_digest=reg_classes_digest,
         )
         if ci == 0:
             ref_ntl = ntl
@@ -3593,6 +3683,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
                 reg_class_tables=reg_class_tables,
                 reg_target_mode=reg_target_mode,
+                reg_classes_digest=reg_classes_digest,
             )
             if reg_loss == "ce":
                 y_reg_n = y_reg.to(dtype=torch.long)
@@ -3631,6 +3722,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         y_reg_b,
                         reg_loss,
                         reg_logits=reg_logits,
+                        reg_class_tables=reg_class_tables,
                     )
                     loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                     loss_pf = _pf_loss_if_enabled(
@@ -3720,6 +3812,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
                     reg_class_tables=reg_class_tables,
                     reg_target_mode=reg_target_mode,
+                    reg_classes_digest=reg_classes_digest,
                 )
                 if reg_loss == "ce":
                     y_reg_n = y_reg.to(dtype=torch.long)
@@ -3757,6 +3850,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             y_reg_b,
                             reg_loss,
                             reg_logits=reg_logits_v,
+                            reg_class_tables=reg_class_tables,
                         )
                         lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                         lpf = _pf_loss_if_enabled(
@@ -3952,6 +4046,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_loss=reg_loss,
         reg_class_tables=reg_class_tables,
         reg_target_mode=reg_target_mode,
+        reg_classes_digest=reg_classes_digest,
         reg_class_values=reg_class_values,
         base_model=base_model,
     )
