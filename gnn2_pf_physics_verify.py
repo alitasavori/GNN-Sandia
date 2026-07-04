@@ -922,7 +922,7 @@ def print_physical_opendss_report(cmp: dict[str, Any]) -> None:
         print("\n[OpenDSS] not requested (run_opendss=False).")
 
     print(
-        "\nBackprop: Huber on kW residuals. "
+        "\nBackprop: Huber on S_base-normalized P/Q residuals (pu). "
         "Refined MV mask keeps hetero load nodes whose Y-neighbors are also hetero "
         "(excludes regxfmr/190-/m/p/n interface buses)."
     )

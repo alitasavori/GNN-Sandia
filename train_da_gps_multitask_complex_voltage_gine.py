@@ -11,8 +11,9 @@ v2 alignment:
 
 Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent physics fallbacks):
 - After denormalizing predicted complex voltage (Re/Im head), penalize nodal P/Q balance residuals
-  in **kW/kvar** with Huber aggregation (``--pf_huber_delta_kw``, default 10 kW) on selected nodes
-  (slack/source excluded).
+  in **kW/kvar**, scaled to per-unit on ``S_base`` before Huber (``--pf_huber_delta_kw`` / ``--pf_s_base_kva``,
+  default 10 kW ≈ 0.002 pu at 5000 kVA) so early-epoch voltage error does not explode the loss. Applied on
+  selected nodes (slack/source excluded).
 - Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
   cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
   **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
@@ -980,12 +981,18 @@ def _load_pf_balance_mask_from_explicit_list(
 
 
 def _pf_huber_mean_sq(r: torch.Tensor, *, delta: float) -> torch.Tensor:
-    """Huber on residuals; ``delta`` is in the same units as ``r`` (kW/kvar)."""
+    """Huber on residuals; ``delta`` must match the units of ``r``."""
     d = max(float(delta), 1e-12)
     abs_r = r.abs()
     quad = 0.5 * r.square()
     lin = d * (abs_r - 0.5 * d)
     return torch.where(abs_r <= d, quad, lin).mean()
+
+
+def _pf_huber_delta_pu(*, huber_delta_kw: float, s_base_kva: float) -> float:
+    """Convert CLI Huber delta (kW/kvar) to per-unit on ``S_base`` for stable physics loss scale."""
+    s_base = max(float(s_base_kva), 1e-12)
+    return max(float(huber_delta_kw), 1e-12) / s_base
 
 
 def _pf_physics_fp32_ctx():
@@ -1232,8 +1239,10 @@ def _pf_debug_nan_report(
         m = mask.to(device=r_p.device, dtype=torch.bool).view(1, -1)
         r_p_m = r_p.masked_select(m)
         r_q_m = r_q.masked_select(m)
-        hub_p = _pf_huber_mean_sq(r_p_m, delta=pf.huber_delta_kw)
-        hub_q = _pf_huber_mean_sq(r_q_m, delta=pf.huber_delta_kw)
+        delta_pu = _pf_huber_delta_pu(huber_delta_kw=pf.huber_delta_kw, s_base_kva=pf.s_base_kva)
+        s_base = max(float(pf.s_base_kva), 1e-12)
+        hub_p = _pf_huber_mean_sq(r_p_m / s_base, delta=delta_pu)
+        hub_q = _pf_huber_mean_sq(r_q_m / s_base, delta=delta_pu)
         hub_tot = hub_p + hub_q
         hub_p_val = float(hub_p.item())
         hub_q_val = float(hub_q.item())
@@ -1358,12 +1367,13 @@ def nodal_power_balance_residual(
     q_yv_kvar = s_im / 1000.0
     r_p = p_inj_kw - p_yv_kw
     r_q = q_inj_kvar - q_yv_kvar
-    delta = huber_delta_kw
+    s_base = max(float(s_base_kva), 1e-12)
+    delta_pu = _pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base_kva)
     if node_mask is not None:
         m = node_mask.to(device=pred_ri.device, dtype=torch.bool).view(1, -1)
         r_p = r_p.masked_select(m)
         r_q = r_q.masked_select(m)
-    return _pf_huber_mean_sq(r_p, delta=delta) + _pf_huber_mean_sq(r_q, delta=delta)
+    return _pf_huber_mean_sq(r_p / s_base, delta=delta_pu) + _pf_huber_mean_sq(r_q / s_base, delta=delta_pu)
 
 
 def _expected_reg_tap_pu(
@@ -1704,6 +1714,15 @@ def _setup_pf_physics(
         pf_mask = _load_pf_balance_mask_from_explicit_list(
             explicit_csv, node_to_local, n_nodes
         )
+        pf_mask = _apply_pf_balance_mask_refinement(
+            pf_mask,
+            node_to_local,
+            pf_root,
+            y_re,
+            y_im,
+            args,
+            label="PF explicit",
+        )
         idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
         hetero_nodes = _load_pf_hetero_node_indices(pf_root, node_to_local)
         _warn_pf_balance_node_issues(
@@ -1819,10 +1838,10 @@ def _setup_pf_physics(
     dense_elems = int(n_nodes) * int(n_nodes)
     pf_debug_nan = _resolve_pf_debug_nan(args)
     print(
-        f"Power-balance physics: weight={w}, units=physical (V volts, Y Siemens, kW Huber), "
+        f"Power-balance physics: weight={w}, units=physical (V volts, Y Siemens, Huber on P/Q pu), "
         f"pf_data_root={pf_root}, nodes={args.pf_balance_nodes}, "
         f"S_base={s_base} kVA, V_base={kv_base} kV, Z_base={z_base:.4f} ohm, "
-        f"huber_delta_kw={huber_delta_kw}, "
+        f"huber_delta_kw={huber_delta_kw} ({_pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base):.4g} pu), "
         f"masked_nodes={int(pf_mask.sum())}/{n_nodes} (slack excluded), "
         f"line_base_edges={int((y_re.abs() > 0).sum().item())}, "
         f"reg_branches={len(reg_edges)}, cap_banks={len(cap_banks)}, "
@@ -4706,7 +4725,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional CSV of explicit balance nodes (columns: node and/or bus and/or node_idx; "
-        "node preferred when present). Used as-is; only slack/source nodes are excluded.",
+        "node preferred when present). Slack/source excluded; interface/hetero refinement still applied.",
     )
     p.add_argument(
         "--pf_s_base_kva",
@@ -4729,7 +4748,7 @@ def parse_args() -> argparse.Namespace:
         "--pf_huber_delta_kw",
         type=float,
         default=10.0,
-        help="Huber delta (kW/kvar) for physics residual (default 10 kW).",
+        help="Huber delta in kW/kvar before per-unit scaling by --pf_s_base_kva (default 10 kW ≈ 0.002 pu).",
     )
     p.add_argument(
         "--pf_bus_kv_base_csv",
