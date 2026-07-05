@@ -4050,6 +4050,8 @@ def _evaluate_split_losses_multi_chunks(
                     reg_logits=reg_logits_v,
                     reg_class_values=reg_class_values_d,
                     label_y_n=yb_n,
+                    y_cap_label=y_cap_b,
+                    y_reg_label=y_reg_b,
                 )
                 if lpf is not None:
                     pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf, epoch=epoch)
@@ -5401,6 +5403,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             reg_logits=reg_logits_v,
                             reg_class_values=reg_class_values_d,
                             label_y_n=yb_n,
+                            y_cap_label=y_cap_b,
+                            y_reg_label=y_reg_b,
+                            epoch=ep,
                         )
                         if lpf is not None:
                             pf_w = _pf_effective_weight(
