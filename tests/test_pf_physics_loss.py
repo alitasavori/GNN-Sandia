@@ -998,6 +998,150 @@ class TestFlowRelativePhysics:
         assert v_var.grad is not None and float(v_var.grad.abs().sum()) > 0
 
 
+class TestHybridPhysics:
+    def _ybus_and_inj(self, synthetic_truth):
+        y_re, y_im = pfmod._ybus_with_predicted_controls(
+            synthetic_truth["y_re_b"],
+            synthetic_truth["y_im_b"],
+            reg_edges=[REG_EDGE],
+            cap_banks=[CAP_BANK],
+            tap_pu=synthetic_truth["tap"],
+            cap_on=synthetic_truth["cap_on"],
+            s_base_kva=S_BASE_KVA,
+            batch_size=1,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+        )
+        p_inj, q_inj = pfmod._assemble_pf_injections(
+            synthetic_truth["x_denorm"].unsqueeze(0),
+            NODE_FEATURE_COLS,
+            batch=_make_synthetic_batch(synthetic_truth["x_denorm"]),
+            n_nodes=N_NODES,
+        )
+        return y_re, y_im, p_inj, q_inj
+
+    def test_zero_at_truth_with_label_v(self, synthetic_truth):
+        v = synthetic_truth["v_ri"]
+        y_re, y_im, p_inj, q_inj = self._ybus_and_inj(synthetic_truth)
+        res = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0),
+                p_inj,
+                q_inj,
+                y_re,
+                y_im,
+                torch.ones(N_NODES, dtype=torch.bool),
+                S_BASE_KVA,
+                v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+                huber_delta_kw=10.0,
+                loss_mode="hybrid",
+                absolute_weight=0.1,
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        assert res < TOL_ZERO_F32
+
+    def test_decomposes_to_flow_plus_alpha_abs(self, synthetic_truth):
+        v_lbl = synthetic_truth["v_ri"]
+        v_bad = v_lbl.clone()
+        v_bad[:, 0] += 0.05
+        y_re, y_im, p_inj, q_inj = self._ybus_and_inj(synthetic_truth)
+        mask = torch.ones(N_NODES, dtype=torch.bool)
+        v_scale = synthetic_truth["v_scale"].unsqueeze(0)
+        alpha = 0.25
+        kw = dict(
+            q_inj_kvar=q_inj,
+            Y_re=y_re,
+            Y_im=y_im,
+            node_mask=mask,
+            s_base_kva=S_BASE_KVA,
+            v_scale_volts=v_scale,
+            huber_delta_kw=10.0,
+            label_ri=v_lbl.unsqueeze(0),
+        )
+        flow = float(
+            pfmod.nodal_power_balance_residual(
+                v_bad.unsqueeze(0), p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA,
+                v_scale_volts=v_scale,
+                huber_delta_kw=10.0,
+                loss_mode="flow_relative",
+                label_ri=v_lbl.unsqueeze(0),
+            ).item()
+        )
+        abs_ = float(
+            pfmod.nodal_power_balance_residual(
+                v_bad.unsqueeze(0), p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA,
+                v_scale_volts=v_scale,
+                huber_delta_kw=10.0,
+                loss_mode="absolute",
+            ).item()
+        )
+        hybrid = float(
+            pfmod.nodal_power_balance_residual(
+                v_bad.unsqueeze(0), p_inj, q_inj, y_re, y_im, mask, S_BASE_KVA,
+                v_scale_volts=v_scale,
+                huber_delta_kw=10.0,
+                loss_mode="hybrid",
+                absolute_weight=alpha,
+                label_ri=v_lbl.unsqueeze(0),
+            ).item()
+        )
+        assert hybrid == pytest.approx(flow + alpha * abs_, rel=1e-5)
+
+    def test_sensitive_to_p_inj_error_at_label_v(self, synthetic_truth):
+        v = synthetic_truth["v_ri"]
+        y_re, y_im, p_inj, q_inj = self._ybus_and_inj(synthetic_truth)
+        p_bad = p_inj.clone()
+        p_bad[0, 1] += 500.0
+        kw = dict(
+            Y_re=y_re,
+            Y_im=y_im,
+            node_mask=torch.ones(N_NODES, dtype=torch.bool),
+            s_base_kva=S_BASE_KVA,
+            v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+            huber_delta_kw=10.0,
+            label_ri=v.unsqueeze(0),
+        )
+        flow_only = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0), p_bad, q_inj, y_re, y_im, kw["node_mask"], S_BASE_KVA,
+                v_scale_volts=kw["v_scale_volts"],
+                huber_delta_kw=10.0,
+                loss_mode="flow_relative",
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        hybrid = float(
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0), p_bad, q_inj, y_re, y_im, kw["node_mask"], S_BASE_KVA,
+                v_scale_volts=kw["v_scale_volts"],
+                huber_delta_kw=10.0,
+                loss_mode="hybrid",
+                absolute_weight=0.1,
+                label_ri=v.unsqueeze(0),
+            ).item()
+        )
+        assert flow_only < TOL_ZERO_F32
+        assert hybrid > flow_only * 10.0
+
+    def test_requires_label_ri(self, synthetic_truth):
+        v = synthetic_truth["v_ri"]
+        y_re, y_im, p_inj, q_inj = self._ybus_and_inj(synthetic_truth)
+        with pytest.raises(ValueError, match="label_ri"):
+            pfmod.nodal_power_balance_residual(
+                v.unsqueeze(0),
+                p_inj,
+                q_inj,
+                y_re,
+                y_im,
+                torch.ones(N_NODES, dtype=torch.bool),
+                S_BASE_KVA,
+                v_scale_volts=synthetic_truth["v_scale"].unsqueeze(0),
+                huber_delta_kw=10.0,
+                loss_mode="hybrid",
+                absolute_weight=0.1,
+            )
+
+
 class TestPfAutoScale:
     def test_effective_weight_caps_ratio(self):
         pf = pfmod.PfPhysicsState(weight=1.0, auto_scale_volt=True, auto_scale_max=100.0)

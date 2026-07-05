@@ -12,6 +12,8 @@ v2 alignment:
 Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent physics fallbacks):
 - **flow_relative** (default): Huber on nodal power from ``Y@V_pred`` vs ``Y@V_label`` (label detached).
   Injection ``P_inj`` cancels — penalizes network power-flow inconsistency, not feature-injection mismatch.
+- **hybrid**: ``L_flow_relative + alpha * L_absolute`` with ``--pf_absolute_weight`` (default 0.1).
+  Flow term is volt-normalized like ``flow_relative``; absolute uses feature-based ``P_inj = P_pv - P_load``.
 - **absolute** (legacy): Huber on ``P_inj - Re(V Y V)`` at predicted ``V`` only.
 - Residuals in **kW/kvar**, scaled to per-unit on ``S_base`` before Huber (``--pf_huber_delta_kw`` /
   ``--pf_s_base_kva``, default 10 kW ≈ 0.002 pu at 5000 kVA). Applied on selected nodes (slack excluded).
@@ -290,6 +292,7 @@ class PfPhysicsState:
     weight_base: float = 0.0
     weight_node_scale: float = 1.0
     loss_mode: str = "flow_relative"
+    absolute_weight: float = 0.1
     auto_scale_volt: bool = False
     auto_scale_max: float = 100.0
     s_base_kva: float = 5000.0
@@ -1405,6 +1408,7 @@ def nodal_power_balance_residual(
     v_scale_volts: torch.Tensor | None = None,
     huber_delta_kw: float = 10.0,
     loss_mode: str = "absolute",
+    absolute_weight: float = 0.1,
     label_ri: torch.Tensor | None = None,
     y_coo: PfYbusCoo | None = None,
     reg_edges: list[tuple[int, int, float, float, int]] | None = None,
@@ -1416,13 +1420,19 @@ def nodal_power_balance_residual(
     """Huber-smoothed physics loss on nodal P/Q (physical units: V volts, Y Siemens, kW/kvar).
 
     ``flow_relative`` (default): ``Huber(S(Y,V_label) - S(Y,V_pred))`` — label power flow detached.
+    ``hybrid``: ``L_flow_relative + alpha * L_absolute`` (``alpha`` = ``absolute_weight``).
     ``absolute``: ``Huber(P_inj - S(Y,V_pred))`` — legacy injection-mismatch form.
     """
     if v_scale_volts is None:
         raise ValueError("nodal_power_balance_residual requires v_scale_volts")
     mode = str(loss_mode or "absolute").strip().lower()
-    if mode not in ("absolute", "flow_relative"):
-        raise ValueError(f"pf loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
+    if mode not in ("absolute", "flow_relative", "hybrid"):
+        raise ValueError(
+            f"pf loss_mode must be 'absolute', 'flow_relative', or 'hybrid', got {loss_mode!r}"
+        )
+    alpha = float(absolute_weight)
+    if mode == "hybrid" and alpha < 0.0:
+        raise ValueError(f"hybrid pf loss requires absolute_weight >= 0, got {alpha!r}")
 
     pred_ri = pred_ri.float()
     p_inj_kw = p_inj_kw.float()
@@ -1441,28 +1451,41 @@ def nodal_power_balance_residual(
     )
     p_yv_kw, q_yv_kvar = _pf_nodal_power_kw_from_v_ri(pred_ri, **y_kw_args)
 
+    def _masked_huber(r_p: torch.Tensor, r_q: torch.Tensor) -> torch.Tensor:
+        s_base = max(float(s_base_kva), 1e-12)
+        delta_pu = _pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base_kva)
+        rp, rq = r_p, r_q
+        if node_mask is not None:
+            m = node_mask.to(device=pred_ri.device, dtype=torch.bool)
+            if m.dim() == 1:
+                m = m.view(1, -1).expand_as(rp)
+            elif m.shape != rp.shape:
+                raise ValueError(
+                    f"node_mask shape {tuple(m.shape)} != residual shape {tuple(rp.shape)}"
+                )
+            rp = rp.masked_select(m)
+            rq = rq.masked_select(m)
+        return _pf_huber_mean_sq(rp / s_base, delta=delta_pu) + _pf_huber_mean_sq(
+            rq / s_base, delta=delta_pu
+        )
+
     if mode == "flow_relative":
         if label_ri is None:
             raise ValueError("flow_relative physics loss requires label_ri (denormalized targets)")
         with torch.no_grad():
             p_yv_lbl, q_yv_lbl = _pf_nodal_power_kw_from_v_ri(label_ri.float(), **y_kw_args)
-        r_p = p_yv_lbl - p_yv_kw
-        r_q = q_yv_lbl - q_yv_kvar
-    else:
-        r_p = p_inj_kw - p_yv_kw
-        r_q = q_inj_kvar - q_yv_kvar
+        return _masked_huber(p_yv_lbl - p_yv_kw, q_yv_lbl - q_yv_kvar)
 
-    s_base = max(float(s_base_kva), 1e-12)
-    delta_pu = _pf_huber_delta_pu(huber_delta_kw=huber_delta_kw, s_base_kva=s_base_kva)
-    if node_mask is not None:
-        m = node_mask.to(device=pred_ri.device, dtype=torch.bool)
-        if m.dim() == 1:
-            m = m.view(1, -1).expand_as(r_p)
-        elif m.shape != r_p.shape:
-            raise ValueError(f"node_mask shape {tuple(m.shape)} != residual shape {tuple(r_p.shape)}")
-        r_p = r_p.masked_select(m)
-        r_q = r_q.masked_select(m)
-    return _pf_huber_mean_sq(r_p / s_base, delta=delta_pu) + _pf_huber_mean_sq(r_q / s_base, delta=delta_pu)
+    if mode == "absolute":
+        return _masked_huber(p_inj_kw - p_yv_kw, q_inj_kvar - q_yv_kvar)
+
+    if label_ri is None:
+        raise ValueError("hybrid physics loss requires label_ri (denormalized targets)")
+    with torch.no_grad():
+        p_yv_lbl, q_yv_lbl = _pf_nodal_power_kw_from_v_ri(label_ri.float(), **y_kw_args)
+    loss_flow = _masked_huber(p_yv_lbl - p_yv_kw, q_yv_lbl - q_yv_kvar)
+    loss_abs = _masked_huber(p_inj_kw - p_yv_kw, q_inj_kvar - q_yv_kvar)
+    return loss_flow + alpha * loss_abs
 
 
 def _curriculum_lambda_scale(epoch_1based: int, warmup_epochs: int, ramp_epochs: int) -> float:
@@ -1701,9 +1724,12 @@ def _power_balance_loss_from_batch(
     )
 
     label_ri = None
-    if str(pf.loss_mode).strip().lower() == "flow_relative":
+    loss_mode = str(pf.loss_mode).strip().lower()
+    if loss_mode in ("flow_relative", "hybrid"):
         if label_y_n is None:
-            raise ValueError("flow_relative physics loss requires label_y_n (normalized voltage targets)")
+            raise ValueError(
+                f"{loss_mode} physics loss requires label_y_n (normalized voltage targets)"
+            )
         label_ri = label_y_n.view(batch.num_graphs, n_nodes, 2).float() * y_std_ri + y_mean_ri
 
     use_sparse = bool(pf.use_sparse_y and pf.y_coo is not None)
@@ -1725,12 +1751,55 @@ def _power_balance_loss_from_batch(
     node_mask = pf.mask
     if int(pf.hard_node_topk) > 0:
         if label_ri is None:
-            raise ValueError("--pf_hard_node_topk requires flow_relative mode with label voltages")
+            raise ValueError(
+                "--pf_hard_node_topk requires flow_relative or hybrid mode with label voltages"
+            )
         node_mask = _pf_topk_voltage_error_mask(
             pf.mask,
             pred_ri,
             label_ri,
             k=int(pf.hard_node_topk),
+        )
+
+    y_sparse_kw = dict(
+        y_coo=pf.y_coo if use_sparse else None,
+        reg_edges=pf.reg_edges if use_sparse else None,
+        cap_banks=pf.cap_banks if use_sparse else None,
+        tap_pu=tap_pu if use_sparse else None,
+        cap_on=cap_on if use_sparse else None,
+        use_sparse_y=use_sparse,
+    )
+    if loss_mode == "hybrid":
+        loss_flow = nodal_power_balance_residual(
+            pred_ri,
+            p_inj,
+            q_inj,
+            y_re,
+            y_im,
+            node_mask,
+            pf.s_base_kva,
+            v_scale_volts=pf.v_scale_volts,
+            huber_delta_kw=pf.huber_delta_kw,
+            loss_mode="flow_relative",
+            label_ri=label_ri,
+            **y_sparse_kw,
+        )
+        loss_abs = nodal_power_balance_residual(
+            pred_ri,
+            p_inj,
+            q_inj,
+            y_re,
+            y_im,
+            node_mask,
+            pf.s_base_kva,
+            v_scale_volts=pf.v_scale_volts,
+            huber_delta_kw=pf.huber_delta_kw,
+            loss_mode="absolute",
+            **y_sparse_kw,
+        )
+        return (
+            loss_flow * _pf_flow_relative_volt_scale(y_std_ri)
+            + float(pf.absolute_weight) * loss_abs
         )
 
     loss_pf = nodal_power_balance_residual(
@@ -1744,15 +1813,11 @@ def _power_balance_loss_from_batch(
         v_scale_volts=pf.v_scale_volts,
         huber_delta_kw=pf.huber_delta_kw,
         loss_mode=pf.loss_mode,
+        absolute_weight=pf.absolute_weight,
         label_ri=label_ri,
-        y_coo=pf.y_coo if use_sparse else None,
-        reg_edges=pf.reg_edges if use_sparse else None,
-        cap_banks=pf.cap_banks if use_sparse else None,
-        tap_pu=tap_pu if use_sparse else None,
-        cap_on=cap_on if use_sparse else None,
-        use_sparse_y=use_sparse,
+        **y_sparse_kw,
     )
-    if str(pf.loss_mode).strip().lower() == "flow_relative":
+    if loss_mode == "flow_relative":
         loss_pf = loss_pf * _pf_flow_relative_volt_scale(y_std_ri)
     return loss_pf
 
@@ -1935,8 +2000,13 @@ def _setup_pf_physics(
     weight_warmup_epochs = max(int(getattr(args, "pf_weight_warmup_epochs", 0) or 0), 0)
     weight_ramp_epochs = max(int(getattr(args, "pf_weight_ramp_epochs", 0) or 0), 0)
     loss_mode = str(getattr(args, "pf_loss_mode", "flow_relative") or "flow_relative").strip().lower()
-    if loss_mode not in ("absolute", "flow_relative"):
-        raise ValueError(f"--pf_loss_mode must be 'absolute' or 'flow_relative', got {loss_mode!r}")
+    if loss_mode not in ("absolute", "flow_relative", "hybrid"):
+        raise ValueError(
+            f"--pf_loss_mode must be 'absolute', 'flow_relative', or 'hybrid', got {loss_mode!r}"
+        )
+    absolute_weight = float(getattr(args, "pf_absolute_weight", 0.1) or 0.1)
+    if loss_mode == "hybrid" and absolute_weight < 0.0:
+        raise ValueError(f"--pf_absolute_weight must be >= 0 for hybrid mode, got {absolute_weight!r}")
     auto_scale_volt = bool(getattr(args, "pf_auto_scale_volt", False))
     auto_scale_max = float(getattr(args, "pf_auto_scale_max", 100.0) or 100.0)
     s_base = float(getattr(args, "pf_s_base_kva", 5000.0))
@@ -2129,8 +2199,11 @@ def _setup_pf_physics(
         schedule_msg = (
             f", weight_schedule=warmup={weight_warmup_epochs}+ramp={weight_ramp_epochs}"
         )
+    mode_msg = (
+        f"hybrid(alpha={absolute_weight:g})" if loss_mode == "hybrid" else loss_mode
+    )
     print(
-        f"Power-balance physics: weight={w:g}, mode={loss_mode}"
+        f"Power-balance physics: weight={w:g}, mode={mode_msg}"
         + wt_scale_msg
         + hard_topk_msg
         + schedule_msg
@@ -2160,6 +2233,7 @@ def _setup_pf_physics(
         weight_base=w_base,
         weight_node_scale=node_scale,
         loss_mode=loss_mode,
+        absolute_weight=absolute_weight,
         auto_scale_volt=auto_scale_volt,
         auto_scale_max=auto_scale_max,
         s_base_kva=s_base,
@@ -5134,9 +5208,17 @@ def parse_args() -> argparse.Namespace:
         "--pf_loss_mode",
         type=str,
         default="flow_relative",
-        choices=("flow_relative", "absolute"),
+        choices=("flow_relative", "absolute", "hybrid"),
         help="Physics loss form: flow_relative=Huber(S(Y,V_label)-S(Y,V_pred)) (default); "
+        "hybrid=L_flow_relative+alpha*L_absolute; "
         "absolute=Huber(P_inj-S(Y,V_pred)) legacy injection mismatch.",
+    )
+    p.add_argument(
+        "--pf_absolute_weight",
+        type=float,
+        default=0.1,
+        help="Alpha on absolute P_inj term when --pf_loss_mode=hybrid (default 0.1). "
+        "Flow term is volt-normalized like flow_relative.",
     )
     p.add_argument(
         "--pf_auto_scale_volt",
