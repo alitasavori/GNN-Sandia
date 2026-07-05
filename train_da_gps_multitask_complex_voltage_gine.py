@@ -3913,6 +3913,165 @@ def _evaluate_multi_chunks(
     return {k: met_acc[k] / float(wtot) for k in met_acc}
 
 
+@torch.no_grad()
+def _evaluate_split_losses_multi_chunks(
+    model: nn.Module,
+    chunk_dirs: list[Path],
+    idx_lists: list[np.ndarray],
+    cache_pts: list[Path],
+    bootstrap_cache_pts: list[Path | None],
+    selected_ids_list: list[list[int] | None],
+    *,
+    nodes_name: str,
+    meta_name: str,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    cache_dir: Path,
+    ref_ntl: dict[str, int],
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    reg_mean: torch.Tensor,
+    reg_std: torch.Tensor,
+    pv_mean: torch.Tensor | None,
+    pv_std: torch.Tensor | None,
+    pv_aux_cols: list[str] | None,
+    device: torch.device,
+    use_amp: bool,
+    reg_loss: str,
+    reg_class_tables: list[dict] | None,
+    reg_target_mode: str,
+    reg_classes_digest: str,
+    reg_class_values: torch.Tensor | None,
+    base_model: nn.Module | None,
+    pf_state: object,
+    lam_v: float,
+    args: argparse.Namespace,
+    mse: nn.Module,
+    bce: nn.Module,
+    n_nodes: int,
+    n_pv_aux: int,
+    epoch: int,
+    batch_size: int,
+    num_workers: int,
+) -> dict[str, float]:
+    """Mean multitask loss (tot/volt/pf) over a split, matching the training val loop."""
+    tot_sum = volt_sum = pf_sum = 0.0
+    n_graphs = 0
+    y_mean_d = y_mean.to(device).float()
+    y_std_d = y_std.to(device).float()
+    reg_mean_d = reg_mean.to(device).float()
+    reg_std_d = reg_std.to(device).float()
+    x_mean_d = x_mean.to(device).float()
+    x_std_d = x_std.to(device).float()
+    reg_class_values_d = reg_class_values.to(device) if reg_class_values is not None else None
+    pin = device.type == "cuda"
+    for ci, ch in enumerate(chunk_dirs):
+        idx_te = idx_lists[ci]
+        if len(idx_te) == 0:
+            continue
+        cpt = cache_pts[ci]
+        boot_pt = bootstrap_cache_pts[ci]
+        x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
+            ch,
+            nodes_name=nodes_name,
+            meta_name=meta_name,
+            node_feature_cols=node_feature_cols,
+            node_pe_csv=node_pe_csv,
+            node_pe_cols=node_pe_cols,
+            selected_sample_ids=selected_ids_list[ci],
+            cap_cols=cap_cols,
+            reg_cols=reg_cols,
+            cache_pt=cpt,
+            bootstrap_gnn_cache_pt=boot_pt,
+            ref_ntl=ref_ntl,
+            pv_aux_cols=pv_aux_cols,
+            reg_class_tables=reg_class_tables,
+            reg_target_mode=reg_target_mode,
+            reg_classes_digest=reg_classes_digest,
+        )
+        if reg_loss == "ce":
+            y_reg_n = y_reg.to(dtype=torch.long)
+        else:
+            y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
+        x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
+        y_pv_n = None
+        if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
+            y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+        ds = DAGPSDataset(x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n)
+        dl = DataLoader(
+            Subset(ds, idx_te.tolist()),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin,
+            persistent_workers=num_workers > 0,
+        )
+        for batch in dl:
+            batch = batch.to(device)
+            batch = _cast_batch_float_tensors(batch)
+            yb = batch.y.view(batch.num_graphs, -1)
+            y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
+            y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+            yb_n = (yb - y_mean_d) / y_std_d
+            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                v_n, c_log, r_p, pv_p = model(batch)
+                lv = mse(v_n.view_as(yb_n), yb_n)
+                lc = bce(c_log, y_cap_b)
+                reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
+                lr_ = _reg_loss_scalar(
+                    r_p if reg_loss != "ce" else None,
+                    y_reg_b,
+                    reg_loss,
+                    reg_logits=reg_logits_v,
+                    reg_class_tables=reg_class_tables,
+                )
+                lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                lpf = _pf_loss_if_enabled(
+                    pf_state,
+                    v_n,
+                    batch,
+                    n_nodes=n_nodes,
+                    y_mean=y_mean_d,
+                    y_std=y_std_d,
+                    x_mean=x_mean_d,
+                    x_std=x_std_d,
+                    cap_logits=c_log,
+                    reg_pred=r_p,
+                    reg_loss=reg_loss,
+                    reg_mean=reg_mean_d,
+                    reg_std=reg_std_d,
+                    reg_logits=reg_logits_v,
+                    reg_class_values=reg_class_values_d,
+                    label_y_n=yb_n,
+                )
+                if lpf is not None:
+                    pf_w = _pf_effective_weight(pf_state, loss_v=lv, loss_pf=lpf, epoch=epoch)
+                    lt = lt + pf_w * lpf
+                    pf_sum += float(lpf.item()) * batch.num_graphs
+                if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                    lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                    lt = lt + float(args.lambda_pv) * lpv
+            tot_sum += float(lt.item()) * batch.num_graphs
+            volt_sum += float(lv.item()) * batch.num_graphs
+            n_graphs += int(batch.num_graphs)
+        del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl
+        gc.collect()
+    denom = max(n_graphs, 1)
+    pf_wt = float(getattr(pf_state, "weight", 0.0))
+    return {
+        "loss_tot": tot_sum / denom,
+        "loss_volt": volt_sum / denom,
+        "loss_pf": pf_sum / denom if pf_wt > 0 else float("nan"),
+    }
+
+
 def _da_gps_ckpt_meta(
     *,
     n_nodes: int,
@@ -4055,6 +4214,37 @@ def _save_periodic_training_checkpoint(
 _SAVE_ONLY_IMPROVE_METRICS = ("mae_vmag_pu", "mae_angle_deg", "mse_ri_normalized")
 _SAVE_ONLY_PRIMARY_METRIC = "mae_vmag_pu"
 
+# (metric_key, display_label, higher_is_better)
+_BASELINE_REPORT_SPECS: tuple[tuple[str, str, bool], ...] = (
+    ("mae_vmag_pu", "|V| MAE", False),
+    ("mae_angle_deg", "angle MAE", False),
+    ("mse_ri_normalized", "Re/Im MSE(nrm)", False),
+    ("r2_vmag_mean", "r2_mean", True),
+    ("r2_vmag_min", "r2_min", True),
+    ("mae_vmag_worst_node", "worst_mae", False),
+    ("loss_tot", "tot", False),
+    ("loss_volt", "volt", False),
+    ("loss_pf", "pf", False),
+)
+
+
+def _baseline_report_specs_for(metrics: dict[str, float]) -> list[tuple[str, str, bool]]:
+    """Return report specs, omitting loss_pf when physics is disabled (NaN)."""
+    specs = list(_BASELINE_REPORT_SPECS)
+    pf_b = metrics.get("loss_pf")
+    pf_c = float(pf_b) if pf_b is not None else float("nan")
+    if pf_c != pf_c:
+        specs = [s for s in specs if s[0] != "loss_pf"]
+    return specs
+
+
+def _format_baseline_metric_value(key: str, value: float) -> str:
+    if key.startswith("loss_"):
+        return f"{value:.4f}"
+    if key.startswith("r2_"):
+        return f"{value:.4f}"
+    return f"{value:.6f}"
+
 
 def _resolve_init_checkpoint_path(args: argparse.Namespace) -> Path | None:
     raw = str(getattr(args, "init_checkpoint", "") or "").strip()
@@ -4156,21 +4346,25 @@ def _checkpoint_improves_over_baseline(
 
 
 def _print_eval_metrics_line(prefix: str, met: dict[str, float]) -> None:
-    print(
-        f"{prefix}|V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"Re/Im MSE(nrm)={met['mse_ri_normalized']:.6f}",
-        flush=True,
-    )
+    parts = [prefix.strip()]
+    for key, label, _hib in _baseline_report_specs_for(met):
+        val = float(met.get(key, float("nan")))
+        parts.append(f"{label}={_format_baseline_metric_value(key, val)}")
+    print("  ".join(parts), flush=True)
 
 
-_BASELINE_METRIC_LABELS: dict[str, str] = {
-    "mae_vmag_pu": "|V| MAE",
-    "mae_angle_deg": "angle MAE",
-    "mse_ri_normalized": "Re/Im MSE(nrm)",
-}
-
-
-def _metric_delta_status(delta: float, *, epsilon: float = 1e-12) -> str:
+def _metric_delta_status(
+    delta: float,
+    *,
+    higher_is_better: bool = False,
+    epsilon: float = 1e-12,
+) -> str:
+    if higher_is_better:
+        if delta > epsilon:
+            return "improved"
+        if delta < -epsilon:
+            return "worse"
+        return "unchanged"
     if delta < -epsilon:
         return "improved"
     if delta > epsilon:
@@ -4180,8 +4374,8 @@ def _metric_delta_status(delta: float, *, epsilon: float = 1e-12) -> str:
 
 def _print_baseline_before_post_tune(val_met: dict[str, float], test_met: dict[str, float]) -> None:
     print("\n=== Baseline before post-tuning (init checkpoint) ===", flush=True)
-    _print_eval_metrics_line("  Val ", val_met)
-    _print_eval_metrics_line("  Test", test_met)
+    _print_eval_metrics_line("Val ", val_met)
+    _print_eval_metrics_line("Test", test_met)
 
 
 def _print_vs_baseline_deltas(
@@ -4197,15 +4391,56 @@ def _print_vs_baseline_deltas(
         ("val", baseline_val, val_met),
         ("test", baseline_test, test_met),
     ):
-        for key in _SAVE_ONLY_IMPROVE_METRICS:
-            label = _BASELINE_METRIC_LABELS.get(key, key)
-            b = float(bmet[key])
-            c = float(cmet[key])
+        for key, label, higher_is_better in _baseline_report_specs_for(bmet):
+            b = float(bmet.get(key, float("nan")))
+            c = float(cmet.get(key, float("nan")))
+            if b != b and c != c:
+                continue
             delta = c - b
-            status = _metric_delta_status(delta)
+            status = _metric_delta_status(delta, higher_is_better=higher_is_better)
+            b_fmt = _format_baseline_metric_value(key, b)
+            c_fmt = _format_baseline_metric_value(key, c)
+            if key.startswith("loss_") or key.startswith("r2_"):
+                delta_fmt = f"{delta:+.4f}"
+            else:
+                delta_fmt = f"{delta:+.5f}"
             print(
-                f"[vs baseline]{ep_tag} {split_name} {label}: {b:.5f} -> {c:.5f} "
-                f"(Δ {delta:+.5f}, {status})",
+                f"[vs baseline]{ep_tag} {split_name} {label}: {b_fmt} -> {c_fmt} "
+                f"(Δ {delta_fmt}, {status})",
+                flush=True,
+            )
+
+
+def _print_before_after_summary(
+    *,
+    baseline_val: dict[str, float],
+    baseline_test: dict[str, float],
+    val_met: dict[str, float],
+    test_met: dict[str, float],
+    title: str = "Before / after (init checkpoint vs fine-tuned best)",
+) -> None:
+    print(f"\n=== {title} ===", flush=True)
+    print(
+        f"{'split':<6} {'metric':<22} {'baseline':>12} {'after':>12} {'delta':>12} {'status':>10}",
+        flush=True,
+    )
+    for split_name, bmet, amet in (
+        ("val", baseline_val, val_met),
+        ("test", baseline_test, test_met),
+    ):
+        for key, label, higher_is_better in _baseline_report_specs_for(bmet):
+            b = float(bmet.get(key, float("nan")))
+            a = float(amet.get(key, float("nan")))
+            if b != b and a != a:
+                continue
+            delta = a - b
+            status = _metric_delta_status(delta, higher_is_better=higher_is_better)
+            print(
+                f"{split_name:<6} {label:<22} "
+                f"{_format_baseline_metric_value(key, b):>12} "
+                f"{_format_baseline_metric_value(key, a):>12} "
+                f"{(f'{delta:+.4f}' if key.startswith(('loss_', 'r2_')) else f'{delta:+.6f}'):>12} "
+                f"{status:>10}",
                 flush=True,
             )
 
@@ -4688,6 +4923,18 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_class_values=reg_class_values,
         base_model=base_model,
     )
+    _loss_eval_kw = dict(
+        **_eval_kw,
+        pf_state=pf_state,
+        lam_v=lam_v,
+        args=args,
+        mse=mse,
+        bce=bce,
+        n_nodes=n_nodes,
+        n_pv_aux=n_pv_aux,
+        batch_size=int(args.batch_size),
+        num_workers=nw,
+    )
     baseline_val_met: dict[str, float] | None = None
     baseline_test_met: dict[str, float] | None = None
     if _should_eval_before_train(args, init_ckpt_path):
@@ -4695,8 +4942,32 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         baseline_val_met = _evaluate_multi_chunks(
             model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
         )
+        baseline_val_met.update(
+            _evaluate_split_losses_multi_chunks(
+                model,
+                chunk_dirs,
+                idx_val_list,
+                cache_pts,
+                bootstrap_cache_pts,
+                selected_ids_list,
+                epoch=0,
+                **_loss_eval_kw,
+            )
+        )
         baseline_test_met = _evaluate_multi_chunks(
             model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+        )
+        baseline_test_met.update(
+            _evaluate_split_losses_multi_chunks(
+                model,
+                chunk_dirs,
+                idx_test_list,
+                cache_pts,
+                bootstrap_cache_pts,
+                selected_ids_list,
+                epoch=0,
+                **_loss_eval_kw,
+            )
         )
         _print_baseline_before_post_tune(baseline_val_met, baseline_test_met)
 
@@ -5108,8 +5379,27 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             ep_val_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
             )
+            ep_val_met.update(
+                {
+                    "loss_tot": val_tot,
+                    "loss_volt": val_v,
+                    "loss_pf": val_pf,
+                }
+            )
             ep_test_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+            )
+            ep_test_met.update(
+                _evaluate_split_losses_multi_chunks(
+                    model,
+                    chunk_dirs,
+                    idx_test_list,
+                    cache_pts,
+                    bootstrap_cache_pts,
+                    selected_ids_list,
+                    epoch=ep,
+                    **_loss_eval_kw,
+                )
             )
             _print_vs_baseline_deltas(
                 epoch=ep,
@@ -5167,8 +5457,32 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     val_met = _evaluate_multi_chunks(
         model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
     )
+    val_met.update(
+        _evaluate_split_losses_multi_chunks(
+            model,
+            chunk_dirs,
+            idx_val_list,
+            cache_pts,
+            bootstrap_cache_pts,
+            selected_ids_list,
+            epoch=int(best_epoch),
+            **_loss_eval_kw,
+        )
+    )
     met = _evaluate_multi_chunks(
         model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+    )
+    met.update(
+        _evaluate_split_losses_multi_chunks(
+            model,
+            chunk_dirs,
+            idx_test_list,
+            cache_pts,
+            bootstrap_cache_pts,
+            selected_ids_list,
+            epoch=int(best_epoch),
+            **_loss_eval_kw,
+        )
     )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
@@ -5218,22 +5532,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     }
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     if baseline_val_met is not None and baseline_test_met is not None:
-        print("\n=== Before / after (init checkpoint vs fine-tuned best) ===", flush=True)
-        print(
-            f"{'split':<6} {'metric':<22} {'baseline':>12} {'after':>12} {'delta':>12}",
-            flush=True,
+        _print_before_after_summary(
+            baseline_val=baseline_val_met,
+            baseline_test=baseline_test_met,
+            val_met=val_met,
+            test_met=met,
         )
-        for split_name, bmet, amet in (
-            ("val", baseline_val_met, val_met),
-            ("test", baseline_test_met, met),
-        ):
-            for key in _SAVE_ONLY_IMPROVE_METRICS:
-                b = float(bmet[key])
-                a = float(amet[key])
-                print(
-                    f"{split_name:<6} {key:<22} {b:12.6f} {a:12.6f} {a - b:12.6f}",
-                    flush=True,
-                )
     _pv_n = met.get("pv_mse_normalized", float("nan"))
     _pv_raw = met.get("pv_mse_raw", float("nan"))
     _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
