@@ -4263,6 +4263,130 @@ def _resolve_init_run_dir(args: argparse.Namespace, init_ckpt: Path | None) -> P
     return None
 
 
+def _load_norm_tensor(path: Path) -> torch.Tensor:
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _try_load_norm_stats_from_init_run_dir(
+    init_run_dir: Path,
+    *,
+    n_node_features: int,
+    n_nodes: int,
+    n_reg: int,
+    n_pv_aux: int,
+    reg_loss: str,
+) -> dict[str, torch.Tensor | None] | None:
+    """Load x/y/reg/pv normalization tensors saved alongside a baseline run."""
+    core = ("x_mean.pt", "x_std.pt", "y_mean.pt", "y_std.pt")
+    missing = [fn for fn in core if not (init_run_dir / fn).is_file()]
+    if missing:
+        return None
+
+    x_mean = _load_norm_tensor(init_run_dir / "x_mean.pt").float().view(1, n_node_features)
+    x_std = _load_norm_tensor(init_run_dir / "x_std.pt").float().view(1, n_node_features)
+    y_mean = _load_norm_tensor(init_run_dir / "y_mean.pt").float().view(1, n_nodes * 2)
+    y_std = _load_norm_tensor(init_run_dir / "y_std.pt").float().view(1, n_nodes * 2)
+
+    if reg_loss == "ce":
+        reg_mean = torch.zeros(1, n_reg, dtype=torch.float32)
+        reg_std = torch.ones(1, n_reg, dtype=torch.float32)
+    else:
+        reg_paths = (init_run_dir / "reg_mean.pt", init_run_dir / "reg_std.pt")
+        if not all(p.is_file() for p in reg_paths):
+            return None
+        reg_mean = _load_norm_tensor(reg_paths[0]).float().view(1, n_reg)
+        reg_std = _load_norm_tensor(reg_paths[1]).float().view(1, n_reg)
+
+    pv_mean: torch.Tensor | None = None
+    pv_std: torch.Tensor | None = None
+    if n_pv_aux > 0:
+        pv_paths = (init_run_dir / "pv_mean.pt", init_run_dir / "pv_std.pt")
+        if not all(p.is_file() for p in pv_paths):
+            return None
+        pv_mean = _load_norm_tensor(pv_paths[0]).float().view(1, n_pv_aux)
+        pv_std = _load_norm_tensor(pv_paths[1]).float().view(1, n_pv_aux)
+
+    return {
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "reg_mean": reg_mean,
+        "reg_std": reg_std,
+        "pv_mean": pv_mean,
+        "pv_std": pv_std,
+    }
+
+
+def _apply_init_run_norm_stats(
+    *,
+    init_run_dir: Path | None,
+    init_ckpt_path: Path | None,
+    args: argparse.Namespace,
+    n_node_features: int,
+    n_nodes: int,
+    n_reg: int,
+    n_pv_aux: int,
+    reg_loss: str,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    reg_mean: torch.Tensor,
+    reg_std: torch.Tensor,
+    pv_mean: torch.Tensor | None,
+    pv_std: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Prefer baseline run norm stats when fine-tuning from --init_checkpoint."""
+    if init_run_dir is None or init_ckpt_path is None:
+        print("norm stats: computed from current train split", flush=True)
+        return x_mean, x_std, y_mean, y_std, reg_mean, reg_std, pv_mean, pv_std
+    if bool(getattr(args, "recompute_norm_stats", False)):
+        print(
+            "norm stats: --recompute_norm_stats set; using current train split "
+            f"(ignoring {init_run_dir})",
+            flush=True,
+        )
+        return x_mean, x_std, y_mean, y_std, reg_mean, reg_std, pv_mean, pv_std
+
+    loaded = _try_load_norm_stats_from_init_run_dir(
+        init_run_dir,
+        n_node_features=n_node_features,
+        n_nodes=n_nodes,
+        n_reg=n_reg,
+        n_pv_aux=n_pv_aux,
+        reg_loss=reg_loss,
+    )
+    if loaded is None:
+        print(
+            f"norm stats: init_run_dir {init_run_dir} missing sidecar *.pt tensors; "
+            "using current train split (upload x/y/reg/pv mean/std from baseline run)",
+            flush=True,
+        )
+        return x_mean, x_std, y_mean, y_std, reg_mean, reg_std, pv_mean, pv_std
+
+    print(f"norm stats: loaded from init_run_dir {init_run_dir}", flush=True)
+    return (
+        loaded["x_mean"],
+        loaded["x_std"],
+        loaded["y_mean"],
+        loaded["y_std"],
+        loaded["reg_mean"],
+        loaded["reg_std"],
+        loaded["pv_mean"],
+        loaded["pv_std"],
+    )
+
+
 def _should_eval_before_train(args: argparse.Namespace, init_ckpt: Path | None) -> bool:
     if bool(getattr(args, "no_eval_before_train", False)):
         return False
@@ -4762,11 +4886,32 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         pv_mean = (sum_pv / float(cnt_pv)).view(1, -1).float()
         pv_var = sum_pv2 / float(cnt_pv) - (sum_pv / float(cnt_pv)) ** 2
         pv_std = torch.sqrt(pv_var.clamp_min(1e-24)).view(1, -1).clamp_min(1e-6).float()
-        torch.save(pv_mean, out_dir / "pv_mean.pt")
-        torch.save(pv_std, out_dir / "pv_std.pt")
     else:
         pv_mean = None
         pv_std = None
+
+    x_mean, x_std, y_mean, y_std, reg_mean, reg_std, pv_mean, pv_std = _apply_init_run_norm_stats(
+        init_run_dir=init_run_dir,
+        init_ckpt_path=init_ckpt_path,
+        args=args,
+        n_node_features=n_node_features,
+        n_nodes=n_nodes,
+        n_reg=n_reg,
+        n_pv_aux=n_pv_aux,
+        reg_loss=reg_loss,
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=y_mean,
+        y_std=y_std,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        pv_mean=pv_mean,
+        pv_std=pv_std,
+    )
+
+    if n_pv_aux > 0 and pv_mean is not None and pv_std is not None:
+        torch.save(pv_mean, out_dir / "pv_mean.pt")
+        torch.save(pv_std, out_dir / "pv_std.pt")
 
     torch.save(x_mean, out_dir / "x_mean.pt")
     torch.save(x_std, out_dir / "x_std.pt")
@@ -5380,11 +5525,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
             )
             ep_val_met.update(
-                {
-                    "loss_tot": val_tot,
-                    "loss_volt": val_v,
-                    "loss_pf": val_pf,
-                }
+                _evaluate_split_losses_multi_chunks(
+                    model,
+                    chunk_dirs,
+                    idx_val_list,
+                    cache_pts,
+                    bootstrap_cache_pts,
+                    selected_ids_list,
+                    epoch=ep,
+                    **_loss_eval_kw,
+                )
             )
             ep_test_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
@@ -5899,8 +6049,14 @@ def parse_args() -> argparse.Namespace:
         "--init_run_dir",
         type=str,
         default="",
-        help="Directory of the source run (reg_class_tables.json, manifest). "
+        help="Directory of the source run (reg_class_tables.json, norm stats *.pt, manifest). "
         "Default: parent folder of --init_checkpoint.",
+    )
+    p.add_argument(
+        "--recompute_norm_stats",
+        action="store_true",
+        help="Recompute x/y/reg/pv mean/std from the current train split even when --init_run_dir "
+        "has sidecar norm tensors (default: load baseline norm stats for init_checkpoint fine-tune).",
     )
     p.add_argument(
         "--init_checkpoint_strict",

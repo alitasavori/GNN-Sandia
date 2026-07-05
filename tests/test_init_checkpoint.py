@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from train_da_gps_multitask_complex_voltage_gine import (
     _BASELINE_REPORT_SPECS,
+    _apply_init_run_norm_stats,
     _baseline_report_specs_for,
     _checkpoint_improves_over_baseline,
     _format_baseline_metric_value,
@@ -16,6 +17,7 @@ from train_da_gps_multitask_complex_voltage_gine import (
     _metric_delta_status,
     _print_eval_metrics_line,
     _print_vs_baseline_deltas,
+    _try_load_norm_stats_from_init_run_dir,
 )
 
 
@@ -180,3 +182,68 @@ def test_print_eval_metrics_line_includes_r2_and_worst(capsys) -> None:
     assert "worst_mae=0.013400" in out
     assert "tot=0.0500" in out
     assert "volt=0.0300" in out
+
+
+def test_try_load_norm_stats_from_init_run_dir(tmp_path: Path) -> None:
+    n_nodes = 2
+    n_feat = 3
+    n_reg = 1
+    n_pv = 2
+    torch.save(torch.zeros(1, n_feat), tmp_path / "x_mean.pt")
+    torch.save(torch.ones(1, n_feat), tmp_path / "x_std.pt")
+    torch.save(torch.zeros(1, n_nodes * 2), tmp_path / "y_mean.pt")
+    torch.save(torch.ones(1, n_nodes * 2), tmp_path / "y_std.pt")
+    torch.save(torch.zeros(1, n_reg), tmp_path / "reg_mean.pt")
+    torch.save(torch.ones(1, n_reg), tmp_path / "reg_std.pt")
+    torch.save(torch.zeros(1, n_pv), tmp_path / "pv_mean.pt")
+    torch.save(torch.ones(1, n_pv), tmp_path / "pv_std.pt")
+
+    loaded = _try_load_norm_stats_from_init_run_dir(
+        tmp_path,
+        n_node_features=n_feat,
+        n_nodes=n_nodes,
+        n_reg=n_reg,
+        n_pv_aux=n_pv,
+        reg_loss="mse",
+    )
+    assert loaded is not None
+    assert loaded["y_mean"].shape == (1, n_nodes * 2)
+    assert loaded["pv_mean"] is not None
+    assert int(loaded["pv_mean"].shape[1]) == n_pv
+
+
+def test_apply_init_run_norm_stats_prefers_init_dir(tmp_path: Path) -> None:
+    n_nodes = 2
+    n_feat = 3
+    n_reg = 1
+    torch.save(torch.full((1, n_feat), 9.0), tmp_path / "x_mean.pt")
+    torch.save(torch.ones(1, n_feat), tmp_path / "x_std.pt")
+    torch.save(torch.zeros(1, n_nodes * 2), tmp_path / "y_mean.pt")
+    torch.save(torch.ones(1, n_nodes * 2), tmp_path / "y_std.pt")
+    torch.save(torch.zeros(1, n_reg), tmp_path / "reg_mean.pt")
+    torch.save(torch.ones(1, n_reg), tmp_path / "reg_std.pt")
+
+    class _Args:
+        recompute_norm_stats = False
+
+    ckpt = tmp_path / "da_gps_multitask_best.pt"
+    ckpt.write_bytes(b"x")
+    x_mean, *_rest = _apply_init_run_norm_stats(
+        init_run_dir=tmp_path,
+        init_ckpt_path=ckpt,
+        args=_Args(),
+        n_node_features=n_feat,
+        n_nodes=n_nodes,
+        n_reg=n_reg,
+        n_pv_aux=0,
+        reg_loss="mse",
+        x_mean=torch.zeros(1, n_feat),
+        x_std=torch.ones(1, n_feat),
+        y_mean=torch.zeros(1, n_nodes * 2),
+        y_std=torch.ones(1, n_nodes * 2),
+        reg_mean=torch.zeros(1, n_reg),
+        reg_std=torch.ones(1, n_reg),
+        pv_mean=None,
+        pv_std=None,
+    )
+    assert float(x_mean[0, 0].item()) == 9.0
