@@ -3289,6 +3289,7 @@ def _empty_eval_metrics(cap_cols: list[str], reg_cols: list[str], meta_aux_cols:
         "rmse_vmag_pu": float("nan"),
         "mae_angle_deg": float("nan"),
         "rmse_angle_deg": float("nan"),
+        "mse_ri_normalized": float("nan"),
         "r2_vmag_mean": float("nan"),
         "r2_vmag_min": float("nan"),
         "mae_vmag_worst_node": float("nan"),
@@ -3378,6 +3379,11 @@ def evaluate(
     pred = torch.cat(preds, dim=0)
     tgt = torch.cat(tgts, dim=0)
     met = _metrics_voltage(pred, tgt)
+    ym = y_mean.view(1, -1).cpu()
+    ys = y_std.view(1, -1).cpu().clamp_min(1e-12)
+    pred_n = (pred - ym) / ys
+    tgt_n = (tgt - ym) / ys
+    met["mse_ri_normalized"] = float(F.mse_loss(pred_n, tgt_n).item())
     cap_log = torch.cat(cap_logits_all, dim=0)
     cap_t = torch.cat(cap_tgt_all, dim=0)
     met["cap_bce"] = float(F.binary_cross_entropy_with_logits(cap_log, cap_t).item())
@@ -4829,13 +4835,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if best_state is not None:
         base_model.load_state_dict(best_state)
 
-    met = _evaluate_multi_chunks(
-        model,
-        chunk_dirs,
-        idx_test_list,
-        cache_pts,
-        bootstrap_cache_pts,
-        selected_ids_list,
+    _eval_kw = dict(
         nodes_name=nodes_name,
         meta_name=meta_name,
         node_feature_cols=node_feature_cols,
@@ -4865,6 +4865,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_class_values=reg_class_values,
         base_model=base_model,
     )
+    val_met = _evaluate_multi_chunks(
+        model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+    )
+    met = _evaluate_multi_chunks(
+        model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+    )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
     torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
@@ -4880,6 +4886,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "best_val": float(best_val),
         "best_val_r2_mean": float(best_val_r2_mean) if best_val_r2_mean == best_val_r2_mean else None,
         "best_val_r2_min": float(best_val_r2_min) if best_val_r2_min == best_val_r2_min else None,
+        "val_metrics": val_met,
         "test_metrics": met,
         "train_seconds": train_seconds,
         "checkpoint": str(ckpt.resolve()),
@@ -4894,7 +4901,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         else f"  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  reg_MAE(pu)={met.get('reg_mae_tap_pu', float('nan')):.6f}"
     )
     print(
+        f"Val |V| MAE={val_met['mae_vmag_pu']:.6f}  angle MAE={val_met['mae_angle_deg']:.6f}  "
+        f"Re/Im MSE(nrm)={val_met['mse_ri_normalized']:.6f}",
+        flush=True,
+    )
+    print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
+        f"Re/Im MSE(nrm)={met['mse_ri_normalized']:.6f}  "
         f"cap_BCE={met['cap_bce']:.6f}{_reg_tail}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
     )
@@ -5840,14 +5853,12 @@ def main() -> None:
     if best_state is not None:
         base_model.load_state_dict(best_state)
 
-    met = evaluate(
-        model,
-        dl_te,
-        device,
-        y_mean_d,
-        y_std_d,
-        reg_mean_d,
-        reg_std_d,
+    _eval_kw = dict(
+        device=device,
+        y_mean=y_mean_d,
+        y_std=y_std_d,
+        reg_mean=reg_mean_d,
+        reg_std=reg_std_d,
         use_amp=use_amp,
         pv_mean=pv_mean_d,
         pv_std=pv_std_d,
@@ -5855,6 +5866,8 @@ def main() -> None:
         reg_cols=reg_cols,
         meta_aux_cols=list(pv_aux_cols) if n_pv_aux > 0 else [],
     )
+    val_met = evaluate(model, dl_va, **_eval_kw)
+    met = evaluate(model, dl_te, **_eval_kw)
     ckpt = out_dir / "da_gps_multitask_best.pt"
     torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
     report = {
@@ -5871,6 +5884,7 @@ def main() -> None:
         "best_val": float(best_val),
         "best_val_r2_mean": float(best_val_r2_mean) if best_val_r2_mean == best_val_r2_mean else None,
         "best_val_r2_min": float(best_val_r2_min) if best_val_r2_min == best_val_r2_min else None,
+        "val_metrics": val_met,
         "test_metrics": met,
         "train_seconds": train_seconds,
         "checkpoint": str(ckpt.resolve()),
@@ -5880,7 +5894,13 @@ def main() -> None:
     _pv_raw = met.get("pv_mse_raw", float("nan"))
     _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
     print(
+        f"Val |V| MAE={val_met['mae_vmag_pu']:.6f}  angle MAE={val_met['mae_angle_deg']:.6f}  "
+        f"Re/Im MSE(nrm)={val_met['mse_ri_normalized']:.6f}",
+        flush=True,
+    )
+    print(
         f"Test |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
+        f"Re/Im MSE(nrm)={met['mse_ri_normalized']:.6f}  "
         f"cap_BCE={met['cap_bce']:.6f}  reg_MSE(pu)={met['reg_mse_tap_pu']:.6f}  "
         f"reg_MAE(pu)={met.get('reg_mae_tap_pu', float('nan')):.6f}{_pv_tail}  time={train_seconds:.1f}s",
         flush=True,
