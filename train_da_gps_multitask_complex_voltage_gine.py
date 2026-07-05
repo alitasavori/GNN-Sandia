@@ -4052,6 +4052,116 @@ def _save_periodic_training_checkpoint(
     tmp.replace(path)
 
 
+_SAVE_ONLY_IMPROVE_METRICS = ("mae_vmag_pu", "mae_angle_deg", "mse_ri_normalized")
+_SAVE_ONLY_PRIMARY_METRIC = "mae_vmag_pu"
+
+
+def _resolve_init_checkpoint_path(args: argparse.Namespace) -> Path | None:
+    raw = str(getattr(args, "init_checkpoint", "") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).resolve()
+
+
+def _resolve_init_run_dir(args: argparse.Namespace, init_ckpt: Path | None) -> Path | None:
+    raw = str(getattr(args, "init_run_dir", "") or "").strip()
+    if raw:
+        p = Path(raw).resolve()
+        return p if p.is_dir() else None
+    if init_ckpt is not None and init_ckpt.is_file():
+        return init_ckpt.parent
+    return None
+
+
+def _should_eval_before_train(args: argparse.Namespace, init_ckpt: Path | None) -> bool:
+    if bool(getattr(args, "no_eval_before_train", False)):
+        return False
+    if bool(getattr(args, "eval_before_train", False)):
+        return True
+    return init_ckpt is not None and init_ckpt.is_file()
+
+
+def _apply_finetune_physics_only_args(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "finetune_physics_only", False)):
+        return
+    args.lambda_cap = 0.0
+    args.lambda_reg = 0.0
+    args.lambda_pv = 0.0
+    print(
+        "finetune_physics_only: lambda_cap/lambda_reg/lambda_pv -> 0 "
+        f"(lambda_voltage={float(getattr(args, 'lambda_voltage', 1.0)):g})",
+        flush=True,
+    )
+
+
+def _load_init_checkpoint(
+    base_model: nn.Module,
+    path: Path,
+    *,
+    strict: bool = False,
+) -> dict[str, object]:
+    """Load ``model_state_dict`` from a prior ``da_gps_multitask_best.pt`` / ``training_last.pt``."""
+    if not path.is_file():
+        raise FileNotFoundError(f"--init_checkpoint not found: {path}")
+    pack = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(pack, dict):
+        raise ValueError(f"init_checkpoint must be a dict payload, got {type(pack)}")
+    sd = pack.get("model_state_dict")
+    if sd is None:
+        sd = pack.get("best_model_state_dict")
+    if sd is None:
+        raise ValueError(f"init_checkpoint missing model_state_dict: {path}")
+    missing, unexpected = base_model.load_state_dict(sd, strict=bool(strict))
+    print(
+        f"Loaded init_checkpoint={path} strict={strict} "
+        f"missing={len(missing)} unexpected={len(unexpected)}",
+        flush=True,
+    )
+    if missing:
+        print(f"  missing keys (first 10): {list(missing)[:10]}", flush=True)
+    if unexpected:
+        print(f"  unexpected keys (first 10): {list(unexpected)[:10]}", flush=True)
+    return pack
+
+
+def _metrics_for_save_gate(metrics: dict[str, float]) -> dict[str, float]:
+    return {k: float(metrics.get(k, float("nan"))) for k in _SAVE_ONLY_IMPROVE_METRICS}
+
+
+def _checkpoint_improves_over_baseline(
+    baseline: dict[str, float],
+    candidate: dict[str, float],
+    *,
+    epsilon: float,
+) -> tuple[bool, str]:
+    """Engage-style gate: primary test |V| MAE must improve; others must not regress."""
+    eps = float(epsilon)
+    b = _metrics_for_save_gate(baseline)
+    c = _metrics_for_save_gate(candidate)
+    reasons: list[str] = []
+    primary_b = b[_SAVE_ONLY_PRIMARY_METRIC]
+    primary_c = c[_SAVE_ONLY_PRIMARY_METRIC]
+    if not (primary_c < primary_b - eps):
+        reasons.append(
+            f"{_SAVE_ONLY_PRIMARY_METRIC}: {primary_c:.6f} not < baseline {primary_b:.6f} - {eps:g}"
+        )
+    for k in _SAVE_ONLY_IMPROVE_METRICS:
+        if k == _SAVE_ONLY_PRIMARY_METRIC:
+            continue
+        if c[k] > b[k] + eps:
+            reasons.append(f"{k}: {c[k]:.6f} > baseline {b[k]:.6f} + {eps:g} (regression)")
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, "ok"
+
+
+def _print_eval_metrics_line(prefix: str, met: dict[str, float]) -> None:
+    print(
+        f"{prefix}|V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
+        f"Re/Im MSE(nrm)={met['mse_ri_normalized']:.6f}",
+        flush=True,
+    )
+
 
 def _chunk_dirs_from_subdir_glob(chunk_parent: Path, glob_pat: str) -> list[Path]:
     """Resolve chunk folders: fnmatch pattern or comma-separated exact names."""
@@ -4075,6 +4185,14 @@ def _chunk_dirs_from_subdir_glob(chunk_parent: Path, glob_pat: str) -> list[Path
 
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
+    _apply_finetune_physics_only_args(args)
+    lam_v = float(getattr(args, "lambda_voltage", 1.0))
+    init_ckpt_path = _resolve_init_checkpoint_path(args)
+    init_run_dir = _resolve_init_run_dir(args, init_ckpt_path)
+    if init_ckpt_path is not None:
+        print(f"init_checkpoint: {init_ckpt_path}", flush=True)
+    if init_run_dir is not None:
+        print(f"init_run_dir: {init_run_dir}", flush=True)
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
     reg_loss = _parse_reg_loss(args.reg_loss)
@@ -4182,20 +4300,31 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     reg_class_tables: list[dict] | None = None
     reg_nclasses: list[int] = []
     if reg_loss == "ce":
-        _sel_for_classes: list[list[int] | None] = []
-        for ci, ch in enumerate(chunk_dirs):
-            _sel_for_classes.append(
-                _select_sample_ids_from_meta(ch / meta_name, float(args.sample_frac), int(args.seed), ci)
-            )
-        reg_raw_all = _collect_reg_raw_all_chunks(chunk_dirs, meta_name, reg_cols, _sel_for_classes)
-        reg_class_tables = _build_reg_class_tables(reg_cols, reg_raw_all)
-        reg_nclasses = [int(t["n_classes"]) for t in reg_class_tables]
+        _loaded_reg_from_init = False
+        if init_run_dir is not None:
+            _rct_init = init_run_dir / "reg_class_tables.json"
+            if _rct_init.is_file():
+                reg_class_tables = json.loads(_rct_init.read_text(encoding="utf-8"))
+                reg_nclasses = [int(t["n_classes"]) for t in reg_class_tables]
+                _loaded_reg_from_init = True
+                print(f"reg_class_tables: loaded from init run {_rct_init}", flush=True)
+                for tab in reg_class_tables:
+                    print(f"  {tab['col']}: n_classes={tab['n_classes']}", flush=True)
+        if not _loaded_reg_from_init:
+            _sel_for_classes: list[list[int] | None] = []
+            for ci, ch in enumerate(chunk_dirs):
+                _sel_for_classes.append(
+                    _select_sample_ids_from_meta(ch / meta_name, float(args.sample_frac), int(args.seed), ci)
+                )
+            reg_raw_all = _collect_reg_raw_all_chunks(chunk_dirs, meta_name, reg_cols, _sel_for_classes)
+            reg_class_tables = _build_reg_class_tables(reg_cols, reg_raw_all)
+            reg_nclasses = [int(t["n_classes"]) for t in reg_class_tables]
+            print("reg_loss=ce: per-regulator tap classes (rounded unique tap_pu):", flush=True)
+            for tab in reg_class_tables:
+                print(f"  {tab['col']}: n_classes={tab['n_classes']}", flush=True)
         (out_dir / "reg_class_tables.json").write_text(
             json.dumps(reg_class_tables, indent=2), encoding="utf-8"
         )
-        print("reg_loss=ce: per-regulator tap classes (rounded unique tap_pu):", flush=True)
-        for tab in reg_class_tables:
-            print(f"  {tab['col']}: n_classes={tab['n_classes']}", flush=True)
 
     reg_classes_digest = _reg_class_tables_digest(reg_class_tables) if reg_class_tables else ""
 
@@ -4475,6 +4604,71 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
+    if init_ckpt_path is not None:
+        _load_init_checkpoint(
+            base_model,
+            init_ckpt_path,
+            strict=bool(getattr(args, "init_checkpoint_strict", False)),
+        )
+
+    _eval_kw = dict(
+        nodes_name=nodes_name,
+        meta_name=meta_name,
+        node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
+        node_pe_cols=node_pe_cols,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        cache_dir=cache_dir,
+        ref_ntl=ref_ntl,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=y_mean,
+        y_std=y_std,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        pv_mean=pv_mean,
+        pv_std=pv_std,
+        pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+        device=device,
+        use_amp=use_amp,
+        reg_loss=reg_loss,
+        reg_class_tables=reg_class_tables,
+        reg_target_mode=reg_target_mode,
+        reg_classes_digest=reg_classes_digest,
+        reg_class_values=reg_class_values,
+        base_model=base_model,
+    )
+    baseline_val_met: dict[str, float] | None = None
+    baseline_test_met: dict[str, float] | None = None
+    if _should_eval_before_train(args, init_ckpt_path):
+        print("[init eval] evaluating init checkpoint (no training)", flush=True)
+        baseline_val_met = _evaluate_multi_chunks(
+            model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+        )
+        baseline_test_met = _evaluate_multi_chunks(
+            model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+        )
+        _print_eval_metrics_line("[init eval] Val ", baseline_val_met)
+        _print_eval_metrics_line("[init eval] Test", baseline_test_met)
+
+    if bool(getattr(args, "eval_only", False)):
+        report = {
+            "task": "DA-GPS multitask chunk_parent eval_only",
+            "chunk_parent": str(chunk_parent),
+            "chunks": [str(p) for p in chunk_dirs],
+            "hyperparameters": vars(args),
+            "init_checkpoint": str(init_ckpt_path) if init_ckpt_path else None,
+            "val_metrics": baseline_val_met,
+            "test_metrics": baseline_test_met,
+            "eval_only": True,
+        }
+        (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        print(f"eval_only: wrote {out_dir / 'da_gps_report.json'}", flush=True)
+        return
+
     best_val = float("inf")
     best_state = None
     bad = 0
@@ -4559,7 +4753,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_logits=reg_logits,
                         reg_class_tables=reg_class_tables,
                     )
-                    loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                    loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                     loss_pf = _pf_loss_if_enabled(
                         pf_state,
                         v_n,
@@ -4727,7 +4921,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             reg_logits=reg_logits_v,
                             reg_class_tables=reg_class_tables,
                         )
-                        lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                        lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                         lpf = _pf_loss_if_enabled(
                             pf_state,
                             v_n,
@@ -4909,36 +5103,6 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if best_state is not None:
         base_model.load_state_dict(best_state)
 
-    _eval_kw = dict(
-        nodes_name=nodes_name,
-        meta_name=meta_name,
-        node_feature_cols=node_feature_cols,
-        node_pe_csv=node_pe_csv,
-        node_pe_cols=node_pe_cols,
-        cap_cols=cap_cols,
-        reg_cols=reg_cols,
-        cache_dir=cache_dir,
-        ref_ntl=ref_ntl,
-        edge_index=edge_index,
-        edge_attr=edge_attr,
-        x_mean=x_mean,
-        x_std=x_std,
-        y_mean=y_mean,
-        y_std=y_std,
-        reg_mean=reg_mean,
-        reg_std=reg_std,
-        pv_mean=pv_mean,
-        pv_std=pv_std,
-        pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
-        device=device,
-        use_amp=use_amp,
-        reg_loss=reg_loss,
-        reg_class_tables=reg_class_tables,
-        reg_target_mode=reg_target_mode,
-        reg_classes_digest=reg_classes_digest,
-        reg_class_values=reg_class_values,
-        base_model=base_model,
-    )
     val_met = _evaluate_multi_chunks(
         model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
     )
@@ -4947,7 +5111,28 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
-    torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
+    save_ok = True
+    reject_reason = ""
+    if bool(getattr(args, "save_only_if_improved", False)):
+        ref_test = baseline_test_met
+        if ref_test is None:
+            print(
+                "save_only_if_improved: no init baseline test metrics; "
+                "use --init_checkpoint (eval_before_train runs automatically)",
+                flush=True,
+            )
+        else:
+            save_ok, reject_reason = _checkpoint_improves_over_baseline(
+                ref_test,
+                met,
+                epsilon=float(getattr(args, "improvement_metric_epsilon", 1e-6)),
+            )
+
+    if save_ok:
+        torch.save(_da_gps_checkpoint_payload(base_model, ckpt_meta), ckpt)
+    else:
+        print(f"REJECTED checkpoint save (save_only_if_improved): {reject_reason}", flush=True)
+
     report = {
         "task": "DA-GPS multitask chunk_parent",
         "chunk_parent": str(chunk_parent),
@@ -4956,6 +5141,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "chunk_tensor_cache_dir": str(cache_dir),
         "n_chunks": len(chunk_dirs),
         "hyperparameters": vars(args),
+        "init_checkpoint": str(init_ckpt_path) if init_ckpt_path else None,
+        "init_baseline_val_metrics": baseline_val_met,
+        "init_baseline_test_metrics": baseline_test_met,
         "best_epoch": int(best_epoch),
         "best_val": float(best_val),
         "best_val_r2_mean": float(best_val_r2_mean) if best_val_r2_mean == best_val_r2_mean else None,
@@ -4963,9 +5151,28 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "val_metrics": val_met,
         "test_metrics": met,
         "train_seconds": train_seconds,
-        "checkpoint": str(ckpt.resolve()),
+        "checkpoint_saved": bool(save_ok),
+        "checkpoint_reject_reason": reject_reason if not save_ok else None,
+        "checkpoint": str(ckpt.resolve()) if save_ok else None,
     }
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if baseline_val_met is not None and baseline_test_met is not None:
+        print("\n=== Before / after (init checkpoint vs fine-tuned best) ===", flush=True)
+        print(
+            f"{'split':<6} {'metric':<22} {'baseline':>12} {'after':>12} {'delta':>12}",
+            flush=True,
+        )
+        for split_name, bmet, amet in (
+            ("val", baseline_val_met, val_met),
+            ("test", baseline_test_met, met),
+        ):
+            for key in _SAVE_ONLY_IMPROVE_METRICS:
+                b = float(bmet[key])
+                a = float(amet[key])
+                print(
+                    f"{split_name:<6} {key:<22} {b:12.6f} {a:12.6f} {a - b:12.6f}",
+                    flush=True,
+                )
     _pv_n = met.get("pv_mse_normalized", float("nan"))
     _pv_raw = met.get("pv_mse_raw", float("nan"))
     _pv_tail = f"  meta_aux_MSE(nrm)={_pv_n:.6f}  meta_aux_MSE(raw)={_pv_raw:.6f}" if n_pv_aux > 0 else ""
@@ -4986,7 +5193,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         flush=True,
     )
     _print_test_per_head_block("[da_gps chunk_parent]", met, cap_cols, reg_cols, list(pv_aux_cols) if n_pv_aux > 0 else [])
-    print(f"Saved {ckpt}", flush=True)
+    if save_ok:
+        print(f"Saved {ckpt}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -5315,6 +5523,66 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="After warmup, linearly ramp physics weight to full over N epochs (0=immediate full weight).",
     )
+    p.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default="",
+        help="Path to da_gps_multitask_best.pt (or training_last.pt) to load before training. "
+        "Uses strict=False by default so minor head mismatches are tolerated.",
+    )
+    p.add_argument(
+        "--init_run_dir",
+        type=str,
+        default="",
+        help="Directory of the source run (reg_class_tables.json, manifest). "
+        "Default: parent folder of --init_checkpoint.",
+    )
+    p.add_argument(
+        "--init_checkpoint_strict",
+        action="store_true",
+        help="Require exact state_dict key match when loading --init_checkpoint (default: strict=False).",
+    )
+    p.add_argument(
+        "--lambda_voltage",
+        type=float,
+        default=1.0,
+        help="Weight on voltage MSE in the multitask loss (1.0=default). "
+        "Use a small value (e.g. 0.01) as an anchor during physics fine-tune; "
+        "0 with --finetune_physics_only for pure physics.",
+    )
+    p.add_argument(
+        "--finetune_physics_only",
+        action="store_true",
+        help="Engage-style post-hoc fine-tune: set lambda_cap/lambda_reg/lambda_pv to 0 "
+        "(physics + optional lambda_voltage anchor only).",
+    )
+    p.add_argument(
+        "--eval_before_train",
+        action="store_true",
+        help="Evaluate val+test metrics on --init_checkpoint before training (default: on when init_checkpoint set).",
+    )
+    p.add_argument(
+        "--no_eval_before_train",
+        action="store_true",
+        help="Skip pre-train eval even when --init_checkpoint is set.",
+    )
+    p.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Load --init_checkpoint, evaluate val+test, write da_gps_report.json, and exit (no training).",
+    )
+    p.add_argument(
+        "--save_only_if_improved",
+        action="store_true",
+        help="Only write da_gps_multitask_best.pt if test |V| MAE improves vs init baseline and "
+        "test angle MAE / norm Re-Im MSE do not regress beyond --improvement_metric_epsilon.",
+    )
+    p.add_argument(
+        "--improvement_metric_epsilon",
+        type=float,
+        default=1e-6,
+        help="Tolerance for non-primary metrics when --save_only_if_improved (default 1e-6).",
+    )
     return p.parse_args()
 
 
@@ -5325,6 +5593,9 @@ def main() -> None:
         main_multi_chunk(args, repo)
         return
 
+    _apply_finetune_physics_only_args(args)
+    lam_v = float(getattr(args, "lambda_voltage", 1.0))
+    init_ckpt_path = _resolve_init_checkpoint_path(args)
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
     reg_loss = _parse_reg_loss(args.reg_loss)
@@ -5654,7 +5925,7 @@ def main() -> None:
                 loss_v = mse(v_n.view_as(yb_n), yb_n)
                 loss_c = bce(c_log, y_cap)
                 loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
-                loss = loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
+                loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                 loss_pf = _pf_loss_if_enabled(
                     pf_state,
                     v_n,
@@ -5765,7 +6036,7 @@ def main() -> None:
                     lv = mse(v_n.view_as(yb_n), yb_n)
                     lc = bce(c_log, y_cap)
                     lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
-                    lt = lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                    lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
                     lpf = _pf_loss_if_enabled(
                         pf_state,
                         v_n,
