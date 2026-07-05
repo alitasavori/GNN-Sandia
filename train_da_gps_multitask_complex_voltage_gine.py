@@ -4163,6 +4163,53 @@ def _print_eval_metrics_line(prefix: str, met: dict[str, float]) -> None:
     )
 
 
+_BASELINE_METRIC_LABELS: dict[str, str] = {
+    "mae_vmag_pu": "|V| MAE",
+    "mae_angle_deg": "angle MAE",
+    "mse_ri_normalized": "Re/Im MSE(nrm)",
+}
+
+
+def _metric_delta_status(delta: float, *, epsilon: float = 1e-12) -> str:
+    if delta < -epsilon:
+        return "improved"
+    if delta > epsilon:
+        return "worse"
+    return "unchanged"
+
+
+def _print_baseline_before_post_tune(val_met: dict[str, float], test_met: dict[str, float]) -> None:
+    print("\n=== Baseline before post-tuning (init checkpoint) ===", flush=True)
+    _print_eval_metrics_line("  Val ", val_met)
+    _print_eval_metrics_line("  Test", test_met)
+
+
+def _print_vs_baseline_deltas(
+    *,
+    epoch: int | None,
+    baseline_val: dict[str, float],
+    baseline_test: dict[str, float],
+    val_met: dict[str, float],
+    test_met: dict[str, float],
+) -> None:
+    ep_tag = f" epoch {epoch}" if epoch is not None else ""
+    for split_name, bmet, cmet in (
+        ("val", baseline_val, val_met),
+        ("test", baseline_test, test_met),
+    ):
+        for key in _SAVE_ONLY_IMPROVE_METRICS:
+            label = _BASELINE_METRIC_LABELS.get(key, key)
+            b = float(bmet[key])
+            c = float(cmet[key])
+            delta = c - b
+            status = _metric_delta_status(delta)
+            print(
+                f"[vs baseline]{ep_tag} {split_name} {label}: {b:.5f} -> {c:.5f} "
+                f"(Δ {delta:+.5f}, {status})",
+                flush=True,
+            )
+
+
 def _chunk_dirs_from_subdir_glob(chunk_parent: Path, glob_pat: str) -> list[Path]:
     """Resolve chunk folders: fnmatch pattern or comma-separated exact names."""
     glob_pat = str(glob_pat).strip()
@@ -4651,8 +4698,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         baseline_test_met = _evaluate_multi_chunks(
             model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
         )
-        _print_eval_metrics_line("[init eval] Val ", baseline_val_met)
-        _print_eval_metrics_line("[init eval] Test", baseline_test_met)
+        _print_baseline_before_post_tune(baseline_val_met, baseline_test_met)
 
     if bool(getattr(args, "eval_only", False)):
         report = {
@@ -5058,6 +5104,21 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
+        if baseline_val_met is not None and baseline_test_met is not None:
+            ep_val_met = _evaluate_multi_chunks(
+                model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+            )
+            ep_test_met = _evaluate_multi_chunks(
+                model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+            )
+            _print_vs_baseline_deltas(
+                epoch=ep,
+                baseline_val=baseline_val_met,
+                baseline_test=baseline_test_met,
+                val_met=ep_val_met,
+                test_met=ep_test_met,
+            )
+            model.train()
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"

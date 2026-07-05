@@ -10,6 +10,7 @@ import torch.nn as nn
 from train_da_gps_multitask_complex_voltage_gine import (
     _checkpoint_improves_over_baseline,
     _load_init_checkpoint,
+    _metric_delta_status,
 )
 
 
@@ -76,3 +77,10 @@ def test_checkpoint_improves_primary_without_secondary_regression() -> None:
     ok3, reason3 = _checkpoint_improves_over_baseline(baseline, flat_v, epsilon=1e-6)
     assert not ok3
     assert "mae_vmag_pu" in reason3
+
+
+def test_metric_delta_status_lower_is_better() -> None:
+    assert _metric_delta_status(-0.00007) == "improved"
+    assert _metric_delta_status(0.00001) == "worse"
+    assert _metric_delta_status(0.0) == "unchanged"
+    assert _metric_delta_status(1e-13) == "unchanged"
