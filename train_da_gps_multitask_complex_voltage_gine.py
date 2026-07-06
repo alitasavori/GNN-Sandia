@@ -25,15 +25,24 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 - ``--pf_hard_node_topk``: apply physics only on top-k balance nodes per graph by ``|V_pred-V_label|`` (0=off).
 - ``--pf_weight_warmup_epochs`` / ``--pf_weight_ramp_epochs``: curriculum — zero physics for warmup epochs,
   then linear ramp to full ``--loss_power_balance_weight`` (smoke: 5+5 avoids early interference).
-- Base ``Y`` from **line-only** ``R_full``/``X_full`` in ``--edge_catalog_csv`` (regulator transformer branches and
-  cap shunts are excluded from the base stamp). Regulator branches from ``--pf_reg_edge_catalog`` are stamped with
-  **predicted** tap ratios; capacitor banks add shunt ``j*B`` at mapped cap buses from **predicted** cap states
+- Base ``Y`` from ``R_full``/``X_full``/``C_full`` (pi-model line shunts) in ``--edge_catalog_csv``; load
+  ``Transformer.*`` series branches included by default (``--pf_include_xfmr_in_y``). Regulator catalog
+  pairs are skipped in the base stamp and re-stamped with predicted taps; capacitor banks add shunt ``j*B``
   (``--pf_detach_controls`` optionally stops gradients through controls). By default
   ``--pf_use_label_controls`` stamps Y with ground-truth cap/reg targets (not model predictions).
   Caps are **not** added to ``Q_inj``.
 - ``P_inj``/``Q_inj`` use **known** denormalized node features only (OpenDSS convention:
   ``P_inj = P_pv - P_load``, ``Q_inj = -Q_pv - Q_load``). Meta-aux PV predictions are supervised separately and
   are **not** used in the physics residual. Missing catalog/mapping/normalization → error.
+
+Optional training add-ons (all default **off**; base recipe unchanged):
+
+- ``--attn_reg_territory_bias`` / ``--attn_reg_territory_beta``: soft downstream bias on regulator token
+  keys in the **second** cross-attention (node→token) only. Hop table from ``--hop_csv`` or repo
+  ``datasets_gnn2_from pc/load_hop_distance_to_each_regulator_all_index_nodes.csv``.
+- ``--reg_ordinal_ce`` (with ``--reg_loss ce``): cost-sensitive CE from |tap_class_j - tap_class_c|.
+- ``--volt_violation_weight`` / ``--volt_lo_pu`` / ``--volt_hi_pu`` / ``--volt_violation_alpha``:
+  per-node voltage MSE weights from target |V| outside [lo, hi].
 """
 from __future__ import annotations
 
@@ -100,22 +109,83 @@ def _reg_col_stem(col: str) -> str | None:
     return _device_stem(m.group(1)) if m else None
 
 
-def _parse_capacitors_dss(dss_path: Path) -> dict[str, tuple[str, float]]:
-    """``stem -> (bus1_node, kvar)`` from ``New Capacitor.NAME Bus1=... kvar=...`` lines."""
-    out: dict[str, tuple[str, float]] = {}
+def _parse_capacitors_dss(dss_path: Path) -> dict[str, tuple[str, float, float | None]]:
+    """``stem -> (bus1_node, kvar, kv_ln_or_none)`` from OpenDSS ``Capacitor`` definitions.
+
+    ``kv`` in Capacitors.dss is the rated **line-to-neutral** kV for wye banks (matches
+  ``dss.Bus.kVBase()`` on the stamped bus). When absent, callers fall back to per-bus
+    ``v_scale_volts``.
+    """
+    out: dict[str, tuple[str, float, float | None]] = {}
     if not dss_path.is_file():
         return out
     pat = re.compile(
-        r"New\s+Capacitor\.(\S+)\s+.*?Bus1=(\S+)\s+.*?kvar=([0-9.eE+-]+)",
+        r"New\s+Capacitor\.(\S+)\s+.*?Bus1=(\S+)\s+.*?(?:kv=([0-9.eE+-]+)\s+)?.*?kvar=([0-9.eE+-]+)",
         flags=re.IGNORECASE,
     )
     for line in dss_path.read_text(encoding="utf-8", errors="replace").splitlines():
         m = pat.search(line.replace("~", " "))
         if not m:
             continue
-        nm, bus, kvar = m.group(1), m.group(2), float(m.group(3))
-        out[_device_stem(nm)] = (str(bus).strip().lower(), float(kvar))
+        nm, bus = m.group(1), m.group(2)
+        kv_raw = m.group(3)
+        kvar = float(m.group(4))
+        kv_ln = float(kv_raw) if kv_raw else None
+        if kv_ln is not None and kv_ln > 11.0:
+            # Nominal LL kV on 3-phase bank entries (e.g. 12.47); convert to LN for B = Q/V_ln².
+            kv_ln = kv_ln / math.sqrt(3.0)
+        out[_device_stem(nm)] = (str(bus).strip().lower(), float(kvar), kv_ln)
     return out
+
+
+def _parse_regulator_tap_bounds_dss(
+    regulators_dss: Path | None = None,
+    transformers_dss: Path | None = None,
+) -> tuple[float, float]:
+    """Global Min/Max tap (pu) from OpenDSS regulator transformer definitions."""
+    tap_min, tap_max = 0.9, 1.1
+    paths: list[Path] = []
+    if regulators_dss is not None and regulators_dss.is_file():
+        paths.append(regulators_dss)
+    if transformers_dss is not None and transformers_dss.is_file():
+        paths.append(transformers_dss)
+    mintap_pat = re.compile(r"Mintap\s*=\s*([0-9.eE+-]+)", flags=re.IGNORECASE)
+    maxtap_pat = re.compile(r"Maxtap\s*=\s*([0-9.eE+-]+)", flags=re.IGNORECASE)
+    mins: list[float] = []
+    maxs: list[float] = []
+    for path in paths:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "transformer" not in line.lower() and "regcontrol" not in line.lower():
+                continue
+            mm = mintap_pat.search(line)
+            mx = maxtap_pat.search(line)
+            if mm:
+                mins.append(float(mm.group(1)))
+            if mx:
+                maxs.append(float(mx.group(1)))
+    if mins:
+        tap_min = min(mins)
+    if maxs:
+        tap_max = max(maxs)
+    return float(tap_min), float(tap_max)
+
+
+_REG_TAP_MIN_PU, _REG_TAP_MAX_PU = _parse_regulator_tap_bounds_dss(
+    Path(__file__).resolve().parent / "8500-node" / "Regulators.dss",
+    Path(__file__).resolve().parent / "8500-node" / "Transformers.dss",
+)
+
+
+def _clamp_reg_tap_pu(
+    tap: torch.Tensor,
+    *,
+    tap_min: float | None = None,
+    tap_max: float | None = None,
+) -> torch.Tensor:
+    """Clamp off-nominal tap to OpenDSS regulator limits (default Mintap/Maxtap from DSS)."""
+    lo = float(_REG_TAP_MIN_PU if tap_min is None else tap_min)
+    hi = float(_REG_TAP_MAX_PU if tap_max is None else tap_max)
+    return tap.clamp(lo, hi)
 
 
 def _cap_bus_local_indices(bus: str, node_to_local: dict[str, int]) -> list[int]:
@@ -138,8 +208,12 @@ def _resolve_cap_bus_nodes(
     cap_nodes_csv: Path | None,
     meta_csv: Path | None,
     capacitors_dss: Path | None,
-) -> list[tuple[int, float, int]]:
-    """``(local_node_idx, q_nominal_kvar_per_stamped_node, cap_col_index)`` for shunt-Y only."""
+) -> list[tuple[int, float, int, float | None]]:
+    """``(local_node_idx, q_nominal_kvar_per_stamped_node, cap_col_index, v_nom_volts|None)``.
+
+    When ``v_nom_volts`` is set (from Capacitors.dss ``kv``), shunt ``B`` uses that nominal
+    LN voltage instead of per-bus ``v_scale_volts``.
+    """
     import pandas as pd
 
     q_nom_by_stem: dict[str, float] = {}
@@ -171,12 +245,15 @@ def _resolve_cap_bus_nodes(
                 if bus and bus != "nan":
                     bus_nodes_by_stem.setdefault(st, []).append(bus)
 
+    kv_ln_by_stem: dict[str, float] = {}
     if capacitors_dss is not None:
-        for st, (bus, kvar) in _parse_capacitors_dss(capacitors_dss).items():
+        for st, (bus, kvar, kv_ln) in _parse_capacitors_dss(capacitors_dss).items():
             q_nom_by_stem.setdefault(st, float(kvar))
             bus_nodes_by_stem.setdefault(st, [bus])
+            if kv_ln is not None:
+                kv_ln_by_stem[st] = float(kv_ln)
 
-    banks: list[tuple[int, float, int]] = []
+    banks: list[tuple[int, float, int, float | None]] = []
     for j, col in enumerate(cap_cols):
         st = _cap_col_stem(col)
         if not st:
@@ -200,8 +277,11 @@ def _resolve_cap_bus_nodes(
         if not node_indices:
             raise ValueError(f"No local nodes resolved for capacitor {st!r} buses {buses!r}")
         q_each = q_nom / float(len(node_indices))
+        v_nom = None
+        if st in kv_ln_by_stem:
+            v_nom = float(kv_ln_by_stem[st]) * 1000.0
         for ni in node_indices:
-            banks.append((int(ni), float(q_each), int(j)))
+            banks.append((int(ni), float(q_each), int(j), v_nom))
     return banks
 
 
@@ -308,12 +388,27 @@ class PfPhysicsState:
     weight_warmup_epochs: int = 0
     weight_ramp_epochs: int = 0
     reg_edges: list[tuple[int, int, float, float, int]] = field(default_factory=list)
-    cap_banks: list[tuple[int, float, int]] = field(default_factory=list)
+    cap_banks: list[tuple[int, float, int, float | None]] = field(default_factory=list)
     detach_controls: bool = False
     use_label_controls: bool = True
     node_feature_cols: list[str] = field(default_factory=list)
     pf_debug_nan: bool = False
     idx_to_node: dict[int, str] = field(default_factory=dict)
+
+
+_LINE_FREQ_HZ = 60.0
+
+
+def _line_shunt_b_half_siemens(c_full_nf: float, *, freq_hz: float = _LINE_FREQ_HZ) -> float:
+    """Pi-model half-line shunt susceptance (Siemens) from total line ``C_full`` in nF.
+
+    OpenDSS ``LineCode.Cmatrix`` is nF per km (or per mile per ``Units``); edge CSV ``C_full`` is
+    ``C_per_len * length`` in nF. Each terminal gets ``j*omega*C/2``.
+    """
+    c_farad = float(c_full_nf) * 1e-9
+    if c_farad <= 0.0:
+        return 0.0
+    return 0.5 * (2.0 * math.pi * float(freq_hz)) * c_farad
 
 
 def _undirected_node_pair(iu: int, iv: int) -> tuple[int, int]:
@@ -475,6 +570,12 @@ def _apply_pf_balance_mask_refinement(
     return mask
 
 
+def _is_xfmr_edge_row(row) -> bool:
+    line_name = str(row.get("line_name", "") or "").strip()
+    linecode = str(row.get("linecode", "") or "").strip().lower()
+    return line_name.startswith("Transformer.") or linecode == "xfmr"
+
+
 def _build_ybus_from_edge_csv(
     edge_csv: Path,
     node_to_local: dict[str, int],
@@ -482,14 +583,21 @@ def _build_ybus_from_edge_csv(
     z_base_ohm: float | None,
     *,
     skip_undirected: set[tuple[int, int]] | None = None,
+    include_xfmr: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build dense Ybus (Re/Im) from undirected ``R_full``/``X_full`` **line** edges only.
+    """Build dense Ybus (Re/Im) from undirected ``R_full``/``X_full`` edges.
 
     When ``z_base_ohm`` is set, admittance is per-unit on that impedance base; when ``None``,
     ``R_full``/``X_full`` are treated as ohms and stamped in Siemens.
 
-    Skips regulator-transformer branches (``skip_undirected`` from hetero catalog, and rows whose
-    ``line_name`` starts with ``Transformer.`` or ``linecode`` is ``xfmr``) so taps are not double-stamped.
+    Includes load/service transformers as series branches when ``include_xfmr=True``.
+    Regulator branches listed in ``skip_undirected`` (hetero catalog pairs) are omitted here
+    and re-stamped with taps elsewhere. Distribution vs regulator transformers in
+    ``gnn_edges_phase_static.csv`` are not distinguished beyond the catalog skip list.
+
+    When ``C_full`` is present (nF, OpenDSS line-code units), pi-model half shunts
+    ``j*omega*C/2`` are added at each terminal. Off-diagonal phase coupling from multiphase
+    line codes is **not** modeled — edge CSV stores scalar ``R_full``/``X_full`` per phase row.
     """
     import pandas as pd
 
@@ -497,15 +605,14 @@ def _build_ybus_from_edge_csv(
     for c in ("from_node", "to_node", "R_full", "X_full"):
         if c not in df.columns:
             raise ValueError(f"{edge_csv} missing {c!r}")
+    has_c = "C_full" in df.columns
     y_re = np.zeros((n_nodes, n_nodes), dtype=np.float64)
     y_im = np.zeros((n_nodes, n_nodes), dtype=np.float64)
     seen: set[tuple[int, int]] = set()
     skip = skip_undirected or set()
     z_base = None if z_base_ohm is None else float(z_base_ohm)
     for _, row in df.iterrows():
-        line_name = str(row.get("line_name", "") or "").strip()
-        linecode = str(row.get("linecode", "") or "").strip().lower()
-        if line_name.startswith("Transformer.") or linecode == "xfmr":
+        if not include_xfmr and _is_xfmr_edge_row(row):
             continue
         u = str(row["from_node"]).strip().lower()
         v = str(row["to_node"]).strip().lower()
@@ -539,6 +646,13 @@ def _build_ybus_from_edge_csv(
         y_re[iv, iv] += y_line_re
         y_im[iu, iu] += y_line_im
         y_im[iv, iv] += y_line_im
+        if has_c:
+            b_half = _line_shunt_b_half_siemens(float(row.get("C_full", 0.0) or 0.0))
+            if z_base is not None:
+                b_half *= z_base
+            if b_half > 0.0:
+                y_im[iu, iu] += b_half
+                y_im[iv, iv] += b_half
     return torch.from_numpy(y_re).float(), torch.from_numpy(y_im).float()
 
 
@@ -548,10 +662,16 @@ def _build_ybus_siemens_from_edge_csv(
     n_nodes: int,
     *,
     skip_undirected: set[tuple[int, int]] | None = None,
+    include_xfmr: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Physical Siemens Y-bus from ``R_full``/``X_full`` in ohms."""
     return _build_ybus_from_edge_csv(
-        edge_csv, node_to_local, n_nodes, None, skip_undirected=skip_undirected
+        edge_csv,
+        node_to_local,
+        n_nodes,
+        None,
+        skip_undirected=skip_undirected,
+        include_xfmr=include_xfmr,
     )
 
 
@@ -610,7 +730,7 @@ def _yv_add_reg_branch_contrib(
     tap: torch.Tensor,
 ) -> None:
     """Add regulator branch stamp to nodal current (matches ``_stamp_reg_branch_ybus``)."""
-    a = tap.clamp(0.9, 1.1)
+    a = _clamp_reg_tap_pu(tap)
     a2 = a * a
     g_t = torch.as_tensor(g, device=v_re.device, dtype=v_re.dtype)
     b_t = torch.as_tensor(b, device=v_re.device, dtype=v_re.dtype)
@@ -637,6 +757,13 @@ def _yv_add_cap_shunt_contrib(
     i_im[:, ni] = i_im[:, ni] + b_shunt * v_re[:, ni]
 
 
+def _unpack_cap_bank(entry: tuple[int, float, int] | tuple[int, float, int, float | None]) -> tuple[int, float, int, float | None]:
+    """Support legacy 3-tuples ``(ni, q_nom, cj)`` and optional ``v_nom_volts`` override."""
+    if len(entry) >= 4:
+        return int(entry[0]), float(entry[1]), int(entry[2]), entry[3]
+    return int(entry[0]), float(entry[1]), int(entry[2]), None
+
+
 def _pf_node_nominal_volts(v_scale_volts: torch.Tensor, ni: int) -> torch.Tensor:
     """Per-bus nominal LN volts; accepts ``(N,)`` or ``(B, N)``."""
     if v_scale_volts.dim() == 1:
@@ -654,7 +781,7 @@ def _compute_yv_current(
     Y_im: torch.Tensor | None = None,
     y_coo: PfYbusCoo | None = None,
     reg_edges: list[tuple[int, int, float, float, int]] | None = None,
-    cap_banks: list[tuple[int, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int, float | None]] | None = None,
     tap_pu: torch.Tensor | None = None,
     cap_on: torch.Tensor | None = None,
     use_sparse_y: bool = True,
@@ -671,8 +798,13 @@ def _compute_yv_current(
             if v_scale_volts is None:
                 raise ValueError("cap shunt stamping requires v_scale_volts")
             v_scale = v_scale_volts.to(device=v_re.device, dtype=v_re.dtype)
-            for ni, q_nom, cj in cap_banks:
-                v_nom = _pf_node_nominal_volts(v_scale, ni)
+            for entry in cap_banks:
+                ni, q_nom, cj, v_nom_override = _unpack_cap_bank(entry)
+                v_nom = (
+                    torch.as_tensor(v_nom_override, device=v_re.device, dtype=v_re.dtype)
+                    if v_nom_override is not None
+                    else _pf_node_nominal_volts(v_scale, ni)
+                )
                 b_shunt = cap_on[:, cj] * (float(q_nom) * 1000.0) / (v_nom * v_nom)
                 _yv_add_cap_shunt_contrib(i_re, i_im, v_re, v_im, ni, b_shunt)
         return i_re, i_im
@@ -1370,7 +1502,7 @@ def _pf_nodal_power_kw_from_v_ri(
     s_base_kva: float,
     y_coo: PfYbusCoo | None = None,
     reg_edges: list[tuple[int, int, float, float, int]] | None = None,
-    cap_banks: list[tuple[int, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int, float | None]] | None = None,
     tap_pu: torch.Tensor | None = None,
     cap_on: torch.Tensor | None = None,
     use_sparse_y: bool = True,
@@ -1412,7 +1544,7 @@ def nodal_power_balance_residual(
     label_ri: torch.Tensor | None = None,
     y_coo: PfYbusCoo | None = None,
     reg_edges: list[tuple[int, int, float, float, int]] | None = None,
-    cap_banks: list[tuple[int, float, int]] | None = None,
+    cap_banks: list[tuple[int, float, int, float | None]] | None = None,
     tap_pu: torch.Tensor | None = None,
     cap_on: torch.Tensor | None = None,
     use_sparse_y: bool = True,
@@ -1583,7 +1715,7 @@ def _stamp_reg_branch_ybus(
     tap: torch.Tensor,
 ) -> None:
     """Off-nominal tap ``a`` on secondary (node ``iu``); primary at ``iv``. In-place on batched ``(B,N,N)``."""
-    a = tap.clamp(0.9, 1.1)
+    a = _clamp_reg_tap_pu(tap)
     a2 = a * a
     g_t = torch.as_tensor(g, device=Y_re.device, dtype=Y_re.dtype)
     b_t = torch.as_tensor(b, device=Y_im.device, dtype=Y_im.dtype)
@@ -1602,7 +1734,7 @@ def _ybus_with_predicted_controls(
     Y_im_base: torch.Tensor,
     *,
     reg_edges: list[tuple[int, int, float, float, int]],
-    cap_banks: list[tuple[int, float, int]],
+    cap_banks: list[tuple[int, float, int, float | None]],
     tap_pu: torch.Tensor,
     cap_on: torch.Tensor,
     s_base_kva: float,
@@ -1616,8 +1748,12 @@ def _ybus_with_predicted_controls(
     for iu, iv, g, b, rj in reg_edges:
         _stamp_reg_branch_ybus(y_re, y_im, iu, iv, g, b, tap_pu[:, rj])
     v_scale = v_scale_volts.to(device=dev, dtype=dt)
-    for ni, q_nom, cj in cap_banks:
-        v_nom = _pf_node_nominal_volts(v_scale, ni)
+    for entry in cap_banks:
+        ni, q_nom, cj, v_nom_override = _unpack_cap_bank(entry)
+        if v_nom_override is not None:
+            v_nom = torch.as_tensor(float(v_nom_override), device=dev, dtype=dt).expand(batch_size)
+        else:
+            v_nom = _pf_node_nominal_volts(v_scale, ni)
         b_siemens = cap_on[:, cj] * (float(q_nom) * 1000.0) / (v_nom * v_nom)
         y_im[:, ni, ni] = y_im[:, ni, ni] + b_siemens
     return y_re, y_im
@@ -2030,8 +2166,9 @@ def _setup_pf_physics(
         )
     reg_edges = _load_regulator_edges_for_pf(reg_catalog, node_to_local, reg_cols, None)
     skip_reg_pairs = {_undirected_node_pair(iu, iv) for iu, iv, _, _, _ in reg_edges}
+    include_xfmr = bool(int(getattr(args, "pf_include_xfmr_in_y", 1) or 1))
     y_re, y_im = _build_ybus_siemens_from_edge_csv(
-        edges_path, node_to_local, n_nodes, skip_undirected=skip_reg_pairs
+        edges_path, node_to_local, n_nodes, skip_undirected=skip_reg_pairs, include_xfmr=include_xfmr
     )
     balance_mode = str(args.pf_balance_nodes)
     raw_explicit = str(getattr(args, "pf_balance_node_list_csv", "") or "").strip()
@@ -2151,7 +2288,7 @@ def _setup_pf_physics(
     )
     if cap_cols:
         n_cap = len(cap_cols)
-        mapped_cj = {int(cj) for _, _, cj in cap_banks}
+        mapped_cj = {int(cj) for _, _, cj, *_ in cap_banks}
         if len(mapped_cj) != n_cap:
             missing = [cap_cols[j] for j in range(n_cap) if j not in mapped_cj]
             raise ValueError(
@@ -2462,11 +2599,19 @@ def _reg_loss_scalar(
     *,
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_tables: list[dict] | None = None,
+    reg_ordinal_ce: bool = False,
+    reg_cost_matrices: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if reg_loss == "ce":
         if not reg_logits:
             raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
         _validate_reg_ce_targets(target, reg_logits, reg_class_tables=reg_class_tables)
+        if reg_ordinal_ce and reg_cost_matrices:
+            losses = [
+                _ordinal_ce_loss_scalar(reg_logits[j], target[:, j].long(), reg_cost_matrices[j])
+                for j in range(len(reg_logits))
+            ]
+            return torch.stack(losses).mean()
         losses = [F.cross_entropy(reg_logits[j], target[:, j].long()) for j in range(len(reg_logits))]
         return torch.stack(losses).mean()
     assert pred is not None
@@ -2481,10 +2626,22 @@ def _reg_loss_elementwise(
     reg_loss: str,
     *,
     reg_logits: list[torch.Tensor] | None = None,
+    reg_ordinal_ce: bool = False,
+    reg_cost_matrices: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if reg_loss == "ce":
         if not reg_logits:
             raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
+        if reg_ordinal_ce and reg_cost_matrices:
+            return torch.stack(
+                [
+                    _ordinal_ce_loss_elementwise(
+                        reg_logits[j], target[:, j].long(), reg_cost_matrices[j]
+                    )
+                    for j in range(len(reg_logits))
+                ],
+                dim=1,
+            )
         return torch.stack(
             [
                 F.cross_entropy(reg_logits[j], target[:, j].long(), reduction="none")
@@ -2496,6 +2653,295 @@ def _reg_loss_elementwise(
     if reg_loss == "mae":
         return (pred - target).abs()
     return (pred - target) ** 2
+
+
+def _ordinal_ce_loss_elementwise(
+    logits: torch.Tensor, target: torch.Tensor, cost_matrix: torch.Tensor
+) -> torch.Tensor:
+    """Per-sample cost-sensitive CE: sum_c cost[y,c] * (-log p_c)."""
+    log_probs = F.log_softmax(logits, dim=-1)
+    costs = cost_matrix.to(device=logits.device, dtype=logits.dtype)[target.long()]
+    return (costs * (-log_probs)).sum(dim=-1)
+
+
+def _ordinal_ce_loss_scalar(
+    logits: torch.Tensor, target: torch.Tensor, cost_matrix: torch.Tensor
+) -> torch.Tensor:
+    return _ordinal_ce_loss_elementwise(logits, target, cost_matrix).mean()
+
+
+def _plain_reg_ce_scalar(reg_logits: list[torch.Tensor], target: torch.Tensor) -> torch.Tensor:
+    losses = [F.cross_entropy(reg_logits[j], target[:, j].long()) for j in range(len(reg_logits))]
+    return torch.stack(losses).mean()
+
+
+def _build_reg_ordinal_cost_matrices(reg_class_tables: list[dict]) -> list[torch.Tensor]:
+    mats: list[torch.Tensor] = []
+    for tab in reg_class_tables:
+        classes = np.asarray(tab["classes"], dtype=np.float64)
+        diff = np.abs(classes[:, None] - classes[None, :]).astype(np.float32)
+        mats.append(torch.from_numpy(diff))
+    return mats
+
+
+def _resolve_hop_csv_path(
+    args: argparse.Namespace, repo: Path, chunk_parent: Path | None = None
+) -> Path:
+    raw = str(getattr(args, "hop_csv", "") or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (repo / p).resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"--hop_csv not found: {p}")
+        return p
+    candidates: list[Path] = [
+        repo / "datasets_gnn2_from pc" / "load_hop_distance_to_each_regulator_all_index_nodes.csv",
+        repo / "datasets_gnn2" / "load_hop_distance_to_each_regulator_all_index_nodes.csv",
+    ]
+    if chunk_parent is not None:
+        candidates.insert(0, chunk_parent.parent / "load_hop_distance_to_each_regulator_all_index_nodes.csv")
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    raise FileNotFoundError(
+        "Regulator hop CSV not found. Pass --hop_csv (output of compute_hop_distance_all_index_nodes.py)."
+    )
+
+
+def _build_reg_territory_mask(
+    node_to_local: dict[str, int],
+    reg_cols: list[str],
+    hop_csv: Path,
+    *,
+    downstream_rule: str = "hop_gt_0",
+) -> torch.Tensor:
+    from da_gps_hop_attention_ratios import (
+        REG_COL_TO_HOP_COL,
+        downstream_mask,
+        hops_for_manifest_nodes,
+        load_hop_frame,
+    )
+
+    n_nodes = len(node_to_local)
+    node_names = [n for n, _ in sorted(node_to_local.items(), key=lambda kv: kv[1])]
+    hop_df = load_hop_frame(hop_csv)
+    mask = np.zeros((n_nodes, len(reg_cols)), dtype=np.float32)
+    for r, reg_col in enumerate(reg_cols):
+        hop_col = REG_COL_TO_HOP_COL.get(reg_col)
+        if hop_col is None:
+            raise KeyError(f"No hop column for regulator {reg_col!r}")
+        hops, miss = hops_for_manifest_nodes(hop_df, node_names, hop_col)
+        if miss:
+            print(
+                f"WARNING: hop CSV missing {len(miss)} nodes for {hop_col} "
+                f"(showing up to 3): {miss[:3]} — treated as non-downstream.",
+                flush=True,
+            )
+        mask[:, r] = downstream_mask(hops, rule=downstream_rule).astype(np.float32)
+    return torch.from_numpy(mask)
+
+
+def _configure_reg_territory_bias(
+    model: "DAGPSModel",
+    node_to_local: dict[str, int],
+    reg_cols: list[str],
+    args: argparse.Namespace,
+    repo: Path,
+    chunk_parent: Path | None = None,
+) -> None:
+    if not bool(getattr(args, "attn_reg_territory_bias", False)):
+        return
+    hop_csv = _resolve_hop_csv_path(args, repo, chunk_parent)
+    rule = str(getattr(args, "attn_reg_territory_downstream_rule", "hop_gt_0"))
+    mask = _build_reg_territory_mask(node_to_local, reg_cols, hop_csv, downstream_rule=rule)
+    beta = float(getattr(args, "attn_reg_territory_beta", 2.0))
+    model.set_reg_territory_bias(mask, beta)
+    active = float(mask.mean().item())
+    print(
+        f"attn_reg_territory_bias: hop_csv={hop_csv} rule={rule!r} beta={beta:g} "
+        f"downstream_frac={active:.4f}",
+        flush=True,
+    )
+
+
+def _voltage_loss_scalar(
+    v_n: torch.Tensor,
+    yb_n: torch.Tensor,
+    yb: torch.Tensor,
+    *,
+    n_nodes: int,
+    mse: nn.Module,
+    violation_weight: bool,
+    volt_lo_pu: float,
+    volt_hi_pu: float,
+    volt_violation_alpha: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if not violation_weight:
+        return mse(v_n.view_as(yb_n), yb_n), {}
+    b = int(yb.size(0))
+    true_ri = yb.view(b, n_nodes, 2)
+    true_mag = torch.sqrt(true_ri[..., 0].square() + true_ri[..., 1].square() + 1e-12)
+    viol = (true_mag < float(volt_lo_pu)) | (true_mag > float(volt_hi_pu))
+    w_node = 1.0 + float(volt_violation_alpha) * viol.to(dtype=yb_n.dtype)
+    w_flat = w_node.reshape(b, n_nodes).repeat_interleave(2, dim=1)
+    se = (v_n - yb_n).square()
+    loss_w = (se * w_flat).sum() / w_flat.sum().clamp_min(1.0)
+    dbg = {
+        "volt_violation_frac": float(viol.float().mean().item()),
+        "volt_weight_mean": float(w_node.mean().item()),
+        "volt_loss_weighted": float(loss_w.detach().item()),
+        "volt_loss_uniform": float(se.mean().detach().item()),
+    }
+    return loss_w, dbg
+
+
+@dataclass
+class _AddonBatchLog:
+    territory_active_frac: float = 0.0
+    ordinal_ce: float = float("nan")
+    plain_ce: float = float("nan")
+    volt_violation_frac: float = float("nan")
+    volt_weight_mean: float = float("nan")
+    volt_loss_weighted: float = float("nan")
+    volt_loss_uniform: float = float("nan")
+
+
+@dataclass
+class _AddonTrainAccum:
+    territory_active_frac: float = 0.0
+    ordinal_ce_sum: float = 0.0
+    plain_ce_sum: float = 0.0
+    volt_violation_frac_sum: float = 0.0
+    volt_weight_mean_sum: float = 0.0
+    volt_loss_weighted_sum: float = 0.0
+    volt_loss_uniform_sum: float = 0.0
+    n: int = 0
+
+    def update(self, row: _AddonBatchLog) -> None:
+        self.n += 1
+        if math.isfinite(row.territory_active_frac):
+            self.territory_active_frac += row.territory_active_frac
+        if math.isfinite(row.ordinal_ce):
+            self.ordinal_ce_sum += row.ordinal_ce
+        if math.isfinite(row.plain_ce):
+            self.plain_ce_sum += row.plain_ce
+        if math.isfinite(row.volt_violation_frac):
+            self.volt_violation_frac_sum += row.volt_violation_frac
+        if math.isfinite(row.volt_weight_mean):
+            self.volt_weight_mean_sum += row.volt_weight_mean
+        if math.isfinite(row.volt_loss_weighted):
+            self.volt_loss_weighted_sum += row.volt_loss_weighted
+        if math.isfinite(row.volt_loss_uniform):
+            self.volt_loss_uniform_sum += row.volt_loss_uniform
+
+    def mean_dict(self) -> dict[str, float]:
+        n = max(self.n, 1)
+        return {
+            "territory_active_frac": self.territory_active_frac / n,
+            "ordinal_ce": self.ordinal_ce_sum / n,
+            "plain_ce": self.plain_ce_sum / n,
+            "volt_violation_frac": self.volt_violation_frac_sum / n,
+            "volt_weight_mean": self.volt_weight_mean_sum / n,
+            "volt_loss_weighted": self.volt_loss_weighted_sum / n,
+            "volt_loss_uniform": self.volt_loss_uniform_sum / n,
+        }
+
+
+def _training_addons_enabled(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "attn_reg_territory_bias", False)
+        or getattr(args, "reg_ordinal_ce", False)
+        or getattr(args, "volt_violation_weight", False)
+    )
+
+
+def _addon_batch_log_row(
+    *,
+    args: argparse.Namespace,
+    base_model: "DAGPSModel",
+    reg_logits: list[torch.Tensor] | None,
+    y_reg_b: torch.Tensor,
+    reg_loss: str,
+    reg_ordinal_ce: bool,
+    reg_cost_matrices: list[torch.Tensor] | None,
+    volt_dbg: dict[str, float],
+) -> _AddonBatchLog:
+    row = _AddonBatchLog()
+    if bool(getattr(args, "attn_reg_territory_bias", False)) and base_model.use_reg_territory_bias:
+        row.territory_active_frac = float(base_model.reg_territory_mask.mean().item())
+    if (
+        reg_loss == "ce"
+        and reg_ordinal_ce
+        and reg_logits
+        and reg_cost_matrices
+    ):
+        row.ordinal_ce = float(
+            _reg_loss_scalar(
+                None,
+                y_reg_b,
+                reg_loss,
+                reg_logits=reg_logits,
+                reg_ordinal_ce=True,
+                reg_cost_matrices=reg_cost_matrices,
+            )
+            .detach()
+            .item()
+        )
+        row.plain_ce = float(_plain_reg_ce_scalar(reg_logits, y_reg_b).detach().item())
+    if volt_dbg:
+        row.volt_violation_frac = volt_dbg.get("volt_violation_frac", float("nan"))
+        row.volt_weight_mean = volt_dbg.get("volt_weight_mean", float("nan"))
+        row.volt_loss_weighted = volt_dbg.get("volt_loss_weighted", float("nan"))
+        row.volt_loss_uniform = volt_dbg.get("volt_loss_uniform", float("nan"))
+    return row
+
+
+def _maybe_log_addon_batch(
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    batch_idx: int,
+    row: _AddonBatchLog,
+) -> None:
+    if not _training_addons_enabled(args):
+        return
+    le = max(1, int(args.log_every))
+    if batch_idx % le != 0:
+        return
+    parts: list[str] = [f"[da_gps addons] epoch {epoch} batch {batch_idx}"]
+    if bool(getattr(args, "attn_reg_territory_bias", False)) and math.isfinite(row.territory_active_frac):
+        parts.append(f"territory_active_frac={row.territory_active_frac:.4f}")
+    if math.isfinite(row.ordinal_ce) and math.isfinite(row.plain_ce):
+        parts.append(f"reg_ordinal_ce={row.ordinal_ce:.4f} plain_ce={row.plain_ce:.4f}")
+    if math.isfinite(row.volt_violation_frac):
+        parts.append(
+            f"volt_viol_frac={row.volt_violation_frac:.4f} w_mean={row.volt_weight_mean:.4f} "
+            f"loss_w={row.volt_loss_weighted:.4f} loss_u={row.volt_loss_uniform:.4f}"
+        )
+    if len(parts) > 1:
+        print(" | ".join(parts), flush=True)
+
+
+def _training_addons_report(
+    args: argparse.Namespace, epoch_metrics: dict[str, float] | None = None
+) -> dict[str, object]:
+    out: dict[str, object] = {
+        "attn_reg_territory_bias": bool(getattr(args, "attn_reg_territory_bias", False)),
+        "attn_reg_territory_beta": float(getattr(args, "attn_reg_territory_beta", 2.0)),
+        "attn_reg_territory_downstream_rule": str(
+            getattr(args, "attn_reg_territory_downstream_rule", "hop_gt_0")
+        ),
+        "reg_ordinal_ce": bool(getattr(args, "reg_ordinal_ce", False)),
+        "volt_violation_weight": bool(getattr(args, "volt_violation_weight", False)),
+        "volt_lo_pu": float(getattr(args, "volt_lo_pu", 0.96)),
+        "volt_hi_pu": float(getattr(args, "volt_hi_pu", 1.04)),
+        "volt_violation_alpha": float(getattr(args, "volt_violation_alpha", 2.0)),
+        "hop_csv": str(getattr(args, "hop_csv", "") or ""),
+    }
+    if epoch_metrics is not None:
+        out["last_epoch_train_means"] = epoch_metrics
+    return out
 
 
 def _norm_sid(s: object) -> int:
@@ -2741,6 +3187,9 @@ class DAGPSBlock(nn.Module):
         self.hidden = hidden
         self.heads = heads
         self.dropout_p = float(dropout)
+        self.n_cap = 0
+        self.reg_territory_beta = 0.0
+        self.reg_territory_mask: torch.Tensor | None = None
         self.wq_nt = nn.Linear(hidden, hidden)
         self.wk_nt = nn.Linear(hidden, hidden)
         self.wv_nt = nn.Linear(hidden, hidden)
@@ -2769,6 +3218,21 @@ class DAGPSBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _reg_territory_attn_bias(
+        self, h_dense: torch.Tensor, T_mid: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self.reg_territory_mask is None or self.reg_territory_beta == 0.0:
+            return None
+        b, _l, _ = h_dense.shape
+        s = int(T_mid.size(1))
+        n_reg = int(self.reg_territory_mask.size(1))
+        bias = h_dense.new_zeros(b, h_dense.size(1), s)
+        reg_bias = self.reg_territory_mask.to(device=h_dense.device, dtype=h_dense.dtype) * float(
+            self.reg_territory_beta
+        )
+        bias[:, :, self.n_cap : self.n_cap + n_reg] = reg_bias.unsqueeze(0).expand(b, -1, -1)
+        return bias
+
     def forward(
         self,
         h_in: torch.Tensor,
@@ -2796,7 +3260,7 @@ class DAGPSBlock(nn.Module):
         T_mid = self.norm_t1(T_in + F.dropout(zt, self.dropout_p, self.training))
         T_mid = self.norm_t2(T_mid + self.ffn_t(T_mid))
 
-        attn_bias = None
+        attn_bias = self._reg_territory_attn_bias(h_dense, T_mid)
 
         q2 = self.wq_tn(h_dense)
         k2 = self.wk_tn(T_mid)
@@ -2893,6 +3357,11 @@ class DAGPSModel(nn.Module):
             and all(int(c) >= 2 for c in self.reg_nclasses)
         )
         self._last_reg_logits: list[torch.Tensor] | None = None
+        self.use_reg_territory_bias = False
+        self.reg_territory_beta = 0.0
+        self.register_buffer(
+            "reg_territory_mask", torch.zeros(self.n_nodes, self.n_reg), persistent=False
+        )
         self.g_tokens = int(n_cap + n_reg + n_system)
         self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
         self.edge_emb = nn.Embedding(self.num_edges, self.edge_emb_dim) if self.edge_emb_dim > 0 else None
@@ -2916,6 +3385,7 @@ class DAGPSModel(nn.Module):
                 for _ in range(int(n_layers))
             ]
         )
+        self._sync_block_territory()
         if self.per_node_heads:
             self.volt_W = nn.Parameter(torch.randn(self.n_nodes, self.hidden, 2) * 0.02)
             self.volt_b = nn.Parameter(torch.zeros(self.n_nodes, 2))
@@ -2957,6 +3427,23 @@ class DAGPSModel(nn.Module):
         else:
             self.pv_W = None
             self.pv_b = None
+
+    def _sync_block_territory(self) -> None:
+        for blk in self.blocks:
+            blk.n_cap = self.n_cap
+            blk.reg_territory_beta = self.reg_territory_beta if self.use_reg_territory_bias else 0.0
+            blk.reg_territory_mask = self.reg_territory_mask if self.use_reg_territory_bias else None
+
+    def set_reg_territory_bias(self, mask: torch.Tensor, beta: float) -> None:
+        if mask.shape != self.reg_territory_mask.shape:
+            raise ValueError(
+                f"reg_territory_mask shape {tuple(mask.shape)} != "
+                f"{tuple(self.reg_territory_mask.shape)}"
+            )
+        self.use_reg_territory_bias = True
+        self.reg_territory_beta = float(beta)
+        self.reg_territory_mask.copy_(mask.to(dtype=self.reg_territory_mask.dtype))
+        self._sync_block_territory()
 
     def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
         return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
@@ -4963,6 +5450,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         n_pv_aux=int(n_pv_aux),
         reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
     ).to(device)
+    reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
+    if reg_ordinal_ce and reg_loss != "ce":
+        raise ValueError("--reg_ordinal_ce requires --reg_loss ce")
+    if reg_ordinal_ce and not reg_class_tables:
+        raise ValueError("--reg_ordinal_ce requires reg_class_tables (reg_loss=ce)")
+    reg_cost_matrices: list[torch.Tensor] | None = None
+    reg_cost_matrices_d: list[torch.Tensor] | None = None
+    if reg_ordinal_ce and reg_class_tables:
+        reg_cost_matrices = _build_reg_ordinal_cost_matrices(reg_class_tables)
+        reg_cost_matrices_d = [m.to(device) for m in reg_cost_matrices]
+        print("reg_ordinal_ce: enabled (cost-sensitive CE from |tap_j - tap_c|)", flush=True)
     ckpt_meta = _da_gps_ckpt_meta(
         n_nodes=n_nodes,
         hidden=int(args.hidden),
@@ -5039,6 +5537,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             init_ckpt_path,
             strict=bool(getattr(args, "init_checkpoint_strict", False)),
         )
+
+    _configure_reg_territory_bias(base_model, ref_ntl, reg_cols, args, repo, chunk_parent)
 
     _eval_kw = dict(
         nodes_name=nodes_name,
@@ -5140,6 +5640,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     best_val_r2_mean = float("nan")
     best_val_r2_min = float("nan")
     t0 = time.perf_counter()
+    last_addon_epoch_metrics: dict[str, float] | None = None
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -5153,6 +5654,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
         pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
         train_batch_idx = 0
+        addon_accum = _AddonTrainAccum()
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
@@ -5207,7 +5709,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 opt.zero_grad(set_to_none=True)
                 with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
                     v_n, c_log, r_p, pv_p = model(batch)
-                    loss_v = mse(v_n.view_as(yb_n), yb_n)
+                    loss_v, volt_dbg = _voltage_loss_scalar(
+                        v_n,
+                        yb_n,
+                        yb,
+                        n_nodes=n_nodes,
+                        mse=mse,
+                        violation_weight=bool(getattr(args, "volt_violation_weight", False)),
+                        volt_lo_pu=float(getattr(args, "volt_lo_pu", 0.96)),
+                        volt_hi_pu=float(getattr(args, "volt_hi_pu", 1.04)),
+                        volt_violation_alpha=float(getattr(args, "volt_violation_alpha", 2.0)),
+                    )
                     loss_c = bce(c_log, y_cap_b)
                     reg_logits = base_model._last_reg_logits if reg_loss == "ce" else None
                     loss_r = _reg_loss_scalar(
@@ -5216,6 +5728,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_loss,
                         reg_logits=reg_logits,
                         reg_class_tables=reg_class_tables,
+                        reg_ordinal_ce=reg_ordinal_ce,
+                        reg_cost_matrices=reg_cost_matrices_d,
                     )
                     loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                     loss_pf = _pf_loss_if_enabled(
@@ -5306,16 +5820,34 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         y_reg_b,
                         reg_loss,
                         reg_logits=reg_logits,
+                        reg_ordinal_ce=reg_ordinal_ce,
+                        reg_cost_matrices=reg_cost_matrices_d,
                     )
                     train_reg_dim += reg_e.sum(dim=0).detach().float().cpu().double()
                     if train_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
                         y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                         mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
                         train_meta_dim += mse_p.sum(dim=0).detach().float().cpu().double()
+                    if _training_addons_enabled(args):
+                        addon_row = _addon_batch_log_row(
+                            args=args,
+                            base_model=base_model,
+                            reg_logits=reg_logits,
+                            y_reg_b=y_reg_b,
+                            reg_loss=reg_loss,
+                            reg_ordinal_ce=reg_ordinal_ce,
+                            reg_cost_matrices=reg_cost_matrices_d,
+                            volt_dbg=volt_dbg,
+                        )
+                        addon_accum.update(addon_row)
+                        _maybe_log_addon_batch(args=args, epoch=ep, batch_idx=train_batch_idx, row=addon_row)
             del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_tr
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        if _training_addons_enabled(args) and addon_accum.n > 0:
+            last_addon_epoch_metrics = addon_accum.mean_dict()
 
         model.eval()
         val_tot = val_v = 0.0
@@ -5525,6 +6057,24 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
+            if _training_addons_enabled(args) and last_addon_epoch_metrics:
+                am = last_addon_epoch_metrics
+                _alog = f"[da_gps chunk_parent addons] epoch {ep}"
+                if bool(getattr(args, "attn_reg_territory_bias", False)):
+                    _alog += f" territory_active_frac={am.get('territory_active_frac', float('nan')):.4f}"
+                if bool(getattr(args, "reg_ordinal_ce", False)):
+                    _alog += (
+                        f" reg_ordinal_ce={am.get('ordinal_ce', float('nan')):.4f}"
+                        f" plain_ce={am.get('plain_ce', float('nan')):.4f}"
+                    )
+                if bool(getattr(args, "volt_violation_weight", False)):
+                    _alog += (
+                        f" volt_viol_frac={am.get('volt_violation_frac', float('nan')):.4f}"
+                        f" w_mean={am.get('volt_weight_mean', float('nan')):.4f}"
+                        f" loss_w={am.get('volt_loss_weighted', float('nan')):.4f}"
+                        f" loss_u={am.get('volt_loss_uniform', float('nan')):.4f}"
+                    )
+                print(_alog, flush=True)
         if baseline_val_met is not None and baseline_test_met is not None:
             ep_val_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
@@ -5685,6 +6235,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "checkpoint_reject_reason": reject_reason if not save_ok else None,
         "checkpoint": str(ckpt.resolve()) if save_ok else None,
     }
+    if _training_addons_enabled(args):
+        report["training_addons"] = _training_addons_report(args, last_addon_epoch_metrics)
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     if baseline_val_met is not None and baseline_test_met is not None:
         _print_before_after_summary(
@@ -5775,6 +6327,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_frac", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers; 0 only for tiny debug runs.")
     p.add_argument("--log_every", type=int, default=1)
+    p.add_argument(
+        "--attn_reg_territory_bias",
+        action="store_true",
+        help="Soft downstream hop bias on regulator token keys in node→token cross-attention only (default off).",
+    )
+    p.add_argument(
+        "--attn_reg_territory_beta",
+        type=float,
+        default=2.0,
+        help="Additive attention bias scale for --attn_reg_territory_bias (downstream nodes).",
+    )
+    p.add_argument(
+        "--attn_reg_territory_downstream_rule",
+        type=str,
+        default="hop_gt_0",
+        choices=("hop_gt_0", "hop_ge_1"),
+        help="Downstream mask rule for hop CSV columns when --attn_reg_territory_bias is set.",
+    )
+    p.add_argument(
+        "--hop_csv",
+        type=str,
+        default="",
+        help="Hop-distance CSV (node, FEEDER_REGA, …). Default: auto under repo datasets_gnn2_from pc/.",
+    )
+    p.add_argument(
+        "--reg_ordinal_ce",
+        action="store_true",
+        help="With --reg_loss ce: cost-sensitive CE from |tap_j - tap_c| (default off = plain CE).",
+    )
+    p.add_argument(
+        "--volt_violation_weight",
+        action="store_true",
+        help="Weight voltage MSE by target |V| violation band (default off = uniform MSE).",
+    )
+    p.add_argument("--volt_lo_pu", type=float, default=0.96, help="Lower |V| limit for --volt_violation_weight.")
+    p.add_argument("--volt_hi_pu", type=float, default=1.04, help="Upper |V| limit for --volt_violation_weight.")
+    p.add_argument(
+        "--volt_violation_alpha",
+        type=float,
+        default=2.0,
+        help="Extra per-node weight = 1 + alpha * 1(|V| outside [lo,hi]) when --volt_violation_weight.",
+    )
     p.add_argument("--cache_tensor", type=str, default="")
     p.add_argument(
         "--cache_dir",
@@ -5982,6 +6576,14 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Capacitor bus map CSV (default: capacitor_involved_nodes.csv under data_root).",
+    )
+    p.add_argument(
+        "--pf_include_xfmr_in_y",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="1=stamp load/service Transformer.* series branches from edge CSV in passive Y (default 1). "
+        "0=lines-only base (regulator pairs still skipped/re-stamped).",
     )
     p.add_argument(
         "--pf_exclude_interface_buses",
@@ -6364,6 +6966,10 @@ def main() -> None:
         per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
     ).to(device)
+    reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
+    if reg_ordinal_ce:
+        raise ValueError("--reg_ordinal_ce requires --reg_loss ce (chunk_parent mode)")
+    reg_cost_matrices_d = None
     ckpt_meta = _da_gps_ckpt_meta(
         n_nodes=n_nodes,
         hidden=int(args.hidden),
@@ -6417,6 +7023,8 @@ def main() -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
+    _configure_reg_territory_bias(base_model, node_to_local, reg_cols, args, repo, chunk_parent=None)
+
     best_val = float("inf")
     best_state = None
     bad = 0
@@ -6424,6 +7032,7 @@ def main() -> None:
     best_val_r2_mean = float("nan")
     best_val_r2_min = float("nan")
     t0 = time.perf_counter()
+    last_addon_epoch_metrics: dict[str, float] | None = None
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -6437,6 +7046,7 @@ def main() -> None:
         val_meta_dim = torch.zeros(n_pv_aux, dtype=torch.float64) if n_pv_aux > 0 else None
         pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
         train_batch_idx = 0
+        addon_accum = _AddonTrainAccum()
         for batch in dl_tr:
             batch = batch.to(device)
             batch = _cast_batch_float_tensors(batch)
@@ -6448,7 +7058,17 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
             with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
                 v_n, c_log, r_p, pv_p = model(batch)
-                loss_v = mse(v_n.view_as(yb_n), yb_n)
+                loss_v, volt_dbg = _voltage_loss_scalar(
+                    v_n,
+                    yb_n,
+                    yb,
+                    n_nodes=n_nodes,
+                    mse=mse,
+                    violation_weight=bool(getattr(args, "volt_violation_weight", False)),
+                    volt_lo_pu=float(getattr(args, "volt_lo_pu", 0.96)),
+                    volt_hi_pu=float(getattr(args, "volt_hi_pu", 1.04)),
+                    volt_violation_alpha=float(getattr(args, "volt_violation_alpha", 2.0)),
+                )
                 loss_c = bce(c_log, y_cap)
                 loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
                 loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
@@ -6540,6 +7160,22 @@ def main() -> None:
                     y_pv_b = batch.y_pv.view(batch.num_graphs, -1)
                     mse_p = F.mse_loss(pv_p, y_pv_b, reduction="none")
                     train_meta_dim += mse_p.sum(dim=0).detach().float().cpu().double()
+                if _training_addons_enabled(args):
+                    addon_row = _addon_batch_log_row(
+                        args=args,
+                        base_model=base_model,
+                        reg_logits=None,
+                        y_reg_b=y_reg,
+                        reg_loss=reg_loss,
+                        reg_ordinal_ce=False,
+                        reg_cost_matrices=None,
+                        volt_dbg=volt_dbg,
+                    )
+                    addon_accum.update(addon_row)
+                    _maybe_log_addon_batch(args=args, epoch=ep, batch_idx=train_batch_idx, row=addon_row)
+
+        if _training_addons_enabled(args) and addon_accum.n > 0:
+            last_addon_epoch_metrics = addon_accum.mean_dict()
 
         model.eval()
         val_tot = val_v = 0.0
@@ -6687,6 +7323,19 @@ def main() -> None:
             _print_per_head_two_lines("[da_gps]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean)
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
+            if _training_addons_enabled(args) and last_addon_epoch_metrics:
+                am = last_addon_epoch_metrics
+                _alog = f"[da_gps addons] epoch {ep}"
+                if bool(getattr(args, "attn_reg_territory_bias", False)):
+                    _alog += f" territory_active_frac={am.get('territory_active_frac', float('nan')):.4f}"
+                if bool(getattr(args, "volt_violation_weight", False)):
+                    _alog += (
+                        f" volt_viol_frac={am.get('volt_violation_frac', float('nan')):.4f}"
+                        f" w_mean={am.get('volt_weight_mean', float('nan')):.4f}"
+                        f" loss_w={am.get('volt_loss_weighted', float('nan')):.4f}"
+                        f" loss_u={am.get('volt_loss_uniform', float('nan')):.4f}"
+                    )
+                print(_alog, flush=True)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -6768,6 +7417,8 @@ def main() -> None:
         "train_seconds": train_seconds,
         "checkpoint": str(ckpt.resolve()),
     }
+    if _training_addons_enabled(args):
+        report["training_addons"] = _training_addons_report(args, last_addon_epoch_metrics)
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     _pv_n = met.get("pv_mse_normalized", float("nan"))
     _pv_raw = met.get("pv_mse_raw", float("nan"))
