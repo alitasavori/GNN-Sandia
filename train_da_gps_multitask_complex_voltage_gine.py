@@ -2684,6 +2684,9 @@ def _build_reg_ordinal_cost_matrices(reg_class_tables: list[dict]) -> list[torch
     return mats
 
 
+_HOP_CSV_NAME = "load_hop_distance_to_each_regulator_all_index_nodes.csv"
+
+
 def _resolve_hop_csv_path(
     args: argparse.Namespace, repo: Path, chunk_parent: Path | None = None
 ) -> Path:
@@ -2695,17 +2698,47 @@ def _resolve_hop_csv_path(
         if not p.is_file():
             raise FileNotFoundError(f"--hop_csv not found: {p}")
         return p
-    candidates: list[Path] = [
-        repo / "datasets_gnn2_from pc" / "load_hop_distance_to_each_regulator_all_index_nodes.csv",
-        repo / "datasets_gnn2" / "load_hop_distance_to_each_regulator_all_index_nodes.csv",
-    ]
+
+    env_raw = str(os.environ.get("GNN2_HOP_CSV", "") or "").strip()
+    candidates: list[Path] = []
+    if env_raw:
+        p = Path(env_raw)
+        if not p.is_absolute():
+            p = (repo / p).resolve()
+        candidates.append(p)
+
     if chunk_parent is not None:
-        candidates.insert(0, chunk_parent.parent / "load_hop_distance_to_each_regulator_all_index_nodes.csv")
+        cp = chunk_parent.resolve()
+        candidates.extend(
+            [
+                (cp / ".." / _HOP_CSV_NAME).resolve(),
+                cp.parent / _HOP_CSV_NAME,
+            ]
+        )
+
+    candidates.extend(
+        [
+            repo / "datasets_gnn2_from pc" / _HOP_CSV_NAME,
+            repo / "datasets_gnn2" / _HOP_CSV_NAME,
+        ]
+    )
+
+    # Common Colab/Drive layout when chunk_parent is not passed or repo is ephemeral.
+    candidates.append(Path("/content/drive/MyDrive/datasets_gnn2") / _HOP_CSV_NAME)
+
+    seen: set[Path] = set()
     for c in candidates:
-        if c.is_file():
-            return c.resolve()
+        key = c.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        if key.is_file():
+            return key
+    searched = "\n  ".join(str(c.resolve()) for c in candidates)
     raise FileNotFoundError(
-        "Regulator hop CSV not found. Pass --hop_csv (output of compute_hop_distance_all_index_nodes.py)."
+        "Regulator hop CSV not found. Pass --hop_csv or set GNN2_HOP_CSV "
+        "(output of compute_hop_distance_all_index_nodes.py). Searched:\n  "
+        f"{searched}"
     )
 
 
