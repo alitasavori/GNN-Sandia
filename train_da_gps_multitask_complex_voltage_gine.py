@@ -2810,15 +2810,21 @@ def _voltage_loss_scalar(
     volt_hi_pu: float,
     volt_violation_alpha: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    # Model returns (B*n_nodes, 2) per-node RI; labels are (B, 2*n_nodes) flat.
+    v_flat = v_n.view_as(yb_n)
     if not violation_weight:
-        return mse(v_n.view_as(yb_n), yb_n), {}
+        return mse(v_flat, yb_n), {}
     b = int(yb.size(0))
+    assert yb_n.shape == (b, 2 * n_nodes), f"yb_n {tuple(yb_n.shape)} != ({b}, {2 * n_nodes})"
+    assert v_flat.shape == yb_n.shape, f"v_flat {tuple(v_flat.shape)} != yb_n {tuple(yb_n.shape)}"
+    # Violation weights from denormalized physical targets yb (|V| pu).
     true_ri = yb.view(b, n_nodes, 2)
     true_mag = torch.sqrt(true_ri[..., 0].square() + true_ri[..., 1].square() + 1e-12)
     viol = (true_mag < float(volt_lo_pu)) | (true_mag > float(volt_hi_pu))
     w_node = 1.0 + float(volt_violation_alpha) * viol.to(dtype=yb_n.dtype)
     w_flat = w_node.reshape(b, n_nodes).repeat_interleave(2, dim=1)
-    se = (v_n - yb_n).square()
+    assert w_flat.shape == yb_n.shape
+    se = (v_flat - yb_n).square()
     loss_w = (se * w_flat).sum() / w_flat.sum().clamp_min(1.0)
     dbg = {
         "volt_violation_frac": float(viol.float().mean().item()),
@@ -7472,5 +7478,50 @@ def main() -> None:
     print(f"Saved {ckpt}", flush=True)
 
 
+def _selftest_voltage_loss_scalar() -> None:
+    """Smoke test: per-node preds (B*N,2) vs flat labels (B,2N), violation weighting."""
+    torch.manual_seed(0)
+    mse = nn.MSELoss()
+    for b, n in ((4, 8), (64, 3817)):
+        v_n = torch.randn(b * n, 2)
+        yb = torch.randn(b, n * 2)
+        yb_n = yb / 3.0
+        ri = yb.view(b, n, 2)
+        ri[..., 0] = 0.95
+        ri[..., 1] = 0.0
+        yb.copy_(ri.reshape(b, n * 2))
+        loss, dbg = _voltage_loss_scalar(
+            v_n,
+            yb_n,
+            yb,
+            n_nodes=n,
+            mse=mse,
+            violation_weight=True,
+            volt_lo_pu=0.96,
+            volt_hi_pu=1.04,
+            volt_violation_alpha=2.0,
+        )
+        loss0, _ = _voltage_loss_scalar(
+            v_n,
+            yb_n,
+            yb,
+            n_nodes=n,
+            mse=mse,
+            violation_weight=False,
+            volt_lo_pu=0.96,
+            volt_hi_pu=1.04,
+            volt_violation_alpha=2.0,
+        )
+        assert loss.ndim == 0 and loss0.ndim == 0
+        assert dbg["volt_violation_frac"] == 1.0
+        assert dbg["volt_weight_mean"] == 3.0
+    print("_selftest_voltage_loss_scalar: ok", flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest-voltage-loss":
+        _selftest_voltage_loss_scalar()
+    else:
+        main()
