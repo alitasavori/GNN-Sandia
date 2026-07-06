@@ -16,8 +16,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from compute_hop_distance_all_index_nodes import HOP_NOT_IN_MV_CATALOG
 from train_da_gps_multitask_complex_voltage import TARGET_REG_COLS
+
+# Hop CSV sentinel (``compute_hop_distance_all_index_nodes.py`` convention): node absent from topology graph.
+HOP_NOT_IN_MV_CATALOG = -1
 
 # Output columns from compute_hop_distance_all_index_nodes.py (regulator names in CSV)
 REG_COL_TO_HOP_COL: dict[str, str] = {  # keys must match checkpoint ``reg_target_cols`` / TARGET_REG_COLS
