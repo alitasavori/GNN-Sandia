@@ -11,6 +11,7 @@ Hop CSV convention:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,138 @@ REG_COL_TO_HOP_COL: dict[str, str] = {  # keys must match checkpoint ``reg_targe
 
 if set(REG_COL_TO_HOP_COL.keys()) != set(TARGET_REG_COLS):
     raise RuntimeError("REG_COL_TO_HOP_COL keys must match TARGET_REG_COLS")
+
+_PHASE_FROM_REG_COL_RE = re.compile(r"_(rega|regb|regc|[abc])_tap_pu$", re.IGNORECASE)
+
+
+def _phase_letter_from_reg_col(reg_col: str) -> str:
+    m = _PHASE_FROM_REG_COL_RE.search(reg_col)
+    if not m:
+        raise ValueError(f"Cannot parse phase from regulator column {reg_col!r}")
+    return {"rega": "A", "regb": "B", "regc": "C", "a": "A", "b": "B", "c": "C"}[m.group(1).lower()]
+
+
+def _reg_unit_and_phase_from_reg_col(reg_col: str) -> tuple[str, str]:
+    phase = _phase_letter_from_reg_col(reg_col)
+    stem = reg_col.replace("reg_", "").replace("_tap_pu", "")
+    for suf in ("_rega", "_regb", "_regc", "_a", "_b", "_c"):
+        if stem.endswith(suf):
+            unit = stem[: -len(suf)]
+            break
+    else:
+        raise ValueError(f"Cannot parse regulator unit from column {reg_col!r}")
+    if unit == "feeder":
+        return "FEEDER", phase
+    if unit.startswith("vreg"):
+        return unit.upper(), phase
+    raise ValueError(f"Unknown regulator unit in column {reg_col!r}")
+
+
+def _reg_unit_and_phase_from_hop_col(hop_col: str) -> tuple[str, str]:
+    if hop_col.startswith("FEEDER_REG") and len(hop_col) == len("FEEDER_REGA"):
+        return "FEEDER", hop_col[-1]
+    if "_" in hop_col and hop_col.startswith("VREG"):
+        unit, phase = hop_col.rsplit("_", 1)
+        if len(phase) == 1 and phase in "ABC":
+            return unit, phase
+    raise ValueError(f"Cannot parse regulator unit/phase from hop column {hop_col!r}")
+
+
+def validate_reg_hop_csv(
+    hop_csv: Path | str,
+    reg_cols: list[str],
+    *,
+    node_names: list[str] | None = None,
+    reg_col_to_hop_col: dict[str, str] | None = None,
+    regulator_csv: Path | str | None = None,
+    max_missing_node_frac: float = 0.0,
+) -> dict[str, str]:
+    """Preflight: map ``reg_cols`` to hop CSV columns; raise on missing/unmapped/phase mismatch.
+
+  When ``node_names`` is set, also checks that every training node appears in the hop CSV.
+  ``max_missing_node_frac=0`` (default) errors on any missing node; increase to warn only.
+  """
+    mapping = dict(reg_col_to_hop_col or REG_COL_TO_HOP_COL)
+    p = Path(hop_csv).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"Hop CSV not found: {p}")
+
+    hop_df = load_hop_frame(p)
+    hop_cols = set(hop_df.columns)
+
+    unmapped = [c for c in reg_cols if c not in mapping]
+    if unmapped:
+        raise ValueError(
+            f"Regulator target columns have no hop mapping: {unmapped}. "
+            f"Update REG_COL_TO_HOP_COL in da_gps_hop_attention_ratios.py."
+        )
+
+    pairs: dict[str, str] = {}
+    missing_hop_cols: list[str] = []
+    phase_mismatches: list[tuple[str, str, str, str]] = []
+    unit_mismatches: list[tuple[str, str, str, str]] = []
+
+    for reg_col in reg_cols:
+        hop_col = mapping[reg_col]
+        pairs[reg_col] = hop_col
+        if hop_col not in hop_cols:
+            missing_hop_cols.append(hop_col)
+            continue
+        reg_unit, reg_phase = _reg_unit_and_phase_from_reg_col(reg_col)
+        hop_unit, hop_phase = _reg_unit_and_phase_from_hop_col(hop_col)
+        if reg_phase != hop_phase:
+            phase_mismatches.append((reg_col, hop_col, reg_phase, hop_phase))
+        if reg_unit != hop_unit:
+            unit_mismatches.append((reg_col, hop_col, reg_unit, hop_unit))
+
+    if missing_hop_cols:
+        raise ValueError(
+            f"Hop CSV {p} missing regulator columns {sorted(set(missing_hop_cols))}. "
+            f"Have: {[c for c in hop_df.columns if c != 'node']}"
+        )
+    if phase_mismatches:
+        detail = "; ".join(
+            f"{rc}->{hc} reg_phase={rp} hop_phase={hp}" for rc, hc, rp, hp in phase_mismatches
+        )
+        raise ValueError(f"Regulator/hop column phase mismatch (A/B/C swapped?): {detail}")
+    if unit_mismatches:
+        detail = "; ".join(
+            f"{rc}->{hc} reg_unit={ru} hop_unit={hu}" for rc, hc, ru, hu in unit_mismatches
+        )
+        raise ValueError(f"Regulator/hop column unit mismatch: {detail}")
+
+    if regulator_csv is not None:
+        reg_path = Path(regulator_csv).resolve()
+        if reg_path.is_file():
+            reg_df = pd.read_csv(reg_path)
+            reg_name_col = "Regulator" if "Regulator" in reg_df.columns else "regulator"
+            if reg_name_col not in reg_df.columns:
+                raise ValueError(f"{reg_path} must have a Regulator column")
+            catalog_hop_cols = {str(x).strip() for x in reg_df[reg_name_col].astype(str)}
+            extra = sorted(set(pairs.values()) - catalog_hop_cols)
+            if extra:
+                raise ValueError(
+                    f"Hop columns {extra} not listed in {reg_path} ({reg_name_col}); "
+                    "territory mask may target wrong regulators."
+                )
+
+    if node_names is not None:
+        hop_nodes = set(hop_df["node"].astype(str).str.strip().str.lower())
+        miss = [str(n).strip().lower() for n in node_names if str(n).strip().lower() not in hop_nodes]
+        if miss:
+            frac = len(miss) / max(len(node_names), 1)
+            msg = (
+                f"Hop CSV missing {len(miss)}/{len(node_names)} training nodes "
+                f"({frac:.4%}); first examples: {miss[:5]}"
+            )
+            if frac > float(max_missing_node_frac):
+                raise ValueError(
+                    msg + " — regenerate hop CSV with the same node index as training "
+                    "(compute_hop_distance_all_index_nodes.py --node-index ...)."
+                )
+            print(f"WARNING: {msg}", flush=True)
+
+    return pairs
 
 
 def load_hop_frame(hop_csv: Path | str) -> pd.DataFrame:
@@ -322,6 +455,7 @@ __all__ = [
     "TARGET_REG_COLS",
     "REG_COL_TO_HOP_COL",
     "HOP_NOT_IN_MV_CATALOG",
+    "validate_reg_hop_csv",
     "load_hop_frame",
     "hops_for_manifest_nodes",
     "downstream_mask",

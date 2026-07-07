@@ -37,12 +37,18 @@ Optional physics loss (``--loss_power_balance_weight`` > 0, strict — no silent
 
 Optional training add-ons (all default **off**; base recipe unchanged):
 
-- ``--attn_reg_territory_bias`` / ``--attn_reg_territory_beta``: soft downstream bias on regulator token
-  keys in the **second** cross-attention (node→token) only. Hop table from ``--hop_csv`` or repo
+- ``--attn_reg_territory_bias`` / ``--attn_reg_territory_beta`` (default 6.0): soft downstream bias on
+  regulator token keys in the **second** cross-attention (node→token) only. With hidden=64, heads=2,
+  scaled dot-product logits are ~O(1/sqrt(d_head)); beta≈6 adds a comparable additive boost on ~18%%
+  downstream node×reg pairs. Hop table from ``--hop_csv`` or repo
   ``datasets_gnn2_from pc/load_hop_distance_to_each_regulator_all_index_nodes.csv``.
-- ``--reg_ordinal_ce`` (with ``--reg_loss ce``): cost-sensitive CE from |tap_class_j - tap_class_c|.
-- ``--volt_violation_weight`` / ``--volt_lo_pu`` / ``--volt_hi_pu`` / ``--volt_violation_alpha``:
-  per-node voltage MSE weights from target |V| outside [lo, hi].
+- ``--reg_hybrid_tap_loss`` / ``--reg_ordinal_alpha`` (default 0.75, with ``--reg_loss ce``): CE plus
+  alpha times expected ordinal tap cost. Cost matrices are normalized to [0, 1] per regulator (divide by
+  max |tap_i - tap_j|) so alpha scales a fraction of CE, not raw tap-PU distance (~0.04 span).
+- ``--reg_ordinal_ce``: deprecated experimental cost-weighted log loss (off by default).
+- ``--volt_violation_weight`` / ``--volt_lo_pu`` / ``--volt_hi_pu`` / ``--volt_violation_alpha`` (default
+  5.0) / ``--volt_violation_mode`` (default ``continuous``): per-node voltage MSE weights. Continuous mode
+  uses w = 1 + alpha * depth outside [lo, hi]; binary mode uses w = 1 + alpha * 1(viol).
 """
 from __future__ import annotations
 
@@ -56,6 +62,7 @@ import math
 import os
 import re
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
@@ -70,6 +77,12 @@ from torch_geometric.nn import GINEConv
 from torch_geometric.utils import to_dense_batch
 
 from train_gnn_only_compare_complex_voltage import _build_complex_targets
+
+# Training add-on coefficient defaults (tuned for comparable loss scale vs base terms).
+_DEFAULT_ATTN_REG_TERRITORY_BETA = 6.0
+_DEFAULT_REG_ORDINAL_ALPHA = 0.75
+_DEFAULT_VOLT_VIOLATION_ALPHA = 5.0
+_DEFAULT_VOLT_VIOLATION_MODE = "continuous"
 
 
 def _to_dense_batch_mv(
@@ -2592,6 +2605,36 @@ def _reg_indices_to_tap_pu(
     return pred_tap, tgt_tap
 
 
+def _reg_tap_metrics_from_logits(
+    reg_logits: list[torch.Tensor],
+    target: torch.Tensor,
+    reg_class_tables: list[dict] | None,
+    *,
+    reg_class_values: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Argmax-decoded tap MAE (pu) and exact class accuracy from regulator logits."""
+    nan = {
+        "reg_tap_mae_pu": float("nan"),
+        "reg_tap_acc": float("nan"),
+        "reg_mean_abs_tap_err": float("nan"),
+    }
+    if not reg_logits or not reg_class_tables:
+        return nan
+    pred_idx = torch.stack([lg.argmax(dim=-1) for lg in reg_logits], dim=1)
+    tgt_idx = target.long()
+    if reg_class_values is not None:
+        cv = reg_class_values.to(device=pred_idx.device, dtype=torch.float32)
+    else:
+        cv = torch.stack(
+            [torch.tensor(tab["classes"], device=pred_idx.device, dtype=torch.float32) for tab in reg_class_tables],
+            dim=0,
+        )
+    pred_tap, true_tap = _reg_indices_to_tap_pu(pred_idx, tgt_idx, cv)
+    mae = float((pred_tap - true_tap).abs().mean().item())
+    acc = float((pred_idx == tgt_idx).float().mean().item())
+    return {"reg_tap_mae_pu": mae, "reg_tap_acc": acc, "reg_mean_abs_tap_err": mae}
+
+
 def _reg_loss_scalar(
     pred: torch.Tensor | None,
     target: torch.Tensor,
@@ -2599,16 +2642,31 @@ def _reg_loss_scalar(
     *,
     reg_logits: list[torch.Tensor] | None = None,
     reg_class_tables: list[dict] | None = None,
+    reg_hybrid_tap_loss: bool = False,
     reg_ordinal_ce: bool = False,
+    reg_ordinal_alpha: float = 1.0,
     reg_cost_matrices: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if reg_loss == "ce":
         if not reg_logits:
             raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
         _validate_reg_ce_targets(target, reg_logits, reg_class_tables=reg_class_tables)
+        if reg_hybrid_tap_loss and reg_cost_matrices:
+            losses = [
+                _hybrid_tap_loss_scalar(
+                    reg_logits[j],
+                    target[:, j].long(),
+                    reg_cost_matrices[j],
+                    alpha=reg_ordinal_alpha,
+                )
+                for j in range(len(reg_logits))
+            ]
+            return torch.stack(losses).mean()
         if reg_ordinal_ce and reg_cost_matrices:
             losses = [
-                _ordinal_ce_loss_scalar(reg_logits[j], target[:, j].long(), reg_cost_matrices[j])
+                _deprecated_cost_weighted_log_loss_scalar(
+                    reg_logits[j], target[:, j].long(), reg_cost_matrices[j]
+                )
                 for j in range(len(reg_logits))
             ]
             return torch.stack(losses).mean()
@@ -2626,16 +2684,31 @@ def _reg_loss_elementwise(
     reg_loss: str,
     *,
     reg_logits: list[torch.Tensor] | None = None,
+    reg_hybrid_tap_loss: bool = False,
     reg_ordinal_ce: bool = False,
+    reg_ordinal_alpha: float = 1.0,
     reg_cost_matrices: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if reg_loss == "ce":
         if not reg_logits:
             raise ValueError("reg_loss=ce requires reg_logits from the model forward pass.")
+        if reg_hybrid_tap_loss and reg_cost_matrices:
+            return torch.stack(
+                [
+                    _hybrid_tap_loss_elementwise(
+                        reg_logits[j],
+                        target[:, j].long(),
+                        reg_cost_matrices[j],
+                        alpha=reg_ordinal_alpha,
+                    )
+                    for j in range(len(reg_logits))
+                ],
+                dim=1,
+            )
         if reg_ordinal_ce and reg_cost_matrices:
             return torch.stack(
                 [
-                    _ordinal_ce_loss_elementwise(
+                    _deprecated_cost_weighted_log_loss_elementwise(
                         reg_logits[j], target[:, j].long(), reg_cost_matrices[j]
                     )
                     for j in range(len(reg_logits))
@@ -2655,19 +2728,68 @@ def _reg_loss_elementwise(
     return (pred - target) ** 2
 
 
-def _ordinal_ce_loss_elementwise(
+def _hybrid_tap_loss_elementwise(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    cost_matrix: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Per-sample hybrid tap loss: CE(z, y) + alpha * sum_c C[y, c] * p_c.
+
+    Cross-entropy with expected ordinal-cost regularization, where
+    C[y, c] = |tau_y - tau_c| / max_{i,j}|tau_i - tau_j| (normalized per regulator) and
+    p = softmax(z). The CE term anchors classification; the ordinal-cost term
+    penalizes probability mass on distant tap classes.
+    """
+    ce = F.cross_entropy(logits, target.long(), reduction="none")
+    ordinal_cost = _hybrid_tap_ordinal_cost_elementwise(
+        logits, target, cost_matrix, alpha=alpha
+    )
+    return ce + ordinal_cost
+
+
+def _hybrid_tap_loss_scalar(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    cost_matrix: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    return _hybrid_tap_loss_elementwise(logits, target, cost_matrix, alpha=alpha).mean()
+
+
+def _hybrid_tap_ce_elementwise(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    return F.cross_entropy(logits, target.long(), reduction="none")
+
+
+def _hybrid_tap_ordinal_cost_elementwise(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    cost_matrix: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    probs = F.softmax(logits, dim=-1)
+    costs_y = cost_matrix.to(device=logits.device, dtype=logits.dtype)[target.long()]
+    return float(alpha) * (costs_y * probs).sum(dim=-1)
+
+
+def _deprecated_cost_weighted_log_loss_elementwise(
     logits: torch.Tensor, target: torch.Tensor, cost_matrix: torch.Tensor
 ) -> torch.Tensor:
-    """Per-sample cost-sensitive CE: sum_c cost[y,c] * (-log p_c)."""
+    """Deprecated experimental loss: sum_c C[y,c] * (-log p_c). Prefer hybrid tap loss."""
     log_probs = F.log_softmax(logits, dim=-1)
     costs = cost_matrix.to(device=logits.device, dtype=logits.dtype)[target.long()]
     return (costs * (-log_probs)).sum(dim=-1)
 
 
-def _ordinal_ce_loss_scalar(
+def _deprecated_cost_weighted_log_loss_scalar(
     logits: torch.Tensor, target: torch.Tensor, cost_matrix: torch.Tensor
 ) -> torch.Tensor:
-    return _ordinal_ce_loss_elementwise(logits, target, cost_matrix).mean()
+    return _deprecated_cost_weighted_log_loss_elementwise(logits, target, cost_matrix).mean()
 
 
 def _plain_reg_ce_scalar(reg_logits: list[torch.Tensor], target: torch.Tensor) -> torch.Tensor:
@@ -2676,10 +2798,14 @@ def _plain_reg_ce_scalar(reg_logits: list[torch.Tensor], target: torch.Tensor) -
 
 
 def _build_reg_ordinal_cost_matrices(reg_class_tables: list[dict]) -> list[torch.Tensor]:
+    """Pairwise |tap_i - tap_j| per regulator, normalized to [0, 1] by max cost."""
     mats: list[torch.Tensor] = []
     for tab in reg_class_tables:
         classes = np.asarray(tab["classes"], dtype=np.float64)
         diff = np.abs(classes[:, None] - classes[None, :]).astype(np.float32)
+        max_cost = float(np.max(diff))
+        if max_cost > 0.0:
+            diff = diff / max_cost
         mats.append(torch.from_numpy(diff))
     return mats
 
@@ -2782,13 +2908,34 @@ def _configure_reg_territory_bias(
     args: argparse.Namespace,
     repo: Path,
     chunk_parent: Path | None = None,
-) -> None:
+) -> dict[str, str] | None:
     if not bool(getattr(args, "attn_reg_territory_bias", False)):
-        return
+        return None
     hop_csv = _resolve_hop_csv_path(args, repo, chunk_parent)
     rule = str(getattr(args, "attn_reg_territory_downstream_rule", "hop_gt_0"))
+    node_names = [n for n, _ in sorted(node_to_local.items(), key=lambda kv: kv[1])]
+    from da_gps_hop_attention_ratios import REG_COL_TO_HOP_COL, validate_reg_hop_csv
+
+    reg_csv = None
+    if chunk_parent is not None:
+        for cand in (
+            chunk_parent.parent / "regulator_involved_nodes.csv",
+            repo / "datasets_gnn2_from pc" / "loadtype_8500_dailyagg" / "regulator_involved_nodes.csv",
+        ):
+            if cand.is_file():
+                reg_csv = cand
+                break
+    reg_hop_map = validate_reg_hop_csv(
+        hop_csv,
+        reg_cols,
+        node_names=node_names,
+        reg_col_to_hop_col=REG_COL_TO_HOP_COL,
+        regulator_csv=reg_csv,
+    )
+    pair_str = ", ".join(f"{rc}->{hc}" for rc, hc in reg_hop_map.items())
+    print(f"attn_reg_territory_bias: reg_col->hop_col mapping: {pair_str}", flush=True)
     mask = _build_reg_territory_mask(node_to_local, reg_cols, hop_csv, downstream_rule=rule)
-    beta = float(getattr(args, "attn_reg_territory_beta", 2.0))
+    beta = float(getattr(args, "attn_reg_territory_beta", _DEFAULT_ATTN_REG_TERRITORY_BETA))
     model.set_reg_territory_bias(mask, beta)
     active = float(mask.mean().item())
     print(
@@ -2796,6 +2943,7 @@ def _configure_reg_territory_bias(
         f"downstream_frac={active:.4f}",
         flush=True,
     )
+    return reg_hop_map
 
 
 def _voltage_loss_scalar(
@@ -2809,6 +2957,7 @@ def _voltage_loss_scalar(
     volt_lo_pu: float,
     volt_hi_pu: float,
     volt_violation_alpha: float,
+    volt_violation_mode: str = _DEFAULT_VOLT_VIOLATION_MODE,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     # Model returns (B*n_nodes, 2) per-node RI; labels are (B, 2*n_nodes) flat.
     v_flat = v_n.view_as(yb_n)
@@ -2820,14 +2969,27 @@ def _voltage_loss_scalar(
     # Violation weights from denormalized physical targets yb (|V| pu).
     true_ri = yb.view(b, n_nodes, 2)
     true_mag = torch.sqrt(true_ri[..., 0].square() + true_ri[..., 1].square() + 1e-12)
-    viol = (true_mag < float(volt_lo_pu)) | (true_mag > float(volt_hi_pu))
-    w_node = 1.0 + float(volt_violation_alpha) * viol.to(dtype=yb_n.dtype)
+    lo_v = float(volt_lo_pu)
+    hi_v = float(volt_hi_pu)
+    viol = (true_mag < lo_v) | (true_mag > hi_v)
+    mode = str(volt_violation_mode or _DEFAULT_VOLT_VIOLATION_MODE).strip().lower()
+    alpha = float(volt_violation_alpha)
+    if mode == "continuous":
+        viol_depth = (lo_v - true_mag).clamp_min(0.0) + (true_mag - hi_v).clamp_min(0.0)
+        w_node = 1.0 + alpha * viol_depth
+    elif mode == "binary":
+        w_node = 1.0 + alpha * viol.to(dtype=yb_n.dtype)
+    else:
+        raise ValueError(f"Unknown volt_violation_mode={volt_violation_mode!r}; use 'continuous' or 'binary'.")
     w_flat = w_node.reshape(b, n_nodes).repeat_interleave(2, dim=1)
     assert w_flat.shape == yb_n.shape
     se = (v_flat - yb_n).square()
     loss_w = (se * w_flat).sum() / w_flat.sum().clamp_min(1.0)
     dbg = {
         "volt_violation_frac": float(viol.float().mean().item()),
+        "volt_violation_depth_mean": float(
+            ((lo_v - true_mag).clamp_min(0.0) + (true_mag - hi_v).clamp_min(0.0)).mean().item()
+        ),
         "volt_weight_mean": float(w_node.mean().item()),
         "volt_loss_weighted": float(loss_w.detach().item()),
         "volt_loss_uniform": float(se.mean().detach().item()),
@@ -2838,33 +3000,59 @@ def _voltage_loss_scalar(
 @dataclass
 class _AddonBatchLog:
     territory_active_frac: float = 0.0
-    ordinal_ce: float = float("nan")
+    hybrid_ce: float = float("nan")
+    ordinal_cost_term: float = float("nan")
     plain_ce: float = float("nan")
+    hybrid_total: float = float("nan")
+    deprecated_cost_weighted: float = float("nan")
+    reg_tap_mae_pu: float = float("nan")
+    reg_tap_acc: float = float("nan")
+    reg_mean_abs_tap_err: float = float("nan")
     volt_violation_frac: float = float("nan")
     volt_weight_mean: float = float("nan")
     volt_loss_weighted: float = float("nan")
     volt_loss_uniform: float = float("nan")
+    volt_loss_delta: float = float("nan")
 
 
 @dataclass
 class _AddonTrainAccum:
     territory_active_frac: float = 0.0
-    ordinal_ce_sum: float = 0.0
+    hybrid_ce_sum: float = 0.0
+    ordinal_cost_term_sum: float = 0.0
     plain_ce_sum: float = 0.0
+    hybrid_total_sum: float = 0.0
+    deprecated_cost_weighted_sum: float = 0.0
+    reg_tap_mae_pu_sum: float = 0.0
+    reg_tap_acc_sum: float = 0.0
+    reg_mean_abs_tap_err_sum: float = 0.0
     volt_violation_frac_sum: float = 0.0
     volt_weight_mean_sum: float = 0.0
     volt_loss_weighted_sum: float = 0.0
     volt_loss_uniform_sum: float = 0.0
+    volt_loss_delta_sum: float = 0.0
     n: int = 0
 
     def update(self, row: _AddonBatchLog) -> None:
         self.n += 1
         if math.isfinite(row.territory_active_frac):
             self.territory_active_frac += row.territory_active_frac
-        if math.isfinite(row.ordinal_ce):
-            self.ordinal_ce_sum += row.ordinal_ce
+        if math.isfinite(row.hybrid_ce):
+            self.hybrid_ce_sum += row.hybrid_ce
+        if math.isfinite(row.ordinal_cost_term):
+            self.ordinal_cost_term_sum += row.ordinal_cost_term
         if math.isfinite(row.plain_ce):
             self.plain_ce_sum += row.plain_ce
+        if math.isfinite(row.hybrid_total):
+            self.hybrid_total_sum += row.hybrid_total
+        if math.isfinite(row.deprecated_cost_weighted):
+            self.deprecated_cost_weighted_sum += row.deprecated_cost_weighted
+        if math.isfinite(row.reg_tap_mae_pu):
+            self.reg_tap_mae_pu_sum += row.reg_tap_mae_pu
+        if math.isfinite(row.reg_tap_acc):
+            self.reg_tap_acc_sum += row.reg_tap_acc
+        if math.isfinite(row.reg_mean_abs_tap_err):
+            self.reg_mean_abs_tap_err_sum += row.reg_mean_abs_tap_err
         if math.isfinite(row.volt_violation_frac):
             self.volt_violation_frac_sum += row.volt_violation_frac
         if math.isfinite(row.volt_weight_mean):
@@ -2873,26 +3061,131 @@ class _AddonTrainAccum:
             self.volt_loss_weighted_sum += row.volt_loss_weighted
         if math.isfinite(row.volt_loss_uniform):
             self.volt_loss_uniform_sum += row.volt_loss_uniform
+        if math.isfinite(row.volt_loss_delta):
+            self.volt_loss_delta_sum += row.volt_loss_delta
 
     def mean_dict(self) -> dict[str, float]:
         n = max(self.n, 1)
         return {
             "territory_active_frac": self.territory_active_frac / n,
-            "ordinal_ce": self.ordinal_ce_sum / n,
+            "hybrid_ce": self.hybrid_ce_sum / n,
+            "ordinal_cost_term": self.ordinal_cost_term_sum / n,
             "plain_ce": self.plain_ce_sum / n,
+            "hybrid_total": self.hybrid_total_sum / n,
+            "deprecated_cost_weighted": self.deprecated_cost_weighted_sum / n,
+            "reg_tap_mae_pu": self.reg_tap_mae_pu_sum / n,
+            "reg_tap_acc": self.reg_tap_acc_sum / n,
+            "reg_mean_abs_tap_err": self.reg_mean_abs_tap_err_sum / n,
             "volt_violation_frac": self.volt_violation_frac_sum / n,
             "volt_weight_mean": self.volt_weight_mean_sum / n,
             "volt_loss_weighted": self.volt_loss_weighted_sum / n,
             "volt_loss_uniform": self.volt_loss_uniform_sum / n,
+            "volt_loss_delta": self.volt_loss_delta_sum / n,
+        }
+
+
+@dataclass
+class _AddonValAccum:
+    val_reg_plain_ce_sum: float = 0.0
+    val_reg_hybrid_ce_sum: float = 0.0
+    val_reg_ordinal_cost_sum: float = 0.0
+    val_reg_hybrid_total_sum: float = 0.0
+    val_reg_tap_mae_pu_sum: float = 0.0
+    val_reg_tap_acc_sum: float = 0.0
+    val_volt_uniform_sum: float = 0.0
+    n: int = 0
+
+    def update(self, row: dict[str, float]) -> None:
+        self.n += 1
+        for key, attr in (
+            ("val_reg_plain_ce", "val_reg_plain_ce_sum"),
+            ("val_reg_hybrid_ce", "val_reg_hybrid_ce_sum"),
+            ("val_reg_ordinal_cost", "val_reg_ordinal_cost_sum"),
+            ("val_reg_hybrid_total", "val_reg_hybrid_total_sum"),
+            ("val_reg_tap_mae_pu", "val_reg_tap_mae_pu_sum"),
+            ("val_reg_tap_acc", "val_reg_tap_acc_sum"),
+            ("val_volt_uniform", "val_volt_uniform_sum"),
+        ):
+            v = row.get(key, float("nan"))
+            if math.isfinite(v):
+                setattr(self, attr, getattr(self, attr) + v)
+
+    def mean_dict(self) -> dict[str, float]:
+        n = max(self.n, 1)
+        return {
+            "val_reg_plain_ce": self.val_reg_plain_ce_sum / n,
+            "val_reg_hybrid_ce": self.val_reg_hybrid_ce_sum / n,
+            "val_reg_ordinal_cost": self.val_reg_ordinal_cost_sum / n,
+            "val_reg_hybrid_total": self.val_reg_hybrid_total_sum / n,
+            "val_reg_tap_mae_pu": self.val_reg_tap_mae_pu_sum / n,
+            "val_reg_tap_acc": self.val_reg_tap_acc_sum / n,
+            "val_volt_uniform": self.val_volt_uniform_sum / n,
         }
 
 
 def _training_addons_enabled(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "attn_reg_territory_bias", False)
+        or getattr(args, "reg_hybrid_tap_loss", False)
         or getattr(args, "reg_ordinal_ce", False)
         or getattr(args, "volt_violation_weight", False)
     )
+
+
+def _log_training_addon_scales(
+    args: argparse.Namespace,
+    *,
+    reg_class_tables: list[dict] | None = None,
+    hidden: int = 64,
+    heads: int = 2,
+) -> None:
+    if not _training_addons_enabled(args):
+        return
+    print("[da_gps addons] expected relative scales at setup:", flush=True)
+    if bool(getattr(args, "attn_reg_territory_bias", False)):
+        beta = float(getattr(args, "attn_reg_territory_beta", _DEFAULT_ATTN_REG_TERRITORY_BETA))
+        dh = max(1, int(hidden) // max(1, int(heads)))
+        logit_scale = 1.0 / math.sqrt(float(dh))
+        print(
+            f"  territory: beta={beta:g} on downstream node×reg keys (~18%% active pairs); "
+            f"typical scaled dot-product logits ~O({logit_scale:.2f}) per head (d_head={dh}); "
+            f"beta adds up to +{beta:g} before softmax",
+            flush=True,
+        )
+    if bool(getattr(args, "reg_hybrid_tap_loss", False)) and reg_class_tables:
+        alpha = float(getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA))
+        spans = [
+            float(np.max(np.asarray(tab["classes"], dtype=np.float64))
+                  - np.min(np.asarray(tab["classes"], dtype=np.float64)))
+            for tab in reg_class_tables
+            if tab.get("classes")
+        ]
+        span_lo = min(spans) if spans else float("nan")
+        span_hi = max(spans) if spans else float("nan")
+        print(
+            f"  hybrid tap: CE ~1-5 typical; ordinal cost normalized to [0,1] per regulator "
+            f"(raw tap spans {span_lo:.4f}-{span_hi:.4f} pu); alpha={alpha:g} "
+            f"→ ordinal term ~{0.2 * alpha:.2f}-{0.6 * alpha:.2f} when mass is spread",
+            flush=True,
+        )
+    if bool(getattr(args, "volt_violation_weight", False)):
+        alpha = float(getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA))
+        mode = str(getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE))
+        lo = float(getattr(args, "volt_lo_pu", 0.96))
+        hi = float(getattr(args, "volt_hi_pu", 1.04))
+        if mode == "continuous":
+            print(
+                f"  voltage: mode=continuous w=1+{alpha:g}*depth outside [{lo},{hi}]; "
+                f"at viol_frac~0.30, depth~0.01-0.03 pu → w_mean~1.5-2.5 (stronger near limits)",
+                flush=True,
+            )
+        else:
+            w_mean_est = 1.0 + alpha * 0.30
+            print(
+                f"  voltage: mode=binary w=1+{alpha:g}*1(viol); "
+                f"at viol_frac~0.30 expected w_mean~{w_mean_est:.2f}",
+                flush=True,
+            )
 
 
 def _addon_batch_log_row(
@@ -2902,38 +3195,115 @@ def _addon_batch_log_row(
     reg_logits: list[torch.Tensor] | None,
     y_reg_b: torch.Tensor,
     reg_loss: str,
+    reg_hybrid_tap_loss: bool,
     reg_ordinal_ce: bool,
+    reg_ordinal_alpha: float,
     reg_cost_matrices: list[torch.Tensor] | None,
+    reg_class_tables: list[dict] | None = None,
+    reg_class_values: torch.Tensor | None = None,
     volt_dbg: dict[str, float],
 ) -> _AddonBatchLog:
     row = _AddonBatchLog()
     if bool(getattr(args, "attn_reg_territory_bias", False)) and base_model.use_reg_territory_bias:
         row.territory_active_frac = float(base_model.reg_territory_mask.mean().item())
-    if (
-        reg_loss == "ce"
-        and reg_ordinal_ce
-        and reg_logits
-        and reg_cost_matrices
-    ):
-        row.ordinal_ce = float(
-            _reg_loss_scalar(
-                None,
-                y_reg_b,
-                reg_loss,
-                reg_logits=reg_logits,
-                reg_ordinal_ce=True,
-                reg_cost_matrices=reg_cost_matrices,
-            )
-            .detach()
-            .item()
-        )
+    if reg_loss == "ce" and reg_logits:
         row.plain_ce = float(_plain_reg_ce_scalar(reg_logits, y_reg_b).detach().item())
+        if reg_cost_matrices and reg_hybrid_tap_loss:
+            ce_parts = [
+                _hybrid_tap_ce_elementwise(reg_logits[j], y_reg_b[:, j].long()).mean()
+                for j in range(len(reg_logits))
+            ]
+            ord_parts = [
+                _hybrid_tap_ordinal_cost_elementwise(
+                    reg_logits[j],
+                    y_reg_b[:, j].long(),
+                    reg_cost_matrices[j],
+                    alpha=reg_ordinal_alpha,
+                ).mean()
+                for j in range(len(reg_logits))
+            ]
+            row.hybrid_ce = float(torch.stack(ce_parts).mean().detach().item())
+            row.ordinal_cost_term = float(torch.stack(ord_parts).mean().detach().item())
+            row.hybrid_total = row.hybrid_ce + row.ordinal_cost_term
+        elif reg_cost_matrices and reg_ordinal_ce:
+            row.deprecated_cost_weighted = float(
+                _reg_loss_scalar(
+                    None,
+                    y_reg_b,
+                    reg_loss,
+                    reg_logits=reg_logits,
+                    reg_ordinal_ce=True,
+                    reg_cost_matrices=reg_cost_matrices,
+                )
+                .detach()
+                .item()
+            )
+    if reg_loss == "ce" and reg_logits and reg_class_tables:
+        tap_m = _reg_tap_metrics_from_logits(
+            reg_logits,
+            y_reg_b,
+            reg_class_tables,
+            reg_class_values=reg_class_values,
+        )
+        row.reg_tap_mae_pu = tap_m["reg_tap_mae_pu"]
+        row.reg_tap_acc = tap_m["reg_tap_acc"]
+        row.reg_mean_abs_tap_err = tap_m["reg_mean_abs_tap_err"]
     if volt_dbg:
         row.volt_violation_frac = volt_dbg.get("volt_violation_frac", float("nan"))
         row.volt_weight_mean = volt_dbg.get("volt_weight_mean", float("nan"))
         row.volt_loss_weighted = volt_dbg.get("volt_loss_weighted", float("nan"))
         row.volt_loss_uniform = volt_dbg.get("volt_loss_uniform", float("nan"))
+        if math.isfinite(row.volt_loss_weighted) and math.isfinite(row.volt_loss_uniform):
+            row.volt_loss_delta = row.volt_loss_weighted - row.volt_loss_uniform
     return row
+
+
+def _addon_val_batch_row(
+    *,
+    reg_logits: list[torch.Tensor] | None,
+    y_reg_b: torch.Tensor,
+    reg_loss: str,
+    reg_hybrid_tap_loss: bool,
+    reg_ordinal_alpha: float,
+    reg_cost_matrices: list[torch.Tensor] | None,
+    reg_class_tables: list[dict] | None,
+    reg_class_values: torch.Tensor | None,
+    val_volt_uniform: float,
+) -> dict[str, float]:
+    """Counterfactual val metrics: always plain CE / uniform volt MSE alongside hybrid."""
+    out: dict[str, float] = {"val_volt_uniform": float(val_volt_uniform)}
+    if reg_loss != "ce" or not reg_logits:
+        return out
+    out["val_reg_plain_ce"] = float(_plain_reg_ce_scalar(reg_logits, y_reg_b).detach().item())
+    if reg_hybrid_tap_loss and reg_cost_matrices:
+        ce_parts = [
+            _hybrid_tap_ce_elementwise(reg_logits[j], y_reg_b[:, j].long()).mean()
+            for j in range(len(reg_logits))
+        ]
+        ord_parts = [
+            _hybrid_tap_ordinal_cost_elementwise(
+                reg_logits[j],
+                y_reg_b[:, j].long(),
+                reg_cost_matrices[j],
+                alpha=reg_ordinal_alpha,
+            ).mean()
+            for j in range(len(reg_logits))
+        ]
+        h_ce = float(torch.stack(ce_parts).mean().detach().item())
+        h_ord = float(torch.stack(ord_parts).mean().detach().item())
+        out["val_reg_hybrid_ce"] = h_ce
+        out["val_reg_ordinal_cost"] = h_ord
+        out["val_reg_hybrid_total"] = h_ce + h_ord
+    if reg_class_tables:
+        tap_m = _reg_tap_metrics_from_logits(
+            reg_logits,
+            y_reg_b,
+            reg_class_tables,
+            reg_class_values=reg_class_values,
+        )
+        out["val_reg_tap_mae_pu"] = tap_m["reg_tap_mae_pu"]
+        out["val_reg_tap_acc"] = tap_m["reg_tap_acc"]
+    return out
 
 
 def _maybe_log_addon_batch(
@@ -2950,36 +3320,144 @@ def _maybe_log_addon_batch(
         return
     parts: list[str] = [f"[da_gps addons] epoch {epoch} batch {batch_idx}"]
     if bool(getattr(args, "attn_reg_territory_bias", False)) and math.isfinite(row.territory_active_frac):
-        parts.append(f"territory_active_frac={row.territory_active_frac:.4f}")
-    if math.isfinite(row.ordinal_ce) and math.isfinite(row.plain_ce):
-        parts.append(f"reg_ordinal_ce={row.ordinal_ce:.4f} plain_ce={row.plain_ce:.4f}")
-    if math.isfinite(row.volt_violation_frac):
+        parts.append(f"territory_frac={row.territory_active_frac:.4f}")
+    if math.isfinite(row.plain_ce):
+        if math.isfinite(row.hybrid_total):
+            parts.append(
+                f"plain_ce={row.plain_ce:.4f} hybrid_total={row.hybrid_total:.4f} "
+                f"ordinal_cost={row.ordinal_cost_term:.4f}"
+            )
+        elif math.isfinite(row.deprecated_cost_weighted):
+            parts.append(
+                f"plain_ce={row.plain_ce:.4f} deprecated_cost_weighted={row.deprecated_cost_weighted:.4f}"
+            )
+        else:
+            parts.append(f"plain_ce={row.plain_ce:.4f}")
+    if math.isfinite(row.reg_tap_mae_pu):
         parts.append(
-            f"volt_viol_frac={row.volt_violation_frac:.4f} w_mean={row.volt_weight_mean:.4f} "
-            f"loss_w={row.volt_loss_weighted:.4f} loss_u={row.volt_loss_uniform:.4f}"
+            f"reg_tap_mae_pu={row.reg_tap_mae_pu:.4f} reg_tap_acc={row.reg_tap_acc:.4f}"
+        )
+    if math.isfinite(row.volt_violation_frac):
+        delta_s = (
+            f" delta={row.volt_loss_delta:.4f}"
+            if math.isfinite(row.volt_loss_delta)
+            else ""
+        )
+        parts.append(
+            f"volt loss_w={row.volt_loss_weighted:.4f} loss_u={row.volt_loss_uniform:.4f}{delta_s}"
         )
     if len(parts) > 1:
         print(" | ".join(parts), flush=True)
 
 
+def _format_addon_epoch_line(
+    *,
+    tag: str,
+    epoch: int,
+    args: argparse.Namespace,
+    train_means: dict[str, float],
+    val_means: dict[str, float] | None,
+    val_r: float,
+    val_tot: float,
+    lam_v: float,
+    lam_cap: float,
+    lam_reg: float,
+    val_v: float,
+    val_c: float,
+    val_pf: float = float("nan"),
+    pf_weight: float = 0.0,
+    val_pv: float = float("nan"),
+    lam_pv: float = 0.0,
+) -> str:
+    am = train_means
+    vm = val_means or {}
+    line = f"{tag} addons] epoch {epoch}"
+    if bool(getattr(args, "attn_reg_territory_bias", False)):
+        line += f" | territory_frac={am.get('territory_active_frac', float('nan')):.4f}"
+    if bool(getattr(args, "reg_hybrid_tap_loss", False)) or bool(getattr(args, "reg_ordinal_ce", False)):
+        if math.isfinite(am.get("hybrid_total", float("nan"))):
+            line += (
+                f" | train plain_ce={am.get('plain_ce', float('nan')):.4f}"
+                f" hybrid_total={am.get('hybrid_total', float('nan')):.4f}"
+                f" ordinal_cost={am.get('ordinal_cost_term', float('nan')):.4f}"
+            )
+        elif math.isfinite(am.get("deprecated_cost_weighted", float("nan"))):
+            line += (
+                f" | train plain_ce={am.get('plain_ce', float('nan')):.4f}"
+                f" deprecated_cost_weighted={am.get('deprecated_cost_weighted', float('nan')):.4f}"
+            )
+        if math.isfinite(am.get("reg_tap_mae_pu", float("nan"))):
+            line += (
+                f" reg_tap_mae_pu={am.get('reg_tap_mae_pu', float('nan')):.4f}"
+                f" reg_tap_acc={am.get('reg_tap_acc', float('nan')):.4f}"
+            )
+    if bool(getattr(args, "volt_violation_weight", False)):
+        line += (
+            f" | volt loss_w={am.get('volt_loss_weighted', float('nan')):.4f}"
+            f" loss_u={am.get('volt_loss_uniform', float('nan')):.4f}"
+            f" delta={am.get('volt_loss_delta', float('nan')):.4f}"
+        )
+    val_plain_ce = vm.get("val_reg_plain_ce", val_r)
+    line += f" | val_reg={val_plain_ce:.4f}"
+    if math.isfinite(vm.get("val_reg_tap_mae_pu", float("nan"))):
+        line += f" val_tap_mae={vm['val_reg_tap_mae_pu']:.4f}"
+    if math.isfinite(vm.get("val_reg_tap_acc", float("nan"))):
+        line += f" val_tap_acc={vm['val_reg_tap_acc']:.4f}"
+    if math.isfinite(vm.get("val_volt_uniform", float("nan"))):
+        line += f" val_volt_uniform={vm['val_volt_uniform']:.4f}"
+    if bool(getattr(args, "reg_hybrid_tap_loss", False)) and math.isfinite(
+        vm.get("val_reg_hybrid_total", float("nan"))
+    ):
+        line += (
+            f" val_hybrid_total={vm['val_reg_hybrid_total']:.4f}"
+            f" val_plain_ce={vm.get('val_reg_plain_ce', float('nan')):.4f}"
+        )
+    decomp = f"{lam_v:g}*volt({val_v:.4f})+{lam_cap:g}*cap({val_c:.4f})+{lam_reg:g}*reg({val_r:.4f})"
+    if pf_weight > 0 and math.isfinite(val_pf):
+        decomp += f"+pf({val_pf:.4e})"
+    if lam_pv > 0 and math.isfinite(val_pv):
+        decomp += f"+{lam_pv:g}*meta({val_pv:.4f})"
+    line += f" | val_tot={val_tot:.4f} [{decomp}]"
+    return line
+
+
 def _training_addons_report(
-    args: argparse.Namespace, epoch_metrics: dict[str, float] | None = None
+    args: argparse.Namespace,
+    epoch_train_metrics: dict[str, float] | None = None,
+    epoch_val_metrics: dict[str, float] | None = None,
+    epoch_history: list[dict[str, object]] | None = None,
+    reg_col_hop_mapping: dict[str, str | None] | None = None,
 ) -> dict[str, object]:
     out: dict[str, object] = {
         "attn_reg_territory_bias": bool(getattr(args, "attn_reg_territory_bias", False)),
-        "attn_reg_territory_beta": float(getattr(args, "attn_reg_territory_beta", 2.0)),
+        "attn_reg_territory_beta": float(
+            getattr(args, "attn_reg_territory_beta", _DEFAULT_ATTN_REG_TERRITORY_BETA)
+        ),
         "attn_reg_territory_downstream_rule": str(
             getattr(args, "attn_reg_territory_downstream_rule", "hop_gt_0")
         ),
+        "reg_hybrid_tap_loss": bool(getattr(args, "reg_hybrid_tap_loss", False)),
+        "reg_ordinal_alpha": float(getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA)),
         "reg_ordinal_ce": bool(getattr(args, "reg_ordinal_ce", False)),
         "volt_violation_weight": bool(getattr(args, "volt_violation_weight", False)),
         "volt_lo_pu": float(getattr(args, "volt_lo_pu", 0.96)),
         "volt_hi_pu": float(getattr(args, "volt_hi_pu", 1.04)),
-        "volt_violation_alpha": float(getattr(args, "volt_violation_alpha", 2.0)),
+        "volt_violation_alpha": float(
+            getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA)
+        ),
+        "volt_violation_mode": str(
+            getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE)
+        ),
         "hop_csv": str(getattr(args, "hop_csv", "") or ""),
     }
-    if epoch_metrics is not None:
-        out["last_epoch_train_means"] = epoch_metrics
+    if reg_col_hop_mapping is not None:
+        out["reg_col_to_hop_col"] = reg_col_hop_mapping
+    if epoch_train_metrics is not None:
+        out["last_epoch_train_means"] = epoch_train_metrics
+    if epoch_val_metrics is not None:
+        out["last_epoch_val_means"] = epoch_val_metrics
+    if epoch_history is not None:
+        out["epoch_history"] = epoch_history
     return out
 
 
@@ -5489,17 +5967,39 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         n_pv_aux=int(n_pv_aux),
         reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
     ).to(device)
+    reg_hybrid_tap_loss = bool(getattr(args, "reg_hybrid_tap_loss", False))
     reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
+    reg_ordinal_alpha = float(getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA))
+    if reg_hybrid_tap_loss and reg_ordinal_ce:
+        raise ValueError("Cannot use both --reg_hybrid_tap_loss and deprecated --reg_ordinal_ce")
+    if reg_ordinal_ce:
+        warnings.warn(
+            "--reg_ordinal_ce is deprecated; use --reg_hybrid_tap_loss instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if reg_hybrid_tap_loss and reg_loss != "ce":
+        raise ValueError("--reg_hybrid_tap_loss requires --reg_loss ce")
     if reg_ordinal_ce and reg_loss != "ce":
         raise ValueError("--reg_ordinal_ce requires --reg_loss ce")
-    if reg_ordinal_ce and not reg_class_tables:
-        raise ValueError("--reg_ordinal_ce requires reg_class_tables (reg_loss=ce)")
+    if (reg_hybrid_tap_loss or reg_ordinal_ce) and not reg_class_tables:
+        raise ValueError("--reg_hybrid_tap_loss/--reg_ordinal_ce require reg_class_tables (reg_loss=ce)")
     reg_cost_matrices: list[torch.Tensor] | None = None
     reg_cost_matrices_d: list[torch.Tensor] | None = None
-    if reg_ordinal_ce and reg_class_tables:
+    if (reg_hybrid_tap_loss or reg_ordinal_ce) and reg_class_tables:
         reg_cost_matrices = _build_reg_ordinal_cost_matrices(reg_class_tables)
         reg_cost_matrices_d = [m.to(device) for m in reg_cost_matrices]
-        print("reg_ordinal_ce: enabled (cost-sensitive CE from |tap_j - tap_c|)", flush=True)
+        if reg_hybrid_tap_loss:
+            print(
+                f"reg_hybrid_tap_loss: enabled (CE + alpha * normalized expected ordinal tap cost, "
+                f"alpha={reg_ordinal_alpha})",
+                flush=True,
+            )
+        else:
+            print(
+                "reg_ordinal_ce: deprecated cost-weighted log loss enabled (experimental)",
+                flush=True,
+            )
     ckpt_meta = _da_gps_ckpt_meta(
         n_nodes=n_nodes,
         hidden=int(args.hidden),
@@ -5577,7 +6077,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             strict=bool(getattr(args, "init_checkpoint_strict", False)),
         )
 
-    _configure_reg_territory_bias(base_model, ref_ntl, reg_cols, args, repo, chunk_parent)
+    reg_col_hop_mapping = _configure_reg_territory_bias(base_model, ref_ntl, reg_cols, args, repo, chunk_parent)
+    _log_training_addon_scales(
+        args,
+        reg_class_tables=reg_class_tables,
+        hidden=int(args.hidden),
+        heads=int(args.heads),
+    )
 
     _eval_kw = dict(
         nodes_name=nodes_name,
@@ -5680,6 +6186,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     best_val_r2_min = float("nan")
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
+    last_addon_val_epoch_metrics: dict[str, float] | None = None
+    addon_epoch_history: list[dict[str, object]] = []
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -5694,6 +6202,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
         train_batch_idx = 0
         addon_accum = _AddonTrainAccum()
+        addon_val_accum = _AddonValAccum()
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
@@ -5757,7 +6266,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         violation_weight=bool(getattr(args, "volt_violation_weight", False)),
                         volt_lo_pu=float(getattr(args, "volt_lo_pu", 0.96)),
                         volt_hi_pu=float(getattr(args, "volt_hi_pu", 1.04)),
-                        volt_violation_alpha=float(getattr(args, "volt_violation_alpha", 2.0)),
+                        volt_violation_alpha=float(
+                            getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA)
+                        ),
+                        volt_violation_mode=str(
+                            getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE)
+                        ),
                     )
                     loss_c = bce(c_log, y_cap_b)
                     reg_logits = base_model._last_reg_logits if reg_loss == "ce" else None
@@ -5767,7 +6281,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_loss,
                         reg_logits=reg_logits,
                         reg_class_tables=reg_class_tables,
+                        reg_hybrid_tap_loss=reg_hybrid_tap_loss,
                         reg_ordinal_ce=reg_ordinal_ce,
+                        reg_ordinal_alpha=reg_ordinal_alpha,
                         reg_cost_matrices=reg_cost_matrices_d,
                     )
                     loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
@@ -5859,7 +6375,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         y_reg_b,
                         reg_loss,
                         reg_logits=reg_logits,
+                        reg_hybrid_tap_loss=reg_hybrid_tap_loss,
                         reg_ordinal_ce=reg_ordinal_ce,
+                        reg_ordinal_alpha=reg_ordinal_alpha,
                         reg_cost_matrices=reg_cost_matrices_d,
                     )
                     train_reg_dim += reg_e.sum(dim=0).detach().float().cpu().double()
@@ -5874,8 +6392,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             reg_logits=reg_logits,
                             y_reg_b=y_reg_b,
                             reg_loss=reg_loss,
+                            reg_hybrid_tap_loss=reg_hybrid_tap_loss,
                             reg_ordinal_ce=reg_ordinal_ce,
+                            reg_ordinal_alpha=reg_ordinal_alpha,
                             reg_cost_matrices=reg_cost_matrices_d,
+                            reg_class_tables=reg_class_tables,
+                            reg_class_values=reg_class_values_d,
                             volt_dbg=volt_dbg,
                         )
                         addon_accum.update(addon_row)
@@ -6015,6 +6537,20 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     val_sum_true2 += (true_mag * true_mag).sum(dim=0)
                     val_sum_se += (err * err).sum(dim=0)
                     val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
+                    if _training_addons_enabled(args):
+                        addon_val_accum.update(
+                            _addon_val_batch_row(
+                                reg_logits=reg_logits_v,
+                                y_reg_b=y_reg_b,
+                                reg_loss=reg_loss,
+                                reg_hybrid_tap_loss=reg_hybrid_tap_loss,
+                                reg_ordinal_alpha=reg_ordinal_alpha,
+                                reg_cost_matrices=reg_cost_matrices_d,
+                                reg_class_tables=reg_class_tables,
+                                reg_class_values=reg_class_values_d,
+                                val_volt_uniform=float(lv.item()),
+                            )
+                        )
                 del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
                 gc.collect()
 
@@ -6048,6 +6584,18 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             val_cap_mean = np.full(n_cap, np.nan)
             val_reg_mean = np.full(n_reg, np.nan)
             val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
+        if _training_addons_enabled(args) and addon_val_accum.n > 0:
+            last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+            epoch_entry: dict[str, object] = {
+                "epoch": ep,
+                "train": last_addon_epoch_metrics or {},
+                "val": last_addon_val_epoch_metrics,
+            }
+            if reg_loss == "ce" and nv > 0:
+                epoch_entry["val_reg_plain_ce_per_head"] = {
+                    reg_cols[j]: float(val_reg_mean[j]) for j in range(min(n_reg, len(reg_cols)))
+                }
+            addon_epoch_history.append(epoch_entry)
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
         if crit < best_val:
@@ -6097,23 +6645,27 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
             if _training_addons_enabled(args) and last_addon_epoch_metrics:
-                am = last_addon_epoch_metrics
-                _alog = f"[da_gps chunk_parent addons] epoch {ep}"
-                if bool(getattr(args, "attn_reg_territory_bias", False)):
-                    _alog += f" territory_active_frac={am.get('territory_active_frac', float('nan')):.4f}"
-                if bool(getattr(args, "reg_ordinal_ce", False)):
-                    _alog += (
-                        f" reg_ordinal_ce={am.get('ordinal_ce', float('nan')):.4f}"
-                        f" plain_ce={am.get('plain_ce', float('nan')):.4f}"
-                    )
-                if bool(getattr(args, "volt_violation_weight", False)):
-                    _alog += (
-                        f" volt_viol_frac={am.get('volt_violation_frac', float('nan')):.4f}"
-                        f" w_mean={am.get('volt_weight_mean', float('nan')):.4f}"
-                        f" loss_w={am.get('volt_loss_weighted', float('nan')):.4f}"
-                        f" loss_u={am.get('volt_loss_uniform', float('nan')):.4f}"
-                    )
-                print(_alog, flush=True)
+                print(
+                    _format_addon_epoch_line(
+                        tag="[da_gps chunk_parent",
+                        epoch=ep,
+                        args=args,
+                        train_means=last_addon_epoch_metrics,
+                        val_means=last_addon_val_epoch_metrics,
+                        val_r=val_r,
+                        val_tot=val_tot,
+                        lam_v=lam_v,
+                        lam_cap=float(args.lambda_cap),
+                        lam_reg=float(args.lambda_reg),
+                        val_v=val_v,
+                        val_c=val_c,
+                        val_pf=val_pf,
+                        pf_weight=float(pf_state.weight),
+                        val_pv=val_pv,
+                        lam_pv=float(args.lambda_pv),
+                    ),
+                    flush=True,
+                )
         if baseline_val_met is not None and baseline_test_met is not None:
             ep_val_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
@@ -6275,7 +6827,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "checkpoint": str(ckpt.resolve()) if save_ok else None,
     }
     if _training_addons_enabled(args):
-        report["training_addons"] = _training_addons_report(args, last_addon_epoch_metrics)
+        report["training_addons"] = _training_addons_report(
+            args,
+            epoch_train_metrics=last_addon_epoch_metrics,
+            epoch_val_metrics=last_addon_val_epoch_metrics,
+            epoch_history=addon_epoch_history,
+            reg_col_hop_mapping=reg_col_hop_mapping,
+        )
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     if baseline_val_met is not None and baseline_test_met is not None:
         _print_before_after_summary(
@@ -6374,8 +6932,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--attn_reg_territory_beta",
         type=float,
-        default=2.0,
-        help="Additive attention bias scale for --attn_reg_territory_bias (downstream nodes).",
+        default=_DEFAULT_ATTN_REG_TERRITORY_BETA,
+        help="Additive attention bias on downstream regulator token keys (2nd cross-attn). "
+        "Scaled dot-product logits are ~O(1/sqrt(d_head)); default 6.0 is comparable to typical "
+        "logit magnitude with hidden=64, heads=2 (d_head=32). Try 4-8 if attention is too peaked.",
     )
     p.add_argument(
         "--attn_reg_territory_downstream_rule",
@@ -6391,9 +6951,21 @@ def parse_args() -> argparse.Namespace:
         help="Hop-distance CSV (node, FEEDER_REGA, …). Default: auto under repo datasets_gnn2_from pc/.",
     )
     p.add_argument(
+        "--reg_hybrid_tap_loss",
+        action="store_true",
+        help="With --reg_loss ce: CE + alpha * E_c[C[y,c]] ordinal tap-cost regularization.",
+    )
+    p.add_argument(
+        "--reg_ordinal_alpha",
+        type=float,
+        default=_DEFAULT_REG_ORDINAL_ALPHA,
+        help="Alpha for --reg_hybrid_tap_loss expected ordinal-cost term (default 0.75). "
+        "Cost matrices are normalized to [0,1] per regulator so alpha scales a fraction of CE.",
+    )
+    p.add_argument(
         "--reg_ordinal_ce",
         action="store_true",
-        help="With --reg_loss ce: cost-sensitive CE from |tap_j - tap_c| (default off = plain CE).",
+        help="DEPRECATED experimental cost-weighted log loss. Use --reg_hybrid_tap_loss instead.",
     )
     p.add_argument(
         "--volt_violation_weight",
@@ -6405,8 +6977,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--volt_violation_alpha",
         type=float,
-        default=2.0,
-        help="Extra per-node weight = 1 + alpha * 1(|V| outside [lo,hi]) when --volt_violation_weight.",
+        default=_DEFAULT_VOLT_VIOLATION_ALPHA,
+        help="Per-node voltage MSE weight scale when --volt_violation_weight. "
+        "Continuous mode (default): w=1+alpha*depth outside [lo,hi]. "
+        "Binary mode: w=1+alpha*1(viol). Default 5.0 gives w_mean~2.5 at viol_frac~0.30 (binary).",
+    )
+    p.add_argument(
+        "--volt_violation_mode",
+        type=str,
+        default=_DEFAULT_VOLT_VIOLATION_MODE,
+        choices=("continuous", "binary"),
+        help="Voltage violation weighting: continuous depth penalty (default) or binary indicator.",
     )
     p.add_argument("--cache_tensor", type=str, default="")
     p.add_argument(
@@ -7005,9 +7586,13 @@ def main() -> None:
         per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
     ).to(device)
+    reg_hybrid_tap_loss = bool(getattr(args, "reg_hybrid_tap_loss", False))
     reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
-    if reg_ordinal_ce:
-        raise ValueError("--reg_ordinal_ce requires --reg_loss ce (chunk_parent mode)")
+    if reg_hybrid_tap_loss or reg_ordinal_ce:
+        raise ValueError(
+            "--reg_hybrid_tap_loss and --reg_ordinal_ce require --reg_loss ce and --chunk_parent "
+            "(single-dataset mode does not support tap-class CE losses)"
+        )
     reg_cost_matrices_d = None
     ckpt_meta = _da_gps_ckpt_meta(
         n_nodes=n_nodes,
@@ -7062,7 +7647,13 @@ def main() -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
-    _configure_reg_territory_bias(base_model, node_to_local, reg_cols, args, repo, chunk_parent=None)
+    reg_col_hop_mapping = _configure_reg_territory_bias(base_model, node_to_local, reg_cols, args, repo, chunk_parent=None)
+    _log_training_addon_scales(
+        args,
+        reg_class_tables=None,
+        hidden=int(args.hidden),
+        heads=int(args.heads),
+    )
 
     best_val = float("inf")
     best_state = None
@@ -7072,6 +7663,8 @@ def main() -> None:
     best_val_r2_min = float("nan")
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
+    last_addon_val_epoch_metrics: dict[str, float] | None = None
+    addon_epoch_history: list[dict[str, object]] = []
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -7086,6 +7679,7 @@ def main() -> None:
         pf_dbg_first_batch = ep == 1 and pf_state.pf_debug_nan
         train_batch_idx = 0
         addon_accum = _AddonTrainAccum()
+        addon_val_accum = _AddonValAccum()
         for batch in dl_tr:
             batch = batch.to(device)
             batch = _cast_batch_float_tensors(batch)
@@ -7106,7 +7700,12 @@ def main() -> None:
                     violation_weight=bool(getattr(args, "volt_violation_weight", False)),
                     volt_lo_pu=float(getattr(args, "volt_lo_pu", 0.96)),
                     volt_hi_pu=float(getattr(args, "volt_hi_pu", 1.04)),
-                    volt_violation_alpha=float(getattr(args, "volt_violation_alpha", 2.0)),
+                    volt_violation_alpha=float(
+                        getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA)
+                    ),
+                    volt_violation_mode=str(
+                        getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE)
+                    ),
                 )
                 loss_c = bce(c_log, y_cap)
                 loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
@@ -7206,7 +7805,9 @@ def main() -> None:
                         reg_logits=None,
                         y_reg_b=y_reg,
                         reg_loss=reg_loss,
+                        reg_hybrid_tap_loss=False,
                         reg_ordinal_ce=False,
+                        reg_ordinal_alpha=reg_ordinal_alpha,
                         reg_cost_matrices=None,
                         volt_dbg=volt_dbg,
                     )
@@ -7255,8 +7856,8 @@ def main() -> None:
                         reg_logits=None,
                         reg_class_values=reg_class_values_d,
                         label_y_n=yb_n,
-                        y_cap_label=y_cap_b,
-                        y_reg_label=y_reg_b,
+                        y_cap_label=y_cap,
+                        y_reg_label=y_reg,
                         epoch=ep,
                     )
                     if lpf is not None:
@@ -7291,6 +7892,20 @@ def main() -> None:
                 val_sum_true2 += (true_mag * true_mag).sum(dim=0)
                 val_sum_se += (err * err).sum(dim=0)
                 val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
+                if _training_addons_enabled(args):
+                    addon_val_accum.update(
+                        _addon_val_batch_row(
+                            reg_logits=None,
+                            y_reg_b=y_reg,
+                            reg_loss=reg_loss,
+                            reg_hybrid_tap_loss=False,
+                            reg_ordinal_alpha=1.0,
+                            reg_cost_matrices=None,
+                            reg_class_tables=None,
+                            reg_class_values=reg_class_values_d,
+                            val_volt_uniform=float(lv.item()),
+                        )
+                    )
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
         val_c = val_c_sum / max(nv, 1)
@@ -7321,6 +7936,15 @@ def main() -> None:
             val_cap_mean = np.full(n_cap, np.nan)
             val_reg_mean = np.full(n_reg, np.nan)
             val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
+        if _training_addons_enabled(args) and addon_val_accum.n > 0:
+            last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+            addon_epoch_history.append(
+                {
+                    "epoch": ep,
+                    "train": last_addon_epoch_metrics or {},
+                    "val": last_addon_val_epoch_metrics,
+                }
+            )
         sch.step(val_tot)
         crit = val_tot if args.early_stop_on == "total" else val_v
         if crit < best_val:
@@ -7363,18 +7987,27 @@ def main() -> None:
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
             if _training_addons_enabled(args) and last_addon_epoch_metrics:
-                am = last_addon_epoch_metrics
-                _alog = f"[da_gps addons] epoch {ep}"
-                if bool(getattr(args, "attn_reg_territory_bias", False)):
-                    _alog += f" territory_active_frac={am.get('territory_active_frac', float('nan')):.4f}"
-                if bool(getattr(args, "volt_violation_weight", False)):
-                    _alog += (
-                        f" volt_viol_frac={am.get('volt_violation_frac', float('nan')):.4f}"
-                        f" w_mean={am.get('volt_weight_mean', float('nan')):.4f}"
-                        f" loss_w={am.get('volt_loss_weighted', float('nan')):.4f}"
-                        f" loss_u={am.get('volt_loss_uniform', float('nan')):.4f}"
-                    )
-                print(_alog, flush=True)
+                print(
+                    _format_addon_epoch_line(
+                        tag="[da_gps",
+                        epoch=ep,
+                        args=args,
+                        train_means=last_addon_epoch_metrics,
+                        val_means=last_addon_val_epoch_metrics,
+                        val_r=val_r,
+                        val_tot=val_tot,
+                        lam_v=lam_v,
+                        lam_cap=float(args.lambda_cap),
+                        lam_reg=float(args.lambda_reg),
+                        val_v=val_v,
+                        val_c=val_c,
+                        val_pf=val_pf,
+                        pf_weight=float(pf_state.weight),
+                        val_pv=val_pv,
+                        lam_pv=float(args.lambda_pv),
+                    ),
+                    flush=True,
+                )
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -7457,7 +8090,13 @@ def main() -> None:
         "checkpoint": str(ckpt.resolve()),
     }
     if _training_addons_enabled(args):
-        report["training_addons"] = _training_addons_report(args, last_addon_epoch_metrics)
+        report["training_addons"] = _training_addons_report(
+            args,
+            epoch_train_metrics=last_addon_epoch_metrics,
+            epoch_val_metrics=last_addon_val_epoch_metrics,
+            epoch_history=addon_epoch_history,
+            reg_col_hop_mapping=reg_col_hop_mapping,
+        )
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     _pv_n = met.get("pv_mse_normalized", float("nan"))
     _pv_raw = met.get("pv_mse_raw", float("nan"))
@@ -7478,6 +8117,30 @@ def main() -> None:
     print(f"Saved {ckpt}", flush=True)
 
 
+def _selftest_hybrid_tap_loss() -> None:
+    """Smoke test: hybrid tap loss = CE + alpha * expected ordinal tap cost."""
+    torch.manual_seed(0)
+    cost = torch.tensor([[0.0, 1.0, 2.0], [1.0, 0.0, 1.0], [2.0, 1.0, 0.0]], dtype=torch.float32)
+    logits = torch.tensor([[2.0, 0.0, -2.0], [0.0, 2.0, 0.0]], dtype=torch.float32)
+    target = torch.tensor([0, 1], dtype=torch.long)
+    alpha = 1.5
+    hybrid = _hybrid_tap_loss_elementwise(logits, target, cost, alpha=alpha)
+    ce = _hybrid_tap_ce_elementwise(logits, target)
+    ord_cost = _hybrid_tap_ordinal_cost_elementwise(logits, target, cost, alpha=alpha)
+    assert torch.allclose(hybrid, ce + ord_cost)
+    # Perfect prediction on class 1: ordinal cost term should be zero.
+    logits_perfect = torch.tensor([[-10.0, 10.0, -10.0]], dtype=torch.float32)
+    target_one = torch.tensor([1], dtype=torch.long)
+    ord_zero = _hybrid_tap_ordinal_cost_elementwise(logits_perfect, target_one, cost, alpha=alpha)
+    assert float(ord_zero.item()) < 1e-5
+    # Production builder normalizes each regulator cost matrix to [0, 1].
+    tab = {"col": "reg_test", "classes": [1.0, 1.02, 1.05], "n_classes": 3, "class_to_index": {}}
+    mats = _build_reg_ordinal_cost_matrices([tab])
+    assert mats[0].max().item() == 1.0
+    assert mats[0].min().item() == 0.0
+    print("_selftest_hybrid_tap_loss: ok", flush=True)
+
+
 def _selftest_voltage_loss_scalar() -> None:
     """Smoke test: per-node preds (B*N,2) vs flat labels (B,2N), violation weighting."""
     torch.manual_seed(0)
@@ -7490,7 +8153,7 @@ def _selftest_voltage_loss_scalar() -> None:
         ri[..., 0] = 0.95
         ri[..., 1] = 0.0
         yb.copy_(ri.reshape(b, n * 2))
-        loss, dbg = _voltage_loss_scalar(
+        loss_bin, dbg_bin = _voltage_loss_scalar(
             v_n,
             yb_n,
             yb,
@@ -7499,7 +8162,8 @@ def _selftest_voltage_loss_scalar() -> None:
             violation_weight=True,
             volt_lo_pu=0.96,
             volt_hi_pu=1.04,
-            volt_violation_alpha=2.0,
+            volt_violation_alpha=5.0,
+            volt_violation_mode="binary",
         )
         loss0, _ = _voltage_loss_scalar(
             v_n,
@@ -7510,12 +8174,45 @@ def _selftest_voltage_loss_scalar() -> None:
             violation_weight=False,
             volt_lo_pu=0.96,
             volt_hi_pu=1.04,
-            volt_violation_alpha=2.0,
+            volt_violation_alpha=5.0,
         )
-        assert loss.ndim == 0 and loss0.ndim == 0
-        assert dbg["volt_violation_frac"] == 1.0
-        assert dbg["volt_weight_mean"] == 3.0
+        assert loss_bin.ndim == 0 and loss0.ndim == 0
+        assert dbg_bin["volt_violation_frac"] == 1.0
+        assert abs(dbg_bin["volt_weight_mean"] - 6.0) < 1e-5
+        ri[..., 0] = 0.90
+        yb.copy_(ri.reshape(b, n * 2))
+        _, dbg_cont = _voltage_loss_scalar(
+            v_n,
+            yb_n,
+            yb,
+            n_nodes=n,
+            mse=mse,
+            violation_weight=True,
+            volt_lo_pu=0.96,
+            volt_hi_pu=1.04,
+            volt_violation_alpha=5.0,
+            volt_violation_mode="continuous",
+        )
+        assert abs(dbg_cont["volt_violation_depth_mean"] - 0.06) < 1e-5
+        assert abs(dbg_cont["volt_weight_mean"] - 1.3) < 1e-4
     print("_selftest_voltage_loss_scalar: ok", flush=True)
+
+
+def _selftest_reg_tap_metrics_from_logits() -> None:
+    """Smoke test: argmax tap MAE/acc from regulator logits."""
+    tables = [{"classes": [0.9, 1.0, 1.1]}]
+    logits = [torch.tensor([[10.0, -5.0, -5.0], [-5.0, 10.0, -5.0]], dtype=torch.float32)]
+    target = torch.tensor([[0, 1]], dtype=torch.long)
+    m = _reg_tap_metrics_from_logits(logits, target, tables)
+    assert m["reg_tap_acc"] == 1.0
+    assert m["reg_tap_mae_pu"] == 0.0
+    assert m["reg_mean_abs_tap_err"] == 0.0
+    logits2 = [torch.tensor([[10.0, -5.0, -5.0]], dtype=torch.float32)]
+    target2 = torch.tensor([[2]], dtype=torch.long)
+    m2 = _reg_tap_metrics_from_logits(logits2, target2, tables)
+    assert m2["reg_tap_acc"] == 0.0
+    assert abs(m2["reg_tap_mae_pu"] - 0.2) < 1e-5
+    print("_selftest_reg_tap_metrics_from_logits: ok", flush=True)
 
 
 if __name__ == "__main__":
@@ -7523,5 +8220,9 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest-voltage-loss":
         _selftest_voltage_loss_scalar()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--selftest-hybrid-tap-loss":
+        _selftest_hybrid_tap_loss()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--selftest-reg-tap-metrics":
+        _selftest_reg_tap_metrics_from_logits()
     else:
         main()
