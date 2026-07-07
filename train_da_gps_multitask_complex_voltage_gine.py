@@ -3005,6 +3005,7 @@ class _AddonBatchLog:
     ordinal_cost_term: float = float("nan")
     plain_ce: float = float("nan")
     hybrid_total: float = float("nan")
+    ordinal_cost_frac: float = float("nan")
     deprecated_cost_weighted: float = float("nan")
     reg_tap_mae_pu: float = float("nan")
     reg_tap_acc: float = float("nan")
@@ -3023,6 +3024,7 @@ class _AddonTrainAccum:
     ordinal_cost_term_sum: float = 0.0
     plain_ce_sum: float = 0.0
     hybrid_total_sum: float = 0.0
+    ordinal_cost_frac_sum: float = 0.0
     deprecated_cost_weighted_sum: float = 0.0
     reg_tap_mae_pu_sum: float = 0.0
     reg_tap_acc_sum: float = 0.0
@@ -3046,6 +3048,8 @@ class _AddonTrainAccum:
             self.plain_ce_sum += row.plain_ce
         if math.isfinite(row.hybrid_total):
             self.hybrid_total_sum += row.hybrid_total
+        if math.isfinite(row.ordinal_cost_frac):
+            self.ordinal_cost_frac_sum += row.ordinal_cost_frac
         if math.isfinite(row.deprecated_cost_weighted):
             self.deprecated_cost_weighted_sum += row.deprecated_cost_weighted
         if math.isfinite(row.reg_tap_mae_pu):
@@ -3073,6 +3077,7 @@ class _AddonTrainAccum:
             "ordinal_cost_term": self.ordinal_cost_term_sum / n,
             "plain_ce": self.plain_ce_sum / n,
             "hybrid_total": self.hybrid_total_sum / n,
+            "ordinal_cost_frac": self.ordinal_cost_frac_sum / n,
             "deprecated_cost_weighted": self.deprecated_cost_weighted_sum / n,
             "reg_tap_mae_pu": self.reg_tap_mae_pu_sum / n,
             "reg_tap_acc": self.reg_tap_acc_sum / n,
@@ -3097,6 +3102,7 @@ class _AddonValAccum:
     val_volt_weighted_sum: float = 0.0
     val_volt_viol_frac_sum: float = 0.0
     val_reg_with_territory_sum: float = 0.0
+    val_reg_ordinal_cost_frac_sum: float = 0.0
     n: int = 0
 
     def update(self, row: dict[str, float]) -> None:
@@ -3106,6 +3112,7 @@ class _AddonValAccum:
             ("val_reg_hybrid_ce", "val_reg_hybrid_ce_sum"),
             ("val_reg_ordinal_cost", "val_reg_ordinal_cost_sum"),
             ("val_reg_hybrid_total", "val_reg_hybrid_total_sum"),
+            ("val_reg_ordinal_cost_frac", "val_reg_ordinal_cost_frac_sum"),
             ("val_reg_tap_mae_pu", "val_reg_tap_mae_pu_sum"),
             ("val_reg_tap_acc", "val_reg_tap_acc_sum"),
             ("val_volt_uniform", "val_volt_uniform_sum"),
@@ -3124,6 +3131,7 @@ class _AddonValAccum:
             "val_reg_hybrid_ce": self.val_reg_hybrid_ce_sum / n,
             "val_reg_ordinal_cost": self.val_reg_ordinal_cost_sum / n,
             "val_reg_hybrid_total": self.val_reg_hybrid_total_sum / n,
+            "val_reg_ordinal_cost_frac": self.val_reg_ordinal_cost_frac_sum / n,
             "val_reg_tap_mae_pu": self.val_reg_tap_mae_pu_sum / n,
             "val_reg_tap_acc": self.val_reg_tap_acc_sum / n,
             "val_volt_uniform": self.val_volt_uniform_sum / n,
@@ -3256,6 +3264,8 @@ def _addon_batch_log_row(
             row.hybrid_ce = float(torch.stack(ce_parts).mean().detach().item())
             row.ordinal_cost_term = float(torch.stack(ord_parts).mean().detach().item())
             row.hybrid_total = row.hybrid_ce + row.ordinal_cost_term
+            if math.isfinite(row.plain_ce) and row.plain_ce > 1e-8:
+                row.ordinal_cost_frac = _ordinal_cost_frac_of_ce(row.ordinal_cost_term, row.plain_ce)
         elif reg_cost_matrices and reg_ordinal_ce:
             row.deprecated_cost_weighted = float(
                 _reg_loss_scalar(
@@ -3334,6 +3344,9 @@ def _addon_val_batch_row(
             out["val_reg_hybrid_ce"] = h_ce
             out["val_reg_ordinal_cost"] = h_ord
             out["val_reg_hybrid_total"] = h_ce + h_ord
+            frac = _ordinal_cost_frac_of_ce(h_ord, plain_ce)
+            if math.isfinite(frac):
+                out["val_reg_ordinal_cost_frac"] = frac
         if reg_class_tables:
             tap_m = _reg_tap_metrics_from_logits(
                 reg_logits,
@@ -3389,9 +3402,14 @@ def _maybe_log_addon_batch(
         parts.append(f"territory_frac={row.territory_active_frac:.4f}")
     if math.isfinite(row.plain_ce):
         if math.isfinite(row.hybrid_total):
+            frac_s = (
+                f" ordinal_frac={100.0 * row.ordinal_cost_frac:.1f}%"
+                if math.isfinite(row.ordinal_cost_frac)
+                else ""
+            )
             parts.append(
                 f"plain_ce={row.plain_ce:.4f} hybrid_total={row.hybrid_total:.4f} "
-                f"ordinal_cost={row.ordinal_cost_term:.4f}"
+                f"ordinal_cost={row.ordinal_cost_term:.4f}{frac_s}"
             )
         elif math.isfinite(row.deprecated_cost_weighted):
             parts.append(
@@ -3442,10 +3460,15 @@ def _format_addon_epoch_line(
         line += f" | territory_frac={am.get('territory_active_frac', float('nan')):.4f}"
     if bool(getattr(args, "reg_hybrid_tap_loss", False)) or bool(getattr(args, "reg_ordinal_ce", False)):
         if math.isfinite(am.get("hybrid_total", float("nan"))):
+            ord_frac_s = (
+                f" ordinal_frac={100.0 * am['ordinal_cost_frac']:.1f}%"
+                if math.isfinite(am.get("ordinal_cost_frac", float("nan")))
+                else ""
+            )
             line += (
                 f" | train plain_ce={am.get('plain_ce', float('nan')):.4f}"
                 f" hybrid_total={am.get('hybrid_total', float('nan')):.4f}"
-                f" ordinal_cost={am.get('ordinal_cost_term', float('nan')):.4f}"
+                f" ordinal_cost={am.get('ordinal_cost_term', float('nan')):.4f}{ord_frac_s}"
             )
         elif math.isfinite(am.get("deprecated_cost_weighted", float("nan"))):
             line += (
@@ -3474,9 +3497,16 @@ def _format_addon_epoch_line(
     if bool(getattr(args, "reg_hybrid_tap_loss", False)) and math.isfinite(
         vm.get("val_reg_hybrid_total", float("nan"))
     ):
+        val_ord_frac = vm.get("val_reg_ordinal_cost_frac", float("nan"))
+        ord_frac_s = (
+            f" val_ordinal_frac={100.0 * val_ord_frac:.1f}%"
+            if math.isfinite(val_ord_frac)
+            else ""
+        )
         line += (
             f" val_hybrid_total={vm['val_reg_hybrid_total']:.4f}"
             f" val_plain_ce={vm.get('val_reg_plain_ce', float('nan')):.4f}"
+            f" val_ordinal_cost={vm.get('val_reg_ordinal_cost', float('nan')):.4f}{ord_frac_s}"
         )
     decomp = f"{lam_v:g}*volt({val_v:.4f})+{lam_cap:g}*cap({val_c:.4f})+{lam_reg:g}*reg({val_r:.4f})"
     if pf_weight > 0 and math.isfinite(val_pf):
@@ -3494,12 +3524,27 @@ def _tap_acc_random_baseline(reg_class_tables: list[dict] | None) -> float:
     return float(sum(inv_k) / len(inv_k)) if inv_k else float("nan")
 
 
+def _ordinal_cost_frac_of_ce(ordinal: float, plain_ce: float) -> float:
+    if not (math.isfinite(ordinal) and math.isfinite(plain_ce)) or plain_ce <= 1e-8:
+        return float("nan")
+    return float(ordinal) / float(plain_ce)
+
+
+def _idx_to_node_label(idx_to_node: dict[int, str] | None, node_idx: int) -> str:
+    if idx_to_node is not None:
+        name = idx_to_node.get(int(node_idx))
+        if name:
+            return str(name)
+    return str(int(node_idx))
+
+
 def _build_epoch_val_counterfactual(
     *,
     args: argparse.Namespace,
     val_means: dict[str, float],
     val_reg_no_territory: float,
     reg_class_tables: list[dict] | None,
+    lam_reg: float = 0.0,
 ) -> dict[str, object]:
     """Per-epoch counterfactual dict for help/hurt analysis without ablation."""
     cf: dict[str, object] = {}
@@ -3524,10 +3569,28 @@ def _build_epoch_val_counterfactual(
         tap_acc = vm.get("val_reg_tap_acc", float("nan"))
         tap_mae = vm.get("val_reg_tap_mae_pu", float("nan"))
         rand_base = _tap_acc_random_baseline(reg_class_tables)
+        ord_frac = vm.get(
+            "val_reg_ordinal_cost_frac",
+            _ordinal_cost_frac_of_ce(ordinal, plain),
+        )
+        delta_hybrid_vs_plain = (
+            hybrid_total - plain
+            if math.isfinite(hybrid_total) and math.isfinite(plain)
+            else float("nan")
+        )
+        val_tot_reg_contrib_delta = (
+            float(lam_reg) * delta_hybrid_vs_plain
+            if math.isfinite(delta_hybrid_vs_plain)
+            else float("nan")
+        )
         cf["hybrid"] = {
             "val_plain_ce": plain,
             "val_ordinal_cost": ordinal,
             "val_hybrid_total": hybrid_total,
+            "delta_hybrid_vs_plain": delta_hybrid_vs_plain,
+            "ordinal_cost_frac_of_ce": ord_frac,
+            "val_tot_reg_contrib_delta": val_tot_reg_contrib_delta,
+            "reg_ordinal_alpha": float(getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA)),
             "val_tap_mae_pu": tap_mae,
             "val_tap_acc": tap_acc,
             "val_tap_acc_random_baseline": rand_base,
@@ -3564,11 +3627,16 @@ def _format_counterfactual_epoch_line(epoch: int, cf: dict[str, object]) -> str:
         )
     hybrid = cf.get("hybrid")
     if isinstance(hybrid, dict):
+        delta = hybrid.get("delta_hybrid_vs_plain", float("nan"))
+        ord_frac = hybrid.get("ordinal_cost_frac_of_ce", float("nan"))
+        frac_s = f" ordinal_frac={100.0 * float(ord_frac):.1f}%" if math.isfinite(float(ord_frac)) else ""
+        delta_hint = " (positive hurts val_reg if hybrid used)" if math.isfinite(float(delta)) and float(delta) > 0 else ""
         parts.append(
             "hybrid: "
             f"val_plain_ce={hybrid.get('val_plain_ce', float('nan')):.4f} "
             f"val_ordinal_cost={hybrid.get('val_ordinal_cost', float('nan')):.4f} "
             f"val_hybrid_total={hybrid.get('val_hybrid_total', float('nan')):.4f} "
+            f"delta_hybrid_vs_plain={delta:.4f}{delta_hint}{frac_s} "
             f"val_tap_acc={hybrid.get('val_tap_acc', float('nan')):.4f}"
         )
     volt = cf.get("voltage")
@@ -6251,6 +6319,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         )
 
     reg_col_hop_mapping = _configure_reg_territory_bias(base_model, ref_ntl, reg_cols, args, repo, chunk_parent)
+    idx_to_node = {int(li): str(node) for node, li in ref_ntl.items()}
     _log_training_addon_scales(
         args,
         reg_class_tables=reg_class_tables,
@@ -6811,6 +6880,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
         val_r2_mean = float(r2_node.mean().item())
         val_r2_min = float(r2_node.min().item())
+        val_r2_min_idx = int(r2_node.argmin().item())
         val_worst_node_mae = val_sum_worst / max(nv, 1)
         train_v = train_v_sum / max(train_n, 1)
         train_c = train_c_sum / max(train_n, 1)
@@ -6836,6 +6906,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 val_means=last_addon_val_epoch_metrics,
                 val_reg_no_territory=territory_cf_accum.mean(),
                 reg_class_tables=reg_class_tables,
+                lam_reg=float(args.lambda_reg),
             )
             last_epoch_val_counterfactual = epoch_cf
             epoch_entry: dict[str, object] = {
@@ -6843,6 +6914,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 "train": last_addon_epoch_metrics or {},
                 "val": last_addon_val_epoch_metrics,
                 "counterfactual": epoch_cf,
+                "val_r2_min_idx": val_r2_min_idx,
+                "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
             }
             if reg_loss == "ce" and nv > 0:
                 epoch_entry["val_reg_plain_ce_per_head"] = {
@@ -6860,31 +6933,60 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             bad = 0
         else:
             bad += 1
-        if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            _log = (
-                f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
-                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
-            )
-            if n_pv_aux > 0:
-                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
-            if pf_state.weight > 0:
-                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
-                _w_eff = float(pf_state.weight) * _sched
-                _wt = f" pf_wt_effective={_w_eff:g}"
-                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
-                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
-                if _sched < 1.0 - 1e-12:
-                    _wt += f" (schedule×{_sched:.3g})"
-                _log += (
-                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                    f"{_wt}"
-                )
+        _log_detail = ep == 1 or ep % max(1, int(args.log_every)) == 0
+        _log = (
+            f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
+            f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
+        )
+        if n_pv_aux > 0:
+            _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+        if pf_state.weight > 0:
+            _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+            _w_eff = float(pf_state.weight) * _sched
+            _wt = f" pf_wt_effective={_w_eff:g}"
+            if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+            if _sched < 1.0 - 1e-12:
+                _wt += f" (schedule×{_sched:.3g})"
             _log += (
-                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}"
+                f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                f"{_wt}"
             )
-            print(_log, flush=True)
+        _log += (
+            f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+            f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+            f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
+            f"val_worst_mae={val_worst_node_mae:.4f} "
+            f"| best={best_val:.4f}"
+        )
+        print(_log, flush=True)
+        if _training_addons_enabled(args) and last_addon_epoch_metrics:
+            print(
+                _format_addon_epoch_line(
+                    tag="[da_gps chunk_parent",
+                    epoch=ep,
+                    args=args,
+                    train_means=last_addon_epoch_metrics,
+                    val_means=last_addon_val_epoch_metrics,
+                    val_r=val_r,
+                    val_tot=val_tot,
+                    lam_v=lam_v,
+                    lam_cap=float(args.lambda_cap),
+                    lam_reg=float(args.lambda_reg),
+                    val_v=val_v,
+                    val_c=val_c,
+                    val_pf=val_pf,
+                    pf_weight=float(pf_state.weight),
+                    val_pv=val_pv,
+                    lam_pv=float(args.lambda_pv),
+                ),
+                flush=True,
+            )
+            if last_epoch_val_counterfactual:
+                _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                if _cf_line:
+                    print(_cf_line, flush=True)
+        if _log_detail:
             _print_per_head_two_lines("[da_gps chunk_parent]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
             if reg_loss == "ce":
                 _reg_head_label = "reg_CE"
@@ -6897,32 +6999,6 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
-            if _training_addons_enabled(args) and last_addon_epoch_metrics:
-                print(
-                    _format_addon_epoch_line(
-                        tag="[da_gps chunk_parent",
-                        epoch=ep,
-                        args=args,
-                        train_means=last_addon_epoch_metrics,
-                        val_means=last_addon_val_epoch_metrics,
-                        val_r=val_r,
-                        val_tot=val_tot,
-                        lam_v=lam_v,
-                        lam_cap=float(args.lambda_cap),
-                        lam_reg=float(args.lambda_reg),
-                        val_v=val_v,
-                        val_c=val_c,
-                        val_pf=val_pf,
-                        pf_weight=float(pf_state.weight),
-                        val_pv=val_pv,
-                        lam_pv=float(args.lambda_pv),
-                    ),
-                    flush=True,
-                )
-                if last_epoch_val_counterfactual:
-                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
-                    if _cf_line:
-                        print(_cf_line, flush=True)
         if baseline_val_met is not None and baseline_test_met is not None:
             ep_val_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
@@ -7910,6 +7986,7 @@ def main() -> None:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
     reg_col_hop_mapping = _configure_reg_territory_bias(base_model, node_to_local, reg_cols, args, repo, chunk_parent=None)
+    idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
     _log_training_addon_scales(
         args,
         reg_class_tables=None,
@@ -8215,6 +8292,7 @@ def main() -> None:
         r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
         val_r2_mean = float(r2_node.mean().item())
         val_r2_min = float(r2_node.min().item())
+        val_r2_min_idx = int(r2_node.argmin().item())
         val_worst_node_mae = val_sum_worst / max(nv, 1)
         train_v = train_v_sum / max(train_n, 1)
         train_c = train_c_sum / max(train_n, 1)
@@ -8240,6 +8318,7 @@ def main() -> None:
                 val_means=last_addon_val_epoch_metrics,
                 val_reg_no_territory=territory_cf_accum.mean(),
                 reg_class_tables=None,
+                lam_reg=float(args.lambda_reg),
             )
             last_epoch_val_counterfactual = epoch_cf
             addon_epoch_history.append(
@@ -8248,6 +8327,8 @@ def main() -> None:
                     "train": last_addon_epoch_metrics or {},
                     "val": last_addon_val_epoch_metrics,
                     "counterfactual": epoch_cf,
+                    "val_r2_min_idx": val_r2_min_idx,
+                    "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
                 }
             )
         sch.step(val_tot)
@@ -8261,62 +8342,65 @@ def main() -> None:
             bad = 0
         else:
             bad += 1
-        if ep == 1 or ep % max(1, int(args.log_every)) == 0:
-            _log = (
-                f"[da_gps] epoch {ep:4d}/{args.epochs} "
-                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
-            )
-            if n_pv_aux > 0:
-                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
-            if pf_state.weight > 0:
-                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
-                _w_eff = float(pf_state.weight) * _sched
-                _wt = f" pf_wt_effective={_w_eff:g}"
-                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
-                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
-                if _sched < 1.0 - 1e-12:
-                    _wt += f" (schedule×{_sched:.3g})"
-                _log += (
-                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                    f"{_wt}"
-                )
+        _log_detail = ep == 1 or ep % max(1, int(args.log_every)) == 0
+        _log = (
+            f"[da_gps] epoch {ep:4d}/{args.epochs} "
+            f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
+        )
+        if n_pv_aux > 0:
+            _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+        if pf_state.weight > 0:
+            _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+            _w_eff = float(pf_state.weight) * _sched
+            _wt = f" pf_wt_effective={_w_eff:g}"
+            if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+            if _sched < 1.0 - 1e-12:
+                _wt += f" (schedule×{_sched:.3g})"
             _log += (
-                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}"
+                f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                f"{_wt}"
             )
-            print(_log, flush=True)
+        _log += (
+            f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+            f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+            f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
+            f"val_worst_mae={val_worst_node_mae:.4f} "
+            f"| best={best_val:.4f}"
+        )
+        print(_log, flush=True)
+        if _training_addons_enabled(args) and last_addon_epoch_metrics:
+            print(
+                _format_addon_epoch_line(
+                    tag="[da_gps",
+                    epoch=ep,
+                    args=args,
+                    train_means=last_addon_epoch_metrics,
+                    val_means=last_addon_val_epoch_metrics,
+                    val_r=val_r,
+                    val_tot=val_tot,
+                    lam_v=lam_v,
+                    lam_cap=float(args.lambda_cap),
+                    lam_reg=float(args.lambda_reg),
+                    val_v=val_v,
+                    val_c=val_c,
+                    val_pf=val_pf,
+                    pf_weight=float(pf_state.weight),
+                    val_pv=val_pv,
+                    lam_pv=float(args.lambda_pv),
+                ),
+                flush=True,
+            )
+            if last_epoch_val_counterfactual:
+                _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                if _cf_line:
+                    print(_cf_line, flush=True)
+        if _log_detail:
             _print_per_head_two_lines("[da_gps]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
             _reg_head_label = "reg_MAE_nrm" if reg_loss == "mae" else "reg_MSE_nrm"
             _print_per_head_two_lines("[da_gps]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean)
             if n_pv_aux > 0:
                 _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
-            if _training_addons_enabled(args) and last_addon_epoch_metrics:
-                print(
-                    _format_addon_epoch_line(
-                        tag="[da_gps",
-                        epoch=ep,
-                        args=args,
-                        train_means=last_addon_epoch_metrics,
-                        val_means=last_addon_val_epoch_metrics,
-                        val_r=val_r,
-                        val_tot=val_tot,
-                        lam_v=lam_v,
-                        lam_cap=float(args.lambda_cap),
-                        lam_reg=float(args.lambda_reg),
-                        val_v=val_v,
-                        val_c=val_c,
-                        val_pf=val_pf,
-                        pf_weight=float(pf_state.weight),
-                        val_pv=val_pv,
-                        lam_pv=float(args.lambda_pv),
-                    ),
-                    flush=True,
-                )
-                if last_epoch_val_counterfactual:
-                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
-                    if _cf_line:
-                        print(_cf_line, flush=True)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
