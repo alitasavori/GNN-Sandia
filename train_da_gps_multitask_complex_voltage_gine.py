@@ -42,12 +42,13 @@ Optional training add-ons (all default **off**; base recipe unchanged):
   scaled dot-product logits are ~O(1/sqrt(d_head)); beta≈6 adds a comparable additive boost on ~18%%
   downstream node×reg pairs. Hop table from ``--hop_csv`` or repo
   ``datasets_gnn2_from pc/load_hop_distance_to_each_regulator_all_index_nodes.csv``.
-- ``--reg_hybrid_tap_loss`` / ``--reg_ordinal_alpha`` (default 0.75, with ``--reg_loss ce``): CE plus
+- ``--reg_hybrid_tap_loss`` / ``--reg_ordinal_alpha`` (default 1.25, with ``--reg_loss ce``): CE plus
   alpha times expected ordinal tap cost. Cost matrices are normalized to [0, 1] per regulator (divide by
-  max |tap_i - tap_j|) so alpha scales a fraction of CE, not raw tap-PU distance (~0.04 span).
+  max |tap_i - tap_j|) so alpha scales a fraction of CE (~8--15%% of plain CE at default), not raw tap-PU
+  distance (~0.04 span).
 - ``--reg_ordinal_ce``: deprecated experimental cost-weighted log loss (off by default).
 - ``--volt_violation_weight`` / ``--volt_lo_pu`` / ``--volt_hi_pu`` / ``--volt_violation_alpha`` (default
-  5.0) / ``--volt_violation_mode`` (default ``continuous``): per-node voltage MSE weights. Continuous mode
+  8.0) / ``--volt_violation_mode`` (default ``continuous``): per-node voltage MSE weights. Continuous mode
   uses w = 1 + alpha * depth outside [lo, hi]; binary mode uses w = 1 + alpha * 1(viol).
 """
 from __future__ import annotations
@@ -80,8 +81,8 @@ from train_gnn_only_compare_complex_voltage import _build_complex_targets
 
 # Training add-on coefficient defaults (tuned for comparable loss scale vs base terms).
 _DEFAULT_ATTN_REG_TERRITORY_BETA = 6.0
-_DEFAULT_REG_ORDINAL_ALPHA = 0.75
-_DEFAULT_VOLT_VIOLATION_ALPHA = 5.0
+_DEFAULT_REG_ORDINAL_ALPHA = 1.25
+_DEFAULT_VOLT_VIOLATION_ALPHA = 8.0
 _DEFAULT_VOLT_VIOLATION_MODE = "continuous"
 
 
@@ -3093,6 +3094,9 @@ class _AddonValAccum:
     val_reg_tap_mae_pu_sum: float = 0.0
     val_reg_tap_acc_sum: float = 0.0
     val_volt_uniform_sum: float = 0.0
+    val_volt_weighted_sum: float = 0.0
+    val_volt_viol_frac_sum: float = 0.0
+    val_reg_with_territory_sum: float = 0.0
     n: int = 0
 
     def update(self, row: dict[str, float]) -> None:
@@ -3105,6 +3109,9 @@ class _AddonValAccum:
             ("val_reg_tap_mae_pu", "val_reg_tap_mae_pu_sum"),
             ("val_reg_tap_acc", "val_reg_tap_acc_sum"),
             ("val_volt_uniform", "val_volt_uniform_sum"),
+            ("val_volt_weighted", "val_volt_weighted_sum"),
+            ("val_volt_viol_frac", "val_volt_viol_frac_sum"),
+            ("val_reg_with_territory", "val_reg_with_territory_sum"),
         ):
             v = row.get(key, float("nan"))
             if math.isfinite(v):
@@ -3120,7 +3127,24 @@ class _AddonValAccum:
             "val_reg_tap_mae_pu": self.val_reg_tap_mae_pu_sum / n,
             "val_reg_tap_acc": self.val_reg_tap_acc_sum / n,
             "val_volt_uniform": self.val_volt_uniform_sum / n,
+            "val_volt_weighted": self.val_volt_weighted_sum / n,
+            "val_volt_viol_frac": self.val_volt_viol_frac_sum / n,
+            "val_reg_with_territory": self.val_reg_with_territory_sum / n,
         }
+
+
+@dataclass
+class _TerritoryCounterfactualAccum:
+    val_reg_no_territory_sum: float = 0.0
+    n: int = 0
+
+    def update(self, plain_ce: float) -> None:
+        if math.isfinite(plain_ce):
+            self.val_reg_no_territory_sum += plain_ce
+            self.n += 1
+
+    def mean(self) -> float:
+        return self.val_reg_no_territory_sum / max(self.n, 1)
 
 
 def _training_addons_enabled(args: argparse.Namespace) -> bool:
@@ -3154,6 +3178,7 @@ def _log_training_addon_scales(
         )
     if bool(getattr(args, "reg_hybrid_tap_loss", False)) and reg_class_tables:
         alpha = float(getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA))
+        lam_reg = float(getattr(args, "lambda_reg", 0.1))
         spans = [
             float(np.max(np.asarray(tab["classes"], dtype=np.float64))
                   - np.min(np.asarray(tab["classes"], dtype=np.float64)))
@@ -3162,28 +3187,34 @@ def _log_training_addon_scales(
         ]
         span_lo = min(spans) if spans else float("nan")
         span_hi = max(spans) if spans else float("nan")
+        ord_lo, ord_hi = 0.08 * alpha, 0.15 * alpha
         print(
             f"  hybrid tap: CE ~1-5 typical; ordinal cost normalized to [0,1] per regulator "
             f"(raw tap spans {span_lo:.4f}-{span_hi:.4f} pu); alpha={alpha:g} "
-            f"→ ordinal term ~{0.2 * alpha:.2f}-{0.6 * alpha:.2f} when mass is spread",
+            f"→ ordinal term ~{ord_lo:.2f}-{ord_hi:.2f} (~8-15% of plain CE target); "
+            f"effective in total loss: lambda_reg={lam_reg:g}×(CE+{alpha:g}×ordinal) "
+            f"→ ordinal contributes ~{lam_reg * ord_lo:.3f}-{lam_reg * ord_hi:.3f} to val_tot",
             flush=True,
         )
     if bool(getattr(args, "volt_violation_weight", False)):
         alpha = float(getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA))
+        lam_v = float(getattr(args, "lambda_v", 1.0))
         mode = str(getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE))
         lo = float(getattr(args, "volt_lo_pu", 0.96))
         hi = float(getattr(args, "volt_hi_pu", 1.04))
         if mode == "continuous":
             print(
                 f"  voltage: mode=continuous w=1+{alpha:g}*depth outside [{lo},{hi}]; "
-                f"at viol_frac~0.30, depth~0.01-0.03 pu → w_mean~1.5-2.5 (stronger near limits)",
+                f"at viol_frac~0.30, depth~0.01-0.03 pu → w_mean~1.5-2.5 (stronger near limits); "
+                f"lambda_v={lam_v:g} scales weighted MSE in total loss",
                 flush=True,
             )
         else:
             w_mean_est = 1.0 + alpha * 0.30
             print(
                 f"  voltage: mode=binary w=1+{alpha:g}*1(viol); "
-                f"at viol_frac~0.30 expected w_mean~{w_mean_est:.2f}",
+                f"at viol_frac~0.30 expected w_mean~{w_mean_est:.2f}; "
+                f"lambda_v={lam_v:g} scales weighted MSE in total loss",
                 flush=True,
             )
 
@@ -3260,6 +3291,7 @@ def _addon_batch_log_row(
 
 def _addon_val_batch_row(
     *,
+    args: argparse.Namespace,
     reg_logits: list[torch.Tensor] | None,
     y_reg_b: torch.Tensor,
     reg_loss: str,
@@ -3269,40 +3301,74 @@ def _addon_val_batch_row(
     reg_class_tables: list[dict] | None,
     reg_class_values: torch.Tensor | None,
     val_volt_uniform: float,
+    v_n: torch.Tensor | None = None,
+    yb_n: torch.Tensor | None = None,
+    yb: torch.Tensor | None = None,
+    n_nodes: int = 0,
+    mse: nn.Module | None = None,
+    territory_enabled: bool = False,
 ) -> dict[str, float]:
-    """Counterfactual val metrics: always plain CE / uniform volt MSE alongside hybrid."""
+    """Counterfactual val metrics: plain CE / uniform volt MSE alongside hybrid & weighted volt."""
     out: dict[str, float] = {"val_volt_uniform": float(val_volt_uniform)}
-    if reg_loss != "ce" or not reg_logits:
-        return out
-    out["val_reg_plain_ce"] = float(_plain_reg_ce_scalar(reg_logits, y_reg_b).detach().item())
-    if reg_hybrid_tap_loss and reg_cost_matrices:
-        ce_parts = [
-            _hybrid_tap_ce_elementwise(reg_logits[j], y_reg_b[:, j].long()).mean()
-            for j in range(len(reg_logits))
-        ]
-        ord_parts = [
-            _hybrid_tap_ordinal_cost_elementwise(
-                reg_logits[j],
-                y_reg_b[:, j].long(),
-                reg_cost_matrices[j],
-                alpha=reg_ordinal_alpha,
-            ).mean()
-            for j in range(len(reg_logits))
-        ]
-        h_ce = float(torch.stack(ce_parts).mean().detach().item())
-        h_ord = float(torch.stack(ord_parts).mean().detach().item())
-        out["val_reg_hybrid_ce"] = h_ce
-        out["val_reg_ordinal_cost"] = h_ord
-        out["val_reg_hybrid_total"] = h_ce + h_ord
-    if reg_class_tables:
-        tap_m = _reg_tap_metrics_from_logits(
-            reg_logits,
-            y_reg_b,
-            reg_class_tables,
-            reg_class_values=reg_class_values,
+    if reg_loss == "ce" and reg_logits:
+        plain_ce = float(_plain_reg_ce_scalar(reg_logits, y_reg_b).detach().item())
+        out["val_reg_plain_ce"] = plain_ce
+        if territory_enabled:
+            out["val_reg_with_territory"] = plain_ce
+        if reg_hybrid_tap_loss and reg_cost_matrices:
+            ce_parts = [
+                _hybrid_tap_ce_elementwise(reg_logits[j], y_reg_b[:, j].long()).mean()
+                for j in range(len(reg_logits))
+            ]
+            ord_parts = [
+                _hybrid_tap_ordinal_cost_elementwise(
+                    reg_logits[j],
+                    y_reg_b[:, j].long(),
+                    reg_cost_matrices[j],
+                    alpha=reg_ordinal_alpha,
+                ).mean()
+                for j in range(len(reg_logits))
+            ]
+            h_ce = float(torch.stack(ce_parts).mean().detach().item())
+            h_ord = float(torch.stack(ord_parts).mean().detach().item())
+            out["val_reg_hybrid_ce"] = h_ce
+            out["val_reg_ordinal_cost"] = h_ord
+            out["val_reg_hybrid_total"] = h_ce + h_ord
+        if reg_class_tables:
+            tap_m = _reg_tap_metrics_from_logits(
+                reg_logits,
+                y_reg_b,
+                reg_class_tables,
+                reg_class_values=reg_class_values,
+            )
+            out["val_reg_tap_mae_pu"] = tap_m["reg_tap_mae_pu"]
+            out["val_reg_tap_acc"] = tap_m["reg_tap_acc"]
+    if (
+        bool(getattr(args, "volt_violation_weight", False))
+        and v_n is not None
+        and yb_n is not None
+        and yb is not None
+        and mse is not None
+        and n_nodes > 0
+    ):
+        _, volt_dbg = _voltage_loss_scalar(
+            v_n,
+            yb_n,
+            yb,
+            n_nodes=n_nodes,
+            mse=mse,
+            violation_weight=True,
+            volt_lo_pu=float(getattr(args, "volt_lo_pu", 0.96)),
+            volt_hi_pu=float(getattr(args, "volt_hi_pu", 1.04)),
+            volt_violation_alpha=float(
+                getattr(args, "volt_violation_alpha", _DEFAULT_VOLT_VIOLATION_ALPHA)
+            ),
+            volt_violation_mode=str(
+                getattr(args, "volt_violation_mode", _DEFAULT_VOLT_VIOLATION_MODE)
+            ),
         )
-        out["val_reg_tap_mae_pu"] = tap_m["reg_tap_mae_pu"]
-        out["val_reg_tap_acc"] = tap_m["reg_tap_acc"]
+        out["val_volt_weighted"] = volt_dbg.get("volt_loss_weighted", float("nan"))
+        out["val_volt_viol_frac"] = volt_dbg.get("volt_violation_frac", float("nan"))
     return out
 
 
@@ -3421,12 +3487,109 @@ def _format_addon_epoch_line(
     return line
 
 
+def _tap_acc_random_baseline(reg_class_tables: list[dict] | None) -> float:
+    if not reg_class_tables:
+        return float("nan")
+    inv_k = [1.0 / max(2, int(tab.get("n_classes", len(tab.get("classes", [])) or 2))) for tab in reg_class_tables]
+    return float(sum(inv_k) / len(inv_k)) if inv_k else float("nan")
+
+
+def _build_epoch_val_counterfactual(
+    *,
+    args: argparse.Namespace,
+    val_means: dict[str, float],
+    val_reg_no_territory: float,
+    reg_class_tables: list[dict] | None,
+) -> dict[str, object]:
+    """Per-epoch counterfactual dict for help/hurt analysis without ablation."""
+    cf: dict[str, object] = {}
+    vm = val_means
+    if bool(getattr(args, "attn_reg_territory_bias", False)):
+        with_t = vm.get("val_reg_with_territory", vm.get("val_reg_plain_ce", float("nan")))
+        without_t = val_reg_no_territory
+        delta_t = (
+            with_t - without_t
+            if math.isfinite(with_t) and math.isfinite(without_t)
+            else float("nan")
+        )
+        cf["territory"] = {
+            "val_reg_with_territory": with_t,
+            "val_reg_no_territory": without_t,
+            "territory_reg_delta": delta_t,
+        }
+    if bool(getattr(args, "reg_hybrid_tap_loss", False)) or bool(getattr(args, "reg_ordinal_ce", False)):
+        plain = vm.get("val_reg_plain_ce", float("nan"))
+        ordinal = vm.get("val_reg_ordinal_cost", float("nan"))
+        hybrid_total = vm.get("val_reg_hybrid_total", float("nan"))
+        tap_acc = vm.get("val_reg_tap_acc", float("nan"))
+        tap_mae = vm.get("val_reg_tap_mae_pu", float("nan"))
+        rand_base = _tap_acc_random_baseline(reg_class_tables)
+        cf["hybrid"] = {
+            "val_plain_ce": plain,
+            "val_ordinal_cost": ordinal,
+            "val_hybrid_total": hybrid_total,
+            "val_tap_mae_pu": tap_mae,
+            "val_tap_acc": tap_acc,
+            "val_tap_acc_random_baseline": rand_base,
+        }
+    if bool(getattr(args, "volt_violation_weight", False)):
+        uniform = vm.get("val_volt_uniform", float("nan"))
+        weighted = vm.get("val_volt_weighted", float("nan"))
+        viol_frac = vm.get("val_volt_viol_frac", float("nan"))
+        delta_v = (
+            weighted - uniform
+            if math.isfinite(weighted) and math.isfinite(uniform)
+            else float("nan")
+        )
+        cf["voltage"] = {
+            "val_uniform": uniform,
+            "val_weighted": weighted,
+            "val_viol_frac": viol_frac,
+            "volt_val_delta": delta_v,
+        }
+    return cf
+
+
+def _format_counterfactual_epoch_line(epoch: int, cf: dict[str, object]) -> str:
+    parts: list[str] = [f"[da_gps addons counterfactual] epoch {epoch}"]
+    terr = cf.get("territory")
+    if isinstance(terr, dict):
+        delta = terr.get("territory_reg_delta", float("nan"))
+        hint = " (negative helps)" if math.isfinite(delta) and delta < 0 else ""
+        parts.append(
+            "territory: "
+            f"val_reg={terr.get('val_reg_with_territory', float('nan')):.4f} "
+            f"no_territory={terr.get('val_reg_no_territory', float('nan')):.4f} "
+            f"delta={delta:.4f}{hint}"
+        )
+    hybrid = cf.get("hybrid")
+    if isinstance(hybrid, dict):
+        parts.append(
+            "hybrid: "
+            f"val_plain_ce={hybrid.get('val_plain_ce', float('nan')):.4f} "
+            f"val_ordinal_cost={hybrid.get('val_ordinal_cost', float('nan')):.4f} "
+            f"val_hybrid_total={hybrid.get('val_hybrid_total', float('nan')):.4f} "
+            f"val_tap_acc={hybrid.get('val_tap_acc', float('nan')):.4f}"
+        )
+    volt = cf.get("voltage")
+    if isinstance(volt, dict):
+        parts.append(
+            "voltage: "
+            f"val_uniform={volt.get('val_uniform', float('nan')):.4f} "
+            f"val_weighted={volt.get('val_weighted', float('nan')):.4f} "
+            f"viol_frac={volt.get('val_viol_frac', float('nan')):.4f} "
+            f"delta={volt.get('volt_val_delta', float('nan')):.4f}"
+        )
+    return " | ".join(parts) if len(parts) > 1 else ""
+
+
 def _training_addons_report(
     args: argparse.Namespace,
     epoch_train_metrics: dict[str, float] | None = None,
     epoch_val_metrics: dict[str, float] | None = None,
     epoch_history: list[dict[str, object]] | None = None,
     reg_col_hop_mapping: dict[str, str | None] | None = None,
+    last_epoch_val_counterfactual: dict[str, object] | None = None,
 ) -> dict[str, object]:
     out: dict[str, object] = {
         "attn_reg_territory_bias": bool(getattr(args, "attn_reg_territory_bias", False)),
@@ -3456,6 +3619,8 @@ def _training_addons_report(
         out["last_epoch_train_means"] = epoch_train_metrics
     if epoch_val_metrics is not None:
         out["last_epoch_val_means"] = epoch_val_metrics
+    if last_epoch_val_counterfactual is not None:
+        out["last_epoch_val_counterfactual"] = last_epoch_val_counterfactual
     if epoch_history is not None:
         out["epoch_history"] = epoch_history
     return out
@@ -3960,6 +4125,14 @@ class DAGPSModel(nn.Module):
         self.use_reg_territory_bias = True
         self.reg_territory_beta = float(beta)
         self.reg_territory_mask.copy_(mask.to(dtype=self.reg_territory_mask.dtype))
+        self._sync_block_territory()
+
+    def set_reg_territory_bias_enabled(self, enabled: bool) -> None:
+        """Toggle territory bias at inference without changing trained weights (counterfactual val)."""
+        if self.reg_territory_beta > 0.0 or bool(self.reg_territory_mask.any().item()):
+            self.use_reg_territory_bias = bool(enabled)
+        else:
+            self.use_reg_territory_bias = False
         self._sync_block_territory()
 
     def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
@@ -6187,6 +6360,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
     last_addon_val_epoch_metrics: dict[str, float] | None = None
+    last_epoch_val_counterfactual: dict[str, object] | None = None
     addon_epoch_history: list[dict[str, object]] = []
 
     for ep in range(1, args.epochs + 1):
@@ -6203,6 +6377,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         train_batch_idx = 0
         addon_accum = _AddonTrainAccum()
         addon_val_accum = _AddonValAccum()
+        territory_cf_accum = _TerritoryCounterfactualAccum()
         train_order = np.random.default_rng(args.seed + ep * 17).permutation(len(chunk_dirs))
         for ci in train_order:
             ci_i = int(ci)
@@ -6540,6 +6715,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     if _training_addons_enabled(args):
                         addon_val_accum.update(
                             _addon_val_batch_row(
+                                args=args,
                                 reg_logits=reg_logits_v,
                                 y_reg_b=y_reg_b,
                                 reg_loss=reg_loss,
@@ -6549,10 +6725,79 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                                 reg_class_tables=reg_class_tables,
                                 reg_class_values=reg_class_values_d,
                                 val_volt_uniform=float(lv.item()),
+                                v_n=v_n,
+                                yb_n=yb_n,
+                                yb=yb,
+                                n_nodes=n_nodes,
+                                mse=mse,
+                                territory_enabled=bool(
+                                    getattr(args, "attn_reg_territory_bias", False)
+                                    and base_model.use_reg_territory_bias
+                                ),
                             )
                         )
                 del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
                 gc.collect()
+
+        if (
+            _training_addons_enabled(args)
+            and bool(getattr(args, "attn_reg_territory_bias", False))
+            and reg_loss == "ce"
+            and nv > 0
+        ):
+            base_model.set_reg_territory_bias_enabled(False)
+            with torch.no_grad():
+                for ci, ch in enumerate(chunk_dirs):
+                    cpt = cache_pts[ci]
+                    boot_pt = bootstrap_cache_pts[ci]
+                    x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
+                        ch,
+                        nodes_name=nodes_name,
+                        meta_name=meta_name,
+                        node_feature_cols=node_feature_cols,
+                        node_pe_csv=node_pe_csv,
+                        node_pe_cols=node_pe_cols,
+                        selected_sample_ids=selected_ids_list[ci],
+                        cap_cols=cap_cols,
+                        reg_cols=reg_cols,
+                        cache_pt=cpt,
+                        bootstrap_gnn_cache_pt=boot_pt,
+                        ref_ntl=ref_ntl,
+                        pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+                        reg_class_tables=reg_class_tables,
+                        reg_target_mode=reg_target_mode,
+                        reg_classes_digest=reg_classes_digest,
+                    )
+                    y_reg_n = y_reg.to(dtype=torch.long)
+                    x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
+                    y_pv_n = None
+                    if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
+                        y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+                    ds = DAGPSDataset(
+                        x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
+                    )
+                    dl_va = DataLoader(
+                        Subset(ds, idx_val_list[ci].tolist()),
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        num_workers=nw,
+                        pin_memory=pin,
+                        persistent_workers=nw > 0,
+                    )
+                    for batch in dl_va:
+                        batch = batch.to(device)
+                        batch = _cast_batch_float_tensors(batch)
+                        y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+                        with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                            _v_n, _c_log, _r_p, _pv_p = model(batch)
+                            reg_logits_cf = base_model._last_reg_logits
+                        if reg_logits_cf:
+                            territory_cf_accum.update(
+                                float(_plain_reg_ce_scalar(reg_logits_cf, y_reg_b).detach().item())
+                            )
+                    del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
+                    gc.collect()
+            base_model.set_reg_territory_bias_enabled(True)
 
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
@@ -6586,10 +6831,18 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
         if _training_addons_enabled(args) and addon_val_accum.n > 0:
             last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+            epoch_cf = _build_epoch_val_counterfactual(
+                args=args,
+                val_means=last_addon_val_epoch_metrics,
+                val_reg_no_territory=territory_cf_accum.mean(),
+                reg_class_tables=reg_class_tables,
+            )
+            last_epoch_val_counterfactual = epoch_cf
             epoch_entry: dict[str, object] = {
                 "epoch": ep,
                 "train": last_addon_epoch_metrics or {},
                 "val": last_addon_val_epoch_metrics,
+                "counterfactual": epoch_cf,
             }
             if reg_loss == "ce" and nv > 0:
                 epoch_entry["val_reg_plain_ce_per_head"] = {
@@ -6666,6 +6919,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     ),
                     flush=True,
                 )
+                if last_epoch_val_counterfactual:
+                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                    if _cf_line:
+                        print(_cf_line, flush=True)
         if baseline_val_met is not None and baseline_test_met is not None:
             ep_val_met = _evaluate_multi_chunks(
                 model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
@@ -6833,6 +7090,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             epoch_val_metrics=last_addon_val_epoch_metrics,
             epoch_history=addon_epoch_history,
             reg_col_hop_mapping=reg_col_hop_mapping,
+            last_epoch_val_counterfactual=last_epoch_val_counterfactual,
         )
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     if baseline_val_met is not None and baseline_test_met is not None:
@@ -6959,8 +7217,10 @@ def parse_args() -> argparse.Namespace:
         "--reg_ordinal_alpha",
         type=float,
         default=_DEFAULT_REG_ORDINAL_ALPHA,
-        help="Alpha for --reg_hybrid_tap_loss expected ordinal-cost term (default 0.75). "
-        "Cost matrices are normalized to [0,1] per regulator so alpha scales a fraction of CE.",
+        help=(
+            "Alpha for --reg_hybrid_tap_loss expected ordinal-cost term (default 1.25). "
+            "Cost matrix is normalized per regulator; target ordinal/CE ratio ~8-15%%."
+        ),
     )
     p.add_argument(
         "--reg_ordinal_ce",
@@ -6978,9 +7238,11 @@ def parse_args() -> argparse.Namespace:
         "--volt_violation_alpha",
         type=float,
         default=_DEFAULT_VOLT_VIOLATION_ALPHA,
-        help="Per-node voltage MSE weight scale when --volt_violation_weight. "
-        "Continuous mode (default): w=1+alpha*depth outside [lo,hi]. "
-        "Binary mode: w=1+alpha*1(viol). Default 5.0 gives w_mean~2.5 at viol_frac~0.30 (binary).",
+        help=(
+            "Per-node voltage MSE weight scale when --volt_violation_weight (default 8.0). "
+            "Continuous mode: w=1+alpha*depth outside [lo,hi]. "
+            "Binary mode: w=1+alpha*1(viol)."
+        ),
     )
     p.add_argument(
         "--volt_violation_mode",
@@ -7664,6 +7926,7 @@ def main() -> None:
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
     last_addon_val_epoch_metrics: dict[str, float] | None = None
+    last_epoch_val_counterfactual: dict[str, object] | None = None
     addon_epoch_history: list[dict[str, object]] = []
 
     for ep in range(1, args.epochs + 1):
@@ -7680,6 +7943,7 @@ def main() -> None:
         train_batch_idx = 0
         addon_accum = _AddonTrainAccum()
         addon_val_accum = _AddonValAccum()
+        territory_cf_accum = _TerritoryCounterfactualAccum()
         for batch in dl_tr:
             batch = batch.to(device)
             batch = _cast_batch_float_tensors(batch)
@@ -7893,19 +8157,52 @@ def main() -> None:
                 val_sum_se += (err * err).sum(dim=0)
                 val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
                 if _training_addons_enabled(args):
+                    reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
                     addon_val_accum.update(
                         _addon_val_batch_row(
-                            reg_logits=None,
+                            args=args,
+                            reg_logits=reg_logits_v,
                             y_reg_b=y_reg,
                             reg_loss=reg_loss,
                             reg_hybrid_tap_loss=False,
-                            reg_ordinal_alpha=1.0,
+                            reg_ordinal_alpha=float(
+                                getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA)
+                            ),
                             reg_cost_matrices=None,
                             reg_class_tables=None,
                             reg_class_values=reg_class_values_d,
                             val_volt_uniform=float(lv.item()),
+                            v_n=v_n,
+                            yb_n=yb_n,
+                            yb=yb,
+                            n_nodes=n_nodes,
+                            mse=mse,
+                            territory_enabled=bool(
+                                getattr(args, "attn_reg_territory_bias", False)
+                                and base_model.use_reg_territory_bias
+                            ),
                         )
                     )
+        if (
+            _training_addons_enabled(args)
+            and bool(getattr(args, "attn_reg_territory_bias", False))
+            and reg_loss == "ce"
+            and nv > 0
+        ):
+            base_model.set_reg_territory_bias_enabled(False)
+            with torch.no_grad():
+                for batch in dl_va:
+                    batch = batch.to(device)
+                    batch = _cast_batch_float_tensors(batch)
+                    y_reg = batch.y_reg.view(batch.num_graphs, -1)
+                    with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                        model(batch)
+                        reg_logits_cf = base_model._last_reg_logits
+                    if reg_logits_cf:
+                        territory_cf_accum.update(
+                            float(_plain_reg_ce_scalar(reg_logits_cf, y_reg).detach().item())
+                        )
+            base_model.set_reg_territory_bias_enabled(True)
         val_tot /= max(nv, 1)
         val_v /= max(nv, 1)
         val_c = val_c_sum / max(nv, 1)
@@ -7938,11 +8235,19 @@ def main() -> None:
             val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
         if _training_addons_enabled(args) and addon_val_accum.n > 0:
             last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+            epoch_cf = _build_epoch_val_counterfactual(
+                args=args,
+                val_means=last_addon_val_epoch_metrics,
+                val_reg_no_territory=territory_cf_accum.mean(),
+                reg_class_tables=None,
+            )
+            last_epoch_val_counterfactual = epoch_cf
             addon_epoch_history.append(
                 {
                     "epoch": ep,
                     "train": last_addon_epoch_metrics or {},
                     "val": last_addon_val_epoch_metrics,
+                    "counterfactual": epoch_cf,
                 }
             )
         sch.step(val_tot)
@@ -8008,6 +8313,10 @@ def main() -> None:
                     ),
                     flush=True,
                 )
+                if last_epoch_val_counterfactual:
+                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                    if _cf_line:
+                        print(_cf_line, flush=True)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -8096,6 +8405,7 @@ def main() -> None:
             epoch_val_metrics=last_addon_val_epoch_metrics,
             epoch_history=addon_epoch_history,
             reg_col_hop_mapping=reg_col_hop_mapping,
+            last_epoch_val_counterfactual=last_epoch_val_counterfactual,
         )
     (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     _pv_n = met.get("pv_mse_normalized", float("nan"))
@@ -8201,8 +8511,8 @@ def _selftest_voltage_loss_scalar() -> None:
 def _selftest_reg_tap_metrics_from_logits() -> None:
     """Smoke test: argmax tap MAE/acc from regulator logits."""
     tables = [{"classes": [0.9, 1.0, 1.1]}]
-    logits = [torch.tensor([[10.0, -5.0, -5.0], [-5.0, 10.0, -5.0]], dtype=torch.float32)]
-    target = torch.tensor([[0, 1]], dtype=torch.long)
+    logits = [torch.tensor([[10.0, -5.0, -5.0]], dtype=torch.float32)]
+    target = torch.tensor([[0]], dtype=torch.long)
     m = _reg_tap_metrics_from_logits(logits, target, tables)
     assert m["reg_tap_acc"] == 1.0
     assert m["reg_tap_mae_pu"] == 0.0
@@ -8215,6 +8525,41 @@ def _selftest_reg_tap_metrics_from_logits() -> None:
     print("_selftest_reg_tap_metrics_from_logits: ok", flush=True)
 
 
+def _selftest_reg_territory_bias_disable() -> None:
+    """Smoke test: disabling territory bias zeros block beta without changing weights."""
+    torch.manual_seed(0)
+    n_nodes, n_reg, hidden, heads = 8, 2, 16, 2
+    model = DAGPSModel(
+        n_nodes=n_nodes,
+        num_edges=4,
+        hidden=hidden,
+        heads=heads,
+        n_layers=1,
+        n_cap=1,
+        n_reg=n_reg,
+        n_system=1,
+        node_in_dim=3,
+        node_emb_dim=0,
+        edge_emb_dim=0,
+        edge_dim=2,
+        dropout=0.0,
+        per_device_reg_head=True,
+        reg_nclasses=[3, 3],
+    )
+    mask = torch.zeros(n_nodes, n_reg)
+    mask[2:, 0] = 1.0
+    model.set_reg_territory_bias(mask, beta=6.0)
+    assert model.use_reg_territory_bias
+    assert model.blocks[0].reg_territory_beta == 6.0
+    model.set_reg_territory_bias_enabled(False)
+    assert not model.use_reg_territory_bias
+    assert model.blocks[0].reg_territory_beta == 0.0
+    model.set_reg_territory_bias_enabled(True)
+    assert model.use_reg_territory_bias
+    assert model.blocks[0].reg_territory_beta == 6.0
+    print("_selftest_reg_territory_bias_disable: ok", flush=True)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -8224,5 +8569,7 @@ if __name__ == "__main__":
         _selftest_hybrid_tap_loss()
     elif len(sys.argv) > 1 and sys.argv[1] == "--selftest-reg-tap-metrics":
         _selftest_reg_tap_metrics_from_logits()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--selftest-reg-territory-disable":
+        _selftest_reg_territory_bias_disable()
     else:
         main()
