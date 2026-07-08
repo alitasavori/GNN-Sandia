@@ -3385,6 +3385,25 @@ def _addon_val_batch_row(
     return out
 
 
+def _eval_every_n(args: argparse.Namespace) -> int:
+    return max(1, int(getattr(args, "eval_every", 10)))
+
+
+def _should_eval_epoch(ep: int, args: argparse.Namespace) -> bool:
+    """Run validation, LR schedule step, best-checkpoint tracking, and full epoch logs."""
+    ee = _eval_every_n(args)
+    epochs = int(args.epochs)
+    return ep == 1 or ep % ee == 0 or ep == epochs
+
+
+def _should_log_batch(batch_idx: int, args: argparse.Namespace) -> bool:
+    """Per-batch addon logging (disabled when --log_every <= 0)."""
+    le = int(getattr(args, "log_every", 0))
+    if le <= 0:
+        return False
+    return batch_idx % le == 0
+
+
 def _maybe_log_addon_batch(
     *,
     args: argparse.Namespace,
@@ -3394,8 +3413,7 @@ def _maybe_log_addon_batch(
 ) -> None:
     if not _training_addons_enabled(args):
         return
-    le = max(1, int(args.log_every))
-    if batch_idx % le != 0:
+    if not _should_log_batch(batch_idx, args):
         return
     parts: list[str] = [f"[da_gps addons] epoch {epoch} batch {batch_idx}"]
     if bool(getattr(args, "attn_reg_territory_bias", False)) and math.isfinite(row.territory_active_frac):
@@ -6654,167 +6672,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         if _training_addons_enabled(args) and addon_accum.n > 0:
             last_addon_epoch_metrics = addon_accum.mean_dict()
 
-        model.eval()
-        val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
-        nv = 0
-        val_sum_true = torch.zeros(n_nodes, device=device)
-        val_sum_true2 = torch.zeros(n_nodes, device=device)
-        val_sum_se = torch.zeros(n_nodes, device=device)
-        val_sum_worst = 0.0
-        with torch.no_grad():
-            for ci, ch in enumerate(chunk_dirs):
-                cpt = cache_pts[ci]
-                boot_pt = bootstrap_cache_pts[ci]
-                x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
-                    ch,
-                    nodes_name=nodes_name,
-                    meta_name=meta_name,
-                    node_feature_cols=node_feature_cols,
-                    node_pe_csv=node_pe_csv,
-                    node_pe_cols=node_pe_cols,
-                    selected_sample_ids=selected_ids_list[ci],
-                    cap_cols=cap_cols,
-                    reg_cols=reg_cols,
-                    cache_pt=cpt,
-                    bootstrap_gnn_cache_pt=boot_pt,
-                    ref_ntl=ref_ntl,
-                    pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
-                    reg_class_tables=reg_class_tables,
-                    reg_target_mode=reg_target_mode,
-                    reg_classes_digest=reg_classes_digest,
-                )
-                if reg_loss == "ce":
-                    y_reg_n = y_reg.to(dtype=torch.long)
-                else:
-                    y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
-                x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
-                y_pv_n = None
-                if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
-                    y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
-                ds = DAGPSDataset(
-                    x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
-                )
-                dl_va = DataLoader(
-                    Subset(ds, idx_val_list[ci].tolist()),
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    num_workers=nw,
-                    pin_memory=pin,
-                    persistent_workers=nw > 0,
-                )
-                for batch in dl_va:
-                    batch = batch.to(device)
-                    batch = _cast_batch_float_tensors(batch)
-                    yb = batch.y.view(batch.num_graphs, -1)
-                    y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
-                    y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
-                    yb_n = (yb - y_mean_d) / y_std_d
-                    with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                        v_n, c_log, r_p, pv_p = model(batch)
-                        lv = mse(v_n.view_as(yb_n), yb_n)
-                        lc = bce(c_log, y_cap_b)
-                        reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
-                        lr_ = _reg_loss_scalar(
-                            r_p if reg_loss != "ce" else None,
-                            y_reg_b,
-                            reg_loss,
-                            reg_logits=reg_logits_v,
-                            reg_class_tables=reg_class_tables,
-                        )
-                        lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
-                        lpf = _pf_loss_if_enabled(
-                            pf_state,
-                            v_n,
-                            batch,
-                            n_nodes=n_nodes,
-                            y_mean=y_mean_d,
-                            y_std=y_std_d,
-                            x_mean=x_mean_d,
-                            x_std=x_std_d,
-                            cap_logits=c_log,
-                            reg_pred=r_p,
-                            reg_loss=reg_loss,
-                            reg_mean=reg_mean_d,
-                            reg_std=reg_std_d,
-                            reg_logits=reg_logits_v,
-                            reg_class_values=reg_class_values_d,
-                            label_y_n=yb_n,
-                            y_cap_label=y_cap_b,
-                            y_reg_label=y_reg_b,
-                            epoch=ep,
-                        )
-                        if lpf is not None:
-                            pf_w = _pf_effective_weight(
-                                pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
-                            )
-                            lt = lt + pf_w * lpf
-                            val_pf_sum += float(lpf.item()) * batch.num_graphs
-                        if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
-                            lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
-                            lt = lt + float(args.lambda_pv) * lpv
-                            val_pv_sum += float(lpv.item()) * batch.num_graphs
-                    val_tot += float(lt.item()) * batch.num_graphs
-                    val_v += float(lv.item()) * batch.num_graphs
-                    val_c_sum += float(lc.item()) * batch.num_graphs
-                    val_r_sum += float(lr_.item()) * batch.num_graphs
-                    nv += int(batch.num_graphs)
-                    bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
-                    val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
-                    reg_ev = _reg_loss_elementwise(
-                        r_p if reg_loss != "ce" else None,
-                        y_reg_b,
-                        reg_loss,
-                        reg_logits=reg_logits_v,
-                    )
-                    val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
-                    if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
-                        lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
-                        val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
-                    v_flat = v_n.view(batch.num_graphs, -1)
-                    pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
-                    true_ri = yb.view(batch.num_graphs, n_nodes, 2)
-                    pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
-                    true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
-                    err = pred_mag - true_mag
-                    val_sum_true += true_mag.sum(dim=0)
-                    val_sum_true2 += (true_mag * true_mag).sum(dim=0)
-                    val_sum_se += (err * err).sum(dim=0)
-                    val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
-                    if _training_addons_enabled(args):
-                        addon_val_accum.update(
-                            _addon_val_batch_row(
-                                args=args,
-                                reg_logits=reg_logits_v,
-                                y_reg_b=y_reg_b,
-                                reg_loss=reg_loss,
-                                reg_hybrid_tap_loss=reg_hybrid_tap_loss,
-                                reg_ordinal_alpha=reg_ordinal_alpha,
-                                reg_cost_matrices=reg_cost_matrices_d,
-                                reg_class_tables=reg_class_tables,
-                                reg_class_values=reg_class_values_d,
-                                val_volt_uniform=float(lv.item()),
-                                v_n=v_n,
-                                yb_n=yb_n,
-                                yb=yb,
-                                n_nodes=n_nodes,
-                                mse=mse,
-                                territory_enabled=bool(
-                                    getattr(args, "attn_reg_territory_bias", False)
-                                    and base_model.use_reg_territory_bias
-                                ),
-                            )
-                        )
-                del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
-                gc.collect()
-
-        if (
-            _training_addons_enabled(args)
-            and bool(getattr(args, "attn_reg_territory_bias", False))
-            and reg_loss == "ce"
-            and nv > 0
-        ):
-            base_model.set_reg_territory_bias_enabled(False)
+        do_eval = _should_eval_epoch(ep, args)
+        if do_eval:
+            model.eval()
+            val_tot = val_v = 0.0
+            val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
+            nv = 0
+            val_sum_true = torch.zeros(n_nodes, device=device)
+            val_sum_true2 = torch.zeros(n_nodes, device=device)
+            val_sum_se = torch.zeros(n_nodes, device=device)
+            val_sum_worst = 0.0
             with torch.no_grad():
                 for ci, ch in enumerate(chunk_dirs):
                     cpt = cache_pts[ci]
@@ -6837,7 +6704,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_target_mode=reg_target_mode,
                         reg_classes_digest=reg_classes_digest,
                     )
-                    y_reg_n = y_reg.to(dtype=torch.long)
+                    if reg_loss == "ce":
+                        y_reg_n = y_reg.to(dtype=torch.long)
+                    else:
+                        y_reg_n = ((y_reg - reg_mean) / reg_std).to(dtype=torch.float32)
                     x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
                     y_pv_n = None
                     if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
@@ -6856,188 +6726,339 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     for batch in dl_va:
                         batch = batch.to(device)
                         batch = _cast_batch_float_tensors(batch)
+                        yb = batch.y.view(batch.num_graphs, -1)
+                        y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
                         y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+                        yb_n = (yb - y_mean_d) / y_std_d
                         with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                            _v_n, _c_log, _r_p, _pv_p = model(batch)
-                            reg_logits_cf = base_model._last_reg_logits
-                        if reg_logits_cf:
-                            territory_cf_accum.update(
-                                float(_plain_reg_ce_scalar(reg_logits_cf, y_reg_b).detach().item())
+                            v_n, c_log, r_p, pv_p = model(batch)
+                            lv = mse(v_n.view_as(yb_n), yb_n)
+                            lc = bce(c_log, y_cap_b)
+                            reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
+                            lr_ = _reg_loss_scalar(
+                                r_p if reg_loss != "ce" else None,
+                                y_reg_b,
+                                reg_loss,
+                                reg_logits=reg_logits_v,
+                                reg_class_tables=reg_class_tables,
+                            )
+                            lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                            lpf = _pf_loss_if_enabled(
+                                pf_state,
+                                v_n,
+                                batch,
+                                n_nodes=n_nodes,
+                                y_mean=y_mean_d,
+                                y_std=y_std_d,
+                                x_mean=x_mean_d,
+                                x_std=x_std_d,
+                                cap_logits=c_log,
+                                reg_pred=r_p,
+                                reg_loss=reg_loss,
+                                reg_mean=reg_mean_d,
+                                reg_std=reg_std_d,
+                                reg_logits=reg_logits_v,
+                                reg_class_values=reg_class_values_d,
+                                label_y_n=yb_n,
+                                y_cap_label=y_cap_b,
+                                y_reg_label=y_reg_b,
+                                epoch=ep,
+                            )
+                            if lpf is not None:
+                                pf_w = _pf_effective_weight(
+                                    pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
+                                )
+                                lt = lt + pf_w * lpf
+                                val_pf_sum += float(lpf.item()) * batch.num_graphs
+                            if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                                lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                                lt = lt + float(args.lambda_pv) * lpv
+                                val_pv_sum += float(lpv.item()) * batch.num_graphs
+                        val_tot += float(lt.item()) * batch.num_graphs
+                        val_v += float(lv.item()) * batch.num_graphs
+                        val_c_sum += float(lc.item()) * batch.num_graphs
+                        val_r_sum += float(lr_.item()) * batch.num_graphs
+                        nv += int(batch.num_graphs)
+                        bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap_b, reduction="none")
+                        val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
+                        reg_ev = _reg_loss_elementwise(
+                            r_p if reg_loss != "ce" else None,
+                            y_reg_b,
+                            reg_loss,
+                            reg_logits=reg_logits_v,
+                        )
+                        val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
+                        if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                            lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
+                            val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
+                        v_flat = v_n.view(batch.num_graphs, -1)
+                        pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
+                        true_ri = yb.view(batch.num_graphs, n_nodes, 2)
+                        pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
+                        true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
+                        err = pred_mag - true_mag
+                        val_sum_true += true_mag.sum(dim=0)
+                        val_sum_true2 += (true_mag * true_mag).sum(dim=0)
+                        val_sum_se += (err * err).sum(dim=0)
+                        val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
+                        if _training_addons_enabled(args):
+                            addon_val_accum.update(
+                                _addon_val_batch_row(
+                                    args=args,
+                                    reg_logits=reg_logits_v,
+                                    y_reg_b=y_reg_b,
+                                    reg_loss=reg_loss,
+                                    reg_hybrid_tap_loss=reg_hybrid_tap_loss,
+                                    reg_ordinal_alpha=reg_ordinal_alpha,
+                                    reg_cost_matrices=reg_cost_matrices_d,
+                                    reg_class_tables=reg_class_tables,
+                                    reg_class_values=reg_class_values_d,
+                                    val_volt_uniform=float(lv.item()),
+                                    v_n=v_n,
+                                    yb_n=yb_n,
+                                    yb=yb,
+                                    n_nodes=n_nodes,
+                                    mse=mse,
+                                    territory_enabled=bool(
+                                        getattr(args, "attn_reg_territory_bias", False)
+                                        and base_model.use_reg_territory_bias
+                                    ),
+                                )
                             )
                     del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
                     gc.collect()
-            base_model.set_reg_territory_bias_enabled(True)
 
-        val_tot /= max(nv, 1)
-        val_v /= max(nv, 1)
-        val_c = val_c_sum / max(nv, 1)
-        val_r = val_r_sum / max(nv, 1)
-        val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
-        val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
-        true_mean = val_sum_true / max(nv, 1)
-        var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
-        mse_node = val_sum_se / max(nv, 1)
-        r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
-        val_r2_mean = float(r2_node.mean().item())
-        val_r2_min = float(r2_node.min().item())
-        val_r2_min_idx = int(r2_node.argmin().item())
-        val_worst_node_mae = val_sum_worst / max(nv, 1)
-        train_v = train_v_sum / max(train_n, 1)
-        train_c = train_c_sum / max(train_n, 1)
-        train_r = train_r_sum / max(train_n, 1)
-        train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
-        train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
-        train_tot = train_loss_sum / max(train_n, 1)
-        train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
-        train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
-        train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
-        if nv > 0:
-            val_cap_mean = (val_cap_dim / float(nv)).numpy()
-            val_reg_mean = (val_reg_dim / float(nv)).numpy()
-            val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
-        else:
-            val_cap_mean = np.full(n_cap, np.nan)
-            val_reg_mean = np.full(n_reg, np.nan)
-            val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
-        if _training_addons_enabled(args) and addon_val_accum.n > 0:
-            last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
-            epoch_cf = _build_epoch_val_counterfactual(
-                args=args,
-                val_means=last_addon_val_epoch_metrics,
-                val_reg_no_territory=territory_cf_accum.mean(),
-                reg_class_tables=reg_class_tables,
-                lam_reg=float(args.lambda_reg),
-            )
-            last_epoch_val_counterfactual = epoch_cf
-            epoch_entry: dict[str, object] = {
-                "epoch": ep,
-                "train": last_addon_epoch_metrics or {},
-                "val": last_addon_val_epoch_metrics,
-                "counterfactual": epoch_cf,
-                "val_r2_min_idx": val_r2_min_idx,
-                "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
-            }
-            if reg_loss == "ce" and nv > 0:
-                epoch_entry["val_reg_plain_ce_per_head"] = {
-                    reg_cols[j]: float(val_reg_mean[j]) for j in range(min(n_reg, len(reg_cols)))
-                }
-            addon_epoch_history.append(epoch_entry)
-        sch.step(val_tot)
-        crit = val_tot if args.early_stop_on == "total" else val_v
-        if crit < best_val:
-            best_val = crit
-            best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-            best_epoch = ep
-            best_val_r2_mean = val_r2_mean
-            best_val_r2_min = val_r2_min
-            bad = 0
-        else:
-            bad += 1
-        _log_detail = ep == 1 or ep % max(1, int(args.log_every)) == 0
-        _log = (
-            f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
-            f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
-        )
-        if n_pv_aux > 0:
-            _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
-        if pf_state.weight > 0:
-            _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
-            _w_eff = float(pf_state.weight) * _sched
-            _wt = f" pf_wt_effective={_w_eff:g}"
-            if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
-                _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
-            if _sched < 1.0 - 1e-12:
-                _wt += f" (schedule×{_sched:.3g})"
-            _log += (
-                f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                f"{_wt}"
-            )
-        _log += (
-            f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-            f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
-            f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
-            f"val_worst_mae={val_worst_node_mae:.4f} "
-            f"| best={best_val:.4f}"
-        )
-        print(_log, flush=True)
-        if _training_addons_enabled(args) and last_addon_epoch_metrics:
-            print(
-                _format_addon_epoch_line(
-                    tag="[da_gps chunk_parent",
-                    epoch=ep,
-                    args=args,
-                    train_means=last_addon_epoch_metrics,
-                    val_means=last_addon_val_epoch_metrics,
-                    val_r=val_r,
-                    val_tot=val_tot,
-                    lam_v=lam_v,
-                    lam_cap=float(args.lambda_cap),
-                    lam_reg=float(args.lambda_reg),
-                    val_v=val_v,
-                    val_c=val_c,
-                    val_pf=val_pf,
-                    pf_weight=float(pf_state.weight),
-                    val_pv=val_pv,
-                    lam_pv=float(args.lambda_pv),
-                ),
-                flush=True,
-            )
-            if last_epoch_val_counterfactual:
-                _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
-                if _cf_line:
-                    print(_cf_line, flush=True)
-        if _log_detail:
-            _print_per_head_two_lines("[da_gps chunk_parent]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
-            if reg_loss == "ce":
-                _reg_head_label = "reg_CE"
-            elif reg_loss == "mae":
-                _reg_head_label = "reg_MAE_nrm"
+            if (
+                _training_addons_enabled(args)
+                and bool(getattr(args, "attn_reg_territory_bias", False))
+                and reg_loss == "ce"
+                and nv > 0
+            ):
+                base_model.set_reg_territory_bias_enabled(False)
+                with torch.no_grad():
+                    for ci, ch in enumerate(chunk_dirs):
+                        cpt = cache_pts[ci]
+                        boot_pt = bootstrap_cache_pts[ci]
+                        x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
+                            ch,
+                            nodes_name=nodes_name,
+                            meta_name=meta_name,
+                            node_feature_cols=node_feature_cols,
+                            node_pe_csv=node_pe_csv,
+                            node_pe_cols=node_pe_cols,
+                            selected_sample_ids=selected_ids_list[ci],
+                            cap_cols=cap_cols,
+                            reg_cols=reg_cols,
+                            cache_pt=cpt,
+                            bootstrap_gnn_cache_pt=boot_pt,
+                            ref_ntl=ref_ntl,
+                            pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+                            reg_class_tables=reg_class_tables,
+                            reg_target_mode=reg_target_mode,
+                            reg_classes_digest=reg_classes_digest,
+                        )
+                        y_reg_n = y_reg.to(dtype=torch.long)
+                        x_n = ((x - x_mean) / x_std).to(dtype=torch.float32)
+                        y_pv_n = None
+                        if n_pv_aux > 0 and y_pv is not None and pv_mean is not None and pv_std is not None:
+                            y_pv_n = ((y_pv - pv_mean) / pv_std).to(dtype=torch.float32)
+                        ds = DAGPSDataset(
+                            x_n, y_ri, y_cap, y_reg_n, edge_index, edge_attr, y_pv=y_pv_n
+                        )
+                        dl_va = DataLoader(
+                            Subset(ds, idx_val_list[ci].tolist()),
+                            batch_size=args.batch_size,
+                            shuffle=False,
+                            num_workers=nw,
+                            pin_memory=pin,
+                            persistent_workers=nw > 0,
+                        )
+                        for batch in dl_va:
+                            batch = batch.to(device)
+                            batch = _cast_batch_float_tensors(batch)
+                            y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
+                            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                                _v_n, _c_log, _r_p, _pv_p = model(batch)
+                                reg_logits_cf = base_model._last_reg_logits
+                            if reg_logits_cf:
+                                territory_cf_accum.update(
+                                    float(_plain_reg_ce_scalar(reg_logits_cf, y_reg_b).detach().item())
+                                )
+                        del x, y_ri, y_cap, y_reg, y_pv, y_reg_n, y_pv_n, x_n, ds, dl_va
+                        gc.collect()
+                base_model.set_reg_territory_bias_enabled(True)
+
+            val_tot /= max(nv, 1)
+            val_v /= max(nv, 1)
+            val_c = val_c_sum / max(nv, 1)
+            val_r = val_r_sum / max(nv, 1)
+            val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
+            val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
+            true_mean = val_sum_true / max(nv, 1)
+            var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
+            mse_node = val_sum_se / max(nv, 1)
+            r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+            val_r2_mean = float(r2_node.mean().item())
+            val_r2_min = float(r2_node.min().item())
+            val_r2_min_idx = int(r2_node.argmin().item())
+            val_worst_node_mae = val_sum_worst / max(nv, 1)
+            train_v = train_v_sum / max(train_n, 1)
+            train_c = train_c_sum / max(train_n, 1)
+            train_r = train_r_sum / max(train_n, 1)
+            train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
+            train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
+            train_tot = train_loss_sum / max(train_n, 1)
+            train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
+            train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
+            train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
+            if nv > 0:
+                val_cap_mean = (val_cap_dim / float(nv)).numpy()
+                val_reg_mean = (val_reg_dim / float(nv)).numpy()
+                val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
             else:
-                _reg_head_label = "reg_MSE_nrm"
-            _print_per_head_two_lines(
-                "[da_gps chunk_parent]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean
+                val_cap_mean = np.full(n_cap, np.nan)
+                val_reg_mean = np.full(n_reg, np.nan)
+                val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
+            if _training_addons_enabled(args) and addon_val_accum.n > 0:
+                last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+                epoch_cf = _build_epoch_val_counterfactual(
+                    args=args,
+                    val_means=last_addon_val_epoch_metrics,
+                    val_reg_no_territory=territory_cf_accum.mean(),
+                    reg_class_tables=reg_class_tables,
+                    lam_reg=float(args.lambda_reg),
+                )
+                last_epoch_val_counterfactual = epoch_cf
+                epoch_entry: dict[str, object] = {
+                    "epoch": ep,
+                    "train": last_addon_epoch_metrics or {},
+                    "val": last_addon_val_epoch_metrics,
+                    "counterfactual": epoch_cf,
+                    "val_r2_min_idx": val_r2_min_idx,
+                    "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
+                }
+                if reg_loss == "ce" and nv > 0:
+                    epoch_entry["val_reg_plain_ce_per_head"] = {
+                        reg_cols[j]: float(val_reg_mean[j]) for j in range(min(n_reg, len(reg_cols)))
+                    }
+                addon_epoch_history.append(epoch_entry)
+            sch.step(val_tot)
+            crit = val_tot if args.early_stop_on == "total" else val_v
+            if crit < best_val:
+                best_val = crit
+                best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                best_epoch = ep
+                best_val_r2_mean = val_r2_mean
+                best_val_r2_min = val_r2_min
+                bad = 0
+            else:
+                bad += 1
+            _le = int(args.log_every)
+            _log_detail = _le > 0 and (ep == 1 or ep % _le == 0)
+            _log = (
+                f"[da_gps chunk_parent] epoch {ep:4d}/{args.epochs} "
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
             )
             if n_pv_aux > 0:
-                _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
-        if baseline_val_met is not None and baseline_test_met is not None:
-            ep_val_met = _evaluate_multi_chunks(
-                model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
-            )
-            ep_val_met.update(
-                _evaluate_split_losses_multi_chunks(
-                    model,
-                    chunk_dirs,
-                    idx_val_list,
-                    cache_pts,
-                    bootstrap_cache_pts,
-                    selected_ids_list,
-                    epoch=ep,
-                    **_loss_eval_kw,
+                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            if pf_state.weight > 0:
+                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+                _w_eff = float(pf_state.weight) * _sched
+                _wt = f" pf_wt_effective={_w_eff:g}"
+                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+                if _sched < 1.0 - 1e-12:
+                    _wt += f" (schedule×{_sched:.3g})"
+                _log += (
+                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                    f"{_wt}"
                 )
+            _log += (
+                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+                f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
+                f"val_worst_mae={val_worst_node_mae:.4f} "
+                f"| best={best_val:.4f}"
             )
-            ep_test_met = _evaluate_multi_chunks(
-                model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
-            )
-            ep_test_met.update(
-                _evaluate_split_losses_multi_chunks(
-                    model,
-                    chunk_dirs,
-                    idx_test_list,
-                    cache_pts,
-                    bootstrap_cache_pts,
-                    selected_ids_list,
-                    epoch=ep,
-                    **_loss_eval_kw,
+            print(_log, flush=True)
+            if _training_addons_enabled(args) and last_addon_epoch_metrics:
+                print(
+                    _format_addon_epoch_line(
+                        tag="[da_gps chunk_parent",
+                        epoch=ep,
+                        args=args,
+                        train_means=last_addon_epoch_metrics,
+                        val_means=last_addon_val_epoch_metrics,
+                        val_r=val_r,
+                        val_tot=val_tot,
+                        lam_v=lam_v,
+                        lam_cap=float(args.lambda_cap),
+                        lam_reg=float(args.lambda_reg),
+                        val_v=val_v,
+                        val_c=val_c,
+                        val_pf=val_pf,
+                        pf_weight=float(pf_state.weight),
+                        val_pv=val_pv,
+                        lam_pv=float(args.lambda_pv),
+                    ),
+                    flush=True,
                 )
-            )
-            _print_vs_baseline_deltas(
-                epoch=ep,
-                baseline_val=baseline_val_met,
-                baseline_test=baseline_test_met,
-                val_met=ep_val_met,
-                test_met=ep_test_met,
-            )
-            model.train()
+                if last_epoch_val_counterfactual:
+                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                    if _cf_line:
+                        print(_cf_line, flush=True)
+            if _log_detail:
+                _print_per_head_two_lines("[da_gps chunk_parent]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
+                if reg_loss == "ce":
+                    _reg_head_label = "reg_CE"
+                elif reg_loss == "mae":
+                    _reg_head_label = "reg_MAE_nrm"
+                else:
+                    _reg_head_label = "reg_MSE_nrm"
+                _print_per_head_two_lines(
+                    "[da_gps chunk_parent]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean
+                )
+                if n_pv_aux > 0:
+                    _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
+            if baseline_val_met is not None and baseline_test_met is not None:
+                ep_val_met = _evaluate_multi_chunks(
+                    model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+                )
+                ep_val_met.update(
+                    _evaluate_split_losses_multi_chunks(
+                        model,
+                        chunk_dirs,
+                        idx_val_list,
+                        cache_pts,
+                        bootstrap_cache_pts,
+                        selected_ids_list,
+                        epoch=ep,
+                        **_loss_eval_kw,
+                    )
+                )
+                ep_test_met = _evaluate_multi_chunks(
+                    model, chunk_dirs, idx_test_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
+                )
+                ep_test_met.update(
+                    _evaluate_split_losses_multi_chunks(
+                        model,
+                        chunk_dirs,
+                        idx_test_list,
+                        cache_pts,
+                        bootstrap_cache_pts,
+                        selected_ids_list,
+                        epoch=ep,
+                        **_loss_eval_kw,
+                    )
+                )
+                _print_vs_baseline_deltas(
+                    epoch=ep,
+                    baseline_val=baseline_val_met,
+                    baseline_test=baseline_test_met,
+                    val_met=ep_val_met,
+                    test_met=ep_test_met,
+                )
+                model.train()
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -7057,7 +7078,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
-        if not args.no_early_stop and bad >= args.patience:
+        if do_eval and not args.no_early_stop and bad >= args.patience:
             print(f"[da_gps chunk_parent] early stop at epoch {ep}", flush=True)
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
@@ -7257,7 +7278,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--sample_frac", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers; 0 only for tiny debug runs.")
-    p.add_argument("--log_every", type=int, default=1)
+    p.add_argument(
+        "--log_every",
+        type=int,
+        default=0,
+        help="Per-batch addon logging interval (0=off). Also gates per-head train/val detail lines on eval epochs.",
+    )
+    p.add_argument(
+        "--eval_every",
+        type=int,
+        default=10,
+        help="Run validation, best-checkpoint tracking, LR schedule step, and full epoch metrics every N epochs "
+        "(epoch 1 and final epoch always eval). Training still runs every epoch.",
+    )
     p.add_argument(
         "--attn_reg_territory_bias",
         action="store_true",
@@ -8158,249 +8191,252 @@ def main() -> None:
         if _training_addons_enabled(args) and addon_accum.n > 0:
             last_addon_epoch_metrics = addon_accum.mean_dict()
 
-        model.eval()
-        val_tot = val_v = 0.0
-        val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
-        nv = 0
-        val_sum_true = torch.zeros(n_nodes, device=device)
-        val_sum_true2 = torch.zeros(n_nodes, device=device)
-        val_sum_se = torch.zeros(n_nodes, device=device)
-        val_sum_worst = 0.0
-        with torch.no_grad():
-            for batch in dl_va:
-                batch = batch.to(device)
-                batch = _cast_batch_float_tensors(batch)
-                yb = batch.y.view(batch.num_graphs, -1)
-                y_cap = batch.y_cap.view(batch.num_graphs, -1)
-                y_reg = batch.y_reg.view(batch.num_graphs, -1)
-                yb_n = (yb - y_mean_d) / y_std_d
-                with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                    v_n, c_log, r_p, pv_p = model(batch)
-                    lv = mse(v_n.view_as(yb_n), yb_n)
-                    lc = bce(c_log, y_cap)
-                    lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
-                    lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
-                    lpf = _pf_loss_if_enabled(
-                        pf_state,
-                        v_n,
-                        batch,
-                        n_nodes=n_nodes,
-                        y_mean=y_mean_d,
-                        y_std=y_std_d,
-                        x_mean=x_mean_d,
-                        x_std=x_std_d,
-                        cap_logits=c_log,
-                        reg_pred=r_p,
-                        reg_loss=reg_loss,
-                        reg_mean=reg_mean_d,
-                        reg_std=reg_std_d,
-                        reg_logits=None,
-                        reg_class_values=reg_class_values_d,
-                        label_y_n=yb_n,
-                        y_cap_label=y_cap,
-                        y_reg_label=y_reg,
-                        epoch=ep,
-                    )
-                    if lpf is not None:
-                        pf_w = _pf_effective_weight(
-                            pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
-                        )
-                        lt = lt + pf_w * lpf
-                        val_pf_sum += float(lpf.item()) * batch.num_graphs
-                    if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
-                        lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
-                        lt = lt + float(args.lambda_pv) * lpv
-                        val_pv_sum += float(lpv.item()) * batch.num_graphs
-                val_tot += float(lt.item()) * batch.num_graphs
-                val_v += float(lv.item()) * batch.num_graphs
-                val_c_sum += float(lc.item()) * batch.num_graphs
-                val_r_sum += float(lr_.item()) * batch.num_graphs
-                nv += int(batch.num_graphs)
-                bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
-                val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
-                reg_ev = _reg_loss_elementwise(r_p, y_reg, reg_loss)
-                val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
-                if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
-                    lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
-                    val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
-                v_flat = v_n.view(batch.num_graphs, -1)
-                pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
-                true_ri = yb.view(batch.num_graphs, n_nodes, 2)
-                pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
-                true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
-                err = pred_mag - true_mag
-                val_sum_true += true_mag.sum(dim=0)
-                val_sum_true2 += (true_mag * true_mag).sum(dim=0)
-                val_sum_se += (err * err).sum(dim=0)
-                val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
-                if _training_addons_enabled(args):
-                    reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
-                    addon_val_accum.update(
-                        _addon_val_batch_row(
-                            args=args,
-                            reg_logits=reg_logits_v,
-                            y_reg_b=y_reg,
-                            reg_loss=reg_loss,
-                            reg_hybrid_tap_loss=False,
-                            reg_ordinal_alpha=float(
-                                getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA)
-                            ),
-                            reg_cost_matrices=None,
-                            reg_class_tables=None,
-                            reg_class_values=reg_class_values_d,
-                            val_volt_uniform=float(lv.item()),
-                            v_n=v_n,
-                            yb_n=yb_n,
-                            yb=yb,
-                            n_nodes=n_nodes,
-                            mse=mse,
-                            territory_enabled=bool(
-                                getattr(args, "attn_reg_territory_bias", False)
-                                and base_model.use_reg_territory_bias
-                            ),
-                        )
-                    )
-        if (
-            _training_addons_enabled(args)
-            and bool(getattr(args, "attn_reg_territory_bias", False))
-            and reg_loss == "ce"
-            and nv > 0
-        ):
-            base_model.set_reg_territory_bias_enabled(False)
+        do_eval = _should_eval_epoch(ep, args)
+        if do_eval:
+            model.eval()
+            val_tot = val_v = 0.0
+            val_c_sum = val_r_sum = val_pv_sum = val_pf_sum = 0.0
+            nv = 0
+            val_sum_true = torch.zeros(n_nodes, device=device)
+            val_sum_true2 = torch.zeros(n_nodes, device=device)
+            val_sum_se = torch.zeros(n_nodes, device=device)
+            val_sum_worst = 0.0
             with torch.no_grad():
                 for batch in dl_va:
                     batch = batch.to(device)
                     batch = _cast_batch_float_tensors(batch)
+                    yb = batch.y.view(batch.num_graphs, -1)
+                    y_cap = batch.y_cap.view(batch.num_graphs, -1)
                     y_reg = batch.y_reg.view(batch.num_graphs, -1)
+                    yb_n = (yb - y_mean_d) / y_std_d
                     with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
-                        model(batch)
-                        reg_logits_cf = base_model._last_reg_logits
-                    if reg_logits_cf:
-                        territory_cf_accum.update(
-                            float(_plain_reg_ce_scalar(reg_logits_cf, y_reg).detach().item())
+                        v_n, c_log, r_p, pv_p = model(batch)
+                        lv = mse(v_n.view_as(yb_n), yb_n)
+                        lc = bce(c_log, y_cap)
+                        lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
+                        lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                        lpf = _pf_loss_if_enabled(
+                            pf_state,
+                            v_n,
+                            batch,
+                            n_nodes=n_nodes,
+                            y_mean=y_mean_d,
+                            y_std=y_std_d,
+                            x_mean=x_mean_d,
+                            x_std=x_std_d,
+                            cap_logits=c_log,
+                            reg_pred=r_p,
+                            reg_loss=reg_loss,
+                            reg_mean=reg_mean_d,
+                            reg_std=reg_std_d,
+                            reg_logits=None,
+                            reg_class_values=reg_class_values_d,
+                            label_y_n=yb_n,
+                            y_cap_label=y_cap,
+                            y_reg_label=y_reg,
+                            epoch=ep,
                         )
-            base_model.set_reg_territory_bias_enabled(True)
-        val_tot /= max(nv, 1)
-        val_v /= max(nv, 1)
-        val_c = val_c_sum / max(nv, 1)
-        val_r = val_r_sum / max(nv, 1)
-        val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
-        val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
-        true_mean = val_sum_true / max(nv, 1)
-        var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
-        mse_node = val_sum_se / max(nv, 1)
-        r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
-        val_r2_mean = float(r2_node.mean().item())
-        val_r2_min = float(r2_node.min().item())
-        val_r2_min_idx = int(r2_node.argmin().item())
-        val_worst_node_mae = val_sum_worst / max(nv, 1)
-        train_v = train_v_sum / max(train_n, 1)
-        train_c = train_c_sum / max(train_n, 1)
-        train_r = train_r_sum / max(train_n, 1)
-        train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
-        train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
-        train_tot = train_loss_sum / max(train_n, 1)
-        train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
-        train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
-        train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
-        if nv > 0:
-            val_cap_mean = (val_cap_dim / float(nv)).numpy()
-            val_reg_mean = (val_reg_dim / float(nv)).numpy()
-            val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
-        else:
-            val_cap_mean = np.full(n_cap, np.nan)
-            val_reg_mean = np.full(n_reg, np.nan)
-            val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
-        if _training_addons_enabled(args) and addon_val_accum.n > 0:
-            last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
-            epoch_cf = _build_epoch_val_counterfactual(
-                args=args,
-                val_means=last_addon_val_epoch_metrics,
-                val_reg_no_territory=territory_cf_accum.mean(),
-                reg_class_tables=None,
-                lam_reg=float(args.lambda_reg),
-            )
-            last_epoch_val_counterfactual = epoch_cf
-            addon_epoch_history.append(
-                {
-                    "epoch": ep,
-                    "train": last_addon_epoch_metrics or {},
-                    "val": last_addon_val_epoch_metrics,
-                    "counterfactual": epoch_cf,
-                    "val_r2_min_idx": val_r2_min_idx,
-                    "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
-                }
-            )
-        sch.step(val_tot)
-        crit = val_tot if args.early_stop_on == "total" else val_v
-        if crit < best_val:
-            best_val = crit
-            best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-            best_epoch = ep
-            best_val_r2_mean = val_r2_mean
-            best_val_r2_min = val_r2_min
-            bad = 0
-        else:
-            bad += 1
-        _log_detail = ep == 1 or ep % max(1, int(args.log_every)) == 0
-        _log = (
-            f"[da_gps] epoch {ep:4d}/{args.epochs} "
-            f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
-        )
-        if n_pv_aux > 0:
-            _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
-        if pf_state.weight > 0:
-            _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
-            _w_eff = float(pf_state.weight) * _sched
-            _wt = f" pf_wt_effective={_w_eff:g}"
-            if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
-                _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
-            if _sched < 1.0 - 1e-12:
-                _wt += f" (schedule×{_sched:.3g})"
-            _log += (
-                f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
-                f"{_wt}"
-            )
-        _log += (
-            f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
-            f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
-            f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
-            f"val_worst_mae={val_worst_node_mae:.4f} "
-            f"| best={best_val:.4f}"
-        )
-        print(_log, flush=True)
-        if _training_addons_enabled(args) and last_addon_epoch_metrics:
-            print(
-                _format_addon_epoch_line(
-                    tag="[da_gps",
-                    epoch=ep,
+                        if lpf is not None:
+                            pf_w = _pf_effective_weight(
+                                pf_state, loss_v=lv, loss_pf=lpf, epoch=ep
+                            )
+                            lt = lt + pf_w * lpf
+                            val_pf_sum += float(lpf.item()) * batch.num_graphs
+                        if n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                            lpv = mse(pv_p, batch.y_pv.view(batch.num_graphs, -1))
+                            lt = lt + float(args.lambda_pv) * lpv
+                            val_pv_sum += float(lpv.item()) * batch.num_graphs
+                    val_tot += float(lt.item()) * batch.num_graphs
+                    val_v += float(lv.item()) * batch.num_graphs
+                    val_c_sum += float(lc.item()) * batch.num_graphs
+                    val_r_sum += float(lr_.item()) * batch.num_graphs
+                    nv += int(batch.num_graphs)
+                    bce_ev = F.binary_cross_entropy_with_logits(c_log, y_cap, reduction="none")
+                    val_cap_dim += bce_ev.sum(dim=0).detach().float().cpu().double()
+                    reg_ev = _reg_loss_elementwise(r_p, y_reg, reg_loss)
+                    val_reg_dim += reg_ev.sum(dim=0).detach().float().cpu().double()
+                    if val_meta_dim is not None and n_pv_aux > 0 and hasattr(batch, "y_pv") and batch.y_pv is not None:
+                        lpv_e = F.mse_loss(pv_p, batch.y_pv.view(batch.num_graphs, -1), reduction="none")
+                        val_meta_dim += lpv_e.sum(dim=0).detach().float().cpu().double()
+                    v_flat = v_n.view(batch.num_graphs, -1)
+                    pred_ri = (v_flat * y_std_d + y_mean_d).view(batch.num_graphs, n_nodes, 2)
+                    true_ri = yb.view(batch.num_graphs, n_nodes, 2)
+                    pred_mag = torch.sqrt(pred_ri[..., 0] * pred_ri[..., 0] + pred_ri[..., 1] * pred_ri[..., 1] + 1e-12)
+                    true_mag = torch.sqrt(true_ri[..., 0] * true_ri[..., 0] + true_ri[..., 1] * true_ri[..., 1] + 1e-12)
+                    err = pred_mag - true_mag
+                    val_sum_true += true_mag.sum(dim=0)
+                    val_sum_true2 += (true_mag * true_mag).sum(dim=0)
+                    val_sum_se += (err * err).sum(dim=0)
+                    val_sum_worst += float(err.abs().max(dim=1).values.sum().item())
+                    if _training_addons_enabled(args):
+                        reg_logits_v = base_model._last_reg_logits if reg_loss == "ce" else None
+                        addon_val_accum.update(
+                            _addon_val_batch_row(
+                                args=args,
+                                reg_logits=reg_logits_v,
+                                y_reg_b=y_reg,
+                                reg_loss=reg_loss,
+                                reg_hybrid_tap_loss=False,
+                                reg_ordinal_alpha=float(
+                                    getattr(args, "reg_ordinal_alpha", _DEFAULT_REG_ORDINAL_ALPHA)
+                                ),
+                                reg_cost_matrices=None,
+                                reg_class_tables=None,
+                                reg_class_values=reg_class_values_d,
+                                val_volt_uniform=float(lv.item()),
+                                v_n=v_n,
+                                yb_n=yb_n,
+                                yb=yb,
+                                n_nodes=n_nodes,
+                                mse=mse,
+                                territory_enabled=bool(
+                                    getattr(args, "attn_reg_territory_bias", False)
+                                    and base_model.use_reg_territory_bias
+                                ),
+                            )
+                        )
+            if (
+                _training_addons_enabled(args)
+                and bool(getattr(args, "attn_reg_territory_bias", False))
+                and reg_loss == "ce"
+                and nv > 0
+            ):
+                base_model.set_reg_territory_bias_enabled(False)
+                with torch.no_grad():
+                    for batch in dl_va:
+                        batch = batch.to(device)
+                        batch = _cast_batch_float_tensors(batch)
+                        y_reg = batch.y_reg.view(batch.num_graphs, -1)
+                        with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                            model(batch)
+                            reg_logits_cf = base_model._last_reg_logits
+                        if reg_logits_cf:
+                            territory_cf_accum.update(
+                                float(_plain_reg_ce_scalar(reg_logits_cf, y_reg).detach().item())
+                            )
+                base_model.set_reg_territory_bias_enabled(True)
+            val_tot /= max(nv, 1)
+            val_v /= max(nv, 1)
+            val_c = val_c_sum / max(nv, 1)
+            val_r = val_r_sum / max(nv, 1)
+            val_pv = val_pv_sum / max(nv, 1) if n_pv_aux > 0 else float("nan")
+            val_pf = val_pf_sum / max(nv, 1) if pf_state.weight > 0 else float("nan")
+            true_mean = val_sum_true / max(nv, 1)
+            var_true = val_sum_true2 / max(nv, 1) - true_mean * true_mean
+            mse_node = val_sum_se / max(nv, 1)
+            r2_node = 1.0 - mse_node / var_true.clamp_min(1e-8)
+            val_r2_mean = float(r2_node.mean().item())
+            val_r2_min = float(r2_node.min().item())
+            val_r2_min_idx = int(r2_node.argmin().item())
+            val_worst_node_mae = val_sum_worst / max(nv, 1)
+            train_v = train_v_sum / max(train_n, 1)
+            train_c = train_c_sum / max(train_n, 1)
+            train_r = train_r_sum / max(train_n, 1)
+            train_pv = train_pv_sum / max(train_n, 1) if n_pv_aux > 0 else float("nan")
+            train_pf = train_pf_sum / max(train_n, 1) if pf_state.weight > 0 else float("nan")
+            train_tot = train_loss_sum / max(train_n, 1)
+            train_cap_mean = (train_cap_dim / max(train_n, 1)).numpy()
+            train_reg_mean = (train_reg_dim / max(train_n, 1)).numpy()
+            train_meta_mean = (train_meta_dim / max(train_n, 1)).numpy() if train_meta_dim is not None else np.zeros(0)
+            if nv > 0:
+                val_cap_mean = (val_cap_dim / float(nv)).numpy()
+                val_reg_mean = (val_reg_dim / float(nv)).numpy()
+                val_meta_mean = (val_meta_dim / float(nv)).numpy() if val_meta_dim is not None else np.zeros(0)
+            else:
+                val_cap_mean = np.full(n_cap, np.nan)
+                val_reg_mean = np.full(n_reg, np.nan)
+                val_meta_mean = np.full(n_pv_aux, np.nan) if n_pv_aux > 0 else np.zeros(0)
+            if _training_addons_enabled(args) and addon_val_accum.n > 0:
+                last_addon_val_epoch_metrics = addon_val_accum.mean_dict()
+                epoch_cf = _build_epoch_val_counterfactual(
                     args=args,
-                    train_means=last_addon_epoch_metrics,
                     val_means=last_addon_val_epoch_metrics,
-                    val_r=val_r,
-                    val_tot=val_tot,
-                    lam_v=lam_v,
-                    lam_cap=float(args.lambda_cap),
+                    val_reg_no_territory=territory_cf_accum.mean(),
+                    reg_class_tables=None,
                     lam_reg=float(args.lambda_reg),
-                    val_v=val_v,
-                    val_c=val_c,
-                    val_pf=val_pf,
-                    pf_weight=float(pf_state.weight),
-                    val_pv=val_pv,
-                    lam_pv=float(args.lambda_pv),
-                ),
-                flush=True,
+                )
+                last_epoch_val_counterfactual = epoch_cf
+                addon_epoch_history.append(
+                    {
+                        "epoch": ep,
+                        "train": last_addon_epoch_metrics or {},
+                        "val": last_addon_val_epoch_metrics,
+                        "counterfactual": epoch_cf,
+                        "val_r2_min_idx": val_r2_min_idx,
+                        "val_r2_min_node": _idx_to_node_label(idx_to_node, val_r2_min_idx),
+                    }
+                )
+            sch.step(val_tot)
+            crit = val_tot if args.early_stop_on == "total" else val_v
+            if crit < best_val:
+                best_val = crit
+                best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                best_epoch = ep
+                best_val_r2_mean = val_r2_mean
+                best_val_r2_min = val_r2_min
+                bad = 0
+            else:
+                bad += 1
+            _le = int(args.log_every)
+            _log_detail = _le > 0 and (ep == 1 or ep % _le == 0)
+            _log = (
+                f"[da_gps] epoch {ep:4d}/{args.epochs} "
+                f"| train_tot={train_tot:.4f} train_volt={train_v:.4f} train_cap={train_c:.4f} train_reg={train_r:.4f}"
             )
-            if last_epoch_val_counterfactual:
-                _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
-                if _cf_line:
-                    print(_cf_line, flush=True)
-        if _log_detail:
-            _print_per_head_two_lines("[da_gps]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
-            _reg_head_label = "reg_MAE_nrm" if reg_loss == "mae" else "reg_MSE_nrm"
-            _print_per_head_two_lines("[da_gps]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean)
             if n_pv_aux > 0:
-                _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
+                _log += f" train_meta_aux={train_pv:.4f} val_meta_aux={val_pv:.4f}"
+            if pf_state.weight > 0:
+                _sched = _pf_weight_schedule_multiplier(pf_state, epoch=ep)
+                _w_eff = float(pf_state.weight) * _sched
+                _wt = f" pf_wt_effective={_w_eff:g}"
+                if pf_state.weight_base > 0 and abs(pf_state.weight_base - pf_state.weight) > 1e-12:
+                    _wt = f" pf_wt_base={pf_state.weight_base:g}{_wt}"
+                if _sched < 1.0 - 1e-12:
+                    _wt += f" (schedule×{_sched:.3g})"
+                _log += (
+                    f" train_pf={train_pf:.4e} val_pf={val_pf:.4e}"
+                    f"{_wt}"
+                )
+            _log += (
+                f" | val_tot={val_tot:.4f} val_volt={val_v:.4f} val_cap={val_c:.4f} val_reg={val_r:.4f} "
+                f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
+                f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
+                f"val_worst_mae={val_worst_node_mae:.4f} "
+                f"| best={best_val:.4f}"
+            )
+            print(_log, flush=True)
+            if _training_addons_enabled(args) and last_addon_epoch_metrics:
+                print(
+                    _format_addon_epoch_line(
+                        tag="[da_gps",
+                        epoch=ep,
+                        args=args,
+                        train_means=last_addon_epoch_metrics,
+                        val_means=last_addon_val_epoch_metrics,
+                        val_r=val_r,
+                        val_tot=val_tot,
+                        lam_v=lam_v,
+                        lam_cap=float(args.lambda_cap),
+                        lam_reg=float(args.lambda_reg),
+                        val_v=val_v,
+                        val_c=val_c,
+                        val_pf=val_pf,
+                        pf_weight=float(pf_state.weight),
+                        val_pv=val_pv,
+                        lam_pv=float(args.lambda_pv),
+                    ),
+                    flush=True,
+                )
+                if last_epoch_val_counterfactual:
+                    _cf_line = _format_counterfactual_epoch_line(ep, last_epoch_val_counterfactual)
+                    if _cf_line:
+                        print(_cf_line, flush=True)
+            if _log_detail:
+                _print_per_head_two_lines("[da_gps]", "cap_BCE", cap_cols, train_cap_mean, val_cap_mean)
+                _reg_head_label = "reg_MAE_nrm" if reg_loss == "mae" else "reg_MSE_nrm"
+                _print_per_head_two_lines("[da_gps]", _reg_head_label, reg_cols, train_reg_mean, val_reg_mean)
+                if n_pv_aux > 0:
+                    _print_per_head_two_lines("[da_gps]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
             _ck = out_dir / "training_last.pt"
@@ -8420,7 +8456,7 @@ def main() -> None:
                 best_val_r2_min=best_val_r2_min,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
-        if not args.no_early_stop and bad >= args.patience:
+        if do_eval and not args.no_early_stop and bad >= args.patience:
             print(f"[da_gps] early stop at epoch {ep}", flush=True)
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
