@@ -2465,6 +2465,122 @@ def _reg_loss_slug(reg_loss: str) -> str:
     return ""
 
 
+_MAP_UNSEEN_REG_TAPS_TO_NEAREST: bool = False
+_DROP_SAMPLES_UNSEEN_REG_TAPS: bool = False
+_WARNED_UNSEEN_REG_COLS: set[str] = set()
+
+
+def _set_map_unseen_reg_taps_to_nearest(enabled: bool) -> None:
+    global _MAP_UNSEEN_REG_TAPS_TO_NEAREST
+    _MAP_UNSEEN_REG_TAPS_TO_NEAREST = bool(enabled)
+
+
+def _set_drop_samples_unseen_reg_taps(enabled: bool) -> None:
+    global _DROP_SAMPLES_UNSEEN_REG_TAPS
+    _DROP_SAMPLES_UNSEEN_REG_TAPS = bool(enabled)
+
+
+def _resolve_map_unseen_reg_taps(args: argparse.Namespace, init_ckpt_path: Path | None) -> bool:
+    raw = getattr(args, "map_unseen_reg_taps_to_nearest", None)
+    if raw is not None:
+        return bool(raw)
+    return False
+
+
+def _resolve_drop_samples_unseen_reg_taps(
+    args: argparse.Namespace,
+    init_ckpt_path: Path | None,
+    reg_loss: str,
+) -> bool:
+    raw = getattr(args, "drop_samples_unseen_reg_taps", None)
+    if raw is not None:
+        return bool(raw)
+    return init_ckpt_path is not None and str(reg_loss).strip().lower() == "ce"
+
+
+def _mask_samples_known_reg_taps(
+    reg_raw: np.ndarray,
+    reg_class_tables: list[dict],
+) -> np.ndarray:
+    """True when every regulator tap_pu (rounded) is in the init class list."""
+    if reg_raw.ndim != 2 or reg_raw.shape[1] != len(reg_class_tables):
+        raise ValueError(f"reg_raw shape {reg_raw.shape} vs n_reg={len(reg_class_tables)}")
+    mask = np.ones(reg_raw.shape[0], dtype=bool)
+    for j, tab in enumerate(reg_class_tables):
+        cls_to_i = {float(c): i for i, c in enumerate(tab["classes"])}
+        yq = np.round(reg_raw[:, j].astype(np.float64), 6)
+        col_ok = np.fromiter((float(v) in cls_to_i for v in yq.tolist()), dtype=bool, count=yq.shape[0])
+        mask &= col_ok
+    return mask
+
+
+def _filter_sample_ids_unseen_reg_taps(
+    meta_csv: Path,
+    sample_ids: list[int],
+    reg_cols: list[str],
+    reg_class_tables: list[dict],
+) -> tuple[list[int], int]:
+    """Drop sample_ids whose regulator tap_pu is outside the loaded CE class lists."""
+    import pandas as pd
+
+    if not sample_ids or not reg_class_tables:
+        return sample_ids, 0
+    usecols = ["sample_id", *reg_cols]
+    df = pd.read_csv(meta_csv)
+    ren = {}
+    for c in df.columns:
+        cs = str(c)
+        if cs.startswith("reg_") and cs.lower() != cs:
+            ren[c] = cs.lower()
+    if ren:
+        df = df.rename(columns=ren)
+    df = df[usecols]
+    lk = {_norm_sid(k): j for j, k in enumerate(df["sample_id"].tolist())}
+    order = [lk[_norm_sid(sid)] for sid in sample_ids]
+    reg_raw = df[list(reg_cols)].to_numpy(dtype=np.float64)[order]
+    mask = _mask_samples_known_reg_taps(reg_raw, reg_class_tables)
+    n_drop = int((~mask).sum())
+    if n_drop == 0:
+        return sample_ids, 0
+    kept = [sid for sid, ok in zip(sample_ids, mask.tolist()) if ok]
+    return kept, n_drop
+
+
+def _apply_drop_unseen_reg_taps(
+    sample_ids: list[int],
+    x: torch.Tensor | None,
+    y_ri: torch.Tensor | None,
+    meta_csv: Path,
+    reg_cols: list[str],
+    reg_class_tables: list[dict],
+    *,
+    chunk_label: str,
+) -> tuple[list[int], torch.Tensor | None, torch.Tensor | None, int]:
+    if not _DROP_SAMPLES_UNSEEN_REG_TAPS or not reg_class_tables:
+        return sample_ids, x, y_ri, 0
+    kept, n_drop = _filter_sample_ids_unseen_reg_taps(
+        meta_csv, sample_ids, reg_cols, reg_class_tables
+    )
+    if n_drop == 0:
+        return sample_ids, x, y_ri, 0
+    n_total = len(sample_ids)
+    if not kept:
+        raise RuntimeError(
+            f"All {n_total} samples dropped for unseen regulator tap_pu in {chunk_label!r}"
+        )
+    print(
+        f"reg CE: dropped {n_drop}/{n_total} samples with unseen tap_pu (init class tables)",
+        flush=True,
+    )
+    if x is not None and y_ri is not None:
+        sid_to_idx = {int(s): i for i, s in enumerate(sample_ids)}
+        keep_idx = [sid_to_idx[int(s)] for s in kept]
+        idx_t = torch.tensor(keep_idx, dtype=torch.long)
+        x = x.index_select(0, idx_t)
+        y_ri = y_ri.index_select(0, idx_t)
+    return kept, x, y_ri, n_drop
+
+
 def _build_reg_class_tables(reg_cols: list[str], reg_raw: np.ndarray) -> list[dict]:
     """One discrete tap class set per regulator column (rounded unique tap_pu values)."""
     if reg_raw.ndim != 2 or reg_raw.shape[1] != len(reg_cols):
@@ -2537,18 +2653,45 @@ def _validate_reg_ce_targets(
             )
 
 
-def _encode_reg_class_indices(reg_raw: np.ndarray, reg_class_tables: list[dict]) -> np.ndarray:
+def _encode_reg_class_indices(
+    reg_raw: np.ndarray,
+    reg_class_tables: list[dict],
+    *,
+    map_unseen_to_nearest: bool | None = None,
+) -> np.ndarray:
+    if map_unseen_to_nearest is None:
+        map_unseen_to_nearest = _MAP_UNSEEN_REG_TAPS_TO_NEAREST
     out = np.zeros((reg_raw.shape[0], len(reg_class_tables)), dtype=np.int64)
     for j, tab in enumerate(reg_class_tables):
-        cls_to_i = {float(c): i for i, c in enumerate(tab["classes"])}
+        classes = np.asarray(tab["classes"], dtype=np.float64)
+        cls_to_i = {float(c): i for i, c in enumerate(classes.tolist())}
         yq = np.round(reg_raw[:, j].astype(np.float64), 6)
-        try:
-            out[:, j] = np.array([cls_to_i[float(v)] for v in yq.tolist()], dtype=np.int64)
-        except KeyError as ex:
-            raise KeyError(
-                f"Unseen tap value for {tab['col']!r} (not in training class list). "
-                f"Rebuild caches with --reg_loss ce after all chunks are visible."
-            ) from ex
+        col_out = np.empty(yq.shape[0], dtype=np.int64)
+        unseen_unique: set[float] = set()
+        for i, v in enumerate(yq.tolist()):
+            fv = float(v)
+            if fv in cls_to_i:
+                col_out[i] = cls_to_i[fv]
+            elif map_unseen_to_nearest:
+                col_out[i] = int(np.argmin(np.abs(classes - fv)))
+                unseen_unique.add(fv)
+            else:
+                raise KeyError(
+                    f"Unseen tap value {fv} for {tab['col']!r} (not in training class list). "
+                    "Rebuild caches with --reg_loss ce after all chunks are visible, or enable "
+                    "--map_unseen_reg_taps_to_nearest when fine-tuning from --init_checkpoint."
+                )
+        if unseen_unique:
+            col_name = str(tab["col"])
+            if col_name not in _WARNED_UNSEEN_REG_COLS:
+                _WARNED_UNSEEN_REG_COLS.add(col_name)
+                ex = sorted(unseen_unique)[:5]
+                print(
+                    f"WARNING: mapped unseen tap_pu value(s) for {col_name!r} to nearest "
+                    f"init-run class ({len(unseen_unique)} unique; examples: {ex}).",
+                    flush=True,
+                )
+        out[:, j] = col_out
     return out
 
 
@@ -4838,6 +4981,7 @@ def _chunk_cache_path(
     meta_aux_slug: str = "",
     reg_slug: str = "",
     reg_classes_digest: str = "",
+    drop_unseen_reg_taps: bool = False,
 ) -> Path:
     if float(sample_frac) >= 1.0:
         tag = "full"
@@ -4850,6 +4994,8 @@ def _chunk_cache_path(
         base = f"{base}__{str(reg_slug).strip()}"
     if str(reg_classes_digest).strip():
         base = f"{base}__rc{str(reg_classes_digest).strip()}"
+    if bool(drop_unseen_reg_taps):
+        base = f"{base}__dropunseen"
     if str(meta_aux_slug).strip():
         base = f"{base}__maux{str(meta_aux_slug).strip()}"
     return cache_dir / f"{base}.pt"
@@ -4919,6 +5065,7 @@ def _ensure_chunk_tensor_cache(
 
     want_reg_mode = str(reg_target_mode).strip().lower()
     want_reg_digest = ""
+    want_drop_unseen = bool(_DROP_SAMPLES_UNSEEN_REG_TAPS)
     if want_reg_mode == "class":
         if reg_class_tables is None:
             raise ValueError("reg_target_mode=class requires reg_class_tables.")
@@ -4929,12 +5076,20 @@ def _ensure_chunk_tensor_cache(
         cache_ok = str(z.get("reg_target_mode", "regression")).lower() == want_reg_mode
         if cache_ok and want_reg_mode == "class":
             stored_digest = str(z.get("reg_class_tables_digest", "") or "").strip()
+            stored_drop = bool(z.get("drop_samples_unseen_reg_taps", False))
             y_reg_cached = z.get("y_reg")
             if stored_digest != want_reg_digest:
                 cache_ok = False
                 print(
                     f"chunk cache reg_class_tables_digest mismatch "
                     f"({stored_digest!r} != {want_reg_digest!r}); rebuilding: {cache_pt}",
+                    flush=True,
+                )
+            elif stored_drop != want_drop_unseen:
+                cache_ok = False
+                print(
+                    f"chunk cache drop_samples_unseen_reg_taps mismatch "
+                    f"({stored_drop!r} != {want_drop_unseen!r}); rebuilding: {cache_pt}",
                     flush=True,
                 )
             elif y_reg_cached is None or not _reg_ce_targets_in_range(y_reg_cached, reg_class_tables):
@@ -4998,6 +5153,15 @@ def _ensure_chunk_tensor_cache(
                 sample_ids = [sample_ids[i] for i in keep_idx]
             if not mp_.is_file():
                 raise FileNotFoundError(mp_)
+            sample_ids, x, y_ri, _ = _apply_drop_unseen_reg_taps(
+                sample_ids,
+                x,
+                y_ri,
+                mp_,
+                reg_cols,
+                reg_class_tables or [],
+                chunk_label=chunk_dir.name,
+            )
             y_cap, y_reg = _load_meta_aux(
                 mp_, sample_ids, cap_cols, reg_cols, reg_class_tables=reg_class_tables
             )
@@ -5019,6 +5183,8 @@ def _ensure_chunk_tensor_cache(
             }
             if want_reg_digest:
                 row["reg_class_tables_digest"] = want_reg_digest
+            if want_drop_unseen:
+                row["drop_samples_unseen_reg_taps"] = True
             if y_pv is not None:
                 row["y_pv"] = y_pv
                 row["meta_aux_cols"] = list(pv_cols)
@@ -5039,6 +5205,15 @@ def _ensure_chunk_tensor_cache(
     y_ri = y_ri.to(dtype=torch.float32)
     if ref_ntl is not None and node_to_local != ref_ntl:
         raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
+    sample_ids, x, y_ri, _ = _apply_drop_unseen_reg_taps(
+        sample_ids,
+        x,
+        y_ri,
+        mp_,
+        reg_cols,
+        reg_class_tables or [],
+        chunk_label=chunk_dir.name,
+    )
     y_cap, y_reg = _load_meta_aux(mp_, sample_ids, cap_cols, reg_cols, reg_class_tables=reg_class_tables)
     y_cap = y_cap.to(dtype=torch.float32)
     if want_reg_mode == "class":
@@ -5058,6 +5233,8 @@ def _ensure_chunk_tensor_cache(
     }
     if want_reg_digest:
         row["reg_class_tables_digest"] = want_reg_digest
+    if want_drop_unseen:
+        row["drop_samples_unseen_reg_taps"] = True
     if y_pv is not None:
         row["y_pv"] = y_pv
         row["meta_aux_cols"] = list(pv_cols)
@@ -5860,10 +6037,31 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     lam_v = float(getattr(args, "lambda_voltage", 1.0))
     init_ckpt_path = _resolve_init_checkpoint_path(args)
     init_run_dir = _resolve_init_run_dir(args, init_ckpt_path)
+    reg_loss_early = _parse_reg_loss(args.reg_loss)
+    drop_unseen_reg_taps = _resolve_drop_samples_unseen_reg_taps(args, init_ckpt_path, reg_loss_early)
+    _set_drop_samples_unseen_reg_taps(drop_unseen_reg_taps)
+    map_unseen_reg_taps = _resolve_map_unseen_reg_taps(args, init_ckpt_path)
+    if drop_unseen_reg_taps and map_unseen_reg_taps:
+        print(
+            "drop_samples_unseen_reg_taps: enabled; disabling map_unseen_reg_taps_to_nearest",
+            flush=True,
+        )
+        map_unseen_reg_taps = False
+    _set_map_unseen_reg_taps_to_nearest(map_unseen_reg_taps)
     if init_ckpt_path is not None:
         print(f"init_checkpoint: {init_ckpt_path}", flush=True)
     if init_run_dir is not None:
         print(f"init_run_dir: {init_run_dir}", flush=True)
+    if drop_unseen_reg_taps:
+        print(
+            "drop_samples_unseen_reg_taps: enabled (exclude samples with tap_pu outside init CE classes)",
+            flush=True,
+        )
+    if map_unseen_reg_taps:
+        print(
+            "map_unseen_reg_taps_to_nearest: enabled (unseen tap_pu -> nearest init-run class)",
+            flush=True,
+        )
     _set_seed(args.seed)
     dropout = 0.0 if args.disable_dropout else float(args.dropout)
     reg_loss = _parse_reg_loss(args.reg_loss)
@@ -6039,6 +6237,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             meta_aux_slug=maux_slug,
             reg_slug=reg_slug,
             reg_classes_digest=reg_classes_digest,
+            drop_unseen_reg_taps=drop_unseen_reg_taps,
         )
         cache_pts.append(da_pt)
         if bootstrap_gnn_cache_dir is not None:
@@ -7649,6 +7848,20 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Directory of the source run (reg_class_tables.json, norm stats *.pt, manifest). "
         "Default: parent folder of --init_checkpoint.",
+    )
+    p.add_argument(
+        "--map_unseen_reg_taps_to_nearest",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When reg class tables come from --init_run_dir, map tap_pu values outside the loaded "
+        "class list to the nearest class (default: off; use --drop_samples_unseen_reg_taps instead).",
+    )
+    p.add_argument(
+        "--drop_samples_unseen_reg_taps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When reg_loss=ce with init-run class tables, exclude samples whose tap_pu is outside "
+        "the loaded class lists before writing chunk caches (default: on when --init_checkpoint is set).",
     )
     p.add_argument(
         "--recompute_norm_stats",
