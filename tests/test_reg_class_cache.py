@@ -9,7 +9,11 @@ import torch
 
 from train_da_gps_multitask_complex_voltage_gine import (
     _build_reg_class_tables,
+    _chunk_cache_drop_flag_compatible,
+    _chunk_cache_load_candidates,
     _chunk_cache_path,
+    _chunk_cache_path_with_dropunseen,
+    _chunk_cache_path_without_dropunseen,
     _encode_reg_class_indices,
     _filter_sample_ids_unseen_reg_taps,
     _reg_ce_targets_in_range,
@@ -77,6 +81,119 @@ def test_chunk_cache_path_includes_drop_unseen_suffix():
         drop_unseen_reg_taps=True,
     )
     assert "__dropunseen" in p.name
+
+
+def test_chunk_cache_dropunseen_path_roundtrip():
+    base = _chunk_cache_path(
+        Path("/tmp/cache"),
+        "run_001",
+        1.0,
+        42,
+        0,
+        feat_slug="nobess",
+        reg_slug="regce",
+        reg_classes_digest="abc123def0",
+        meta_aux_slug="deadbeef",
+    )
+    with_drop = _chunk_cache_path_with_dropunseen(base)
+    assert "__dropunseen__maux" in with_drop.name
+    assert _chunk_cache_path_without_dropunseen(with_drop) == base
+
+
+def test_chunk_cache_load_candidates_prefers_dropunseen_for_holdout():
+    holdout = _chunk_cache_path(
+        Path("/tmp/cache"),
+        "run_001",
+        1.0,
+        42,
+        0,
+        feat_slug="nobess",
+        reg_slug="regce",
+        reg_classes_digest="abc123def0",
+        meta_aux_slug="deadbeef",
+        drop_unseen_reg_taps=False,
+    )
+    cands = _chunk_cache_load_candidates(holdout, want_drop_unseen=False)
+    assert len(cands) == 2
+    assert cands[0] == holdout
+    assert "__dropunseen__maux" in cands[1].name
+
+
+def test_chunk_cache_drop_flag_compatible_nobess_holdout(tmp_path: Path):
+    import pandas as pd
+
+    reg_cols = ["reg_feeder_rega_tap_pu"]
+    tables = _build_reg_class_tables(reg_cols, np.array([[0.975], [1.0]], dtype=np.float64))
+    meta = tmp_path / "gnn_sample_meta.csv"
+    pd.DataFrame(
+        {
+            "sample_id": [1, 2],
+            "reg_feeder_rega_tap_pu": [0.975, 1.0],
+        }
+    ).to_csv(meta, index=False)
+    cache_pt = _chunk_cache_path(
+        tmp_path,
+        "run_001",
+        1.0,
+        42,
+        0,
+        feat_slug="nobess",
+        reg_slug="regce",
+        reg_classes_digest=_reg_class_tables_digest(tables),
+        drop_unseen_reg_taps=True,
+    )
+    z = {
+        "sample_ids": [1, 2],
+        "drop_samples_unseen_reg_taps": True,
+    }
+    assert _chunk_cache_drop_flag_compatible(
+        True,
+        False,
+        z,
+        tmp_path,
+        "gnn_sample_meta.csv",
+        reg_cols,
+        tables,
+        cache_pt,
+    )
+
+
+def test_chunk_cache_drop_flag_rejects_withder_dropped_samples(tmp_path: Path):
+    import pandas as pd
+
+    reg_cols = ["reg_feeder_rega_tap_pu"]
+    tables = _build_reg_class_tables(reg_cols, np.array([[0.975], [1.0]], dtype=np.float64))
+    meta = tmp_path / "gnn_sample_meta.csv"
+    pd.DataFrame(
+        {
+            "sample_id": [1, 2, 3],
+            "reg_feeder_rega_tap_pu": [0.975, 0.98125, 1.0],
+        }
+    ).to_csv(meta, index=False)
+    cache_pt = _chunk_cache_path(
+        tmp_path,
+        "run_withder",
+        1.0,
+        42,
+        0,
+        reg_slug="regce",
+        reg_classes_digest=_reg_class_tables_digest(tables),
+        drop_unseen_reg_taps=True,
+    )
+    z = {
+        "sample_ids": [1, 2, 3],
+        "drop_samples_unseen_reg_taps": True,
+    }
+    assert not _chunk_cache_drop_flag_compatible(
+        True,
+        False,
+        z,
+        tmp_path,
+        "gnn_sample_meta.csv",
+        reg_cols,
+        tables,
+        cache_pt,
+    )
 
 
 def test_filter_sample_ids_unseen_reg_taps(tmp_path: Path):

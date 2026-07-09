@@ -5001,6 +5001,113 @@ def _chunk_cache_path(
     return cache_dir / f"{base}.pt"
 
 
+_CHUNK_CACHE_FALLBACK_LOGGED: set[str] = set()
+
+
+def _chunk_cache_path_is_nobess(cache_path: Path) -> bool:
+    return "__nobess__" in cache_path.name
+
+
+def _chunk_cache_path_with_dropunseen(cache_pt: Path) -> Path:
+    """Insert ``__dropunseen`` before ``__maux`` suffix or before ``.pt``."""
+    stem = cache_pt.stem
+    if "__dropunseen" in stem:
+        return cache_pt
+    if "__maux" in stem:
+        i = stem.index("__maux")
+        return cache_pt.with_name(f"{stem[:i]}__dropunseen{stem[i:]}.pt")
+    return cache_pt.with_name(f"{stem}__dropunseen.pt")
+
+
+def _chunk_cache_path_without_dropunseen(cache_pt: Path) -> Path:
+    stem = cache_pt.stem
+    if "__dropunseen" not in stem:
+        return cache_pt
+    new_stem = stem.replace("__dropunseen__", "__", 1)
+    if "__dropunseen" in new_stem:
+        new_stem = new_stem.replace("__dropunseen", "", 1)
+    return cache_pt.with_name(f"{new_stem}.pt")
+
+
+def _chunk_cache_sample_ids(z: dict) -> list[int]:
+    sids = z.get("sample_ids")
+    if isinstance(sids, torch.Tensor):
+        return [int(x) for x in sids.tolist()]
+    return [int(x) for x in list(sids)]
+
+
+def _drop_unseen_would_drop_samples(
+    chunk_dir: Path,
+    meta_name: str,
+    sample_ids: list[int],
+    reg_cols: list[str],
+    reg_class_tables: list[dict],
+) -> int:
+    meta_csv = chunk_dir / meta_name
+    if not sample_ids or not reg_class_tables or not meta_csv.is_file():
+        return 0
+    _, n_drop = _filter_sample_ids_unseen_reg_taps(
+        meta_csv, sample_ids, reg_cols, reg_class_tables
+    )
+    return int(n_drop)
+
+
+def _chunk_cache_drop_flag_compatible(
+    stored_drop: bool,
+    want_drop: bool,
+    z: dict,
+    chunk_dir: Path,
+    meta_name: str,
+    reg_cols: list[str],
+    reg_class_tables: list[dict] | None,
+    cache_path: Path,
+) -> bool:
+    if stored_drop == want_drop:
+        return True
+    if reg_class_tables is None:
+        return False
+    sids = _chunk_cache_sample_ids(z)
+    n_drop = _drop_unseen_would_drop_samples(
+        chunk_dir, meta_name, sids, reg_cols, reg_class_tables
+    )
+    if n_drop > 0:
+        return False
+    return _chunk_cache_path_is_nobess(cache_path) or n_drop == 0
+
+
+def _chunk_cache_load_candidates(cache_pt: Path, want_drop_unseen: bool) -> list[Path]:
+    out = [cache_pt]
+    if not want_drop_unseen:
+        alt = _chunk_cache_path_with_dropunseen(cache_pt)
+        if alt != cache_pt:
+            out.append(alt)
+    else:
+        alt = _chunk_cache_path_without_dropunseen(cache_pt)
+        if alt != cache_pt:
+            out.append(alt)
+    return out
+
+
+def _log_chunk_cache_drop_fallback_once(want_pt: Path, used_pt: Path) -> None:
+    key = str(want_pt.resolve()) if want_pt.is_absolute() else str(want_pt)
+    if key in _CHUNK_CACHE_FALLBACK_LOGGED:
+        return
+    _CHUNK_CACHE_FALLBACK_LOGGED.add(key)
+    nobess = _chunk_cache_path_is_nobess(used_pt)
+    reason = "equivalent no-BESS" if nobess else "drop-unseen removed 0 samples"
+    print(
+        f"chunk cache: reusing {used_pt.name} for holdout ({reason})",
+        flush=True,
+    )
+
+
+def _find_node_pe_csv_under_chunk_parent(chunk_parent: Path) -> Path | None:
+    hits = sorted(chunk_parent.glob("run_*/gnn_node_index_master.csv"))
+    if not hits:
+        return None
+    return hits[0].resolve()
+
+
 def _meta_aux_cols_from_args(args: argparse.Namespace) -> list[str]:
     """Prefer --aux_meta_cols; fall back to deprecated --aux_pv_meta_cols."""
     raw = str(getattr(args, "aux_meta_cols", "") or "").strip()
@@ -5071,8 +5178,14 @@ def _ensure_chunk_tensor_cache(
             raise ValueError("reg_target_mode=class requires reg_class_tables.")
         want_reg_digest = str(reg_classes_digest or _reg_class_tables_digest(reg_class_tables)).strip()
 
-    if cache_pt.is_file():
-        z = torch.load(cache_pt, map_location="cpu", weights_only=False)
+    load_pt: Path | None = None
+    for cand in _chunk_cache_load_candidates(cache_pt, want_drop_unseen):
+        if cand.is_file():
+            load_pt = cand
+            break
+
+    if load_pt is not None:
+        z = torch.load(load_pt, map_location="cpu", weights_only=False)
         cache_ok = str(z.get("reg_target_mode", "regression")).lower() == want_reg_mode
         if cache_ok and want_reg_mode == "class":
             stored_digest = str(z.get("reg_class_tables_digest", "") or "").strip()
@@ -5085,7 +5198,16 @@ def _ensure_chunk_tensor_cache(
                     f"({stored_digest!r} != {want_reg_digest!r}); rebuilding: {cache_pt}",
                     flush=True,
                 )
-            elif stored_drop != want_drop_unseen:
+            elif not _chunk_cache_drop_flag_compatible(
+                stored_drop,
+                want_drop_unseen,
+                z,
+                chunk_dir,
+                meta_name,
+                reg_cols,
+                reg_class_tables,
+                load_pt,
+            ):
                 cache_ok = False
                 print(
                     f"chunk cache drop_samples_unseen_reg_taps mismatch "
@@ -5106,14 +5228,12 @@ def _ensure_chunk_tensor_cache(
                 flush=True,
             )
         if cache_ok:
+            if load_pt != cache_pt:
+                _log_chunk_cache_drop_fallback_once(cache_pt, load_pt)
             ntl = z["node_to_local"]
             if ref_ntl is not None and ntl != ref_ntl:
                 raise RuntimeError(f"node_to_local mismatch vs first chunk: {chunk_dir}")
-            sids = z["sample_ids"]
-            if isinstance(sids, torch.Tensor):
-                sids = [int(x) for x in sids.tolist()]
-            else:
-                sids = list(sids)
+            sids = _chunk_cache_sample_ids(z)
             x = z["x"].to(dtype=torch.float32)
             y_ri = z["y_ri"].to(dtype=torch.float32)
             y_cap = z["y_cap"].to(dtype=torch.float32)
@@ -6253,6 +6373,24 @@ def _maybe_build_holdout_eval_pool(
     split_seed = _eval_holdout_seed(args)
     # no-BESS holdout: keep all samples (baseline taps are in init CE class tables).
     holdout_drop = False
+    holdout_node_pe = node_pe_csv
+    if str(feat_slug).strip() == "nobess":
+        pe_from_holdout = _find_node_pe_csv_under_chunk_parent(chunk_parent)
+        if pe_from_holdout is not None:
+            if node_pe_csv is not None:
+                try:
+                    same_pe = pe_from_holdout.resolve() == node_pe_csv.resolve()
+                except OSError:
+                    same_pe = str(pe_from_holdout) == str(node_pe_csv)
+            else:
+                same_pe = False
+            if not same_pe:
+                print(
+                    f"holdout: node_pe_csv from {pe_from_holdout} "
+                    f"(training arg was {node_pe_csv})",
+                    flush=True,
+                )
+            holdout_node_pe = pe_from_holdout
     return _build_chunk_eval_pool(
         label=label,
         chunk_parent=chunk_parent,
@@ -6272,7 +6410,7 @@ def _maybe_build_holdout_eval_pool(
         nodes_name=nodes_name,
         meta_name=meta_name,
         node_feature_cols=node_feature_cols,
-        node_pe_csv=node_pe_csv,
+        node_pe_csv=holdout_node_pe,
         node_pe_cols=node_pe_cols,
         cap_cols=cap_cols,
         reg_cols=reg_cols,
