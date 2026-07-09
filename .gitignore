@@ -13,6 +13,7 @@ gnn2_architecture_search/
 
 # Plots and images
 *.png
+!plots/presentation/*.png
 output plots/
 new dss from dr mirzaei/gnn3_best7_output/
 
