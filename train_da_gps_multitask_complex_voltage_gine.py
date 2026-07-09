@@ -6031,6 +6031,357 @@ def _chunk_dirs_from_subdir_glob(chunk_parent: Path, glob_pat: str) -> list[Path
         key=lambda p: p.name,
     )
 
+
+@dataclass
+class _ChunkEvalPool:
+    """Val/test-only chunk pool for dual train-pool vs holdout evaluation."""
+
+    label: str
+    chunk_parent: Path
+    chunk_dirs: list[Path]
+    idx_val_list: list[np.ndarray]
+    idx_test_list: list[np.ndarray]
+    selected_ids_list: list[list[int] | None]
+    cache_pts: list[Path]
+    bootstrap_cache_pts: list[Path | None]
+    split_seed: int
+
+
+@contextlib.contextmanager
+def _disabled_drop_unseen_reg_taps():
+    global _DROP_SAMPLES_UNSEEN_REG_TAPS
+    prev = bool(_DROP_SAMPLES_UNSEEN_REG_TAPS)
+    _DROP_SAMPLES_UNSEEN_REG_TAPS = False
+    try:
+        yield
+    finally:
+        _DROP_SAMPLES_UNSEEN_REG_TAPS = prev
+
+
+def _eval_holdout_seed(args: argparse.Namespace) -> int:
+    hs = int(getattr(args, "eval_holdout_seed", -1))
+    return int(args.seed) if hs < 0 else hs
+
+
+def _chunk_permutation_split(
+    n: int,
+    *,
+    split_seed: int,
+    chunk_idx: int,
+    train_frac: float,
+    val_frac: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(int(split_seed) + int(chunk_idx) * 100_003)
+    perm = rng.permutation(n)
+    n_train = int(n * float(train_frac))
+    n_val = int(n * float(val_frac))
+    n_test = n - n_train - n_val
+    if min(n_train, n_val, n_test) < 1:
+        raise ValueError(f"Invalid train/val/test split for chunk index {chunk_idx} (n={n}).")
+    return (
+        perm[:n_train],
+        perm[n_train : n_train + n_val],
+        perm[n_train + n_val :],
+    )
+
+
+def _build_chunk_eval_pool(
+    *,
+    label: str,
+    chunk_parent: Path,
+    glob_pat: str,
+    split_seed: int,
+    sample_frac: float,
+    train_frac: float,
+    val_frac: float,
+    cache_dir: Path,
+    bootstrap_gnn_cache_dir: Path | None,
+    feat_slug: str,
+    maux_slug: str,
+    reg_slug: str,
+    reg_classes_digest: str,
+    ref_digest: str,
+    edge_name: str,
+    nodes_name: str,
+    meta_name: str,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    ref_ntl: dict[str, int],
+    pv_aux_cols: list[str],
+    n_pv_aux: int,
+    reg_class_tables: list[dict] | None,
+    reg_target_mode: str,
+    drop_unseen_reg_taps: bool = False,
+) -> _ChunkEvalPool:
+    chunk_dirs = _chunk_dirs_from_subdir_glob(chunk_parent, glob_pat)
+    if not chunk_dirs:
+        raise FileNotFoundError(
+            f"eval holdout: no subdirs matching {glob_pat!r} under {chunk_parent}"
+        )
+    for ch in chunk_dirs:
+        ep = ch / edge_name
+        if not ep.is_file():
+            raise FileNotFoundError(ep)
+        if _file_digest(ep) != ref_digest:
+            raise RuntimeError(
+                f"Holdout edge catalog differs from train pool (must match topology): {ep}"
+            )
+
+    print(f"[eval_holdout:{label}] {len(chunk_dirs)} chunks under {chunk_parent}", flush=True)
+    for d in chunk_dirs:
+        print(f"  - {d.name}", flush=True)
+
+    idx_val_list: list[np.ndarray] = []
+    idx_test_list: list[np.ndarray] = []
+    selected_ids_list: list[list[int] | None] = []
+    cache_pts: list[Path] = []
+    bootstrap_cache_pts: list[Path | None] = []
+
+    with _disabled_drop_unseen_reg_taps():
+        for ci, ch in enumerate(chunk_dirs):
+            meta_path = ch / meta_name
+            sel_ids = _select_sample_ids_from_meta(
+                meta_path, float(sample_frac), int(split_seed), ci
+            )
+            selected_ids_list.append(sel_ids)
+            da_pt = _chunk_cache_path(
+                cache_dir,
+                ch.name,
+                float(sample_frac),
+                int(split_seed),
+                ci,
+                feat_slug=feat_slug,
+                meta_aux_slug=maux_slug,
+                reg_slug=reg_slug,
+                reg_classes_digest=reg_classes_digest,
+                drop_unseen_reg_taps=bool(drop_unseen_reg_taps),
+            )
+            cache_pts.append(da_pt)
+            if bootstrap_gnn_cache_dir is not None:
+                boot_name = _chunk_cache_path(
+                    cache_dir,
+                    ch.name,
+                    float(sample_frac),
+                    int(split_seed),
+                    ci,
+                    feat_slug=feat_slug,
+                    meta_aux_slug="",
+                ).name
+                bootstrap_cache_pts.append(bootstrap_gnn_cache_dir / boot_name)
+            else:
+                bootstrap_cache_pts.append(None)
+            boot_pt = bootstrap_cache_pts[-1]
+            x, y_ri, y_cap, y_reg, y_pv, _sids, _ntl = _ensure_chunk_tensor_cache(
+                ch,
+                nodes_name=nodes_name,
+                meta_name=meta_name,
+                node_feature_cols=node_feature_cols,
+                node_pe_csv=node_pe_csv,
+                node_pe_cols=node_pe_cols,
+                selected_sample_ids=sel_ids,
+                cap_cols=cap_cols,
+                reg_cols=reg_cols,
+                cache_pt=da_pt,
+                bootstrap_gnn_cache_pt=boot_pt,
+                ref_ntl=ref_ntl,
+                pv_aux_cols=pv_aux_cols if n_pv_aux > 0 else None,
+                reg_class_tables=reg_class_tables,
+                reg_target_mode=reg_target_mode,
+                reg_classes_digest=reg_classes_digest,
+            )
+            n = int(x.shape[0])
+            _itr, idx_val, idx_test = _chunk_permutation_split(
+                n,
+                split_seed=int(split_seed),
+                chunk_idx=ci,
+                train_frac=float(train_frac),
+                val_frac=float(val_frac),
+            )
+            idx_val_list.append(idx_val)
+            idx_test_list.append(idx_test)
+            del x, y_ri, y_cap, y_reg, y_pv
+            gc.collect()
+
+    return _ChunkEvalPool(
+        label=str(label),
+        chunk_parent=chunk_parent,
+        chunk_dirs=chunk_dirs,
+        idx_val_list=idx_val_list,
+        idx_test_list=idx_test_list,
+        selected_ids_list=selected_ids_list,
+        cache_pts=cache_pts,
+        bootstrap_cache_pts=bootstrap_cache_pts,
+        split_seed=int(split_seed),
+    )
+
+
+def _maybe_build_holdout_eval_pool(
+    args: argparse.Namespace,
+    *,
+    cache_dir: Path,
+    bootstrap_gnn_cache_dir: Path | None,
+    feat_slug: str,
+    maux_slug: str,
+    reg_slug: str,
+    reg_classes_digest: str,
+    ref_digest: str,
+    edge_name: str,
+    nodes_name: str,
+    meta_name: str,
+    node_feature_cols: list[str],
+    node_pe_csv: Path | None,
+    node_pe_cols: str,
+    cap_cols: list[str],
+    reg_cols: list[str],
+    ref_ntl: dict[str, int],
+    pv_aux_cols: list[str],
+    n_pv_aux: int,
+    reg_class_tables: list[dict] | None,
+    reg_target_mode: str,
+) -> _ChunkEvalPool | None:
+    parent_s = str(getattr(args, "eval_holdout_chunk_parent", "") or "").strip()
+    if not parent_s:
+        return None
+    chunk_parent = Path(parent_s).resolve()
+    if not chunk_parent.is_dir():
+        raise FileNotFoundError(f"--eval_holdout_chunk_parent not found: {chunk_parent}")
+    glob_pat = str(getattr(args, "eval_holdout_chunk_glob", "run_*") or "run_*").strip()
+    label = str(getattr(args, "eval_holdout_label", "nobess_holdout") or "nobess_holdout").strip()
+    split_seed = _eval_holdout_seed(args)
+    # no-BESS holdout: keep all samples (baseline taps are in init CE class tables).
+    holdout_drop = False
+    return _build_chunk_eval_pool(
+        label=label,
+        chunk_parent=chunk_parent,
+        glob_pat=glob_pat,
+        split_seed=split_seed,
+        sample_frac=float(args.sample_frac),
+        train_frac=float(args.train_frac),
+        val_frac=float(args.val_frac),
+        cache_dir=cache_dir,
+        bootstrap_gnn_cache_dir=bootstrap_gnn_cache_dir,
+        feat_slug=feat_slug,
+        maux_slug=maux_slug,
+        reg_slug=reg_slug,
+        reg_classes_digest=reg_classes_digest,
+        ref_digest=ref_digest,
+        edge_name=edge_name,
+        nodes_name=nodes_name,
+        meta_name=meta_name,
+        node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
+        node_pe_cols=node_pe_cols,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        ref_ntl=ref_ntl,
+        pv_aux_cols=pv_aux_cols,
+        n_pv_aux=n_pv_aux,
+        reg_class_tables=reg_class_tables,
+        reg_target_mode=reg_target_mode,
+        drop_unseen_reg_taps=holdout_drop,
+    )
+
+
+def _eval_chunk_pool_val_test(
+    model: nn.Module,
+    pool: _ChunkEvalPool,
+    *,
+    epoch: int | None,
+    eval_kw: dict,
+    loss_eval_kw: dict,
+) -> tuple[dict[str, float], dict[str, float]]:
+    with _disabled_drop_unseen_reg_taps():
+        val_met = _evaluate_multi_chunks(
+            model,
+            pool.chunk_dirs,
+            pool.idx_val_list,
+            pool.cache_pts,
+            pool.bootstrap_cache_pts,
+            pool.selected_ids_list,
+            **eval_kw,
+        )
+        val_met.update(
+            _evaluate_split_losses_multi_chunks(
+                model,
+                pool.chunk_dirs,
+                pool.idx_val_list,
+                pool.cache_pts,
+                pool.bootstrap_cache_pts,
+                pool.selected_ids_list,
+                epoch=int(epoch or 0),
+                **loss_eval_kw,
+            )
+        )
+        test_met = _evaluate_multi_chunks(
+            model,
+            pool.chunk_dirs,
+            pool.idx_test_list,
+            pool.cache_pts,
+            pool.bootstrap_cache_pts,
+            pool.selected_ids_list,
+            **eval_kw,
+        )
+        test_met.update(
+            _evaluate_split_losses_multi_chunks(
+                model,
+                pool.chunk_dirs,
+                pool.idx_test_list,
+                pool.cache_pts,
+                pool.bootstrap_cache_pts,
+                pool.selected_ids_list,
+                epoch=int(epoch or 0),
+                **loss_eval_kw,
+            )
+        )
+    return val_met, test_met
+
+
+def _print_eval_pool_section(
+    label: str,
+    phase: str,
+    val_met: dict[str, float],
+    test_met: dict[str, float],
+) -> None:
+    print(f"\n=== {label} ({phase}) ===", flush=True)
+    _print_eval_metrics_line("Val ", val_met)
+    _print_eval_metrics_line("Test", test_met)
+
+
+def _eval_pool_report_block(
+    pool: _ChunkEvalPool,
+    *,
+    init_baseline_val: dict[str, float] | None,
+    init_baseline_test: dict[str, float] | None,
+    final_val: dict[str, float] | None,
+    final_test: dict[str, float] | None,
+    best_epoch: int | None = None,
+    epoch_history: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    block: dict[str, object] = {
+        "label": pool.label,
+        "chunk_parent": str(pool.chunk_parent),
+        "chunks": [str(p) for p in pool.chunk_dirs],
+        "split_seed": int(pool.split_seed),
+        "n_chunks": len(pool.chunk_dirs),
+    }
+    if init_baseline_val is not None:
+        block["init_baseline_val_metrics"] = init_baseline_val
+    if init_baseline_test is not None:
+        block["init_baseline_test_metrics"] = init_baseline_test
+    if final_val is not None:
+        block["final_val_metrics"] = final_val
+    if final_test is not None:
+        block["final_test_metrics"] = final_test
+    if best_epoch is not None:
+        block["best_epoch"] = int(best_epoch)
+    if epoch_history:
+        block["epoch_history"] = epoch_history
+    return block
+
+
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
     _apply_finetune_physics_only_args(args)
@@ -6284,16 +6635,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         assert sum_x is not None and sum_x2 is not None and sum_y is not None and sum_reg is not None and edge_index is not None
 
         n = int(x.shape[0])
-        rng = np.random.default_rng(int(args.seed) + ci * 100_003)
-        perm = rng.permutation(n)
-        n_train = int(n * args.train_frac)
-        n_val = int(n * args.val_frac)
-        n_test = n - n_train - n_val
-        if min(n_train, n_val, n_test) < 1:
-            raise ValueError(f"Invalid train/val/test split for chunk {ch.name}.")
-        idx_train_list.append(perm[:n_train])
-        idx_val_list.append(perm[n_train : n_train + n_val])
-        idx_test_list.append(perm[n_train + n_val :])
+        itr, iv, ite = _chunk_permutation_split(
+            n,
+            split_seed=int(args.seed),
+            chunk_idx=ci,
+            train_frac=float(args.train_frac),
+            val_frac=float(args.val_frac),
+        )
+        idx_train_list.append(itr)
+        idx_val_list.append(iv)
+        idx_test_list.append(ite)
 
         itr = idx_train_list[-1]
         xt = x[itr].reshape(-1, n_node_features).to(dtype=torch.float64)
@@ -6323,6 +6674,33 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
 
     assert ref_ntl is not None and edge_index is not None and edge_attr is not None
     assert sum_y is not None and cnt_x > 0
+
+    holdout_pool = _maybe_build_holdout_eval_pool(
+        args,
+        cache_dir=cache_dir,
+        bootstrap_gnn_cache_dir=bootstrap_gnn_cache_dir,
+        feat_slug=feat_slug,
+        maux_slug=maux_slug,
+        reg_slug=reg_slug,
+        reg_classes_digest=reg_classes_digest,
+        ref_digest=ref_digest,
+        edge_name=edge_name,
+        nodes_name=nodes_name,
+        meta_name=meta_name,
+        node_feature_cols=node_feature_cols,
+        node_pe_csv=node_pe_csv,
+        node_pe_cols=node_pe_cols,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
+        ref_ntl=ref_ntl,
+        pv_aux_cols=pv_aux_cols,
+        n_pv_aux=n_pv_aux,
+        reg_class_tables=reg_class_tables,
+        reg_target_mode=reg_target_mode,
+    )
+    holdout_baseline_val_met: dict[str, float] | None = None
+    holdout_baseline_test_met: dict[str, float] | None = None
+    holdout_epoch_history: list[dict[str, object]] = []
 
     assert sum_x is not None and sum_x2 is not None
     x_mean = (sum_x / float(cnt_x)).view(1, n_node_features).float()
@@ -6589,7 +6967,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     baseline_val_met: dict[str, float] | None = None
     baseline_test_met: dict[str, float] | None = None
     if _should_eval_before_train(args, init_ckpt_path):
-        print("[init eval] evaluating init checkpoint (no training)", flush=True)
+        print("[init eval] train_pool_eval (training chunks)", flush=True)
         baseline_val_met = _evaluate_multi_chunks(
             model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
         )
@@ -6620,7 +6998,27 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 **_loss_eval_kw,
             )
         )
-        _print_baseline_before_post_tune(baseline_val_met, baseline_test_met)
+        _print_eval_pool_section(
+            "train_pool_eval",
+            "eval_before_train",
+            baseline_val_met,
+            baseline_test_met,
+        )
+        if holdout_pool is not None:
+            print(f"[init eval] holdout ({holdout_pool.label})", flush=True)
+            holdout_baseline_val_met, holdout_baseline_test_met = _eval_chunk_pool_val_test(
+                model,
+                holdout_pool,
+                epoch=0,
+                eval_kw=_eval_kw,
+                loss_eval_kw=_loss_eval_kw,
+            )
+            _print_eval_pool_section(
+                holdout_pool.label,
+                "eval_before_train",
+                holdout_baseline_val_met,
+                holdout_baseline_test_met,
+            )
 
     if bool(getattr(args, "eval_only", False)):
         report = {
@@ -6629,10 +7027,35 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             "chunks": [str(p) for p in chunk_dirs],
             "hyperparameters": vars(args),
             "init_checkpoint": str(init_ckpt_path) if init_ckpt_path else None,
+            "train_pool_eval": _eval_pool_report_block(
+                _ChunkEvalPool(
+                    label="train_pool_eval",
+                    chunk_parent=chunk_parent,
+                    chunk_dirs=chunk_dirs,
+                    idx_val_list=idx_val_list,
+                    idx_test_list=idx_test_list,
+                    selected_ids_list=selected_ids_list,
+                    cache_pts=cache_pts,
+                    bootstrap_cache_pts=bootstrap_cache_pts,
+                    split_seed=int(args.seed),
+                ),
+                init_baseline_val=baseline_val_met,
+                init_baseline_test=baseline_test_met,
+                final_val=baseline_val_met,
+                final_test=baseline_test_met,
+            ),
             "val_metrics": baseline_val_met,
             "test_metrics": baseline_test_met,
             "eval_only": True,
         }
+        if holdout_pool is not None:
+            report["holdout_eval"] = _eval_pool_report_block(
+                holdout_pool,
+                init_baseline_val=holdout_baseline_val_met,
+                init_baseline_test=holdout_baseline_test_met,
+                final_val=holdout_baseline_val_met,
+                final_test=holdout_baseline_test_met,
+            )
         (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(f"eval_only: wrote {out_dir / 'da_gps_report.json'}", flush=True)
         return
@@ -7219,7 +7642,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 )
                 if n_pv_aux > 0:
                     _print_per_head_two_lines("[da_gps chunk_parent]", "meta_aux_MSE_nrm", pv_aux_cols, train_meta_mean, val_meta_mean)
-            if baseline_val_met is not None and baseline_test_met is not None:
+            if do_eval:
                 ep_val_met = _evaluate_multi_chunks(
                     model, chunk_dirs, idx_val_list, cache_pts, bootstrap_cache_pts, selected_ids_list, **_eval_kw
                 )
@@ -7250,13 +7673,41 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         **_loss_eval_kw,
                     )
                 )
-                _print_vs_baseline_deltas(
-                    epoch=ep,
-                    baseline_val=baseline_val_met,
-                    baseline_test=baseline_test_met,
-                    val_met=ep_val_met,
-                    test_met=ep_test_met,
+                _print_eval_pool_section(
+                    "train_pool_eval",
+                    f"epoch {ep}",
+                    ep_val_met,
+                    ep_test_met,
                 )
+                if baseline_val_met is not None and baseline_test_met is not None:
+                    _print_vs_baseline_deltas(
+                        epoch=ep,
+                        baseline_val=baseline_val_met,
+                        baseline_test=baseline_test_met,
+                        val_met=ep_val_met,
+                        test_met=ep_test_met,
+                    )
+                if holdout_pool is not None:
+                    ho_val_met, ho_test_met = _eval_chunk_pool_val_test(
+                        model,
+                        holdout_pool,
+                        epoch=ep,
+                        eval_kw=_eval_kw,
+                        loss_eval_kw=_loss_eval_kw,
+                    )
+                    _print_eval_pool_section(
+                        holdout_pool.label,
+                        f"epoch {ep}",
+                        ho_val_met,
+                        ho_test_met,
+                    )
+                    holdout_epoch_history.append(
+                        {
+                            "epoch": int(ep),
+                            "val_metrics": ho_val_met,
+                            "test_metrics": ho_test_met,
+                        }
+                    )
                 model.train()
         _ce = int(args.checkpoint_every)
         if _ce > 0 and ep % _ce == 0:
@@ -7334,6 +7785,27 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         )
     )
 
+    holdout_final_val_met: dict[str, float] | None = None
+    holdout_final_test_met: dict[str, float] | None = None
+    if holdout_pool is not None:
+        holdout_final_val_met, holdout_final_test_met = _eval_chunk_pool_val_test(
+            model,
+            holdout_pool,
+            epoch=int(best_epoch),
+            eval_kw=_eval_kw,
+            loss_eval_kw=_loss_eval_kw,
+        )
+
+    print("\n=== Final evaluation (best checkpoint) ===", flush=True)
+    _print_eval_pool_section("train_pool_eval", f"best epoch {best_epoch}", val_met, met)
+    if holdout_pool is not None and holdout_final_val_met is not None and holdout_final_test_met is not None:
+        _print_eval_pool_section(
+            holdout_pool.label,
+            f"best epoch {best_epoch}",
+            holdout_final_val_met,
+            holdout_final_test_met,
+        )
+
     ckpt = out_dir / "da_gps_multitask_best.pt"
     save_ok = True
     reject_reason = ""
@@ -7374,11 +7846,39 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         "best_val_r2_min": float(best_val_r2_min) if best_val_r2_min == best_val_r2_min else None,
         "val_metrics": val_met,
         "test_metrics": met,
+        "train_pool_eval": _eval_pool_report_block(
+            _ChunkEvalPool(
+                label="train_pool_eval",
+                chunk_parent=chunk_parent,
+                chunk_dirs=chunk_dirs,
+                idx_val_list=idx_val_list,
+                idx_test_list=idx_test_list,
+                selected_ids_list=selected_ids_list,
+                cache_pts=cache_pts,
+                bootstrap_cache_pts=bootstrap_cache_pts,
+                split_seed=int(args.seed),
+            ),
+            init_baseline_val=baseline_val_met,
+            init_baseline_test=baseline_test_met,
+            final_val=val_met,
+            final_test=met,
+            best_epoch=int(best_epoch),
+        ),
         "train_seconds": train_seconds,
         "checkpoint_saved": bool(save_ok),
         "checkpoint_reject_reason": reject_reason if not save_ok else None,
         "checkpoint": str(ckpt.resolve()) if save_ok else None,
     }
+    if holdout_pool is not None:
+        report["holdout_eval"] = _eval_pool_report_block(
+            holdout_pool,
+            init_baseline_val=holdout_baseline_val_met,
+            init_baseline_test=holdout_baseline_test_met,
+            final_val=holdout_final_val_met,
+            final_test=holdout_final_test_met,
+            best_epoch=int(best_epoch),
+            epoch_history=holdout_epoch_history,
+        )
     if _training_addons_enabled(args):
         report["training_addons"] = _training_addons_report(
             args,
@@ -7902,6 +8402,31 @@ def parse_args() -> argparse.Namespace:
         "--eval_only",
         action="store_true",
         help="Load --init_checkpoint, evaluate val+test, write da_gps_report.json, and exit (no training).",
+    )
+    p.add_argument(
+        "--eval_holdout_chunk_parent",
+        type=str,
+        default="",
+        help="Optional chunk parent for holdout val/test eval (e.g. no-BESS chunks while training on with-DER). "
+        "Uses init_run_dir norm stats; does not affect training.",
+    )
+    p.add_argument(
+        "--eval_holdout_chunk_glob",
+        type=str,
+        default="run_*",
+        help="fnmatch pattern or comma-separated chunk names under --eval_holdout_chunk_parent.",
+    )
+    p.add_argument(
+        "--eval_holdout_label",
+        type=str,
+        default="nobess_holdout",
+        help="Section label for holdout metrics in logs and da_gps_report.json.",
+    )
+    p.add_argument(
+        "--eval_holdout_seed",
+        type=int,
+        default=-1,
+        help="Per-chunk 80/10/10 split seed for holdout chunks (-1 = use --seed).",
     )
     p.add_argument(
         "--save_only_if_improved",
