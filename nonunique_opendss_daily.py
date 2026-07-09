@@ -346,27 +346,90 @@ def set_controllers(low_init: bool):
             _set_capacitor_states(nm, on=True)
 
 
-def randomize_controllers(
-    rng: np.random.Generator | None = None,
-    *,
-    dynamic_only: bool = True,
-) -> None:
-    """Random regulator taps and dynamic capacitor bank on/off before an independent snapshot solve.
-
-    When ``dynamic_only`` is True (default), static capacitors without ``CapControl``
-    (e.g. ``CAPBank3``) are left energized instead of randomized.
-    """
-    rng = rng or np.random.default_rng()
-    controlled = _controlled_capacitor_names() if dynamic_only else None
+def _randomize_regulator_taps_uniform(rng: np.random.Generator) -> None:
     for nm in dss.RegControls.AllNames():
         dss.RegControls.Name(nm)
         dss.RegControls.TapNumber(int(rng.integers(LOW_TAP, HIGH_TAP + 1)))
+
+
+def _randomize_regulator_taps_bimodal(
+    rng: np.random.Generator,
+    *,
+    p_extreme: float = 0.35,
+) -> None:
+    """Sample taps toward ``LOW_TAP`` / ``HIGH_TAP`` more often than uniform (wider voltage spread)."""
+    p = float(p_extreme)
+    p = min(max(p, 0.0), 0.5)
+    p_mid = max(0.0, 1.0 - 2.0 * p)
+    for nm in dss.RegControls.AllNames():
+        dss.RegControls.Name(nm)
+        u = float(rng.random())
+        if u < p:
+            tap = LOW_TAP
+        elif u < p + p_mid:
+            tap = int(rng.integers(LOW_TAP, HIGH_TAP + 1))
+        else:
+            tap = HIGH_TAP
+        dss.RegControls.TapNumber(int(tap))
+
+
+def _randomize_capacitor_banks(
+    rng: np.random.Generator,
+    *,
+    dynamic_only: bool = True,
+) -> None:
+    controlled = _controlled_capacitor_names() if dynamic_only else None
     for nm in dss.Capacitors.AllNames():
         if dynamic_only and not _is_dynamic_capacitor(nm, controlled=controlled):
             _set_capacitor_states(nm, on=True)
             continue
         bank_on = bool(rng.integers(0, 2))
         _set_capacitor_states(nm, on=bank_on)
+
+
+def randomize_controllers(
+    rng: np.random.Generator | None = None,
+    *,
+    dynamic_only: bool = True,
+    mode: str = "uniform",
+    warm_start_index: int = 0,
+) -> None:
+    """Random regulator taps and capacitor bank on/off before an independent snapshot solve.
+
+    ``mode``:
+    - ``uniform`` (default): i.i.d. uniform taps in [LOW_TAP, HIGH_TAP], random dynamic cap on/off.
+    - ``corners``: warm-start 0 = all regs at LOW_TAP + dynamic caps off; 1 = all HIGH + caps on;
+      remaining starts are uniform.
+    - ``wide``: corners for 0–1, then bimodal extreme taps + random caps for 2–3, then uniform.
+
+    When ``dynamic_only`` is True (default), static capacitors without ``CapControl``
+    (e.g. ``CAPBank3``) are left energized instead of randomized.
+    """
+    rng = rng or np.random.default_rng()
+    m = str(mode).strip().lower()
+    k = int(warm_start_index)
+    if m in ("corners", "wide"):
+        if k == 0:
+            set_controllers(low_init=True)
+            return
+        if k == 1:
+            set_controllers(low_init=False)
+            return
+    if m == "wide":
+        if k == 2:
+            _randomize_regulator_taps_bimodal(rng, p_extreme=0.5)
+            _randomize_capacitor_banks(rng, dynamic_only=dynamic_only)
+            return
+        if k == 3:
+            _randomize_regulator_taps_uniform(rng)
+            _randomize_capacitor_banks(rng, dynamic_only=dynamic_only)
+            for nm in dss.Capacitors.AllNames():
+                if dynamic_only:
+                    continue
+                _set_capacitor_states(nm, on=bool(rng.integers(0, 2)))
+            return
+    _randomize_regulator_taps_uniform(rng)
+    _randomize_capacitor_banks(rng, dynamic_only=dynamic_only)
 
 
 def inject_controller_warmstart(

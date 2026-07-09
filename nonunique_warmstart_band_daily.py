@@ -82,6 +82,8 @@ def run_warmstart_band_daily(
     cfg: DailySimConfig | None = None,
     *,
     n_warm_starts: int = 10,
+    warm_start_mode: str = "uniform",
+    warm_start_randomize_static_caps: bool = False,
     monitor_nodes: list[str] | None = None,
     include_da_gps: bool | None = None,
     plot_reg_cap: bool = True,
@@ -134,7 +136,12 @@ def run_warmstart_band_daily(
         ctx = _snapshot_step_context(cfg)
         _apply_snapshot_timestep(ctx, cfg, t, der_mult=der_mult)
         for k in range(n_ws):
-            randomize_controllers(rng)
+            randomize_controllers(
+                rng,
+                dynamic_only=not bool(warm_start_randomize_static_caps),
+                mode=str(warm_start_mode),
+                warm_start_index=int(k),
+            )
             try:
                 dss.Solution.InitSnap()
             except Exception:

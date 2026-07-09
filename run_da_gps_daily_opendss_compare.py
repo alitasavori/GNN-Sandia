@@ -1083,6 +1083,16 @@ def _precompute_daily_feature_tables(
             idx_list.append(key_to_idx[key])
             load_j_list.append(j)
             w_list.append(float(w))
+    # PV buses (e.g. pv1/pv2 on l3235256, p850080) often carry no loads, so they are absent
+    # from load_to_busph. Register their bus.phase keys so `pv_node_coeff` / `p_pv_kw`
+    # match `_fill_p_pv_kw_from_pmpp_and_irr` (Pmpp0×m_irr split on element phases).
+    for nm in pv_names:
+        raw = str(nm).strip()
+        for bus, ph, w in pv_to_busph.get(raw, []):
+            bk = str(bus).strip().lower()
+            key = (bk, int(ph))
+            if key not in key_to_idx:
+                key_to_idx[key] = len(key_to_idx)
     n_busph = len(key_to_idx)
     busph_load_j = np.asarray(load_j_list, dtype=np.int32)
     busph_idx = np.asarray(idx_list, dtype=np.int32)
@@ -1441,6 +1451,7 @@ def run_da_gps_daily_voltages(
     device: str | None = None,
     skip_opendss: bool = True,
     return_device_states: bool = True,
+    gnn_batch_steps: int | None = None,
 ) -> dict[str, np.ndarray] | dict[str, object]:
     """Run DA-GPS daily GNN inference without plots or CSV exports.
 
@@ -1498,6 +1509,7 @@ def run_da_gps_daily_voltages(
         der_q_frac_p=float(der_q_frac_p),
         voltages_only=True,
         skip_opendss_solve=bool(skip_opendss),
+        gnn_batch_steps=gnn_batch_steps,
     )
     if result is None:
         raise RuntimeError("run_da_gps_daily_voltages: internal run() returned None")
@@ -2597,12 +2609,19 @@ def run(
             f"cap_sigmoid {cap_out.shape} ({n_cap_fin} finite); skipped plots/CSV exports.",
             flush=True,
         )
+        meta_out = (
+            meta_gnn.astype(np.float64, copy=True)
+            if meta_gnn is not None and n_pv_plot > 0
+            else np.zeros((npts, 0), dtype=np.float64)
+        )
         return {
             "voltages": out_v,
             "reg_tap_pu": reg_out,
             "cap_sigmoid": cap_out,
             "reg_cols": [str(c) for c in reg_cols[:n_reg_plot]],
             "cap_cols": [str(c) for c in cap_cols[:n_cap_plot]],
+            "meta_aux_gnn": meta_out,
+            "meta_aux_cols": [str(c) for c in pv_aux_cols[:n_pv_plot]],
             "gnn_setup_once_s": gnn_setup_once_s,
             "gnn_per_step_s": gnn_per_step_s,
             "gnn_total_wall_s": gnn_total_wall_s,
