@@ -74,3 +74,12 @@ OpenDSS labels are ground truth. Physics should be a differentiable surrogate cl
 ```
 
 Effective physics weight: epoch 4 → 0.004, ep 5 → 0.008, ep 6 → 0.012, ep 7+ → 0.02.
+
+## 5. Warm-start band metrics (DA-GPS daily compare)
+
+| Metric | Role |
+|--------|------|
+| `inside_band_frac` | Binary coverage: fraction of timesteps with DA-GPS inside OpenDSS min-max envelope from N random controller warm-starts. |
+| `da_gps_cloud_proximity` | Soft proximity in [0,1]: 1 inside band; outside decays as exp(-d/scale) with d = distance to nearest edge and scale = max(half-width, floor). Discrete reg/cap use tap or bank-step scale. |
+
+CRPS and interval scores assume a predictive distribution or calibrated quantile fan; warm-start clouds are empirical min-max envelopes, not a full ensemble CDF. Cloud proximity grades nearness without reconstructing per-step histograms.

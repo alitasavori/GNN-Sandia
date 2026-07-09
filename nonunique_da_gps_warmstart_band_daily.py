@@ -75,6 +75,101 @@ def _inside_band_fraction(y: np.ndarray, ymin: np.ndarray, ymax: np.ndarray) -> 
     return float(np.mean((y[m] >= ymin[m]) & (y[m] <= ymax[m])))
 
 
+# CRPS / interval scores need a predictive distribution or calibrated quantile fan; warm-start
+# clouds are empirical min-max envelopes from N controller inits, not a full ensemble CDF.
+# Band proximity gives graded credit near the cloud via smooth decay outside [lo, hi].
+_EPS_BAND = 1e-9
+
+
+def _band_proximity_continuous_per_step(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+    *,
+    min_scale: float = 1e-4,
+) -> np.ndarray:
+    """Per-timestep cloud proximity in [0, 1].
+
+    Inside [ymin, ymax]: 1.  Outside: exp(-d / scale) with
+    d = distance to nearest band edge and scale = max(0.5 * (ymax - ymin), min_scale).
+    """
+    y = np.asarray(y, dtype=np.float64)
+    ymin = np.asarray(ymin, dtype=np.float64)
+    ymax = np.asarray(ymax, dtype=np.float64)
+    m = np.isfinite(y) & np.isfinite(ymin) & np.isfinite(ymax)
+    scores = np.full(y.shape, np.nan, dtype=np.float64)
+    if not m.any():
+        return scores
+    lo = ymin[m]
+    hi = ymax[m]
+    yy = y[m]
+    scale = np.maximum(0.5 * (hi - lo), float(min_scale))
+    inside = (yy >= lo) & (yy <= hi)
+    d = np.where(yy > hi, yy - hi, np.where(yy < lo, lo - yy, 0.0))
+    scores[m] = np.where(inside, 1.0, np.exp(-d / scale))
+    return scores
+
+
+def _band_proximity_discrete_per_step(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+    *,
+    step_scale: float = 1.0,
+) -> np.ndarray:
+    """Discrete cloud proximity: 1 inside integer band; exp(-d / step_scale) outside.
+
+    ``y`` is already discretized (tap # or cap steps ON). ``step_scale`` is one tap step
+    or the capacitor bank step count for normalization.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    ymin = np.asarray(ymin, dtype=np.float64)
+    ymax = np.asarray(ymax, dtype=np.float64)
+    m = np.isfinite(y) & np.isfinite(ymin) & np.isfinite(ymax)
+    scores = np.full(y.shape, np.nan, dtype=np.float64)
+    if not m.any():
+        return scores
+    lo = ymin[m]
+    hi = ymax[m]
+    yy = y[m]
+    scale = max(float(step_scale), 1.0)
+    inside = (yy >= lo) & (yy <= hi)
+    d = np.where(yy > hi, yy - hi, np.where(yy < lo, lo - yy, 0.0))
+    scores[m] = np.where(inside, 1.0, np.exp(-d / scale))
+    return scores
+
+
+def _mean_band_proximity(scores: np.ndarray) -> float:
+    m = np.isfinite(scores)
+    if not m.any():
+        return float("nan")
+    return float(np.mean(scores[m]))
+
+
+def _band_proximity_continuous(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+    *,
+    min_scale: float = 1e-4,
+) -> float:
+    return _mean_band_proximity(
+        _band_proximity_continuous_per_step(y, ymin, ymax, min_scale=min_scale)
+    )
+
+
+def _band_proximity_discrete(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+    *,
+    step_scale: float = 1.0,
+) -> float:
+    return _mean_band_proximity(
+        _band_proximity_discrete_per_step(y, ymin, ymax, step_scale=step_scale)
+    )
+
+
 CAP_ON_THRESHOLD = 0.5
 
 
@@ -782,6 +877,8 @@ def run_da_gps_warmstart_band_daily(
     meta_max = np.nanmax(meta_dss, axis=1) if n_meta > 0 else None
 
     inside: dict[str, dict[str, float]] = {"voltage": {}, "regulator": {}, "capacitor": {}, "meta_aux": {}}
+    proximity: dict[str, dict[str, float]] = {"voltage": {}, "regulator": {}, "capacitor": {}, "meta_aux": {}}
+    cap_steps_by_name = _cap_num_steps_by_name(cap_names)
 
     if da_v is not None:
         for j, node in enumerate(collect_nodes):
@@ -791,6 +888,9 @@ def run_da_gps_warmstart_band_daily(
             v_da = np.asarray(v_da, dtype=float).ravel()[:npts]
             frac = _inside_band_fraction(v_da, volts_min[:, j], volts_max[:, j])
             inside["voltage"][node] = frac
+            proximity["voltage"][node] = _band_proximity_continuous(
+                v_da, volts_min[:, j], volts_max[:, j], min_scale=1e-4
+            )
 
     if da_reg_disc:
         for nm in reg_names:
@@ -799,6 +899,9 @@ def run_da_gps_warmstart_band_daily(
                 continue
             j = reg_names.index(nm)
             inside["regulator"][nm] = _inside_band_fraction(y_da, taps_min[:, j], taps_max[:, j])
+            proximity["regulator"][nm] = _band_proximity_discrete(
+                y_da, taps_min[:, j], taps_max[:, j], step_scale=1.0
+            )
 
     if da_cap_disc:
         for nm in cap_names:
@@ -807,6 +910,10 @@ def run_da_gps_warmstart_band_daily(
                 continue
             j = cap_names.index(nm)
             inside["capacitor"][nm] = _inside_band_fraction(y_da, cap_min[:, j], cap_max[:, j])
+            cap_scale = float(_dict_lookup(cap_steps_by_name, nm) or 1.0)
+            proximity["capacitor"][nm] = _band_proximity_discrete(
+                y_da, cap_min[:, j], cap_max[:, j], step_scale=max(1.0, cap_scale)
+            )
 
     if da_meta and meta_min is not None and meta_max is not None:
         for col in meta_cols:
@@ -816,6 +923,9 @@ def run_da_gps_warmstart_band_daily(
             y_da = np.asarray(y_da, dtype=float).ravel()[:npts]
             j = meta_cols.index(col)
             inside["meta_aux"][col] = _inside_band_fraction(y_da, meta_min[:, j], meta_max[:, j])
+            proximity["meta_aux"][col] = _band_proximity_continuous(
+                y_da, meta_min[:, j], meta_max[:, j], min_scale=1e-3
+            )
 
     print("\n=== DA-GPS inside OpenDSS warm-start band [min,max] ===")
     print(
@@ -836,6 +946,27 @@ def run_da_gps_warmstart_band_daily(
         vals = [v for v in items.values() if np.isfinite(v)]
         if vals:
             print(f"    mean across series: {100.0 * float(np.mean(vals)):.1f}%")
+
+    print("\n=== DA-GPS cloud proximity to OpenDSS warm-start band ===")
+    print(
+        "  score in [0,1]: 1 inside band; outside decays as exp(-d/scale) "
+        "(continuous: scale=max(half-width,1e-4); discrete: tap/cap step scale)",
+        flush=True,
+    )
+    for group, items in proximity.items():
+        if not items:
+            continue
+        print(f"  [{group}]")
+        shown = 0
+        for name, prox in sorted(items.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else -1.0)):
+            if shown < 8 or group != "voltage" or not plot_all_cache_nodes:
+                print(f"    {name}: cloud proximity {prox:.3f}")
+                shown += 1
+        if group == "voltage" and plot_all_cache_nodes and len(items) > 8:
+            print(f"    ... ({len(items)} nodes total; see per-node CSV in out_dir)")
+        vals = [v for v in items.values() if np.isfinite(v)]
+        if vals:
+            print(f"    mean across series: {float(np.mean(vals)):.3f}")
 
     volt_png_dir: Path | None = None
     vdpi = int(voltage_plot_dpi) if int(voltage_plot_dpi) > 0 else (96 if plot_all_cache_nodes else 160)
@@ -863,10 +994,11 @@ def run_da_gps_warmstart_band_daily(
         node_rows = []
         for j, node in enumerate(collect_nodes):
             frac = inside["voltage"].get(node, float("nan"))
-            node_rows.append((str(node).strip().lower(), frac))
-        df_inside = pd.DataFrame(node_rows, columns=["node", "inside_frac_dagps"]).sort_values(
-            "inside_frac_dagps", ascending=True
-        )
+            prox = proximity["voltage"].get(node, float("nan"))
+            node_rows.append((str(node).strip().lower(), frac, prox))
+        df_inside = pd.DataFrame(
+            node_rows, columns=["node", "inside_frac_dagps", "cloud_proximity_dagps"]
+        ).sort_values("inside_frac_dagps", ascending=True)
         inside_csv = out_path / f"inside_band_per_node_{stem_short}.csv"
         _write_csv(df_inside, inside_csv)
         aux_outputs["warmstart_inside_band_per_node_csv"] = str(inside_csv)
@@ -1058,6 +1190,7 @@ def run_da_gps_warmstart_band_daily(
                 )
 
         v_fracs = [v for v in inside["voltage"].values() if np.isfinite(v)]
+        v_prox = [v for v in proximity["voltage"].values() if np.isfinite(v)]
         summary = {
             "mode": "da_gps_warmstart_band_daily",
             "run_dir": str(Path(cfg.da_gps_run_dir).resolve()),
@@ -1076,7 +1209,9 @@ def run_da_gps_warmstart_band_daily(
             "n_collect_nodes": n_nodes,
             "n_voltage_pngs": n_plot_ranked if plot_all_cache_nodes else len(collect_nodes),
             "mean_inside_frac_voltage_dagps": float(np.mean(v_fracs)) if v_fracs else float("nan"),
+            "mean_cloud_proximity_voltage_dagps": float(np.mean(v_prox)) if v_prox else float("nan"),
             "inside_band_frac": inside,
+            "cloud_proximity": proximity,
             "aux_outputs": aux_outputs,
             "wall_s_opendss_warmstart": wall_s,
             "timing": {
@@ -1201,6 +1336,7 @@ def run_da_gps_warmstart_band_daily(
         "da_gps_meta_by_name": da_meta,
         "da_gps_hours": da_hours,
         "da_gps_inside_band_frac": inside,
+        "da_gps_cloud_proximity": proximity,
         "converged": converged,
         "wall_s": wall_s,
         "gnn_timing": {
