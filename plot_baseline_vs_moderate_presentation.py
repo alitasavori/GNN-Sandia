@@ -198,6 +198,179 @@ def plot_figure2_tap_accuracy(out_path: Path) -> None:
     plt.close(fig)
 
 
+def _annotate_best_point(
+    ax,
+    epoch: int,
+    value: float,
+    *,
+    text: str,
+    color: str,
+    xytext: tuple[float, float],
+    fmt: str = ".4f",
+) -> None:
+    ax.scatter([epoch], [value], s=90, color=color, zorder=5, edgecolors="white", linewidths=1.5)
+    ax.annotate(
+        f"{text}\nep{epoch} = {value:{fmt}}",
+        xy=(epoch, value),
+        xytext=xytext,
+        textcoords="offset points",
+        fontsize=10,
+        fontweight="bold",
+        color=color,
+        ha="center",
+        arrowprops=dict(arrowstyle="->", color=color, lw=1.2),
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=color, alpha=0.92),
+    )
+
+
+def plot_figure_claim_tot_reg_tap(out_path: Path) -> None:
+    """Single-slide figure supporting the regulator-targeted win claim."""
+    claim = (
+        "We don't win on total loss, but we win where the add-ons target regulators: "
+        "lower CE and ~63% tap accuracy."
+    )
+
+    best_baseline_tot_ep, best_baseline_tot = min(
+        zip(BASELINE["epochs"], BASELINE["val_tot"]), key=lambda x: x[1]
+    )
+    best_moderate_tot_ep, best_moderate_tot = min(
+        zip(MODERATE["epochs"], MODERATE["val_tot"]), key=lambda x: x[1]
+    )
+    best_moderate_reg_ep, best_moderate_reg = min(
+        zip(MODERATE["epochs"], MODERATE["val_reg"]), key=lambda x: x[1]
+    )
+    baseline_reg_at_best_tot = BASELINE["val_reg"][BASELINE["epochs"].index(best_baseline_tot_ep)]
+    best_moderate_tap = MODERATE["val_tap_acc"][MODERATE["epochs"].index(best_moderate_reg_ep)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), constrained_layout=True)
+    fig.suptitle(claim, fontsize=15, fontweight="bold", y=1.06)
+
+    # Panel A — total loss (tie at best)
+    ax = axes[0]
+    _plot_series(
+        ax,
+        BASELINE["epochs"],
+        BASELINE["val_tot"],
+        label=BASELINE["label"],
+        color=BASELINE_COLOR,
+        marker="o",
+    )
+    _plot_series(
+        ax,
+        MODERATE["epochs"],
+        MODERATE["val_tot"],
+        label=MODERATE["label"],
+        color=MODERATE_COLOR,
+        marker="s",
+    )
+    _style_panel(ax, "A  Total validation loss", "val_tot", higher_better=False)
+    _annotate_best_point(
+        ax,
+        best_baseline_tot_ep,
+        best_baseline_tot,
+        text="Tie",
+        color=BASELINE_COLOR,
+        xytext=(0, 18),
+    )
+    _annotate_best_point(
+        ax,
+        best_moderate_tot_ep,
+        best_moderate_tot,
+        text="Tie",
+        color=MODERATE_COLOR,
+        xytext=(0, -34),
+    )
+
+    # Panel B — regulator CE (moderate wins)
+    ax = axes[1]
+    _plot_series(
+        ax,
+        BASELINE["epochs"],
+        BASELINE["val_reg"],
+        label=BASELINE["label"],
+        color=BASELINE_COLOR,
+        marker="o",
+    )
+    _plot_series(
+        ax,
+        MODERATE["epochs"],
+        MODERATE["val_reg"],
+        label=MODERATE["label"],
+        color=MODERATE_COLOR,
+        marker="s",
+    )
+    _style_panel(ax, "B  Regulator CE (plain)", "val_reg", higher_better=False)
+    _annotate_best_point(
+        ax,
+        best_baseline_tot_ep,
+        baseline_reg_at_best_tot,
+        text="Baseline",
+        color=BASELINE_COLOR,
+        xytext=(-12, 16),
+        fmt=".3f",
+    )
+    _annotate_best_point(
+        ax,
+        best_moderate_reg_ep,
+        best_moderate_reg,
+        text="Moderate wins",
+        color=MODERATE_COLOR,
+        xytext=(12, -30),
+        fmt=".3f",
+    )
+    ax.text(
+        0.98,
+        0.04,
+        f"0.858 vs 0.862",
+        transform=ax.transAxes,
+        fontsize=11,
+        fontweight="bold",
+        color=MODERATE_COLOR,
+        ha="right",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#fef2f2", edgecolor=MODERATE_COLOR),
+    )
+
+    # Panel C — tap accuracy (moderate only)
+    ax = axes[2]
+    _plot_series(
+        ax,
+        MODERATE["epochs"],
+        MODERATE["val_tap_acc"],
+        label=MODERATE["label"],
+        color=MODERATE_COLOR,
+        marker="s",
+    )
+    _style_panel(ax, "C  Regulator tap accuracy", "val_tap_acc", higher_better=True)
+    ax.set_ylim(0.35, 0.68)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0, decimals=0))
+    _annotate_best_point(
+        ax,
+        best_moderate_reg_ep,
+        best_moderate_tap,
+        text="~63%",
+        color=MODERATE_COLOR,
+        xytext=(0, 16),
+        fmt=".1%",
+    )
+    ax.text(
+        0.02,
+        0.96,
+        "Baseline not logged",
+        transform=ax.transAxes,
+        fontsize=11,
+        color="dimgray",
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="#f8fafc", edgecolor="#cbd5e1"),
+    )
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.0), frameon=False)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_figure3_territory_mechanism(out_path: Path) -> None:
     fig, ax1 = plt.subplots(figsize=(12, 6), constrained_layout=True)
 
@@ -249,11 +422,13 @@ def main() -> None:
         "fig1": OUT_DIR / "fig1_core_metrics_2x2.png",
         "fig2": OUT_DIR / "fig2_val_tap_acc.png",
         "fig3": OUT_DIR / "fig3_territory_counterfactual.png",
+        "claim": OUT_DIR / "fig_claim_tot_reg_tap.png",
     }
 
     plot_figure1_core_metrics(paths["fig1"])
     plot_figure2_tap_accuracy(paths["fig2"])
     plot_figure3_territory_mechanism(paths["fig3"])
+    plot_figure_claim_tot_reg_tap(paths["claim"])
 
     for name, path in paths.items():
         print(f"Saved {name}: {path}")
