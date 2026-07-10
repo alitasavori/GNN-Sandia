@@ -6423,6 +6423,119 @@ def _maybe_build_holdout_eval_pool(
     )
 
 
+def _subset_eval_report_key(label: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_]+", "_", str(label).strip()).strip("_")
+    return f"subset_eval_{safe}" if safe else "subset_eval"
+
+
+def _slice_train_pool_subset(
+    *,
+    label: str,
+    chunk_parent: Path,
+    chunk_dirs: list[Path],
+    indices: list[int],
+    idx_val_list: list[np.ndarray],
+    idx_test_list: list[np.ndarray],
+    selected_ids_list: list[list[int] | None],
+    cache_pts: list[Path],
+    bootstrap_cache_pts: list[Path | None],
+    split_seed: int,
+) -> _ChunkEvalPool:
+    if not indices:
+        raise ValueError(f"subset eval {label!r}: no training chunks matched")
+    sub_dirs = [chunk_dirs[i] for i in indices]
+    print(f"[eval_subset:{label}] {len(sub_dirs)} chunks from training pool", flush=True)
+    for d in sub_dirs:
+        print(f"  - {d.name}", flush=True)
+    return _ChunkEvalPool(
+        label=str(label),
+        chunk_parent=chunk_parent,
+        chunk_dirs=sub_dirs,
+        idx_val_list=[idx_val_list[i] for i in indices],
+        idx_test_list=[idx_test_list[i] for i in indices],
+        selected_ids_list=[selected_ids_list[i] for i in indices],
+        cache_pts=[cache_pts[i] for i in indices],
+        bootstrap_cache_pts=[bootstrap_cache_pts[i] for i in indices],
+        split_seed=int(split_seed),
+    )
+
+
+def _train_pool_subset_indices(
+    chunk_dirs: list[Path],
+    *,
+    subset_parent: Path,
+    glob_pat: str,
+) -> list[int]:
+    allowed = {p.name for p in _chunk_dirs_from_subdir_glob(subset_parent, glob_pat)}
+    return [i for i, ch in enumerate(chunk_dirs) if ch.name in allowed]
+
+
+def _maybe_build_subset_eval_pools_from_train(
+    args: argparse.Namespace,
+    *,
+    chunk_parent: Path,
+    chunk_dirs: list[Path],
+    idx_val_list: list[np.ndarray],
+    idx_test_list: list[np.ndarray],
+    selected_ids_list: list[list[int] | None],
+    cache_pts: list[Path],
+    bootstrap_cache_pts: list[Path | None],
+) -> list[_ChunkEvalPool]:
+    """Val/test eval on training-pool subsets (reuses train caches and per-chunk splits)."""
+    pools: list[_ChunkEvalPool] = []
+    split_seed = int(args.seed)
+    specs = (
+        (
+            "eval_subset_nobess_chunk_parent",
+            "eval_subset_nobess_chunk_glob",
+            "eval_subset_nobess_label",
+            "nobess_40",
+        ),
+        (
+            "eval_subset_withder_chunk_parent",
+            "eval_subset_withder_chunk_glob",
+            "eval_subset_withder_label",
+            "withder_4",
+        ),
+    )
+    for parent_attr, glob_attr, label_attr, default_label in specs:
+        parent_s = str(getattr(args, parent_attr, "") or "").strip()
+        if not parent_s:
+            continue
+        subset_parent = Path(parent_s).resolve()
+        if not subset_parent.is_dir():
+            raise FileNotFoundError(f"--{parent_attr} not found: {subset_parent}")
+        glob_pat = str(getattr(args, glob_attr, "run_*") or "run_*").strip()
+        label = str(getattr(args, label_attr, default_label) or default_label).strip()
+        indices = _train_pool_subset_indices(
+            chunk_dirs,
+            subset_parent=subset_parent,
+            glob_pat=glob_pat,
+        )
+        if not indices:
+            print(
+                f"[eval_subset:{label}] warning: no training chunks match "
+                f"{glob_pat!r} under {subset_parent}",
+                flush=True,
+            )
+            continue
+        pools.append(
+            _slice_train_pool_subset(
+                label=label,
+                chunk_parent=chunk_parent,
+                chunk_dirs=chunk_dirs,
+                indices=indices,
+                idx_val_list=idx_val_list,
+                idx_test_list=idx_test_list,
+                selected_ids_list=selected_ids_list,
+                cache_pts=cache_pts,
+                bootstrap_cache_pts=bootstrap_cache_pts,
+                split_seed=split_seed,
+            )
+        )
+    return pools
+
+
 def _eval_chunk_pool_val_test(
     model: nn.Module,
     pool: _ChunkEvalPool,
@@ -6836,9 +6949,24 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_class_tables=reg_class_tables,
         reg_target_mode=reg_target_mode,
     )
+    subset_pools = _maybe_build_subset_eval_pools_from_train(
+        args,
+        chunk_parent=chunk_parent,
+        chunk_dirs=chunk_dirs,
+        idx_val_list=idx_val_list,
+        idx_test_list=idx_test_list,
+        selected_ids_list=selected_ids_list,
+        cache_pts=cache_pts,
+        bootstrap_cache_pts=bootstrap_cache_pts,
+    )
     holdout_baseline_val_met: dict[str, float] | None = None
     holdout_baseline_test_met: dict[str, float] | None = None
     holdout_epoch_history: list[dict[str, object]] = []
+    subset_baseline: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
+    subset_epoch_histories: dict[str, list[dict[str, object]]] = {
+        p.label: [] for p in subset_pools
+    }
+    train_pool_epoch_history: list[dict[str, object]] = []
 
     assert sum_x is not None and sum_x2 is not None
     x_mean = (sum_x / float(cnt_x)).view(1, n_node_features).float()
@@ -7157,6 +7285,22 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 holdout_baseline_val_met,
                 holdout_baseline_test_met,
             )
+        for sub_pool in subset_pools:
+            print(f"[init eval] subset ({sub_pool.label})", flush=True)
+            sub_val, sub_test = _eval_chunk_pool_val_test(
+                model,
+                sub_pool,
+                epoch=0,
+                eval_kw=_eval_kw,
+                loss_eval_kw=_loss_eval_kw,
+            )
+            _print_eval_pool_section(
+                sub_pool.label,
+                "eval_before_train",
+                sub_val,
+                sub_test,
+            )
+            subset_baseline[sub_pool.label] = (sub_val, sub_test)
 
     if bool(getattr(args, "eval_only", False)):
         report = {
@@ -7193,6 +7337,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 init_baseline_test=holdout_baseline_test_met,
                 final_val=holdout_baseline_val_met,
                 final_test=holdout_baseline_test_met,
+            )
+        for sub_pool in subset_pools:
+            sub_init = subset_baseline.get(sub_pool.label)
+            report[_subset_eval_report_key(sub_pool.label)] = _eval_pool_report_block(
+                sub_pool,
+                init_baseline_val=sub_init[0] if sub_init else None,
+                init_baseline_test=sub_init[1] if sub_init else None,
+                final_val=sub_init[0] if sub_init else None,
+                final_test=sub_init[1] if sub_init else None,
             )
         (out_dir / "da_gps_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(f"eval_only: wrote {out_dir / 'da_gps_report.json'}", flush=True)
@@ -7817,6 +7970,13 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     ep_val_met,
                     ep_test_met,
                 )
+                train_pool_epoch_history.append(
+                    {
+                        "epoch": int(ep),
+                        "val_metrics": ep_val_met,
+                        "test_metrics": ep_test_met,
+                    }
+                )
                 if baseline_val_met is not None and baseline_test_met is not None:
                     _print_vs_baseline_deltas(
                         epoch=ep,
@@ -7844,6 +8004,27 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             "epoch": int(ep),
                             "val_metrics": ho_val_met,
                             "test_metrics": ho_test_met,
+                        }
+                    )
+                for sub_pool in subset_pools:
+                    sub_val_met, sub_test_met = _eval_chunk_pool_val_test(
+                        model,
+                        sub_pool,
+                        epoch=ep,
+                        eval_kw=_eval_kw,
+                        loss_eval_kw=_loss_eval_kw,
+                    )
+                    _print_eval_pool_section(
+                        sub_pool.label,
+                        f"epoch {ep}",
+                        sub_val_met,
+                        sub_test_met,
+                    )
+                    subset_epoch_histories[sub_pool.label].append(
+                        {
+                            "epoch": int(ep),
+                            "val_metrics": sub_val_met,
+                            "test_metrics": sub_test_met,
                         }
                     )
                 model.train()
@@ -7933,6 +8114,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             eval_kw=_eval_kw,
             loss_eval_kw=_loss_eval_kw,
         )
+    subset_final: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
+    for sub_pool in subset_pools:
+        sub_final_val, sub_final_test = _eval_chunk_pool_val_test(
+            model,
+            sub_pool,
+            epoch=int(best_epoch),
+            eval_kw=_eval_kw,
+            loss_eval_kw=_loss_eval_kw,
+        )
+        subset_final[sub_pool.label] = (sub_final_val, sub_final_test)
 
     print("\n=== Final evaluation (best checkpoint) ===", flush=True)
     _print_eval_pool_section("train_pool_eval", f"best epoch {best_epoch}", val_met, met)
@@ -7943,6 +8134,15 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             holdout_final_val_met,
             holdout_final_test_met,
         )
+    for sub_pool in subset_pools:
+        sub_fin = subset_final.get(sub_pool.label)
+        if sub_fin is not None:
+            _print_eval_pool_section(
+                sub_pool.label,
+                f"best epoch {best_epoch}",
+                sub_fin[0],
+                sub_fin[1],
+            )
 
     ckpt = out_dir / "da_gps_multitask_best.pt"
     save_ok = True
@@ -8001,6 +8201,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             final_val=val_met,
             final_test=met,
             best_epoch=int(best_epoch),
+            epoch_history=train_pool_epoch_history,
         ),
         "train_seconds": train_seconds,
         "checkpoint_saved": bool(save_ok),
@@ -8016,6 +8217,18 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             final_test=holdout_final_test_met,
             best_epoch=int(best_epoch),
             epoch_history=holdout_epoch_history,
+        )
+    for sub_pool in subset_pools:
+        sub_init = subset_baseline.get(sub_pool.label)
+        sub_fin = subset_final.get(sub_pool.label)
+        report[_subset_eval_report_key(sub_pool.label)] = _eval_pool_report_block(
+            sub_pool,
+            init_baseline_val=sub_init[0] if sub_init else None,
+            init_baseline_test=sub_init[1] if sub_init else None,
+            final_val=sub_fin[0] if sub_fin else None,
+            final_test=sub_fin[1] if sub_fin else None,
+            best_epoch=int(best_epoch),
+            epoch_history=subset_epoch_histories.get(sub_pool.label, []),
         )
     if _training_addons_enabled(args):
         report["training_addons"] = _training_addons_report(
@@ -8565,6 +8778,43 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Per-chunk 80/10/10 split seed for holdout chunks (-1 = use --seed).",
+    )
+    p.add_argument(
+        "--eval_subset_nobess_chunk_parent",
+        type=str,
+        default="",
+        help="Chunk parent for no-BESS subset val/test eval on training-pool chunks (e.g. 40 no-BESS "
+        "runs while training on a blended parent). Reuses train caches and per-chunk splits.",
+    )
+    p.add_argument(
+        "--eval_subset_nobess_chunk_glob",
+        type=str,
+        default="run_*",
+        help="fnmatch pattern or comma-separated chunk names under --eval_subset_nobess_chunk_parent.",
+    )
+    p.add_argument(
+        "--eval_subset_nobess_label",
+        type=str,
+        default="nobess_40",
+        help="Log/report label for no-BESS subset eval (da_gps_report.json key: subset_eval_<label>).",
+    )
+    p.add_argument(
+        "--eval_subset_withder_chunk_parent",
+        type=str,
+        default="",
+        help="Chunk parent for with-DER subset val/test eval on training-pool chunks.",
+    )
+    p.add_argument(
+        "--eval_subset_withder_chunk_glob",
+        type=str,
+        default="run_*",
+        help="fnmatch pattern or comma-separated chunk names under --eval_subset_withder_chunk_parent.",
+    )
+    p.add_argument(
+        "--eval_subset_withder_label",
+        type=str,
+        default="withder_4",
+        help="Log/report label for with-DER subset eval (da_gps_report.json key: subset_eval_<label>).",
     )
     p.add_argument(
         "--save_only_if_improved",
