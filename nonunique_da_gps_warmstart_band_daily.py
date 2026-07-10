@@ -146,6 +146,155 @@ def _mean_band_proximity(scores: np.ndarray) -> float:
     return float(np.mean(scores[m]))
 
 
+def _band_outside_distance_per_step(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+) -> np.ndarray:
+    """Per-timestep distance to nearest band edge when outside; 0 when inside.
+
+    Uses the same edge distance ``d`` as cloud proximity (before ``exp(-d/scale)``).
+    Units follow ``y``: pu for voltage/meta aux, tap steps for regulators, cap
+    steps ON for capacitors.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    ymin = np.asarray(ymin, dtype=np.float64)
+    ymax = np.asarray(ymax, dtype=np.float64)
+    m = np.isfinite(y) & np.isfinite(ymin) & np.isfinite(ymax)
+    dist = np.full(y.shape, np.nan, dtype=np.float64)
+    if not m.any():
+        return dist
+    lo = ymin[m]
+    hi = ymax[m]
+    yy = y[m]
+    d = np.where(yy > hi, yy - hi, np.where(yy < lo, lo - yy, 0.0))
+    dist[m] = d
+    return dist
+
+
+def _mean_finite_dict(items: dict[str, float]) -> float:
+    """Mean over finite values in a per-device metric dict."""
+    vals = [float(v) for v in items.values() if np.isfinite(v)]
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
+
+
+def _aggregate_group_band_metrics(
+    inside: dict[str, float],
+    proximity: dict[str, float],
+    outside_dist: dict[str, float],
+    set_dist: dict[str, float],
+) -> dict[str, float | int]:
+    """Mean inside-band frac, cloud proximity, set distance, and outside distance."""
+    return {
+        "n_devices": len(inside),
+        "mean_inside_band_frac": _mean_finite_dict(inside),
+        "mean_cloud_proximity": _mean_finite_dict(proximity),
+        "mean_set_distance": _mean_finite_dict(set_dist),
+        "mean_outside_distance": _mean_finite_dict(outside_dist),
+    }
+
+
+def _build_aggregated_band_metrics(
+    inside: dict[str, dict[str, float]],
+    proximity: dict[str, dict[str, float]],
+    outside_dist: dict[str, dict[str, float]],
+    set_dist: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float | int]]:
+    """Aggregated means for voltage, regulator, capacitor, and meta_aux groups."""
+    groups = ("voltage", "regulator", "capacitor", "meta_aux")
+    out: dict[str, dict[str, float | int]] = {}
+    for group in groups:
+        ib = inside.get(group) or {}
+        if not ib:
+            continue
+        out[group] = _aggregate_group_band_metrics(
+            ib,
+            proximity.get(group) or {},
+            outside_dist.get(group) or {},
+            set_dist.get(group) or {},
+        )
+    return out
+
+
+_GROUP_UNITS = {
+    "voltage": "pu",
+    "regulator": "tap steps",
+    "capacitor": "cap steps ON",
+    "meta_aux": "pu/kW/kvar",
+}
+
+
+def _print_aggregated_band_summary(aggregated: dict[str, dict[str, float | int]]) -> None:
+    """Print group-level means before per-device breakdown."""
+    if not aggregated:
+        return
+    print("\n=== DA-GPS aggregated warm-start band metrics (all devices) ===")
+    for group, stats in aggregated.items():
+        n = int(stats.get("n_devices", 0))
+        frac = float(stats.get("mean_inside_band_frac", float("nan")))
+        prox = float(stats.get("mean_cloud_proximity", float("nan")))
+        sdist = float(stats.get("mean_set_distance", float("nan")))
+        odist = float(stats.get("mean_outside_distance", float("nan")))
+        unit = _GROUP_UNITS.get(group, "")
+        frac_s = f"{100.0 * frac:.1f}%" if np.isfinite(frac) else "n/a"
+        prox_s = f"{prox:.3f}" if np.isfinite(prox) else "n/a"
+        sdist_s = f"{sdist:.4g}" if np.isfinite(sdist) else "n/a"
+        odist_s = f"{odist:.4g}" if np.isfinite(odist) else "n/a"
+        print(
+            f"  [{group}] n={n}  inside={frac_s}  "
+            f"cloud_proximity={prox_s}  set_distance={sdist_s}  "
+            f"mean_outside_distance={odist_s} {unit}",
+            flush=True,
+        )
+
+
+def _mean_set_distance(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+) -> float:
+    """Mean distance to nearest point in the valid set [ymin, ymax].
+
+    Per timestep: 0 inside the band; otherwise distance to the nearest edge.
+    Averaged over **all** valid timesteps (inside steps contribute 0). This is
+    the set-distance / nearest-valid-solution error when the warm-start cloud
+    defines the feasible interval.
+    """
+    dist = _band_outside_distance_per_step(y, ymin, ymax)
+    m = np.isfinite(dist)
+    if not m.any():
+        return float("nan")
+    return float(np.mean(dist[m]))
+
+
+def _mean_outside_distance(
+    y: np.ndarray,
+    ymin: np.ndarray,
+    ymax: np.ndarray,
+) -> float:
+    """Mean distance to nearest band edge over **outside-only** timesteps.
+
+    Returns 0.0 when every valid timestep is inside the band; ``nan`` when no
+    valid timesteps exist. ``frac_outside`` is ``1 - inside_band_frac``.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    ymin = np.asarray(ymin, dtype=np.float64)
+    ymax = np.asarray(ymax, dtype=np.float64)
+    m = np.isfinite(y) & np.isfinite(ymin) & np.isfinite(ymax)
+    if not m.any():
+        return float("nan")
+    lo = ymin[m]
+    hi = ymax[m]
+    yy = y[m]
+    inside = (yy >= lo) & (yy <= hi)
+    if not np.any(~inside):
+        return 0.0
+    d = np.where(yy > hi, yy - hi, np.where(yy < lo, lo - yy, 0.0))
+    return float(np.mean(d[~inside]))
+
+
 def _band_proximity_continuous(
     y: np.ndarray,
     ymin: np.ndarray,
@@ -878,6 +1027,18 @@ def run_da_gps_warmstart_band_daily(
 
     inside: dict[str, dict[str, float]] = {"voltage": {}, "regulator": {}, "capacitor": {}, "meta_aux": {}}
     proximity: dict[str, dict[str, float]] = {"voltage": {}, "regulator": {}, "capacitor": {}, "meta_aux": {}}
+    outside_dist: dict[str, dict[str, float]] = {
+        "voltage": {},
+        "regulator": {},
+        "capacitor": {},
+        "meta_aux": {},
+    }
+    set_dist: dict[str, dict[str, float]] = {
+        "voltage": {},
+        "regulator": {},
+        "capacitor": {},
+        "meta_aux": {},
+    }
     cap_steps_by_name = _cap_num_steps_by_name(cap_names)
 
     if da_v is not None:
@@ -886,11 +1047,15 @@ def run_da_gps_warmstart_band_daily(
             if v_da is None:
                 continue
             v_da = np.asarray(v_da, dtype=float).ravel()[:npts]
-            frac = _inside_band_fraction(v_da, volts_min[:, j], volts_max[:, j])
+            v_lo = volts_min[:, j]
+            v_hi = volts_max[:, j]
+            frac = _inside_band_fraction(v_da, v_lo, v_hi)
             inside["voltage"][node] = frac
             proximity["voltage"][node] = _band_proximity_continuous(
-                v_da, volts_min[:, j], volts_max[:, j], min_scale=1e-4
+                v_da, v_lo, v_hi, min_scale=1e-4
             )
+            outside_dist["voltage"][node] = _mean_outside_distance(v_da, v_lo, v_hi)
+            set_dist["voltage"][node] = _mean_set_distance(v_da, v_lo, v_hi)
 
     if da_reg_disc:
         for nm in reg_names:
@@ -898,10 +1063,14 @@ def run_da_gps_warmstart_band_daily(
             if y_da is None:
                 continue
             j = reg_names.index(nm)
-            inside["regulator"][nm] = _inside_band_fraction(y_da, taps_min[:, j], taps_max[:, j])
+            lo = taps_min[:, j]
+            hi = taps_max[:, j]
+            inside["regulator"][nm] = _inside_band_fraction(y_da, lo, hi)
             proximity["regulator"][nm] = _band_proximity_discrete(
-                y_da, taps_min[:, j], taps_max[:, j], step_scale=1.0
+                y_da, lo, hi, step_scale=1.0
             )
+            outside_dist["regulator"][nm] = _mean_outside_distance(y_da, lo, hi)
+            set_dist["regulator"][nm] = _mean_set_distance(y_da, lo, hi)
 
     if da_cap_disc:
         for nm in cap_names:
@@ -909,11 +1078,15 @@ def run_da_gps_warmstart_band_daily(
             if y_da is None:
                 continue
             j = cap_names.index(nm)
-            inside["capacitor"][nm] = _inside_band_fraction(y_da, cap_min[:, j], cap_max[:, j])
+            lo = cap_min[:, j]
+            hi = cap_max[:, j]
+            inside["capacitor"][nm] = _inside_band_fraction(y_da, lo, hi)
             cap_scale = float(_dict_lookup(cap_steps_by_name, nm) or 1.0)
             proximity["capacitor"][nm] = _band_proximity_discrete(
-                y_da, cap_min[:, j], cap_max[:, j], step_scale=max(1.0, cap_scale)
+                y_da, lo, hi, step_scale=max(1.0, cap_scale)
             )
+            outside_dist["capacitor"][nm] = _mean_outside_distance(y_da, lo, hi)
+            set_dist["capacitor"][nm] = _mean_set_distance(y_da, lo, hi)
 
     if da_meta and meta_min is not None and meta_max is not None:
         for col in meta_cols:
@@ -922,12 +1095,19 @@ def run_da_gps_warmstart_band_daily(
                 continue
             y_da = np.asarray(y_da, dtype=float).ravel()[:npts]
             j = meta_cols.index(col)
-            inside["meta_aux"][col] = _inside_band_fraction(y_da, meta_min[:, j], meta_max[:, j])
+            lo = meta_min[:, j]
+            hi = meta_max[:, j]
+            inside["meta_aux"][col] = _inside_band_fraction(y_da, lo, hi)
             proximity["meta_aux"][col] = _band_proximity_continuous(
-                y_da, meta_min[:, j], meta_max[:, j], min_scale=1e-3
+                y_da, lo, hi, min_scale=1e-3
             )
+            outside_dist["meta_aux"][col] = _mean_outside_distance(y_da, lo, hi)
+            set_dist["meta_aux"][col] = _mean_set_distance(y_da, lo, hi)
 
-    print("\n=== DA-GPS inside OpenDSS warm-start band [min,max] ===")
+    aggregated = _build_aggregated_band_metrics(inside, proximity, outside_dist, set_dist)
+    _print_aggregated_band_summary(aggregated)
+
+    print("\n=== DA-GPS inside OpenDSS warm-start band [min,max] (per device) ===")
     print(
         "  (regulator/capacitor: DA-GPS rounded to discrete tap # / steps ON before inside-band check)",
         flush=True,
@@ -943,11 +1123,8 @@ def run_da_gps_warmstart_band_daily(
                 shown += 1
         if group == "voltage" and plot_all_cache_nodes and len(items) > 8:
             print(f"    ... ({len(items)} nodes total; see per-node CSV in out_dir)")
-        vals = [v for v in items.values() if np.isfinite(v)]
-        if vals:
-            print(f"    mean across series: {100.0 * float(np.mean(vals)):.1f}%")
 
-    print("\n=== DA-GPS cloud proximity to OpenDSS warm-start band ===")
+    print("\n=== DA-GPS cloud proximity to OpenDSS warm-start band (per device) ===")
     print(
         "  score in [0,1]: 1 inside band; outside decays as exp(-d/scale) "
         "(continuous: scale=max(half-width,1e-4); discrete: tap/cap step scale)",
@@ -964,9 +1141,42 @@ def run_da_gps_warmstart_band_daily(
                 shown += 1
         if group == "voltage" and plot_all_cache_nodes and len(items) > 8:
             print(f"    ... ({len(items)} nodes total; see per-node CSV in out_dir)")
-        vals = [v for v in items.values() if np.isfinite(v)]
-        if vals:
-            print(f"    mean across series: {float(np.mean(vals)):.3f}")
+
+    print("\n=== DA-GPS set distance to OpenDSS warm-start band (per device) ===")
+    print(
+        "  mean distance to nearest valid point in [lo, hi] over all timesteps "
+        "(0 inside band); units: pu (|V|/meta), tap steps (reg), cap steps ON (cap)",
+        flush=True,
+    )
+    for group, items in set_dist.items():
+        if not items:
+            continue
+        print(f"  [{group}]")
+        shown = 0
+        for name, dist in sorted(items.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else -1.0), reverse=True):
+            if shown < 8 or group != "voltage" or not plot_all_cache_nodes:
+                print(f"    {name}: set distance {dist:.4g}")
+                shown += 1
+        if group == "voltage" and plot_all_cache_nodes and len(items) > 8:
+            print(f"    ... ({len(items)} nodes total; see per-node CSV in out_dir)")
+
+    print("\n=== DA-GPS mean outside distance to OpenDSS warm-start band (per device) ===")
+    print(
+        "  mean edge distance over outside timesteps only (0 when always inside); "
+        "units: pu (|V|/meta), tap steps (reg), cap steps ON (cap)",
+        flush=True,
+    )
+    for group, items in outside_dist.items():
+        if not items:
+            continue
+        print(f"  [{group}]")
+        shown = 0
+        for name, dist in sorted(items.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else -1.0), reverse=True):
+            if shown < 8 or group != "voltage" or not plot_all_cache_nodes:
+                print(f"    {name}: mean outside distance {dist:.4g}")
+                shown += 1
+        if group == "voltage" and plot_all_cache_nodes and len(items) > 8:
+            print(f"    ... ({len(items)} nodes total; see per-node CSV in out_dir)")
 
     volt_png_dir: Path | None = None
     vdpi = int(voltage_plot_dpi) if int(voltage_plot_dpi) > 0 else (96 if plot_all_cache_nodes else 160)
@@ -995,9 +1205,18 @@ def run_da_gps_warmstart_band_daily(
         for j, node in enumerate(collect_nodes):
             frac = inside["voltage"].get(node, float("nan"))
             prox = proximity["voltage"].get(node, float("nan"))
-            node_rows.append((str(node).strip().lower(), frac, prox))
+            odist = outside_dist["voltage"].get(node, float("nan"))
+            sdist = set_dist["voltage"].get(node, float("nan"))
+            node_rows.append((str(node).strip().lower(), frac, prox, sdist, odist))
         df_inside = pd.DataFrame(
-            node_rows, columns=["node", "inside_frac_dagps", "cloud_proximity_dagps"]
+            node_rows,
+            columns=[
+                "node",
+                "inside_frac_dagps",
+                "cloud_proximity_dagps",
+                "set_distance_dagps",
+                "mean_outside_distance_dagps",
+            ],
         ).sort_values("inside_frac_dagps", ascending=True)
         inside_csv = out_path / f"inside_band_per_node_{stem_short}.csv"
         _write_csv(df_inside, inside_csv)
@@ -1189,8 +1408,6 @@ def run_da_gps_warmstart_band_daily(
                     show=show and not plot_all_cache_nodes,
                 )
 
-        v_fracs = [v for v in inside["voltage"].values() if np.isfinite(v)]
-        v_prox = [v for v in proximity["voltage"].values() if np.isfinite(v)]
         summary = {
             "mode": "da_gps_warmstart_band_daily",
             "run_dir": str(Path(cfg.da_gps_run_dir).resolve()),
@@ -1208,10 +1425,11 @@ def run_da_gps_warmstart_band_daily(
             "plot_all_cache_nodes": bool(plot_all_cache_nodes),
             "n_collect_nodes": n_nodes,
             "n_voltage_pngs": n_plot_ranked if plot_all_cache_nodes else len(collect_nodes),
-            "mean_inside_frac_voltage_dagps": float(np.mean(v_fracs)) if v_fracs else float("nan"),
-            "mean_cloud_proximity_voltage_dagps": float(np.mean(v_prox)) if v_prox else float("nan"),
+            "aggregated": aggregated,
             "inside_band_frac": inside,
             "cloud_proximity": proximity,
+            "set_distance": set_dist,
+            "mean_outside_distance": outside_dist,
             "aux_outputs": aux_outputs,
             "wall_s_opendss_warmstart": wall_s,
             "timing": {
@@ -1230,6 +1448,19 @@ def run_da_gps_warmstart_band_daily(
                 else float("nan"),
             },
         }
+        for group, stats in aggregated.items():
+            summary[f"mean_inside_frac_{group}_dagps"] = float(
+                stats.get("mean_inside_band_frac", float("nan"))
+            )
+            summary[f"mean_cloud_proximity_{group}_dagps"] = float(
+                stats.get("mean_cloud_proximity", float("nan"))
+            )
+            summary[f"mean_set_distance_{group}_dagps"] = float(
+                stats.get("mean_set_distance", float("nan"))
+            )
+            summary[f"mean_outside_distance_{group}_dagps"] = float(
+                stats.get("mean_outside_distance", float("nan"))
+            )
         summary_path = out_path / "run_summary.json"
         _write_json_text(summary_path, json.dumps(summary, indent=2))
         print(f"[da_gps_warmstart_band] wrote {summary_path}", flush=True)
@@ -1337,6 +1568,9 @@ def run_da_gps_warmstart_band_daily(
         "da_gps_hours": da_hours,
         "da_gps_inside_band_frac": inside,
         "da_gps_cloud_proximity": proximity,
+        "da_gps_set_distance": set_dist,
+        "da_gps_mean_outside_distance": outside_dist,
+        "da_gps_aggregated": aggregated,
         "converged": converged,
         "wall_s": wall_s,
         "gnn_timing": {

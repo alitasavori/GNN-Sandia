@@ -1180,6 +1180,12 @@ def _pf_physics_fp32_ctx():
     return contextlib.nullcontext()
 
 
+def _amp_autocast_ctx(use_amp: bool):
+    if use_amp:
+        return torch.amp.autocast("cuda")
+    return contextlib.nullcontext()
+
+
 _PF_BALANCE_NODE_WARNED: set[int] = set()
 
 
@@ -4832,7 +4838,7 @@ def evaluate(
         yb = batch.y.view(batch.num_graphs, -1)
         y_cap = batch.y_cap.view(batch.num_graphs, -1)
         y_reg = batch.y_reg.view(batch.num_graphs, -1)
-        with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+        with _amp_autocast_ctx(use_amp):
             v_n, c_log, r_p, pv_p = model(batch)
         v_n_flat = v_n.view(batch.num_graphs, -1)
         preds.append((v_n_flat * y_std.to(device) + y_mean.to(device)).cpu())
@@ -5580,7 +5586,7 @@ def _evaluate_split_losses_multi_chunks(
             y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
             y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
             yb_n = (yb - y_mean_d) / y_std_d
-            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+            with _amp_autocast_ctx(use_amp):
                 v_n, c_log, r_p, pv_p = model(batch)
                 lv = mse(v_n.view_as(yb_n), yb_n)
                 lc = bce(c_log, y_cap_b)
@@ -7163,9 +7169,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     )
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
-        from torch.cuda.amp import GradScaler as _GradScaler
-
-        scaler = _GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
         print("AMP (autocast + GradScaler): enabled", flush=True)
     else:
         scaler = None
@@ -7430,7 +7434,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
                 yb_n = (yb - y_mean_d) / y_std_d
                 opt.zero_grad(set_to_none=True)
-                with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                with _amp_autocast_ctx(use_amp):
                     v_n, c_log, r_p, pv_p = model(batch)
                     loss_v, volt_dbg = _voltage_loss_scalar(
                         v_n,
@@ -7643,7 +7647,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         y_cap_b = batch.y_cap.view(batch.num_graphs, -1)
                         y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
                         yb_n = (yb - y_mean_d) / y_std_d
-                        with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                        with _amp_autocast_ctx(use_amp):
                             v_n, c_log, r_p, pv_p = model(batch)
                             lv = mse(v_n.view_as(yb_n), yb_n)
                             lc = bce(c_log, y_cap_b)
@@ -7790,7 +7794,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                             batch = batch.to(device)
                             batch = _cast_batch_float_tensors(batch)
                             y_reg_b = batch.y_reg.view(batch.num_graphs, -1)
-                            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                            with _amp_autocast_ctx(use_amp):
                                 _v_n, _c_log, _r_p, _pv_p = model(batch)
                                 reg_logits_cf = base_model._last_reg_logits
                             if reg_logits_cf:
@@ -9135,9 +9139,7 @@ def main() -> None:
     reg_class_values_d = None
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
-        from torch.cuda.amp import GradScaler as _GradScaler
-
-        scaler = _GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
         print("AMP (autocast + GradScaler): enabled", flush=True)
     else:
         scaler = None
@@ -9189,7 +9191,7 @@ def main() -> None:
             y_reg = batch.y_reg.view(batch.num_graphs, -1)
             yb_n = (yb - y_mean_d) / y_std_d
             opt.zero_grad(set_to_none=True)
-            with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+            with _amp_autocast_ctx(use_amp):
                 v_n, c_log, r_p, pv_p = model(batch)
                 loss_v, volt_dbg = _voltage_loss_scalar(
                     v_n,
@@ -9335,7 +9337,7 @@ def main() -> None:
                     y_cap = batch.y_cap.view(batch.num_graphs, -1)
                     y_reg = batch.y_reg.view(batch.num_graphs, -1)
                     yb_n = (yb - y_mean_d) / y_std_d
-                    with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                    with _amp_autocast_ctx(use_amp):
                         v_n, c_log, r_p, pv_p = model(batch)
                         lv = mse(v_n.view_as(yb_n), yb_n)
                         lc = bce(c_log, y_cap)
@@ -9433,7 +9435,7 @@ def main() -> None:
                         batch = batch.to(device)
                         batch = _cast_batch_float_tensors(batch)
                         y_reg = batch.y_reg.view(batch.num_graphs, -1)
-                        with (torch.cuda.amp.autocast() if use_amp else contextlib.nullcontext()):
+                        with _amp_autocast_ctx(use_amp):
                             model(batch)
                             reg_logits_cf = base_model._last_reg_logits
                         if reg_logits_cf:
