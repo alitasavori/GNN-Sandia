@@ -37,6 +37,7 @@ from nonunique_da_gps_daily_compare import (
 from nonunique_opendss_daily import (
     DailySimConfig,
     apply_explicit_loads_pv,
+    build_der_injection_record,
     collect_load_bases,
     collect_pv_bases,
     compile_and_setup,
@@ -690,6 +691,11 @@ def _load_da_gps_bundle(
         sys.modules.pop("run_da_gps_daily_opendss_compare", None)
         from run_da_gps_daily_opendss_compare import run_da_gps_daily_voltages
 
+        der_max_kw = float(cfg.der_nominal_kw if cfg.include_der else 0.0)
+        der_max_kvar = float(cfg.der_nominal_kvar if cfg.include_der else 0.0)
+        # Match OpenDSS Q/P; default 0.1 only when kW is unset (legacy GNN default).
+        der_q_frac_p = (der_max_kvar / der_max_kw) if der_max_kw > 0.0 else 0.1
+
         bundle = run_da_gps_daily_voltages(
             run_dir=cfg.da_gps_run_dir,
             cache_pt=cfg.da_gps_cache_pt,
@@ -697,8 +703,9 @@ def _load_da_gps_bundle(
             node_names=collect_nodes,
             load_profile_path=str(load_csv),
             pv_irradiance_profile_path=str(irr_csv),
-            der_max_kw=float(cfg.der_nominal_kw if cfg.include_der else 0.0),
+            der_max_kw=der_max_kw,
             der_buses=str(cfg.der_bus if cfg.include_der else ""),
+            der_q_frac_p=float(der_q_frac_p),
             der_profile_path=str(cfg.der_profile_csv if cfg.include_der else "") or None,
             npts=int(inf_npts),
             step_min=int(inf_step_min),
@@ -1184,9 +1191,10 @@ def run_da_gps_warmstart_band_daily(
     vf_h = float(voltage_plot_fig_h) if float(voltage_plot_fig_h) > 0 else (3.2 if plot_all_cache_nodes else 4.2)
     stem_safe = _safe_stem(cfg_stem)
     stem_short = _stem_short(cfg_stem)
-    aux_outputs: dict[str, str] = {}
+    aux_outputs: dict[str, Any] = {}
     t_hours = display_hours_array(cfg)
     n_plot_ranked = len(collect_nodes)
+    der_record = build_der_injection_record(cfg, der_mult)
 
     if out_path is not None:
         out_path.mkdir(parents=True, exist_ok=True)
@@ -1425,6 +1433,7 @@ def run_da_gps_warmstart_band_daily(
             "plot_all_cache_nodes": bool(plot_all_cache_nodes),
             "n_collect_nodes": n_nodes,
             "n_voltage_pngs": n_plot_ranked if plot_all_cache_nodes else len(collect_nodes),
+            "der": der_record,
             "aggregated": aggregated,
             "inside_band_frac": inside,
             "cloud_proximity": proximity,
@@ -1543,6 +1552,7 @@ def run_da_gps_warmstart_band_daily(
         "warm_start_randomize_static_caps": bool(warm_start_randomize_static_caps),
         "load_profile": str(load_csv),
         "pv_profile": str(irr_csv),
+        "der_injection": der_record,
         "collect_nodes": collect_nodes,
         "monitor_nodes": monitor_resolved,
         "plot_all_cache_nodes": plot_all_cache_nodes,

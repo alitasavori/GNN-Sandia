@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,7 @@ class DailySimConfig:
     include_der: bool = False
     der_nominal_kw: float = 0.0
     der_nominal_kvar: float = 0.0
+    # Comma/semicolon/whitespace-separated bus names; total P/Q split equally across buses.
     der_bus: str = DER_BUS
     der_profile_csv: Path = field(default_factory=lambda: DER_PROFILE_CSV)
     monitor_candidates: list[str] = field(default_factory=lambda: list(MONITOR_CANDIDATES))
@@ -556,26 +558,115 @@ def load_der_multiplier_profile(csv_path: Path, *, cfg: DailySimConfig):
     return np.interp(target, times, mult)
 
 
+def parse_der_bus_list(spec: str) -> list[str]:
+    """Parse ``der_bus`` as comma / semicolon / whitespace-separated unique bus names."""
+    out: list[str] = []
+    for part in re.split(r"[,;\s]+", str(spec).strip()):
+        b = part.strip().lower()
+        if b and b not in out:
+            out.append(b)
+    return out
+
+
 def install_der_generator(cfg: DailySimConfig, bus: str):
-    bus = str(bus).strip().lower()
-    kv_ll = 12.47
-    try:
-        dss.Circuit.SetActiveBus(bus)
-        kv_ln = float(dss.Bus.kVBase())
-        if np.isfinite(kv_ln) and kv_ln > 0:
-            kv_ll = kv_ln * np.sqrt(3.0)
-    except Exception:
-        pass
-    dss.Text.Command(
-        f"New Generator.DER1 phases=3 bus1={bus} conn=wye model=1 "
-        f"kV={kv_ll:.6f} kW=0 kvar=0 vminpu=0.01 vmaxpu=10"
-    )
+    """Install one 3-phase ``Generator.DER{{i}}`` per bus in ``bus`` (comma-separated OK)."""
+    buses = parse_der_bus_list(bus)
+    for i, bk in enumerate(buses):
+        kv_ll = 12.47
+        try:
+            dss.Circuit.SetActiveBus(bk)
+            kv_ln = float(dss.Bus.kVBase())
+            if np.isfinite(kv_ln) and kv_ln > 0:
+                kv_ll = kv_ln * np.sqrt(3.0)
+        except Exception:
+            pass
+        gname = f"DER{i + 1}"
+        dss.Text.Command(
+            f"New Generator.{gname} phases=3 bus1={bk} conn=wye model=1 "
+            f"kV={kv_ll:.6f} kW=0 kvar=0 vminpu=0.01 vmaxpu=10"
+        )
 
 
 def set_der_injection(cfg: DailySimConfig, t: int, der_mult: np.ndarray):
-    dss.Generators.Name("DER1")
-    dss.Generators.kW(float(cfg.der_nominal_kw * der_mult[t]))
-    dss.Generators.kvar(float(cfg.der_nominal_kvar * der_mult[t]))
+    """Set total ``P/Q * der_mult[t]`` split equally across installed DER buses (3ph gens)."""
+    buses = parse_der_bus_list(cfg.der_bus)
+    if not buses:
+        return
+    n_bus = float(len(buses))
+    p_bus = float(cfg.der_nominal_kw * der_mult[t]) / n_bus
+    q_bus = float(cfg.der_nominal_kvar * der_mult[t]) / n_bus
+    for i in range(len(buses)):
+        dss.Generators.Name(f"DER{i + 1}")
+        dss.Generators.kW(p_bus)
+        dss.Generators.kvar(q_bus)
+
+
+def build_der_injection_record(
+    cfg: DailySimConfig,
+    der_mult: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """JSON-serializable DER injection location + P/Q schedule (matches ``set_der_injection``).
+
+    When ``include_der`` is False, returns ``{"include_der": false}`` only.
+    Otherwise uses compact arrays (readable for 288-step days) with equal-split
+    allocation across buses and OpenDSS gen names ``DER1``…``DERn``.
+    """
+    if not bool(cfg.include_der):
+        return {"include_der": False}
+
+    buses = parse_der_bus_list(cfg.der_bus)
+    n_bus = len(buses)
+    gen_names = [f"DER{i + 1}" for i in range(n_bus)]
+    npts = int(cfg.npts)
+    hours = np.asarray(cfg.hours, dtype=float)
+    if der_mult is None:
+        mult = np.zeros(npts, dtype=float)
+    else:
+        mult = np.asarray(der_mult, dtype=float).ravel()
+        if len(mult) != npts:
+            raise ValueError(
+                f"der_mult length {len(mult)} != cfg.npts={npts}"
+            )
+    p_nom = float(cfg.der_nominal_kw)
+    q_nom = float(cfg.der_nominal_kvar)
+    total_p = (p_nom * mult).astype(float)
+    total_q = (q_nom * mult).astype(float)
+    if n_bus > 0:
+        p_bus = (total_p / float(n_bus)).astype(float)
+        q_bus = (total_q / float(n_bus)).astype(float)
+    else:
+        p_bus = np.zeros(npts, dtype=float)
+        q_bus = np.zeros(npts, dtype=float)
+
+    per_bus = []
+    for i, bus in enumerate(buses):
+        per_bus.append(
+            {
+                "bus": bus,
+                "opendss_gen": gen_names[i],
+                "p_kw": p_bus.tolist(),
+                "q_kvar": q_bus.tolist(),
+            }
+        )
+
+    return {
+        "include_der": True,
+        "buses": buses,
+        "opendss_gen_names": gen_names,
+        "der_nominal_kw": p_nom,
+        "der_nominal_kvar": q_nom,
+        "der_profile_csv": str(Path(cfg.der_profile_csv).resolve())
+        if cfg.der_profile_csv
+        else None,
+        "allocation": "equal_split_across_buses",
+        "npts": npts,
+        "step_min": int(cfg.step_min),
+        "hour": hours.tolist(),
+        "multiplier": mult.tolist(),
+        "total_p_kw": total_p.tolist(),
+        "total_q_kvar": total_q.tolist(),
+        "per_bus": per_bus,
+    }
 
 
 def apply_explicit_loads_pv(load_names, base_kw, base_kvar, pv_names, pv_base, m_t, ir_t):
