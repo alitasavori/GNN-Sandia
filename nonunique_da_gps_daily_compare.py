@@ -48,7 +48,12 @@ from nonunique_opendss_daily import (
     resolve_monitor_nodes,
     tap_pu_to_tap_number,
 )
-from compare_mv_daily_timing import amortize_gnn_timing_to_display_grid, format_gnn_grid_log
+from compare_mv_daily_timing import (
+    amortize_gnn_timing_to_display_grid,
+    compute_mv_daily_timing_metrics,
+    format_gnn_grid_log,
+    print_mv_daily_pipeline_and_speedups,
+)
 from nonunique_plots import plot_all
 
 DAILY_COMPARE_STYLE = [("OpenDSS daily", "-")]
@@ -315,6 +320,9 @@ def run_da_gps_predictions(
             "gnn_setup_once_s": timing["gnn_setup_once_s"],
             "gnn_per_step_s": timing["gnn_per_step_s"],
             "gnn_total_wall_s": timing["gnn_total_wall_s"],
+            "feature_build_s_total": bundle.get("feature_build_s_total"),
+            "gnn_forward_only_s_total": bundle.get("gnn_forward_only_s_total"),
+            "gnn_bucket_s_total": bundle.get("gnn_bucket_s_total"),
             "n_ok": timing["n_ok"],
             "gnn_grid": timing,
         }
@@ -430,6 +438,117 @@ def _gnn_deployment_wall_s(
     return None
 
 
+def _fair_timing_pipeline_metrics(
+    *,
+    n_ok: int,
+    dss_solve_s: np.ndarray,
+    dss_collect_s: np.ndarray,
+    npts: int,
+    feature_build_s_total: float | None,
+    gnn_forward_only_s_total: float | None,
+    dss_apply_s_total: float = 0.0,
+) -> dict[str, float]:
+    """Method B (daily QSTS): DSS apply is 0 unless explicitly timed."""
+    solve_total = float(np.sum(dss_solve_s[:npts]))
+    collect_total = float(np.sum(dss_collect_s[:npts]))
+    feature_total = float(feature_build_s_total or 0.0)
+    forward_total = float(gnn_forward_only_s_total or 0.0)
+    return compute_mv_daily_timing_metrics(
+        n_ok=n_ok,
+        open_apply_s_total=float(dss_apply_s_total),
+        open_solve_only_s_total=solve_total,
+        open_get_s_total=collect_total,
+        feature_build_s_total=feature_total,
+        gnn_forward_only_s_total=forward_total,
+    )
+
+
+def build_fair_timing_summary(
+    *,
+    cfg: DailySimConfig,
+    boot,
+    dss: dict[str, Any],
+    gnn: dict[str, Any],
+    monitor_nodes: list[str],
+    collect_nodes: list[str],
+    monitor_mae: float,
+    device_requested: str,
+    device: str,
+    include_der: bool,
+    env: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    """JSON summary for Method B fair timing (metrics-only notebook cell)."""
+    npts = int(cfg.npts)
+    n_ok = int(dss["converged"].sum())
+    gnn_deploy = _gnn_deployment_wall_s(
+        gnn.get("gnn_total_wall_s"),
+        gnn.get("gnn_setup_once_s"),
+        gnn.get("gnn_per_step_s"),
+        gnn.get("n_ok"),
+    )
+    dss_wall = float(dss["total_wall_s"])
+    wall_speedup = (
+        dss_wall / float(gnn_deploy)
+        if gnn_deploy is not None and float(gnn_deploy) > 1e-9
+        else float("nan")
+    )
+    pipeline = _fair_timing_pipeline_metrics(
+        n_ok=n_ok,
+        dss_solve_s=dss["solve_s"],
+        dss_collect_s=dss["collect_s"],
+        npts=npts,
+        feature_build_s_total=gnn.get("feature_build_s_total"),
+        gnn_forward_only_s_total=gnn.get("gnn_forward_only_s_total"),
+    )
+    return {
+        "mode": "da_gps_daily_compare",
+        "metrics_only": True,
+        "step_min": int(cfg.step_min),
+        "npts": npts,
+        "include_der": bool(include_der),
+        "device_requested": str(device_requested),
+        "device": str(device),
+        "checkpoint": str(boot.checkpoint),
+        "cache_pt": str(boot.cache_pt),
+        "load_profile": str(boot.load_profile),
+        "pv_profile": str(boot.irr_profile),
+        "n_collect_nodes": len(collect_nodes),
+        "monitor_nodes": list(monitor_nodes),
+        "monitor_mae_pu": monitor_mae,
+        "dss_wall_s": dss_wall,
+        "dss_converged": n_ok,
+        "gnn_wall_s": float(gnn["gnn_wall_s"]),
+        "gnn_setup_once_s": gnn.get("gnn_setup_once_s"),
+        "gnn_per_step_s": gnn.get("gnn_per_step_s"),
+        "gnn_total_wall_s": gnn.get("gnn_total_wall_s"),
+        "gnn_deployment_wall_s": gnn_deploy,
+        "wall_speedup_dss_over_gnn_deploy": wall_speedup,
+        "wall_speedup_basis": "dss_wall_s / gnn_deployment_wall_s",
+        "timing_ms_per_ok_step": {
+            "dss_apply_ms": pipeline["dss_apply_ms"],
+            "dss_solve_ms": pipeline["dss_solve_ms"],
+            "dss_collect_ms": pipeline["dss_collect_ms"],
+            "dss_apply_plus_solve_ms": pipeline["dss_true_ms"],
+            "dss_apply_plus_solve_plus_collect_ms": pipeline["dss_total_ms"],
+            "gnn_feature_generation_ms": pipeline["gnn_feature_ms"],
+            "gnn_forward_ms": pipeline["gnn_forward_ms"],
+            "gnn_feature_plus_forward_ms": pipeline["gnn_total_ms"],
+            "dss_apply_note": "daily QSTS: no per-step apply timer (profiles at compile)",
+        },
+        "speedup": {
+            "true_speedup": pipeline["true_speedup"],
+            "true_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
+            "full_dss_speedup": pipeline["full_dss_speedup"],
+            "full_dss_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
+            "deploy_speedup": pipeline["deploy_speedup"],
+            "deploy_speedup_basis": "dss_apply_plus_solve_ms / (dss_apply_ms + gnn_feature_plus_forward_ms)",
+            "net_speedup": pipeline["net_speedup"],
+            "net_speedup_basis": "dss_solve_ms / gnn_feature_plus_forward_ms",
+        },
+        "env": env or {},
+    }
+
+
 def print_timing_summary(
     *,
     n_ok: int,
@@ -444,11 +563,19 @@ def print_timing_summary(
     gnn_total_wall_s: float | None = None,
     gnn_n_ok: int | None = None,
     gnn_grid: dict[str, float | int | bool] | None = None,
+    feature_build_s_total: float | None = None,
+    gnn_forward_only_s_total: float | None = None,
 ) -> None:
     n_ok = max(1, int(n_ok))
     npts = max(1, int(npts))
-    mean_solve_ms = 1000.0 * float(np.sum(dss_solve_s[:npts])) / n_ok
-    mean_collect_ms = 1000.0 * float(np.sum(dss_collect_s[:npts])) / n_ok
+    pipeline = _fair_timing_pipeline_metrics(
+        n_ok=n_ok,
+        dss_solve_s=dss_solve_s,
+        dss_collect_s=dss_collect_s,
+        npts=npts,
+        feature_build_s_total=feature_build_s_total,
+        gnn_forward_only_s_total=gnn_forward_only_s_total,
+    )
     dss_solve_total = float(np.sum(dss_solve_s[:npts]))
     dss_solve_per = dss_solve_total / n_ok
     gnn_deploy_s = _gnn_deployment_wall_s(
@@ -482,8 +609,12 @@ def print_timing_summary(
         f"(compile-once not timed; loop wall incl. collect = {dss_wall_s:.2f} s)",
         flush=True,
     )
-    print(f"  OpenDSS mean Solve() / step:  {mean_solve_ms:.2f} ms  (converged steps only in denominator)", flush=True)
-    print(f"  OpenDSS mean collect V/step:  {mean_collect_ms:.2f} ms", flush=True)
+    print(
+        f"  OpenDSS mean Solve() / step:  {pipeline['dss_solve_ms']:.2f} ms  "
+        f"(converged steps only in denominator)",
+        flush=True,
+    )
+    print(f"  OpenDSS mean collect V/step:  {pipeline['dss_collect_ms']:.2f} ms", flush=True)
     if (
         gnn_setup_once_s is not None
         and gnn_per_step_s is not None
@@ -530,6 +661,11 @@ def print_timing_summary(
             f"(dss loop wall / gnn_total_wall_s; excludes wrapper import)",
             flush=True,
         )
+    print_mv_daily_pipeline_and_speedups(
+        pipeline,
+        log_prefix="[da_gps_daily_compare]",
+        dss_apply_note="daily QSTS: apply_ms=0 (profiles at compile, not per-step timed)",
+    )
 
 
 def _final_devices_one_liner(
@@ -573,6 +709,14 @@ def _da_gps_compare_summary(
         if gnn_deploy_s is not None and gnn_deploy_s > 1e-9
         else float("nan")
     )
+    pipeline = _fair_timing_pipeline_metrics(
+        n_ok=int(dss["converged"].sum()),
+        dss_solve_s=dss["solve_s"],
+        dss_collect_s=dss["collect_s"],
+        npts=int(cfg.npts),
+        feature_build_s_total=gnn.get("feature_build_s_total"),
+        gnn_forward_only_s_total=gnn.get("gnn_forward_only_s_total"),
+    )
     return {
         "mode": "da_gps_daily_compare",
         "step_min": cfg.step_min,
@@ -594,6 +738,22 @@ def _da_gps_compare_summary(
         "gnn_total_wall_s": gnn.get("gnn_total_wall_s"),
         "wall_speedup": speedup,
         "wall_speedup_basis": "dss_wall_s / gnn_deployment_wall_s",
+        "timing_ms_per_ok_step": {
+            "dss_apply_ms": pipeline["dss_apply_ms"],
+            "dss_solve_ms": pipeline["dss_solve_ms"],
+            "dss_collect_ms": pipeline["dss_collect_ms"],
+            "dss_apply_plus_solve_ms": pipeline["dss_true_ms"],
+            "dss_apply_plus_solve_plus_collect_ms": pipeline["dss_total_ms"],
+            "gnn_feature_generation_ms": pipeline["gnn_feature_ms"],
+            "gnn_forward_ms": pipeline["gnn_forward_ms"],
+            "gnn_feature_plus_forward_ms": pipeline["gnn_total_ms"],
+        },
+        "speedup": {
+            "true_speedup": pipeline["true_speedup"],
+            "full_dss_speedup": pipeline["full_dss_speedup"],
+            "deploy_speedup": pipeline["deploy_speedup"],
+            "net_speedup": pipeline["net_speedup"],
+        },
         "final_devices": _final_devices_one_liner(
             dss["reg_names"], dss["cap_names"], dss["reg_tap"], dss["cap_on"]
         ),
@@ -769,6 +929,8 @@ def run_da_gps_daily_compare_and_plot(
         gnn_total_wall_s=gnn.get("gnn_total_wall_s"),
         gnn_n_ok=gnn.get("n_ok"),
         gnn_grid=gnn.get("gnn_grid"),
+        feature_build_s_total=gnn.get("feature_build_s_total"),
+        gnn_forward_only_s_total=gnn.get("gnn_forward_only_s_total"),
     )
 
     return _da_gps_compare_summary(
@@ -791,6 +953,7 @@ def run_da_gps_daily_compare_and_plot(
 
 
 __all__ = [
+    "build_fair_timing_summary",
     "load_cache_node_order",
     "run_da_gps_daily_compare_and_plot",
     "run_opendss_daily_truth",

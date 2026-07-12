@@ -133,7 +133,7 @@ from compare_gnn_inference_utils import (
     read_gnn_batch_steps,
 )
 from compare_mv_daily_timing import (
-    per_ok_ms,
+    compute_mv_daily_timing_metrics,
     print_mv_daily_timing_summary,
     sync_inference_device,
 )
@@ -2625,6 +2625,9 @@ def run(
             "gnn_setup_once_s": gnn_setup_once_s,
             "gnn_per_step_s": gnn_per_step_s,
             "gnn_total_wall_s": gnn_total_wall_s,
+            "feature_build_s_total": feature_build_s_total,
+            "gnn_forward_only_s_total": gnn_forward_only_s_total,
+            "gnn_bucket_s_total": gnn_infer_s_total,
             "n_ok": n_ok,
             "npts": npts,
         }
@@ -2653,30 +2656,21 @@ def run(
         gnn_total_wall_s=gnn_total_wall_s,
     )
 
-    # --- Flowchart-aligned labels (same timers as homo/hetero daily compare) ---
-    dss_apply_ms = per_ok_ms(open_apply_s_total, n_ok)
-    dss_solve_ms = per_ok_ms(open_solve_only_s_total, n_ok)
-    dss_collect_ms = per_ok_ms(open_get_s_total, n_ok)
-    gnn_feature_gen_ms = per_ok_ms(feature_build_s_total, n_ok)
-    gnn_forward_ms = per_ok_ms(gnn_forward_only_s_total, n_ok)
-    dss_pipeline_ms = dss_apply_ms + dss_solve_ms + dss_collect_ms
-    gnn_pipeline_ms = gnn_feature_gen_ms + gnn_forward_ms
-    print("\n[da_gps_daily] === Pipeline (flowchart buckets; mean ms / converged step) ===", flush=True)
-    print(
-        f"  OpenDSS: dss_apply_ms={dss_apply_ms:.3f}  dss_solve_ms={dss_solve_ms:.3f}  "
-        f"dss_collect_ms={dss_collect_ms:.3f}  (collect = read |V| after Solve for MAE/plots)",
-        flush=True,
+    pipeline_metrics = compute_mv_daily_timing_metrics(
+        n_ok=n_ok,
+        open_apply_s_total=open_apply_s_total,
+        open_solve_only_s_total=open_solve_only_s_total,
+        open_get_s_total=open_get_s_total,
+        feature_build_s_total=feature_build_s_total,
+        gnn_forward_only_s_total=gnn_forward_only_s_total,
     )
-    print(f"  OpenDSS total (apply+solve+collect): {dss_pipeline_ms:.3f} ms/ok-step", flush=True)
-    print(
-        f"  GNN:     gnn_feature_generation_ms={gnn_feature_gen_ms:.3f}  gnn_forward_ms={gnn_forward_ms:.3f}",
-        flush=True,
-    )
-    print(f"  GNN total (feature gen + forward): {gnn_pipeline_ms:.3f} ms/ok-step", flush=True)
-    print(
-        "  Note: snapshot reassert is still in the detailed block above (benchmark overhead, not in this sum).",
-        flush=True,
-    )
+    dss_apply_ms = pipeline_metrics["dss_apply_ms"]
+    dss_solve_ms = pipeline_metrics["dss_solve_ms"]
+    dss_collect_ms = pipeline_metrics["dss_collect_ms"]
+    gnn_feature_gen_ms = pipeline_metrics["gnn_feature_ms"]
+    gnn_forward_ms = pipeline_metrics["gnn_forward_ms"]
+    dss_pipeline_ms = pipeline_metrics["dss_total_ms"]
+    gnn_pipeline_ms = pipeline_metrics["gnn_total_ms"]
 
     mask = np.isfinite(v_dss) & np.isfinite(v_gnn)
     if mask.any():
@@ -3101,10 +3095,21 @@ def run(
             "dss_apply_ms": dss_apply_ms,
             "dss_solve_ms": dss_solve_ms,
             "dss_collect_ms": dss_collect_ms,
+            "dss_apply_plus_solve_ms": pipeline_metrics["dss_true_ms"],
             "dss_apply_plus_solve_plus_collect_ms": dss_pipeline_ms,
             "gnn_feature_generation_ms": gnn_feature_gen_ms,
             "gnn_forward_ms": gnn_forward_ms,
             "gnn_feature_plus_forward_ms": gnn_pipeline_ms,
+        },
+        "speedup": {
+            "true_speedup": pipeline_metrics["true_speedup"],
+            "true_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
+            "full_dss_speedup": pipeline_metrics["full_dss_speedup"],
+            "full_dss_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
+            "deploy_speedup": pipeline_metrics["deploy_speedup"],
+            "deploy_speedup_basis": "dss_apply_plus_solve_ms / (dss_apply_ms + gnn_feature_plus_forward_ms)",
+            "net_speedup": pipeline_metrics["net_speedup"],
+            "net_speedup_basis": "dss_solve_ms / gnn_feature_plus_forward_ms",
         },
         "cap_reg_aux_outputs": aux_outputs,
         "voltage_plot_mode": "all_cache_nodes" if plot_all_cache_nodes else "explicit_plot_node",

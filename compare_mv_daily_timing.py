@@ -2,8 +2,8 @@
 Unified wall-clock timing report for ``compare_homo_mv_daily`` and ``compare_hetero_mv_daily``.
 
 Separates OpenDSS **reassert** (snapshot bookkeeping) from **Solve() only**, labels
-voltage collection as benchmarking-only, and prints deployment / net speedup lines with
-explicit formulas (shared apply cost; collect V excluded from speedup comparisons).
+voltage collection as benchmarking-only, and prints pipeline ms plus true / full_dss /
+deploy / net speedup lines with explicit formulas.
 
 ---------------------------------------------------------------------------
 Inference device (CPU vs GPU)
@@ -57,11 +57,13 @@ From building GPU/CPU tensors through scatter back to NumPy node voltages. On **
 :func:`sync_inference_device` runs ``torch.cuda.synchronize()`` **after** the forward
 so asynchronous kernel time is included in the bucket; on **CPU** there is no extra sync.
 
-**Deployment vs net speedup (printed summary)**  
-- *Deployment* includes shared **apply** on both DSS and GNN sides, excludes **collect V**.  
-- *Net* excludes **apply** from both sides: compares **Solve() only** vs **feature + forward-only**.
+**Pipeline speedup (printed summary)**  
+- *true_speedup* (primary fair compare): ``(apply + Solve) / (feature + forward)``.  
+- *full_dss_speedup*: ``(apply + Solve + collect V) / (feature + forward)``.  
+- *deploy_speedup*: ``(apply + Solve) / (apply + feature + forward)`` — shared apply on GNN side.  
+- *net_speedup*: ``Solve() only / (feature + forward)`` — apply excluded from both sides.
 
-See :func:`print_mv_daily_timing_summary` for the exact printed formulas.
+See :func:`compute_mv_daily_timing_metrics` and :func:`print_mv_daily_timing_summary`.
 """
 
 from __future__ import annotations
@@ -129,6 +131,103 @@ def sync_inference_device(device) -> None:
 
     if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize()
+
+
+def compute_mv_daily_timing_metrics(
+    *,
+    n_ok: int,
+    open_apply_s_total: float = 0.0,
+    open_solve_only_s_total: float = 0.0,
+    open_get_s_total: float = 0.0,
+    feature_build_s_total: float = 0.0,
+    gnn_forward_only_s_total: float = 0.0,
+) -> dict[str, float]:
+    """Per-ok-step pipeline ms and speedup ratios from flowchart-aligned timers."""
+    dss_apply_ms = per_ok_ms(open_apply_s_total, n_ok)
+    dss_solve_ms = per_ok_ms(open_solve_only_s_total, n_ok)
+    dss_collect_ms = per_ok_ms(open_get_s_total, n_ok)
+    gnn_feature_ms = per_ok_ms(feature_build_s_total, n_ok)
+    gnn_forward_ms = per_ok_ms(gnn_forward_only_s_total, n_ok)
+
+    dss_true_ms = dss_apply_ms + dss_solve_ms
+    gnn_true_ms = gnn_feature_ms + gnn_forward_ms
+    dss_full_ms = dss_true_ms + dss_collect_ms
+    dss_deploy_ms = dss_true_ms
+    gnn_deploy_ms = dss_apply_ms + gnn_true_ms
+    dss_net_ms = dss_solve_ms
+    gnn_net_ms = gnn_true_ms
+
+    def _ratio(num: float, den: float) -> float:
+        return num / den if den > 1e-12 else float("nan")
+
+    return {
+        "dss_apply_ms": dss_apply_ms,
+        "dss_solve_ms": dss_solve_ms,
+        "dss_collect_ms": dss_collect_ms,
+        "dss_total_ms": dss_full_ms,
+        "dss_true_ms": dss_true_ms,
+        "gnn_feature_ms": gnn_feature_ms,
+        "gnn_forward_ms": gnn_forward_ms,
+        "gnn_total_ms": gnn_true_ms,
+        "gnn_true_ms": gnn_true_ms,
+        "true_speedup": _ratio(dss_true_ms, gnn_true_ms),
+        "full_dss_speedup": _ratio(dss_full_ms, gnn_true_ms),
+        "deploy_speedup": _ratio(dss_deploy_ms, gnn_deploy_ms),
+        "net_speedup": _ratio(dss_net_ms, gnn_net_ms),
+        "dss_deploy_ms": dss_deploy_ms,
+        "gnn_deploy_ms": gnn_deploy_ms,
+        "dss_net_ms": dss_net_ms,
+        "gnn_net_ms": gnn_net_ms,
+    }
+
+
+def _fmt_speedup(value: float) -> str:
+    import math
+
+    return f"{value:.2f}×" if math.isfinite(value) else "n/a"
+
+
+def print_mv_daily_pipeline_and_speedups(
+    metrics: dict[str, float],
+    *,
+    log_prefix: str = "[compare_mv_daily_timing]",
+    dss_apply_note: str = "",
+) -> None:
+    """Print tabulated DSS/GNN pipeline ms and speedup ratios."""
+    print(f"\n=== {log_prefix} Pipeline timing (mean ms / converged step) ===", flush=True)
+    apply_note = f"  {dss_apply_note}" if dss_apply_note else ""
+    print(
+        f"  DSS  apply_ms={metrics['dss_apply_ms']:.3f}  solve_ms={metrics['dss_solve_ms']:.3f}  "
+        f"collect_ms={metrics['dss_collect_ms']:.3f}  total_ms={metrics['dss_total_ms']:.3f}  "
+        f"(apply+solve+collect){apply_note}",
+        flush=True,
+    )
+    print(
+        f"  GNN  feature_ms={metrics['gnn_feature_ms']:.3f}  forward_ms={metrics['gnn_forward_ms']:.3f}  "
+        f"total_ms={metrics['gnn_total_ms']:.3f}  (feature+forward)",
+        flush=True,
+    )
+    print(f"\n=== {log_prefix} Speedup ratios (DSS / GNN) ===", flush=True)
+    print(
+        f"  true_speedup     (apply+solve / feature+forward):           "
+        f"{_fmt_speedup(metrics['true_speedup'])}  [primary fair compare]",
+        flush=True,
+    )
+    print(
+        f"  full_dss_speedup (apply+solve+collect / feature+forward):  "
+        f"{_fmt_speedup(metrics['full_dss_speedup'])}  [DSS includes collect]",
+        flush=True,
+    )
+    print(
+        f"  deploy_speedup   (apply+solve / apply+feature+forward):    "
+        f"{_fmt_speedup(metrics['deploy_speedup'])}  [shared apply on GNN side]",
+        flush=True,
+    )
+    print(
+        f"  net_speedup      (solve / feature+forward):                "
+        f"{_fmt_speedup(metrics['net_speedup'])}  [apply excluded]",
+        flush=True,
+    )
 
 
 def print_mv_daily_timing_summary(
@@ -240,9 +339,16 @@ def print_mv_daily_timing_summary(
         )
     print(f"Timesteps converged: {n_ok}/{npts}  (nonconv={n_nonconv})", flush=True)
 
-    # --- Deployment comparison (shared apply on both sides; collect V excluded) ---
-    dss_deploy = _po(open_apply_s_total + open_solve_only_s_total)
-    gnn_deploy = _po(open_apply_s_total + feature_build_s_total + gnn_forward_only_s_total)
+    pipeline_metrics = compute_mv_daily_timing_metrics(
+        n_ok=n_ok,
+        open_apply_s_total=open_apply_s_total,
+        open_solve_only_s_total=open_solve_only_s_total,
+        open_get_s_total=open_get_s_total,
+        feature_build_s_total=feature_build_s_total,
+        gnn_forward_only_s_total=gnn_forward_only_s_total,
+    )
+    dss_deploy = pipeline_metrics["dss_deploy_ms"]
+    gnn_deploy = pipeline_metrics["gnn_deploy_ms"]
     if gnn_setup_once_s is not None and gnn_total_wall_s is not None and n_ok > 0:
         gnn_setup = float(gnn_setup_once_s)
         gnn_per = float(gnn_per_step_s or 0.0)
@@ -268,34 +374,17 @@ def print_mv_daily_timing_summary(
             f"(setup/{n_ok} steps spread over converged steps)",
             flush=True,
         )
-    print("\n=== Deployment comparison (shared apply included; collect V excluded) ===", flush=True)
+    print_mv_daily_pipeline_and_speedups(pipeline_metrics, log_prefix=log_prefix)
     print(
-        f"DSS deployment cost (apply + Solve() only):     {dss_deploy:.3f} ms/ok-step",
+        f"\n{log_prefix} Legacy deploy line: DSS deploy={dss_deploy:.3f} ms  "
+        f"GNN deploy={gnn_deploy:.3f} ms  deploy_speedup={_fmt_speedup(pipeline_metrics['deploy_speedup'])}",
         flush=True,
     )
     print(
-        f"GNN deployment cost (apply + feature + fwd-only): {gnn_deploy:.3f} ms/ok-step",
+        f"{log_prefix} collect V mean {_po(open_get_s_total):.1f} ms/ok-step is reported above; "
+        "excluded from true/deploy speedups, included in full_dss_speedup.",
         flush=True,
     )
-    if gnn_deploy > 0:
-        print(f"Speedup (DSS_deploy / GNN_deploy):               {dss_deploy / gnn_deploy:.2f}×", flush=True)
-    print(
-        f"Note: collect V mean {_po(open_get_s_total):.1f} ms/ok-step is excluded — benchmarking only.",
-        flush=True,
-    )
-
-    # --- Net speedup (apply excluded from both sides) ---
-    dss_net = _po(open_solve_only_s_total)
-    gnn_net = _po(feature_build_s_total + gnn_forward_only_s_total)
-    print("\n=== Net speedup (shared apply excluded from both sides) ===", flush=True)
-    print(
-        "Formula:  DSS_net = Solve() only;  GNN_net = feature build + GNN forward-only.",
-        flush=True,
-    )
-    print(f"DSS net (Solve() only):           {dss_net:.3f} ms/ok-step", flush=True)
-    print(f"GNN net (feature + fwd-only):     {gnn_net:.3f} ms/ok-step", flush=True)
-    if gnn_net > 0:
-        print(f"Net speedup (DSS_net / GNN_net):  {dss_net / gnn_net:.2f}×", flush=True)
 
 
 def amortize_gnn_timing_to_display_grid(
