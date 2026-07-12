@@ -822,6 +822,7 @@ def run_da_gps_warmstart_band_daily(
     plot_reg_cap: bool = True,
     plot_meta_aux: bool = True,
     plot_warmstart_lines: bool = True,
+    write_voltage_pngs: bool = True,
     seed: int | None = 42,
     show: bool = True,
     device: str | None = None,
@@ -832,6 +833,10 @@ def run_da_gps_warmstart_band_daily(
     When ``plot_all_cache_nodes=True`` (default), scope matches ``run_da_gps_daily_opendss_compare``
     with ``--plot-all-cache-nodes``: all cache∩circuit nodes, PNGs under ``out_dir/daily_voltage/``,
     reg/cap/meta PNGs + CSV/JSON in ``out_dir``. Only OpenDSS truth differs (warm-start band vs single QSTS).
+
+    Set ``write_voltage_pngs=False`` (with ``plot_reg_cap`` / ``plot_meta_aux`` False) for metrics-only
+    multi-scenario sweeps: still computes aggregated band metrics and writes CSV/JSON when ``out_dir``
+    is set, but skips per-node voltage PNGs.
     """
     from nonunique_opendss_daily import DA_GPS_REF_LOAD_PROFILE, DA_GPS_REF_PV_PROFILE
 
@@ -1264,38 +1269,45 @@ def run_da_gps_warmstart_band_daily(
             )
         n_plot_ranked = len(plot_rows)
         rank_w = max(4, len(str(max(1, n_plot_ranked))))
-        volt_png_dir.mkdir(parents=True, exist_ok=True)
-        for rank_idx, (n, frac) in enumerate(plot_rows):
-            j = node_to_j[n]
-            node_disp = collect_nodes[j]
-            rk = str(rank_idx + 1).zfill(rank_w)
-            tot = str(n_plot_ranked).zfill(rank_w)
-            png_path = volt_png_dir / _warmstart_voltage_png_basename(
-                stem_safe=stem_safe,
-                rk=rk,
-                tot=tot,
-                inside_frac=frac,
-                node_fn=n.replace(".", "_"),
-            )
-            _save_voltage_band_png(
-                png_path,
-                cfg,
-                node=node_disp,
-                j=j,
-                volts=volts,
-                volts_min=volts_min,
-                volts_max=volts_max,
-                n_warm_starts=n_ws,
-                inside_frac=frac,
-                rank_human=rank_idx + 1,
-                n_plot_ranked=n_plot_ranked,
-                da_gps_voltages=da_v,
-                da_gps_hours=da_hours,
-                plot_warmstart_lines=plot_warmstart_lines,
-                dpi=vdpi,
-                fig_w=vf_w,
-                fig_h=vf_h,
-                show=False,
+        if write_voltage_pngs:
+            volt_png_dir.mkdir(parents=True, exist_ok=True)
+            for rank_idx, (n, frac) in enumerate(plot_rows):
+                j = node_to_j[n]
+                node_disp = collect_nodes[j]
+                rk = str(rank_idx + 1).zfill(rank_w)
+                tot = str(n_plot_ranked).zfill(rank_w)
+                png_path = volt_png_dir / _warmstart_voltage_png_basename(
+                    stem_safe=stem_safe,
+                    rk=rk,
+                    tot=tot,
+                    inside_frac=frac,
+                    node_fn=n.replace(".", "_"),
+                )
+                _save_voltage_band_png(
+                    png_path,
+                    cfg,
+                    node=node_disp,
+                    j=j,
+                    volts=volts,
+                    volts_min=volts_min,
+                    volts_max=volts_max,
+                    n_warm_starts=n_ws,
+                    inside_frac=frac,
+                    rank_human=rank_idx + 1,
+                    n_plot_ranked=n_plot_ranked,
+                    da_gps_voltages=da_v,
+                    da_gps_hours=da_hours,
+                    plot_warmstart_lines=plot_warmstart_lines,
+                    dpi=vdpi,
+                    fig_w=vf_w,
+                    fig_h=vf_h,
+                    show=False,
+                )
+        else:
+            print(
+                "[da_gps_warmstart_band] write_voltage_pngs=False: skipping |V| PNGs "
+                "(metrics / CSV / JSON still written).",
+                flush=True,
             )
 
         if plot_reg_cap and n_reg > 0:

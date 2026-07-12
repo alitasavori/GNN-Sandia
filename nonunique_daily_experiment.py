@@ -105,6 +105,7 @@ def run_and_plot(
             plot_reg_cap=bool(kwargs.pop("plot_reg_cap", True)),
             plot_meta_aux=bool(kwargs.pop("plot_meta_aux", True)),
             plot_warmstart_lines=bool(kwargs.pop("plot_warmstart_lines", True)),
+            write_voltage_pngs=bool(kwargs.pop("write_voltage_pngs", True)),
             seed=kwargs.pop("seed", 42),
             show=show,
             device=device,
