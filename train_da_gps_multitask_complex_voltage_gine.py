@@ -4628,8 +4628,44 @@ def _load_meta_aux(
     return torch.from_numpy(y_cap), torch.from_numpy(reg_raw.astype(np.float32))
 
 
-def _load_meta_pv(meta_csv: Path, sample_ids: list[int], pv_cols: list[str]) -> torch.Tensor:
-    """Numeric columns from ``gnn_sample_meta`` (float targets), rows aligned to ``sample_ids`` order."""
+# Columns in gnn_sample_meta that may need a unit fix when loaded as aux/cache targets.
+# 906 generators historically wrote losses ~1000× too large; use --meta_loss_scale 0.001.
+_META_LOSS_SCALE_COLS: frozenset[str] = frozenset(
+    {"p_loss_total_post_kw", "q_loss_total_post_kvar"}
+)
+_ACTIVE_META_LOSS_SCALE: float = 1.0
+
+
+def _configure_meta_loss_scale(scale: float) -> float:
+    """Set process-wide scale applied to P/Q loss meta columns in ``_load_meta_pv``."""
+    global _ACTIVE_META_LOSS_SCALE
+    _ACTIVE_META_LOSS_SCALE = float(scale)
+    return _ACTIVE_META_LOSS_SCALE
+
+
+def _apply_meta_loss_col_scale(col_names: list[str], raw: np.ndarray, scale: float) -> np.ndarray:
+    """Multiply P_loss/Q_loss columns in ``raw`` (N, K) by ``scale`` when scale != 1."""
+    if abs(float(scale) - 1.0) <= 1e-15 or raw.size == 0:
+        return raw
+    out = np.array(raw, dtype=np.float64, copy=True)
+    for j, c in enumerate(col_names):
+        if str(c).strip().lower() in _META_LOSS_SCALE_COLS:
+            out[:, j] *= float(scale)
+    return out
+
+
+def _load_meta_pv(
+    meta_csv: Path,
+    sample_ids: list[int],
+    pv_cols: list[str],
+    *,
+    meta_loss_scale: float | None = None,
+) -> torch.Tensor:
+    """Numeric columns from ``gnn_sample_meta`` (float targets), rows aligned to ``sample_ids`` order.
+
+    When ``meta_loss_scale`` is set (or the process default from ``--meta_loss_scale``),
+    ``P_loss_total_post_kw`` / ``Q_loss_total_post_kvar`` are multiplied by that factor.
+    """
     import pandas as pd
 
     if not pv_cols:
@@ -4652,6 +4688,8 @@ def _load_meta_pv(meta_csv: Path, sample_ids: list[int], pv_cols: list[str]) -> 
         raise KeyError(f"{len(miss)} sample_id values missing from {meta_csv} for PV aux (showing up to 5): {miss[:5]}")
     order = [lk[_norm_sid(sid)] for sid in sample_ids]
     raw = df[use_orig].to_numpy(dtype=np.float64)[order]
+    scale = float(_ACTIVE_META_LOSS_SCALE if meta_loss_scale is None else meta_loss_scale)
+    raw = _apply_meta_loss_col_scale([str(c).lower() for c in pv_cols], raw, scale)
     return torch.from_numpy(raw.astype(np.float32))
 
 
@@ -5123,10 +5161,16 @@ def _meta_aux_cols_from_args(args: argparse.Namespace) -> list[str]:
     return [c.strip().lower() for c in raw.split(",") if c.strip()]
 
 
-def _meta_aux_cache_slug(meta_aux_cols: list[str]) -> str:
+def _meta_aux_cache_slug(meta_aux_cols: list[str], meta_loss_scale: float = 1.0) -> str:
     if not meta_aux_cols:
         return ""
-    return hashlib.md5(",".join(meta_aux_cols).encode("utf-8")).hexdigest()[:8]
+    payload = ",".join(meta_aux_cols)
+    # Bake loss-column scale into the slug only when it can affect cached y_pv.
+    if abs(float(meta_loss_scale) - 1.0) > 1e-12 and any(
+        c in _META_LOSS_SCALE_COLS for c in meta_aux_cols
+    ):
+        payload = f"{payload}|mloss={float(meta_loss_scale):.6g}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
 
 
 def _ensure_chunk_tensor_cache(
@@ -6642,6 +6686,13 @@ def _eval_pool_report_block(
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
     _apply_finetune_physics_only_args(args)
+    _mloss = _configure_meta_loss_scale(float(getattr(args, "meta_loss_scale", 1.0)))
+    if abs(_mloss - 1.0) > 1e-12:
+        print(
+            f"meta_loss_scale={_mloss:g}: scaling P_loss_total_post_kw / Q_loss_total_post_kvar "
+            "when those columns are loaded as meta-aux targets",
+            flush=True,
+        )
     lam_v = float(getattr(args, "lambda_voltage", 1.0))
     init_ckpt_path = _resolve_init_checkpoint_path(args)
     init_run_dir = _resolve_init_run_dir(args, init_ckpt_path)
@@ -6713,7 +6764,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if _bad:
         raise ValueError(f"--aux_meta_cols must not include reserved column name(s): {_bad}")
     n_pv_aux = len(pv_aux_cols)
-    maux_slug = _meta_aux_cache_slug(pv_aux_cols)
+    maux_slug = _meta_aux_cache_slug(pv_aux_cols, meta_loss_scale=float(getattr(args, "meta_loss_scale", 1.0)))
     if n_pv_aux > int(args.n_system_tokens):
         raise ValueError(
             f"--n_system_tokens ({args.n_system_tokens}) must be >= number of meta-aux columns ({n_pv_aux}). "
@@ -8500,6 +8551,15 @@ def parse_args() -> argparse.Namespace:
         "Overrides --aux_pv_meta_cols when non-empty. Empty disables.",
     )
     p.add_argument(
+        "--meta_loss_scale",
+        type=float,
+        default=1.0,
+        help="Multiply P_loss_total_post_kw and Q_loss_total_post_kvar by this factor when those "
+        "columns are loaded from gnn_sample_meta into aux/cache targets (default 1.0 = unchanged). "
+        "Use 0.001 for 906 datasets whose stored losses are ~1000× too large; no dataset regen needed. "
+        "8500 / correct units: leave at 1.0.",
+    )
+    p.add_argument(
         "--aux_pv_meta_cols",
         type=str,
         default="",
@@ -8843,6 +8903,13 @@ def main() -> None:
         return
 
     _apply_finetune_physics_only_args(args)
+    _mloss = _configure_meta_loss_scale(float(getattr(args, "meta_loss_scale", 1.0)))
+    if abs(_mloss - 1.0) > 1e-12:
+        print(
+            f"meta_loss_scale={_mloss:g}: scaling P_loss_total_post_kw / Q_loss_total_post_kvar "
+            "when those columns are loaded as meta-aux targets",
+            flush=True,
+        )
     lam_v = float(getattr(args, "lambda_voltage", 1.0))
     init_ckpt_path = _resolve_init_checkpoint_path(args)
     _set_seed(args.seed)
