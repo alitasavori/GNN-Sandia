@@ -7579,6 +7579,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         return
 
     best_val = float("inf")
+    best_es = float("inf")  # patience reference (only moves on >= min_delta)
     best_state = None
     bad = 0
     best_epoch = 0
@@ -8084,15 +8085,19 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 addon_epoch_history.append(epoch_entry)
             sch.step(val_tot)
             crit = val_tot if args.early_stop_on == "total" else val_v
+            min_delta = float(args.min_delta)
+            # Checkpoint on any strict improvement; patience clock uses min_delta vs best_es.
             if crit < best_val:
                 best_val = crit
                 best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-                best_epoch = ep
                 best_val_r2_mean = val_r2_mean
                 best_val_r2_min = val_r2_min
+            if best_es == float("inf") or (best_es - crit) >= min_delta:
+                best_es = crit
+                best_epoch = ep
                 bad = 0
             else:
-                # Epochs since last improvement (not eval-step count), so --patience
+                # Epochs since last significant improvement (not eval-step count), so --patience
                 # matches calendar epochs even when --eval_every > 1.
                 bad = int(ep - best_epoch) if best_epoch > 0 else bad + 1
             _le = int(args.log_every)
@@ -8120,7 +8125,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
                 f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
                 f"val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}"
+                f"| best={best_val:.4f} @ epoch {best_epoch} "
+                f"| epochs_since_best={bad} patience={int(args.patience)} min_delta={min_delta:g}"
             )
             print(_log, flush=True)
             if _training_addons_enabled(args) and last_addon_epoch_metrics:
@@ -8280,7 +8286,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             print(
                 f"[da_gps chunk_parent] early stop at epoch {ep}, "
                 f"best={best_val:.4f} @ epoch {best_epoch} "
-                f"(patience={int(args.patience)}, early_stop_on={args.early_stop_on})",
+                f"(epochs_since_best={bad}, patience={int(args.patience)}, "
+                f"min_delta={float(args.min_delta):g}, early_stop_on={args.early_stop_on})",
                 flush=True,
             )
             if int(args.checkpoint_every) > 0:
@@ -8572,6 +8579,14 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Early-stop after this many epochs without improving the --early_stop_on val metric "
         "(checked on eval epochs; counts calendar epochs, not eval steps).",
+    )
+    p.add_argument(
+        "--min_delta",
+        type=float,
+        default=1e-4,
+        help="Minimum drop in --early_stop_on val metric to reset patience "
+        "(default 1e-4; MLP launcher uses 1e-3). Checkpoints still save on any strict improvement; "
+        "patience / best_epoch only reset when (best_es - val) >= min_delta.",
     )
     p.add_argument(
         "--no_early_stop",
@@ -9425,6 +9440,7 @@ def main() -> None:
     )
 
     best_val = float("inf")
+    best_es = float("inf")  # patience reference (only moves on >= min_delta)
     best_state = None
     bad = 0
     best_epoch = 0
@@ -9765,15 +9781,19 @@ def main() -> None:
                 )
             sch.step(val_tot)
             crit = val_tot if args.early_stop_on == "total" else val_v
+            min_delta = float(args.min_delta)
+            # Checkpoint on any strict improvement; patience clock uses min_delta vs best_es.
             if crit < best_val:
                 best_val = crit
                 best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-                best_epoch = ep
                 best_val_r2_mean = val_r2_mean
                 best_val_r2_min = val_r2_min
+            if best_es == float("inf") or (best_es - crit) >= min_delta:
+                best_es = crit
+                best_epoch = ep
                 bad = 0
             else:
-                # Epochs since last improvement (not eval-step count), so --patience
+                # Epochs since last significant improvement (not eval-step count), so --patience
                 # matches calendar epochs even when --eval_every > 1.
                 bad = int(ep - best_epoch) if best_epoch > 0 else bad + 1
             _le = int(args.log_every)
@@ -9801,7 +9821,8 @@ def main() -> None:
                 f"| val_r2_mean={val_r2_mean:.4f} val_r2_min={val_r2_min:.4f} "
                 f"val_r2_min_node={_idx_to_node_label(idx_to_node, val_r2_min_idx)} "
                 f"val_worst_mae={val_worst_node_mae:.4f} "
-                f"| best={best_val:.4f}"
+                f"| best={best_val:.4f} @ epoch {best_epoch} "
+                f"| epochs_since_best={bad} patience={int(args.patience)} min_delta={min_delta:g}"
             )
             print(_log, flush=True)
             if _training_addons_enabled(args) and last_addon_epoch_metrics:
@@ -9859,7 +9880,8 @@ def main() -> None:
             print(
                 f"[da_gps] early stop at epoch {ep}, "
                 f"best={best_val:.4f} @ epoch {best_epoch} "
-                f"(patience={int(args.patience)}, early_stop_on={args.early_stop_on})",
+                f"(epochs_since_best={bad}, patience={int(args.patience)}, "
+                f"min_delta={float(args.min_delta):g}, early_stop_on={args.early_stop_on})",
                 flush=True,
             )
             if int(args.checkpoint_every) > 0:

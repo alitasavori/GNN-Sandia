@@ -238,9 +238,12 @@ def launch_mlp_training(
     smoke_test: bool = False,
     smoke_chunk_count: int = 3,
     smoke_epochs: int = 15,
-    smoke_patience: int = 5,  # match DA-GPS Colab smoke; calendar epochs since best
+    smoke_patience: int = 5,  # calendar epochs since meaningful best (min_delta)
     full_epochs: int = 200,
-    full_patience: int = 30,  # match DA-GPS Colab full runs (--patience 30)
+    # Aggressive MLP-only early stop: flat baselines should die by ~epoch 25–40, not crawl to 200.
+    # DA-GPS/GINE keep trainer defaults (patience=30, min_delta=1e-4) unless they pass these flags.
+    full_patience: int = 15,
+    min_delta: float = 1e-3,  # ignore val_tot noise like 0.9963→0.9956 for patience
     seed: int = 42,
     hidden: int | None = None,
     layers: int | None = None,
@@ -401,6 +404,8 @@ def launch_mlp_training(
         "1e-5",
         "--patience",
         str(patience),
+        "--min_delta",
+        str(min_delta),
         "--seed",
         str(seed),
         "--train_frac",
@@ -429,7 +434,14 @@ def launch_mlp_training(
     print(f"SMOKE_TEST:     {smoke_test}")
     print(f"HIDDEN/LAYERS:  {hidden}/{layers}")
     print(f"EPOCHS:         {epochs}")
-    print(f"PATIENCE:       {patience}  (calendar epochs since best; early_stop_on=total≈val_volt for mlp)")
+    print(
+        f"PATIENCE:       {patience}  (calendar epochs since meaningful best; "
+        f"early_stop_on=total≈val_volt for mlp)"
+    )
+    print(
+        f"MIN_DELTA:      {min_delta:g}  (patience resets only if best-val >= min_delta; "
+        f"ckpt still saves on any improve)"
+    )
     print(f"CHUNK_PARENT:   {chunk_parent}")
     print(f"CHUNK_GLOB:     {chunk_glob}")
     print(f"DA_CACHE_ROOT:  {da_cache_root}")
