@@ -4225,6 +4225,85 @@ class DAGPSBlock(nn.Module):
         )
 
 
+class PlainNodeMLP(nn.Module):
+    """Per-node MLP baseline: node features -> complex voltage (Re, Im). No graph or aux heads."""
+
+    def __init__(
+        self,
+        *,
+        n_nodes: int,
+        node_in_dim: int,
+        hidden: int,
+        n_layers: int,
+        dropout: float,
+        node_emb_dim: int = 0,
+        per_node_heads: bool = False,
+        n_cap: int = 0,
+        n_reg: int = 0,
+        n_pv_aux: int = 0,
+        **_unused,
+    ):
+        super().__init__()
+        self.n_nodes = int(n_nodes)
+        self.node_in_dim = int(node_in_dim)
+        self.hidden = int(hidden)
+        self.n_layers = max(1, int(n_layers))
+        self.n_cap = int(n_cap)
+        self.n_reg = int(n_reg)
+        self.n_pv_aux = int(n_pv_aux)
+        self.node_emb_dim = max(0, int(node_emb_dim))
+        self.per_node_heads = bool(per_node_heads)
+        self.node_emb = nn.Embedding(self.n_nodes, self.node_emb_dim) if self.node_emb_dim > 0 else None
+        in_dim = self.node_in_dim + self.node_emb_dim
+        body: list[nn.Module] = []
+        d = in_dim
+        for _ in range(self.n_layers):
+            body.extend([nn.Linear(d, hidden), nn.GELU(), nn.Dropout(float(dropout))])
+            d = hidden
+        self.body = nn.Sequential(*body)
+        if self.per_node_heads:
+            self.volt_W = nn.Parameter(torch.randn(self.n_nodes, hidden, 2) * 0.02)
+            self.volt_b = nn.Parameter(torch.zeros(self.n_nodes, 2))
+            self.volt_head = None
+        else:
+            self.volt_head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 2))
+            self.volt_W = None
+            self.volt_b = None
+        self._last_reg_logits: list[torch.Tensor] | None = None
+        self.use_reg_territory_bias = False
+        self.reg_territory_beta = 0.0
+        self.register_buffer(
+            "reg_territory_mask", torch.zeros(self.n_nodes, max(self.n_reg, 0)), persistent=False
+        )
+
+    def _node_ids(self, n_total: int, device: torch.device) -> torch.Tensor:
+        return torch.arange(self.n_nodes, device=device, dtype=torch.long).repeat(n_total // self.n_nodes)
+
+    def set_reg_territory_bias(self, mask: torch.Tensor, beta: float) -> None:
+        return
+
+    def set_reg_territory_bias_enabled(self, enabled: bool) -> None:
+        return
+
+    def forward(self, data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = data.x
+        if self.node_emb is not None:
+            x = torch.cat([x, self.node_emb(self._node_ids(x.size(0), x.device))], dim=-1)
+        h = self.body(x)
+        B = int(data.num_graphs) if hasattr(data, "num_graphs") and data.num_graphs is not None else 1
+        if self.per_node_heads:
+            h_per = h.view(B, self.n_nodes, self.hidden)
+            volt = torch.einsum("bnd,ndo->bno", h_per, self.volt_W) + self.volt_b
+            volt = volt.reshape(B * self.n_nodes, 2)
+        else:
+            volt = self.volt_head(h)
+        cap_logits = volt.new_zeros((B, self.n_cap))
+        reg_pred = volt.new_zeros((B, self.n_reg))
+        pv_pred = volt.new_zeros((B, self.n_pv_aux))
+        self._last_reg_logits = None
+        return volt, cap_logits, reg_pred, pv_pred
+
+
 class DAGPSModel(nn.Module):
     def __init__(
         self,
@@ -5684,6 +5763,96 @@ def _evaluate_split_losses_multi_chunks(
     }
 
 
+def _parse_model_type(args: argparse.Namespace) -> str:
+    mt = str(getattr(args, "model", "gine") or "gine").strip().lower()
+    if mt not in ("gine", "mlp"):
+        raise ValueError(f"--model must be gine or mlp, got {mt!r}")
+    return mt
+
+
+def _resolve_train_device(args: argparse.Namespace) -> torch.device:
+    raw = str(getattr(args, "device", "auto") or "auto").strip().lower()
+    if raw in ("", "auto", "default"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if raw == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is not available")
+        return torch.device("cuda")
+    if raw == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unknown --device {raw!r} (expected auto, cuda, or cpu)")
+
+
+def _apply_volt_only_mlp_args(args: argparse.Namespace) -> None:
+    if _parse_model_type(args) != "mlp":
+        return
+    if (
+        float(getattr(args, "lambda_cap", 0.0)) != 0.0
+        or float(getattr(args, "lambda_reg", 0.0)) != 0.0
+        or float(getattr(args, "lambda_pv", 0.0)) != 0.0
+    ):
+        print("model=mlp volt-only: forcing lambda_cap/lambda_reg/lambda_pv -> 0", flush=True)
+    args.lambda_cap = 0.0
+    args.lambda_reg = 0.0
+    args.lambda_pv = 0.0
+    if str(getattr(args, "aux_meta_cols", "") or "").strip() or str(getattr(args, "aux_pv_meta_cols", "") or "").strip():
+        print("model=mlp volt-only: clearing aux_meta_cols / aux_pv_meta_cols", flush=True)
+    args.aux_meta_cols = ""
+    args.aux_pv_meta_cols = ""
+    if int(getattr(args, "n_system_tokens", 0)) != 0:
+        print("model=mlp volt-only: forcing n_system_tokens -> 0", flush=True)
+    args.n_system_tokens = 0
+
+
+def _build_da_gps_base_model(
+    args: argparse.Namespace,
+    *,
+    n_nodes: int,
+    num_edges: int,
+    n_cap: int,
+    n_reg: int,
+    n_sys: int,
+    node_in_dim: int,
+    edge_dim: int,
+    dropout: float,
+    n_pv_aux: int,
+    reg_nclasses: list[int] | None,
+    reg_loss: str,
+) -> nn.Module:
+    model_type = _parse_model_type(args)
+    common_kw = dict(
+        n_nodes=n_nodes,
+        node_in_dim=node_in_dim,
+        hidden=int(args.hidden),
+        n_layers=int(args.layers),
+        dropout=dropout,
+        node_emb_dim=int(args.node_emb_dim),
+        per_node_heads=bool(args.per_node_heads),
+        n_cap=n_cap,
+        n_reg=n_reg,
+        n_pv_aux=int(n_pv_aux),
+    )
+    if model_type == "mlp":
+        print(
+            f"model=mlp: per-node MLP baseline ({int(args.layers)} hidden layer(s), "
+            f"hidden={int(args.hidden)}, node_emb_dim={int(args.node_emb_dim)})",
+            flush=True,
+        )
+        return PlainNodeMLP(**common_kw)
+    return DAGPSModel(
+        num_edges=int(num_edges),
+        heads=int(args.heads),
+        n_system=n_sys,
+        edge_emb_dim=int(args.edge_emb_dim),
+        edge_dim=int(edge_dim),
+        gradient_checkpointing=bool(args.gradient_checkpointing),
+        per_device_cap_head=bool(args.per_device_cap_head),
+        per_device_reg_head=bool(args.per_device_reg_head),
+        reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
+        **common_kw,
+    )
+
+
 def _da_gps_ckpt_meta(
     *,
     n_nodes: int,
@@ -5707,9 +5876,11 @@ def _da_gps_ckpt_meta(
     reg_nclasses: list[int] | None = None,
     chunk_parent: str | None = None,
     chunk_folders: list[str] | None = None,
+    model_type: str = "gine",
 ) -> dict[str, object]:
     """Architecture / target metadata shared by ``da_gps_multitask_best.pt`` and ``training_last.pt``."""
     meta: dict[str, object] = {
+        "model_type": str(model_type),
         "n_nodes": int(n_nodes),
         "hidden": int(hidden),
         "layers": int(layers),
@@ -6685,6 +6856,7 @@ def _eval_pool_report_block(
 
 def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     """Train on many chunk folders (no merged mega-CSV). One chunk loaded at a time."""
+    _apply_volt_only_mlp_args(args)
     _apply_finetune_physics_only_args(args)
     _mloss = _configure_meta_loss_scale(float(getattr(args, "meta_loss_scale", 1.0)))
     if abs(_mloss - 1.0) > 1e-12:
@@ -7101,30 +7273,25 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         n_chunks=len(chunk_dirs),
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_train_device(args)
+    print(f"device: {device}", flush=True)
     pin = device.type == "cuda"
     nw = int(args.num_workers)
+    model_type = _parse_model_type(args)
 
-    base_model = DAGPSModel(
+    base_model = _build_da_gps_base_model(
+        args,
         n_nodes=n_nodes,
         num_edges=int(edge_index.shape[1]),
-        hidden=int(args.hidden),
-        heads=int(args.heads),
-        n_layers=int(args.layers),
         n_cap=n_cap,
         n_reg=n_reg,
-        n_system=n_sys,
+        n_sys=n_sys,
         node_in_dim=n_node_features,
-        node_emb_dim=int(args.node_emb_dim),
-        edge_emb_dim=int(args.edge_emb_dim),
         edge_dim=int(edge_attr.size(1)),
         dropout=dropout,
-        gradient_checkpointing=bool(args.gradient_checkpointing),
-        per_node_heads=bool(args.per_node_heads),
-        per_device_cap_head=bool(args.per_device_cap_head),
-        per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
         reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
+        reg_loss=reg_loss,
     ).to(device)
     reg_hybrid_tap_loss = bool(getattr(args, "reg_hybrid_tap_loss", False))
     reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
@@ -7181,9 +7348,10 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         reg_nclasses=list(reg_nclasses) if reg_loss == "ce" else None,
         chunk_parent=str(chunk_parent),
         chunk_folders=[str(p) for p in chunk_dirs],
+        model_type=model_type,
     )
     model = base_model
-    if device.type == "cuda" and not args.no_compile:
+    if device.type == "cuda" and not args.no_compile and model_type != "mlp":
         try:
             model = torch.compile(base_model)  # type: ignore[assignment]
             print("torch.compile: enabled", flush=True)
@@ -7234,7 +7402,11 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             strict=bool(getattr(args, "init_checkpoint_strict", False)),
         )
 
-    reg_col_hop_mapping = _configure_reg_territory_bias(base_model, ref_ntl, reg_cols, args, repo, chunk_parent)
+    reg_col_hop_mapping = None
+    if model_type != "mlp":
+        reg_col_hop_mapping = _configure_reg_territory_bias(
+            base_model, ref_ntl, reg_cols, args, repo, chunk_parent
+        )
     idx_to_node = {int(li): str(node) for node, li in ref_ntl.items()}
     _log_training_addon_scales(
         args,
@@ -8361,6 +8533,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--edge_emb_dim", type=int, default=0, help="Optional learned edge-id embedding dim.")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--disable_dropout", action="store_true")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="gine",
+        choices=("gine", "mlp"),
+        help="Backbone: gine=DA-GPS GINE+tokens (default); mlp=per-node MLP volt-only baseline "
+        "(forces lambda_cap/lambda_reg/lambda_pv=0 and no aux tokens).",
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=("auto", "cuda", "cpu"),
+        help="Training device (default auto: cuda when available else cpu).",
+    )
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--lambda_cap", type=float, default=0.1)
@@ -8902,6 +9089,7 @@ def main() -> None:
         main_multi_chunk(args, repo)
         return
 
+    _apply_volt_only_mlp_args(args)
     _apply_finetune_physics_only_args(args)
     _mloss = _configure_meta_loss_scale(float(getattr(args, "meta_loss_scale", 1.0)))
     if abs(_mloss - 1.0) > 1e-12:
@@ -9089,7 +9277,8 @@ def main() -> None:
         n_chunks=1,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_train_device(args)
+    print(f"device: {device}", flush=True)
     pf_state = _setup_pf_physics(
         edges_path=edges_path,
         nodes_path=nodes_path,
@@ -9134,25 +9323,20 @@ def main() -> None:
         persistent_workers=nw > 0,
     )
 
-    base_model = DAGPSModel(
+    model_type = _parse_model_type(args)
+    base_model = _build_da_gps_base_model(
+        args,
         n_nodes=n_nodes,
         num_edges=int(edge_index.shape[1]),
-        hidden=int(args.hidden),
-        heads=int(args.heads),
-        n_layers=int(args.layers),
         n_cap=n_cap,
         n_reg=n_reg,
-        n_system=n_sys,
+        n_sys=n_sys,
         node_in_dim=n_node_features,
-        node_emb_dim=int(args.node_emb_dim),
-        edge_emb_dim=int(args.edge_emb_dim),
         edge_dim=int(edge_attr.size(1)),
         dropout=dropout,
-        gradient_checkpointing=bool(args.gradient_checkpointing),
-        per_node_heads=bool(args.per_node_heads),
-        per_device_cap_head=bool(args.per_device_cap_head),
-        per_device_reg_head=bool(args.per_device_reg_head),
         n_pv_aux=int(n_pv_aux),
+        reg_nclasses=None,
+        reg_loss=reg_loss,
     ).to(device)
     reg_hybrid_tap_loss = bool(getattr(args, "reg_hybrid_tap_loss", False))
     reg_ordinal_ce = bool(getattr(args, "reg_ordinal_ce", False))
@@ -9181,9 +9365,10 @@ def main() -> None:
         cap_target_cols=cap_cols,
         reg_target_cols=reg_cols,
         reg_loss=reg_loss,
+        model_type=model_type,
     )
     model = base_model
-    if device.type == "cuda" and not args.no_compile:
+    if device.type == "cuda" and not args.no_compile and model_type != "mlp":
         try:
             model = torch.compile(base_model)  # type: ignore[assignment]
             print("torch.compile: enabled", flush=True)
@@ -9213,7 +9398,11 @@ def main() -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
-    reg_col_hop_mapping = _configure_reg_territory_bias(base_model, node_to_local, reg_cols, args, repo, chunk_parent=None)
+    reg_col_hop_mapping = None
+    if model_type != "mlp":
+        reg_col_hop_mapping = _configure_reg_territory_bias(
+            base_model, node_to_local, reg_cols, args, repo, chunk_parent=None
+        )
     idx_to_node = {int(li): str(node) for node, li in node_to_local.items()}
     _log_training_addon_scales(
         args,
