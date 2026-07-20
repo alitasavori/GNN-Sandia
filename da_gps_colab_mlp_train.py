@@ -34,10 +34,15 @@ class FeederMlpTrainConfig:
     runs_parent_colab: Path
     runs_parent_win: Path
     run_name_prefix: str
+    # Default MLP width/depth for launch_mlp_training(feeder) when hidden/layers omitted.
+    # OUT_DIR tags use run_name_prefix -> e.g. mlp_8500_l4_h256_<timestamp>.
+    hidden: int
+    layers: int
     use_full_span_glob: bool = True
 
 
 FEEDER_MLP_CONFIGS: dict[str, FeederMlpTrainConfig] = {
+    # Largest feeder: wider/deeper MLP than the shared l2_h64 baseline.
     "8500": FeederMlpTrainConfig(
         feeder="8500",
         chunk_parent_colab=MYDRIVE_DATA / "original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40",
@@ -48,8 +53,11 @@ FEEDER_MLP_CONFIGS: dict[str, FeederMlpTrainConfig] = {
         runs_parent_colab=Path("/content/GNN-Sandia/gnn2_architecture_search/attention checkpoints"),
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="mlp_8500_l{layers}_h{hidden}",
+        hidden=256,
+        layers=4,
         use_full_span_glob=False,
     ),
+    # Small feeder: keep original small MLP baseline (l2_h64).
     "ieee34": FeederMlpTrainConfig(
         feeder="ieee34",
         chunk_parent_colab=MYDRIVE_DATA / "original_ieee34_mirzaei_chunked",
@@ -60,8 +68,11 @@ FEEDER_MLP_CONFIGS: dict[str, FeederMlpTrainConfig] = {
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="mlp_ieee34_l{layers}_h{hidden}",
+        hidden=64,
+        layers=2,
         use_full_span_glob=True,
     ),
+    # Medium feeder: mid-size MLP (between ieee34 baseline and 8500).
     "906": FeederMlpTrainConfig(
         feeder="906",
         chunk_parent_colab=MYDRIVE_DATA / "original_906_lvtestcase_chunked",
@@ -72,6 +83,8 @@ FEEDER_MLP_CONFIGS: dict[str, FeederMlpTrainConfig] = {
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="mlp_906_l{layers}_h{hidden}",
+        hidden=128,
+        layers=3,
         use_full_span_glob=True,
     ),
 }
@@ -229,15 +242,23 @@ def launch_mlp_training(
     full_epochs: int = 200,
     full_patience: int = 30,
     seed: int = 42,
-    hidden: int = 64,
-    layers: int = 2,
+    hidden: int | None = None,
+    layers: int | None = None,
     node_emb_dim: int = 2,
     batch_size: int = 64,
     mount_drive: bool = True,
 ) -> MlpTrainLaunchResult:
-    """Preflight + subprocess train for one feeder. Mount Drive on Colab when ``mount_drive=True``."""
+    """Preflight + subprocess train for one feeder. Mount Drive on Colab when ``mount_drive=True``.
+
+    ``hidden`` / ``layers`` default to ``FEEDER_MLP_CONFIGS[feeder]`` (8500: 256/4, 906: 128/3,
+    ieee34: 64/2). OUT_DIR embeds size via ``run_name_prefix`` (e.g. ``mlp_8500_l4_h256_...``).
+    """
     key = normalize_feeder_key(feeder)
     cfg = FEEDER_MLP_CONFIGS[key]
+    if hidden is None:
+        hidden = cfg.hidden
+    if layers is None:
+        layers = cfg.layers
     on_colab = is_colab()
     if on_colab and mount_drive and not _drive_mounted():
         from google.colab import drive
@@ -406,6 +427,7 @@ def launch_mlp_training(
     print(f"REPO:           {repo_path}")
     print(f"DEVICE:         {dev}")
     print(f"SMOKE_TEST:     {smoke_test}")
+    print(f"HIDDEN/LAYERS:  {hidden}/{layers}")
     print(f"CHUNK_PARENT:   {chunk_parent}")
     print(f"CHUNK_GLOB:     {chunk_glob}")
     print(f"DA_CACHE_ROOT:  {da_cache_root}")
