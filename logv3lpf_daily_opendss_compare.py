@@ -290,11 +290,27 @@ def _apply_native_pv_pmpp_at_step(
             pass
 
 
+def _import_logv_daily_timing():
+    """Import timing helpers; reload if a stale kernel module lacks Log(v) symbols."""
+    import importlib
+    import sys
+
+    mod = sys.modules.get("compare_mv_daily_timing")
+    if mod is not None and not hasattr(mod, "print_logv_daily_timing_summary"):
+        importlib.reload(mod)
+    from compare_mv_daily_timing import (  # noqa: PLC0415
+        print_logv_daily_timing_summary,
+        print_logv_extra_od_probes,
+    )
+
+    return print_logv_daily_timing_summary, print_logv_extra_od_probes
+
+
 def print_logv_daily_speed_summary(series: dict[str, Any], *, feeder: str = "") -> None:
     """Notebook-friendly Method A-style speed summary from ``run_daily_opendss_vs_logv3lpf`` output."""
     import numpy as np
 
-    from compare_mv_daily_timing import print_logv_daily_timing_summary, print_logv_extra_od_probes
+    print_logv_daily_timing_summary, print_logv_extra_od_probes = _import_logv_daily_timing()
 
     summ = series.get("summary") or {}
     n_ok = int(summ.get("n_ok") or np.isfinite(series.get("mae_vm_all_nodes", [])).sum())
@@ -1241,7 +1257,7 @@ def run_daily_opendss_vs_logv3lpf(
                     f"max MAE={float(np.max(arr[m])):.5f}"
                 )
     if time_speed:
-        from compare_mv_daily_timing import print_logv_daily_timing_summary, print_logv_extra_od_probes
+        print_logv_daily_timing_summary, print_logv_extra_od_probes = _import_logv_daily_timing()
 
         n_ok = int(npts - n_bad)
         logv_stock_s_total = float(np.nansum(series["t_logv_s"]))
