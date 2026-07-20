@@ -5,7 +5,8 @@ Faithful to arXiv:2403.00892v3 framing where possible:
   - Joint MSE on bus V/φ and substation P/Q (default ``--lambda_sub 1``).
   - Adam + MultiStepLR at 50%% / 80%% of max epochs (gamma=0.1; schedule is an
     implementation assumption — paper says Adam lr=0.001).
-  - Default epochs=1000, effective batch ≈128 (batch_size × grad_accum).
+  - Default epochs=50 (launcher), MultiStepLR milestones at 50%/80% of max epochs
+    (→ 25, 40 when epochs=50); effective batch ≈128 (batch_size × grad_accum).
 
 Artifacts (per OUT_DIR):
   - pfmn_oracle_best.pt
@@ -649,7 +650,7 @@ def train(args: argparse.Namespace) -> Path:
                 "targets: bus Vmag/Vang and substation P/Q per phase",
                 "GENConv DeeperGCN: powermean, learn_p, msg_norm, learn_msg_scale, residual res+",
                 "joint MSE on voltage + substation heads (default lambda_sub=1)",
-                "Adam lr=0.001; epochs default 1000; effective batch ≈128",
+                "Adam lr=0.001; epochs default 50; effective batch ≈128",
             ],
             "implementation_choices": [
                 "hidden=128, L=12 unified across ieee34/906/8500 (paper silent on exact L/hidden)",
@@ -948,7 +949,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--train_frac", type=float, default=0.80)
     p.add_argument("--val_frac", type=float, default=0.10)
     p.add_argument("--sample_frac", type=float, default=1.0)
-    p.add_argument("--epochs", type=int, default=1000, help="Paper: 1000")
+    p.add_argument("--epochs", type=int, default=50, help="Max epochs (launcher default 50)")
     p.add_argument(
         "--batch_size",
         type=int,
@@ -967,7 +968,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr_gamma", type=float, default=0.1, help="MultiStepLR gamma")
     p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--patience", type=int, default=80, help="Calendar epochs (paper-scale runs)")
+    p.add_argument("--patience", type=int, default=20, help="Early-stop patience (calendar epochs)")
     p.add_argument("--min_delta", type=float, default=0.0)
     p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--eval_every", type=int, default=10)

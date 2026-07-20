@@ -3,8 +3,9 @@
 Mirrors ``da_gps_colab_mlp_train.py`` UX: Drive mount, chunk selection (span>=50),
 preflight print, subprocess to ``train_powerflowmultinet.py``.
 
-Paper-faithful defaults (arXiv:2403.00892v3): epochs=1000, lambda_sub=1.0 (joint
-V/φ + substation P/Q), hidden=128, L=12 for ieee34/906/8500, effective batch≈128.
+Defaults: epochs=50, lambda_sub=1.0 (joint V/φ + substation P/Q), hidden=128, L=12
+for ieee34/906/8500, effective batch≈128. MultiStepLR at 50%/80% of max epochs
+(→ milestones 25, 40 when epochs=50).
 
 Speed defaults: feeder-aware ``batch_size`` / ``grad_accum``, ``interactive_pause=False``,
 and on Colab ``cache_local=True`` (copy Drive caches → ``/content/pfmn_cache`` then train).
@@ -29,11 +30,35 @@ from pathlib import Path
 
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
+# Bump when Colab preflight defaults change so users can verify git pull worked.
+PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed"
+
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
 _FULL_CHUNK_MIN_SCEN = 50
 _CACHE_SUFFIX = "__pfmn_oracle_v2.pt"
 _COLAB_LOCAL_CACHE_ROOT = Path("/content/pfmn_cache")
+
+
+def _launcher_git_sha(repo_path: Path) -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_path),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _launcher_file_mtime() -> str:
+    try:
+        ts = Path(__file__).resolve().stat().st_mtime
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -300,8 +325,8 @@ def launch_pfmn_training(
     smoke_chunk_count: int = 3,
     smoke_epochs: int = 15,
     smoke_patience: int = 5,
-    full_epochs: int = 1000,
-    full_patience: int = 80,
+    full_epochs: int = 50,
+    full_patience: int = 20,
     seed: int = 42,
     hidden: int | None = None,
     layers: int | None = None,
@@ -314,9 +339,10 @@ def launch_pfmn_training(
 ) -> PfmnTrainLaunchResult:
     """Preflight + subprocess train for one feeder (oracle tap/cap PFMN baseline).
 
-    Unified defaults for ieee34 / 906 / 8500: L=12, hidden=128, epochs=1000,
+    Unified defaults for ieee34 / 906 / 8500: L=12, hidden=128, epochs=50,
     lambda_sub=1.0 (joint V/φ + substation P/Q), effective batch ≈128.
     Feeder-aware microbatch (ieee34 64×2, 906 32×4, 8500 16×8).
+    MultiStepLR milestones scale with epochs (50 → 25, 40). Patience default 20.
     OUT_DIR: ``pfmn_oracle_{feeder}_l{L}_h{H}_{timestamp}``.
 
     ``interactive_pause`` (default False): if True, after each eval_every=10 checkpoint
@@ -499,12 +525,20 @@ def launch_pfmn_training(
     else:
         cmd.append("--no_interactive_pause")
 
+    git_sha = _launcher_git_sha(repo_path)
+    file_mtime = _launcher_file_mtime()
     print(f"=== Preflight (PowerFlowMultiNet oracle {key}) ===")
+    print(f"PFMN_LAUNCHER_VERSION: {PFMN_LAUNCHER_VERSION}")
+    print(f"CODE_REV:       git_sha={git_sha}  launcher_mtime={file_mtime}")
     print(f"REPO:           {repo_path}")
     print(f"DEVICE:         {dev}")
     print(f"SMOKE_TEST:     {smoke_test}")
     print(f"HIDDEN/LAYERS:  {hidden}/{layers}  (unified; paper silent on exact sizes)")
-    print(f"EPOCHS:         {epochs}  (paper=1000; smoke uses {smoke_epochs})")
+    print(
+        f"EPOCHS:         {epochs}  (full default={full_epochs}; smoke uses {smoke_epochs}; "
+        f"MultiStepLR @ 50%/80% → milestones scale with epochs)"
+    )
+    print(f"PATIENCE:       {patience}")
     print(f"LAMBDA_SUB:     {lambda_sub}  (1=joint V/φ+sub P/Q; 0=volt-only)")
     print(
         f"EFF_BATCH:      ~{batch_size * grad_accum}  "
@@ -579,6 +613,7 @@ def launch_pfmn_training(
 __all__ = [
     "FEEDER_PFMN_CONFIGS",
     "FeederPfmnTrainConfig",
+    "PFMN_LAUNCHER_VERSION",
     "PfmnTrainLaunchResult",
     "launch_pfmn_training",
     "select_training_chunk_glob",
