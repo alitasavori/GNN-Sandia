@@ -66,31 +66,49 @@ def reassert_snapshot_before_each_solve() -> None:
     dss.Solution.Mode(1)
 
 
+# PV irradiance loadshapes neutralized under snapshot (explicit ``Pmpp = Pmpp0 × m_irr``).
+# 8500 uses ``IrradDay001``; Mirzaei ieee34 uses ``IrradShape``.
+_SNAPSHOT_IRRAD_LOADSHAPE_NAMES = ("IrradDay001", "IrradShape")
+
+
+def _loadshape_all_names() -> list[str]:
+    """OpenDSSDirect spelling differs by version (``LoadShapes`` vs ``LoadShape``)."""
+    for api in ("LoadShapes", "LoadShape"):
+        try:
+            names = getattr(dss, api).AllNames()
+            if names is not None:
+                return [str(x) for x in names]
+        except Exception:
+            continue
+    return []
+
+
 def neutralize_pv_irrad_loadshape_for_snapshot(*, npts: int, step_min: float = 5.0) -> None:
-    """Point ``Loadshape.IrradDay001`` (PV ``Daily=``) at unity mults for snapshot solves.
+    """Point PV irradiance loadshapes at unity mults for snapshot solves.
 
     OpenDSS ``mode=snapshot`` does not apply PV ``Daily=`` irradiance the same way as native
     ``mode=daily`` even when ``hour``/``sec`` are set after ``reassert_snapshot``. Explicit
     ``Pmpp = Pmpp0 × m_irr[t]`` per step (``compare_daily_8500_mlp_gnn`` style) is required;
-    leaving the real profile on ``IrradDay001`` would double-count irradiance.
+    leaving the real profile on ``IrradDay001`` / ``IrradShape`` would double-count irradiance.
 
-    No-op when ``IrradDay001`` is absent (ieee34 / 906 and other non-8500 masters).
+    No-op when neither candidate loadshape is present (e.g. 906 LVTestCase has no PV).
     """
-    try:
-        names = {str(x).strip().lower() for x in (dss.LoadShapes.AllNames() or [])}
-    except Exception:
-        names = set()
-    if "irradday001" not in names:
-        return
+    present = {str(x).strip().lower(): str(x).strip() for x in _loadshape_all_names()}
     n = int(max(1, npts))
     interval_h = float(step_min) / 60.0
     ones = ",".join("1" for _ in range(n))
-    try:
-        dss.Text.Command(
-            f"Edit Loadshape.IrradDay001 npts={n} interval={interval_h} mult=({ones})"
-        )
-    except Exception:
-        return
+    for cand in _SNAPSHOT_IRRAD_LOADSHAPE_NAMES:
+        key = cand.lower()
+        if key not in present:
+            continue
+        for edit_name in (cand, present[key]):
+            try:
+                dss.Text.Command(
+                    f"Edit Loadshape.{edit_name} npts={n} interval={interval_h} mult=({ones})"
+                )
+                break
+            except Exception:
+                continue
 
 
 def rebind_irradiance_loadshape_irradday001(
@@ -123,9 +141,9 @@ def setup_da_gps_snapshot_opendss(
 ) -> None:
     """Post-compile wiring shared by DA-GPS daily compare and ``run_snapshot_series``.
 
-    Snapshot solves use explicit ``Pmpp = Pmpp0 × m_irr[t]``; ``IrradDay001`` is neutralized so
-    irradiance is never read from OpenDSS loadshapes (avoids double-count vs daily ``Daily=``).
-    ``irr_csv`` is accepted for API compatibility but ignored here.
+    Snapshot solves use explicit ``Pmpp = Pmpp0 × m_irr[t]``; ``IrradDay001`` / ``IrradShape``
+    are neutralized so irradiance is never read from OpenDSS loadshapes (avoids double-count
+    vs daily ``Daily=``). ``irr_csv`` is accepted for API compatibility but ignored here.
     """
     import run_daily_aggregate_dataset_8500 as rd8500
 

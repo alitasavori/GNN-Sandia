@@ -16,7 +16,9 @@ PV in Python; they do **not** switch the DSS master (use ``--feeder`` for that).
 
 For **8500**, irradiance also rebinds ``Loadshape.IrradDay001`` then neutralizes it for snapshot
 solves; each step sets ``Pmpp = Pmpp0 × m_irr[i]`` explicitly. ``Load..Daily`` shapes are detached
-so per-step ``kW`` / ``kvar`` are not scaled twice. ieee34 / 906 skip IrradDay001 when absent.
+so per-step ``kW`` / ``kvar`` are not scaled twice. **ieee34** also neutralizes ``IrradShape`` and
+applies loads via ``DEVICE_P/Q_SHARE × BASELINE`` (training convention; not raw DSS nameplates).
+**906** nameplate sum already equals training ``P_LOAD_MEAN`` (55 kW) — no remapping.
   - Read OpenDSS |V| and voltage angle (deg) for all ``*.[123]`` buses; build DA-GPS node inputs, run the
     checkpoint once, denormalize the complex voltage head, scatter predicted |V| and angle (``atan2``).
     Node ``p_pv_kw`` is recomputed each step as ``Pmpp0 × m_irr[i]`` on bus phases — same as dataset
@@ -174,6 +176,115 @@ def normalize_feeder(feeder: str | None) -> str:
 
 def _ieee34_dss_path() -> Path:
     return (REPO_ROOT / "new dss from dr mirzaei" / "IEEE34_PV.dss").resolve()
+
+
+def _ieee34_training_aligned_load_bases(
+    base_names: list[str],
+    base_kw: np.ndarray,
+    base_kvar: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Replace DSS nameplates with ``DEVICE_P/Q_SHARE × BASELINE`` (ieee34 training).
+
+    Mirzaei IEEE34 pairs many distributed loads (sending + receiving). Summing every
+    ``Load.kW`` nameplate ≈ 1769 kW (~2× physical). Dataset generation redistributes
+    ``inj.BASELINE`` (~849 kW / ~501 kvar) via ``DEVICE_P_SHARE`` / ``DEVICE_Q_SHARE`` in
+    ``inj.apply_snapshot_timeconditioned``. Method A must reuse that convention so DSS
+    setpoints and GNN ``p_load_kw`` / ``q_load_kvar`` match training at ``m_t=1``.
+    """
+    p0 = float(inj.BASELINE["P_load_total_kw"])
+    q0 = float(inj.BASELINE["Q_load_total_kvar"])
+    lut = {str(n).strip().lower(): i for i, n in enumerate(base_names)}
+    out_p = np.zeros(len(base_names), dtype=np.float64)
+    out_q = np.zeros(len(base_names), dtype=np.float64)
+    for key, share in inj.DEVICE_P_SHARE.items():
+        i = lut.get(str(key).strip().lower())
+        if i is not None:
+            out_p[i] = p0 * float(share)
+    for key, share in inj.DEVICE_Q_SHARE.items():
+        i = lut.get(str(key).strip().lower())
+        if i is not None:
+            out_q[i] = q0 * float(share)
+    # Keep dtype/shape parity with callers; unused nameplate arrays are intentional.
+    _ = base_kw, base_kvar
+    return out_p, out_q
+
+
+def _ieee34_training_aligned_pv_bases(pv_base_pmpp_kw: dict[str, float]) -> dict[str, float]:
+    """Prefer ``BASELINE['P_pv_total_kw'] × PV_PMMP_SHARE`` over DSS nameplate ``Pmpp``.
+
+    Training ``apply_snapshot_timeconditioned`` sets ``pmpp0 = P_pv_total × share`` (975×0.5),
+    while the Mirzaei DSS nameplates are 500 kW each. Align Method A ``p_pv_kw`` / DSS ``Pmpp``
+    with the training helper when shares are present.
+    """
+    pv0 = float(inj.BASELINE.get("P_pv_total_kw", 0.0))
+    shares = getattr(inj, "PV_PMMP_SHARE", None) or {}
+    share_lut = {str(k).strip().lower(): float(v) for k, v in shares.items()}
+    if pv0 <= 0.0 or not share_lut:
+        return pv_base_pmpp_kw
+    out = dict(pv_base_pmpp_kw)
+    for nm in list(out.keys()):
+        share = share_lut.get(str(nm).strip().lower())
+        if share is not None:
+            out[nm] = pv0 * float(share)
+    return out
+
+
+def _align_method_a_load_bases_for_feeder(
+    feeder_key: str,
+    *,
+    base_names: list[str],
+    base_kw: np.ndarray,
+    base_kvar: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Feeder-specific load bases for Method A DSS apply + GNN features.
+
+    Returns ``(base_kw, base_kvar, meta)`` where ``meta`` has nameplate/physical totals for logging.
+    **8500** unchanged (nameplate × ``m_t``). **906** already matches training means (documented).
+    **ieee34** remaps to ``DEVICE_*_SHARE × BASELINE``.
+    """
+    nameplate_p = float(np.sum(base_kw)) if len(base_kw) else 0.0
+    nameplate_q = float(np.sum(base_kvar)) if len(base_kvar) else 0.0
+    key = normalize_feeder(feeder_key)
+    if key == "ieee34":
+        aligned_p, aligned_q = _ieee34_training_aligned_load_bases(base_names, base_kw, base_kvar)
+        physical_p = float(np.sum(aligned_p))
+        physical_q = float(np.sum(aligned_q))
+        meta = {
+            "feeder": key,
+            "dss_nameplate_sum_kw": nameplate_p,
+            "dss_nameplate_sum_kvar": nameplate_q,
+            "physical_P_kw": physical_p,
+            "physical_Q_kvar": physical_q,
+            "ratio_p": physical_p / nameplate_p if nameplate_p > 1e-12 else float("nan"),
+            "align": "DEVICE_P/Q_SHARE*BASELINE",
+        }
+        return aligned_p, aligned_q, meta
+    if key == "906":
+        # 906 training (`run_original_style_dataset_906_lvtestcase._apply_snapshot_loads_only`)
+        # uses P_LOAD_MEAN_DEFAULT_KW = n_loads (=55) with each load rated 1 kW. DSS nameplate
+        # sum equals that mean, so Method A ``base_kw * m_t`` matches training *totals*.
+        # Spatial allocation still uses a single daily ``m_t`` (not per-load Daily_1min profiles).
+        meta = {
+            "feeder": key,
+            "dss_nameplate_sum_kw": nameplate_p,
+            "dss_nameplate_sum_kvar": nameplate_q,
+            "physical_P_kw": nameplate_p,
+            "physical_Q_kvar": nameplate_q,
+            "ratio_p": 1.0 if nameplate_p > 1e-12 else float("nan"),
+            "align": "nameplate==P_LOAD_MEAN (no remap)",
+        }
+        return base_kw, base_kvar, meta
+    # 8500 (and any other): nameplate × m_t as historically used in daily compare.
+    meta = {
+        "feeder": key,
+        "dss_nameplate_sum_kw": nameplate_p,
+        "dss_nameplate_sum_kvar": nameplate_q,
+        "physical_P_kw": nameplate_p,
+        "physical_Q_kvar": nameplate_q,
+        "ratio_p": 1.0 if nameplate_p > 1e-12 else float("nan"),
+        "align": "dss_nameplate",
+    }
+    return base_kw, base_kvar, meta
 
 
 def _compile_feeder_master(feeder: str) -> dict[str, str]:
@@ -2166,12 +2277,14 @@ def run(
     if not skip_opendss_solve:
         setup_da_gps_snapshot_opendss(npts=int(npts), step_min=float(step_min))
         print(
-            "[da_gps_daily] OpenDSS: IrradDay001 → unity for snapshot solves; "
+            "[da_gps_daily] OpenDSS: IrradDay001/IrradShape → unity for snapshot solves; "
             "PV Pmpp = Pmpp0×m_irr[i] each step (shared setup with compare snapshot mode).",
             flush=True,
         )
     pv_names_dss = _discover_pv_system_names()
     pv_base_pmpp_kw = _read_pv_base_pmpp_kw(pv_names_dss)
+    if feeder_key == "ieee34":
+        pv_base_pmpp_kw = _ieee34_training_aligned_pv_bases(pv_base_pmpp_kw)
     pv_to_busph_w = _collect_pv_to_busph_weights()
     if col_pv is not None and pv_names_dss:
         n_alloc = sum(len(pv_to_busph_w.get(str(nm).strip(), [])) for nm in pv_names_dss)
@@ -2179,7 +2292,7 @@ def run(
             f"[da_gps_daily] p_pv_kw (GNN x): ``pmpp_set×m_pv_t`` style = Pmpp0×m_irr[i] per PV, "
             f"equal split over element phases ({len(pv_names_dss)} PVsystems, {n_alloc} bus-phase terms) — "
             f"``_apply_snapshot_with_pv`` / ``_collect_pv_maps``; DSS ``Pmpp`` = Pmpp0×m_irr[i] "
-            f"(unity IrradDay001 under snapshot mode).",
+            f"(unity IrradDay001/IrradShape under snapshot mode).",
             flush=True,
         )
         if n_alloc == 0:
@@ -2195,6 +2308,20 @@ def run(
     base_kw = np.array([float(d["kw"]) for d in loads], dtype=np.float64)
     base_kvar = np.array([float(d["kvar"]) for d in loads], dtype=np.float64)
     base_names = [str(d["name"]) for d in loads]
+    base_kw, base_kvar, load_align_meta = _align_method_a_load_bases_for_feeder(
+        feeder_key,
+        base_names=base_names,
+        base_kw=base_kw,
+        base_kvar=base_kvar,
+    )
+    print(
+        f"[da_gps_daily] load alignment feeder={feeder_key}: "
+        f"physical_P_kw≈{load_align_meta['physical_P_kw']:.4g}  "
+        f"dss_nameplate_sum≈{load_align_meta['dss_nameplate_sum_kw']:.4g}  "
+        f"ratio={load_align_meta['ratio_p']:.4g}  "
+        f"({load_align_meta['align']}; physical_Q_kvar≈{load_align_meta['physical_Q_kvar']:.4g})",
+        flush=True,
+    )
 
     print(
         f"[da_gps_daily] stress: daily_stress={daily_stress:g} scenario_scale={scenario_scale:g} "
