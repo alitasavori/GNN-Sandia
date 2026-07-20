@@ -235,11 +235,15 @@ def launch_pfmn_training(
     grad_accum: int = 16,
     lambda_sub: float = 0.0,
     mount_drive: bool = True,
+    interactive_pause: bool = True,
 ) -> PfmnTrainLaunchResult:
     """Preflight + subprocess train for one feeder (oracle tap/cap PFMN baseline).
 
     Defaults: ieee34 L=8 h=128; 906 L=12 h=128; 8500 L=12 h=128.
     OUT_DIR: ``pfmn_oracle_{feeder}_l{L}_h{H}_{timestamp}``.
+
+    ``interactive_pause`` (default True): after each eval_every=10 checkpoint, pause for
+    continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or ``STOP`` under OUT_DIR.
     """
     key = normalize_feeder_key(feeder)
     cfg = FEEDER_PFMN_CONFIGS[key]
@@ -387,6 +391,11 @@ def launch_pfmn_training(
         "--lambda_sub",
         str(lambda_sub),
     ]
+    if interactive_pause:
+        cmd.append("--interactive_pause")
+        os.environ.setdefault("TRAIN_INTERACTIVE", "1")
+    else:
+        cmd.append("--no_interactive_pause")
 
     print(f"=== Preflight (PowerFlowMultiNet oracle {key}) ===")
     print(f"REPO:           {repo_path}")
@@ -399,6 +408,13 @@ def launch_pfmn_training(
     print(f"PFMN_CACHE:     {cache_root}")
     print(f"RUNS_PARENT:    {runs_parent}")
     print(f"OUT_DIR:        {out_dir}")
+    print(f"INTERACTIVE_PAUSE: {interactive_pause}")
+    if interactive_pause:
+        print(
+            "  After each eval_every=10: create empty CONTINUE or STOP under OUT_DIR "
+            "(Colab subprocess has no TTY). Or type c/s if running trainer in a terminal."
+        )
+        print(f"  e.g.  !touch '{out_dir / 'STOP'}'   /   !touch '{out_dir / 'CONTINUE'}'")
     print(f"Found {len(chunks)} chunk(s)")
     print("=================")
     print("\nRunning:\n ", " ".join(cmd), "\n", flush=True)

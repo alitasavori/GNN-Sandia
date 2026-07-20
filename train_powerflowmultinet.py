@@ -41,6 +41,11 @@ from build_powerflowmultinet_graph import (
     materialize_edge_attr,
 )
 from powerflowmultinet_model import PowerFlowMultiNet
+from train_interactive_pause import (
+    add_interactive_pause_args,
+    ask_continue_or_stop,
+    should_interactive_pause,
+)
 
 try:
     from tqdm.auto import tqdm
@@ -610,6 +615,32 @@ def train(args: argparse.Namespace) -> Path:
             print(f"[pfmn] early stop at epoch {epoch} (patience={args.patience})", flush=True)
             break
 
+        if should_interactive_pause(epoch, args):
+            _choice = ask_continue_or_stop(
+                out_dir=out_dir,
+                epoch=epoch,
+                epochs=int(args.epochs),
+                best_val=float(best_val) if best_val < float("inf") else None,
+                best_epoch=int(best_epoch),
+            )
+            if _choice == "stop":
+                print(
+                    f"[pfmn] interactive stop at epoch {epoch}, "
+                    f"best={best_val:.6g} @ epoch {best_epoch}",
+                    flush=True,
+                )
+                _atomic_torch_save(
+                    {
+                        **_bundle(epoch, best=False),
+                        "optimizer_state_dict": opt.state_dict(),
+                        "best_val": best_val,
+                        "best_epoch": best_epoch,
+                    },
+                    out_dir / "training_last.pt",
+                )
+                print(f"  checkpoint (interactive stop) -> {out_dir / 'training_last.pt'}", flush=True)
+                break
+
     # Final / best eval
     best_path = out_dir / "pfmn_oracle_best.pt"
     if best_path.is_file():
@@ -661,6 +692,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--eval_every", type=int, default=10)
+    add_interactive_pause_args(p)
     p.add_argument("--checkpoint_every", type=int, default=10)
     p.add_argument("--lambda_sub", type=float, default=0.0, help="0 = volt-only baseline")
     p.add_argument("--num_workers", type=int, default=0)

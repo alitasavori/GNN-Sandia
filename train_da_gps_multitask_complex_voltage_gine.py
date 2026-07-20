@@ -78,6 +78,11 @@ from torch_geometric.nn import GINEConv
 from torch_geometric.utils import to_dense_batch
 
 from train_gnn_only_compare_complex_voltage import _build_complex_targets
+from train_interactive_pause import (
+    add_interactive_pause_args,
+    ask_continue_or_stop,
+    should_interactive_pause,
+)
 
 # Training add-on coefficient defaults (tuned for comparable loss scale vs base terms).
 _DEFAULT_ATTN_REG_TERRITORY_BETA = 6.0
@@ -8309,6 +8314,39 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
+        if should_interactive_pause(ep, args):
+            _choice = ask_continue_or_stop(
+                out_dir=out_dir,
+                epoch=ep,
+                epochs=int(args.epochs),
+                best_val=float(best_val) if best_val == best_val else None,
+                best_epoch=int(best_epoch),
+            )
+            if _choice == "stop":
+                print(
+                    f"[da_gps chunk_parent] interactive stop at epoch {ep}, "
+                    f"best={best_val:.4f} @ epoch {best_epoch}",
+                    flush=True,
+                )
+                if int(args.checkpoint_every) > 0:
+                    _ck = out_dir / "training_last.pt"
+                    _save_periodic_training_checkpoint(
+                        _ck,
+                        base_model,
+                        opt,
+                        sch,
+                        scaler,
+                        ckpt_meta,
+                        epoch=ep,
+                        bad=bad,
+                        best_val=best_val,
+                        best_state=best_state,
+                        best_epoch=best_epoch,
+                        best_val_r2_mean=best_val_r2_mean,
+                        best_val_r2_min=best_val_r2_min,
+                    )
+                    print(f"  periodic checkpoint (interactive stop) -> {_ck}", flush=True)
+                break
 
     train_seconds = time.perf_counter() - t0
     if best_state is not None:
@@ -8611,6 +8649,7 @@ def parse_args() -> argparse.Namespace:
         help="Run validation, best-checkpoint tracking, LR schedule step, and full epoch metrics every N epochs "
         "(epoch 1 and final epoch always eval). Training still runs every epoch.",
     )
+    add_interactive_pause_args(p)
     p.add_argument(
         "--attn_reg_territory_bias",
         action="store_true",
@@ -9903,6 +9942,39 @@ def main() -> None:
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
+        if should_interactive_pause(ep, args):
+            _choice = ask_continue_or_stop(
+                out_dir=out_dir,
+                epoch=ep,
+                epochs=int(args.epochs),
+                best_val=float(best_val) if best_val == best_val else None,
+                best_epoch=int(best_epoch),
+            )
+            if _choice == "stop":
+                print(
+                    f"[da_gps] interactive stop at epoch {ep}, "
+                    f"best={best_val:.4f} @ epoch {best_epoch}",
+                    flush=True,
+                )
+                if int(args.checkpoint_every) > 0:
+                    _ck = out_dir / "training_last.pt"
+                    _save_periodic_training_checkpoint(
+                        _ck,
+                        base_model,
+                        opt,
+                        sch,
+                        scaler,
+                        ckpt_meta,
+                        epoch=ep,
+                        bad=bad,
+                        best_val=best_val,
+                        best_state=best_state,
+                        best_epoch=best_epoch,
+                        best_val_r2_mean=best_val_r2_mean,
+                        best_val_r2_min=best_val_r2_min,
+                    )
+                    print(f"  periodic checkpoint (interactive stop) -> {_ck}", flush=True)
+                break
 
     train_seconds = time.perf_counter() - t0
     if best_state is not None:

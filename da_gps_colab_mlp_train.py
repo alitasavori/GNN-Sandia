@@ -250,11 +250,15 @@ def launch_mlp_training(
     node_emb_dim: int = 2,
     batch_size: int = 64,
     mount_drive: bool = True,
+    interactive_pause: bool = True,
 ) -> MlpTrainLaunchResult:
     """Preflight + subprocess train for one feeder. Mount Drive on Colab when ``mount_drive=True``.
 
     ``hidden`` / ``layers`` default to ``FEEDER_MLP_CONFIGS[feeder]`` (8500: 256/4, 906: 128/3,
     ieee34: 64/2). OUT_DIR embeds size via ``run_name_prefix`` (e.g. ``mlp_8500_l4_h256_...``).
+
+    ``interactive_pause`` (default True): after each eval_every=10 checkpoint, pause for
+    continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or ``STOP`` under OUT_DIR.
     """
     key = normalize_feeder_key(feeder)
     cfg = FEEDER_MLP_CONFIGS[key]
@@ -427,6 +431,11 @@ def launch_mlp_training(
         "--dropout",
         "0.1",
     ]
+    if interactive_pause:
+        cmd.append("--interactive_pause")
+        os.environ.setdefault("TRAIN_INTERACTIVE", "1")
+    else:
+        cmd.append("--no_interactive_pause")
 
     print(f"=== Preflight (MLP volt-only {key}) ===")
     print(f"REPO:           {repo_path}")
@@ -448,6 +457,13 @@ def launch_mlp_training(
     print(f"GNN_CACHE_ROOT: {gnn_cache_root}")
     print(f"RUNS_PARENT:    {runs_parent}")
     print(f"OUT_DIR:        {out_dir}")
+    print(f"INTERACTIVE_PAUSE: {interactive_pause}")
+    if interactive_pause:
+        print(
+            "  After each eval_every=10: create empty CONTINUE or STOP under OUT_DIR "
+            "(Colab subprocess has no TTY). Or type c/s if running trainer in a terminal."
+        )
+        print(f"  e.g.  !touch '{out_dir / 'STOP'}'   /   !touch '{out_dir / 'CONTINUE'}'")
     print(f"Found {len(chunks)} chunk(s)")
     print("=================")
     print("\nRunning:\n ", " ".join(cmd), "\n", flush=True)
