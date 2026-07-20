@@ -58,8 +58,9 @@ From building GPU/CPU tensors through scatter back to NumPy node voltages. On **
 so asynchronous kernel time is included in the bucket; on **CPU** there is no extra sync.
 
 **Pipeline speedup (printed summary)**  
-- *true_speedup* (primary fair compare): ``(apply + Solve) / (feature + forward)``.  
-- *full_dss_speedup*: ``(apply + Solve + collect V) / (feature + forward)``.  
+- *true_speedup* (primary fair compare): ``(apply + Solve + collect V) / (feature + forward)``.  
+- *full_dss_speedup*: alias of *true_speedup* (same formula; kept for older JSON consumers).  
+- *apply_solve_speedup*: ``(apply + Solve) / (feature + forward)`` — excludes collect.  
 - *deploy_speedup*: ``(apply + Solve) / (apply + feature + forward)`` — shared apply on GNN side.  
 - *net_speedup*: ``Solve() only / (feature + forward)`` — apply excluded from both sides.
 
@@ -160,18 +161,21 @@ def compute_mv_daily_timing_metrics(
     def _ratio(num: float, den: float) -> float:
         return num / den if den > 1e-12 else float("nan")
 
+    true_speedup = _ratio(dss_full_ms, gnn_true_ms)
     return {
         "dss_apply_ms": dss_apply_ms,
         "dss_solve_ms": dss_solve_ms,
         "dss_collect_ms": dss_collect_ms,
         "dss_total_ms": dss_full_ms,
-        "dss_true_ms": dss_true_ms,
+        "dss_true_ms": dss_true_ms,  # apply+solve only (used by deploy/net helpers)
         "gnn_feature_ms": gnn_feature_ms,
         "gnn_forward_ms": gnn_forward_ms,
         "gnn_total_ms": gnn_true_ms,
         "gnn_true_ms": gnn_true_ms,
-        "true_speedup": _ratio(dss_true_ms, gnn_true_ms),
-        "full_dss_speedup": _ratio(dss_full_ms, gnn_true_ms),
+        # Primary slide/report metric: DSS includes collect V.
+        "true_speedup": true_speedup,
+        "full_dss_speedup": true_speedup,  # alias of true_speedup
+        "apply_solve_speedup": _ratio(dss_true_ms, gnn_true_ms),
         "deploy_speedup": _ratio(dss_deploy_ms, gnn_deploy_ms),
         "net_speedup": _ratio(dss_net_ms, gnn_net_ms),
         "dss_deploy_ms": dss_deploy_ms,
@@ -209,13 +213,18 @@ def print_mv_daily_pipeline_and_speedups(
     )
     print(f"\n=== {log_prefix} Speedup ratios (DSS / GNN) ===", flush=True)
     print(
-        f"  true_speedup     (apply+solve / feature+forward):           "
+        f"  true_speedup     (apply+solve+collect / feature+forward):  "
         f"{_fmt_speedup(metrics['true_speedup'])}  [primary fair compare]",
         flush=True,
     )
     print(
-        f"  full_dss_speedup (apply+solve+collect / feature+forward):  "
-        f"{_fmt_speedup(metrics['full_dss_speedup'])}  [DSS includes collect]",
+        f"  full_dss_speedup (alias of true_speedup):                   "
+        f"{_fmt_speedup(metrics['full_dss_speedup'])}",
+        flush=True,
+    )
+    print(
+        f"  apply_solve_speedup (apply+solve / feature+forward):       "
+        f"{_fmt_speedup(metrics['apply_solve_speedup'])}  [excludes collect]",
         flush=True,
     )
     print(
@@ -382,9 +391,157 @@ def print_mv_daily_timing_summary(
     )
     print(
         f"{log_prefix} collect V mean {_po(open_get_s_total):.1f} ms/ok-step is reported above; "
-        "excluded from true/deploy speedups, included in full_dss_speedup.",
+        "included in true_speedup / full_dss_speedup; excluded from deploy/net/apply_solve.",
         flush=True,
     )
+
+
+def print_logv_daily_timing_summary(
+    *,
+    n_ok: int,
+    npts: int,
+    n_nonconv: int,
+    open_apply_s_total: float,
+    open_reassert_s_total: float,
+    open_solve_only_s_total: float,
+    open_get_s_total: float,
+    logv_stock_s_total: float,
+    fast_forward_s_total: float,
+    fast_refresh_s_total: float = 0.0,
+    n_fast_refresh: int = 0,
+    feeder: str = "",
+    control_mode: str = "",
+    title: str = "Daily Timing Summary (Log(v) vs OpenDSS)",
+    log_prefix: str = "[logv_daily_compare]",
+) -> dict[str, float]:
+    """Method A-compatible OpenDSS buckets + Log(v) stock / FastLogv pipeline ms."""
+
+    def _po(total: float) -> float:
+        return per_ok_ms(total, n_ok)
+
+    print(f"\n{log_prefix} Wall-clock breakdown:", flush=True)
+    print(f"=== {title} ===", flush=True)
+    if feeder:
+        print(f"feeder={feeder}  control_mode={control_mode}  snapshot Solve() per step", flush=True)
+    print(
+        "OpenDSS apply loads (DSS API only): total "
+        f"{open_apply_s_total:.4f}s | mean {_po(open_apply_s_total):.3f} ms/ok-step",
+        flush=True,
+    )
+    print(
+        "OpenDSS snapshot reassert overhead: total "
+        f"{open_reassert_s_total:.4f}s | mean {_po(open_reassert_s_total):.3f} ms/ok-step  "
+        "(``set mode=snapshot``, caps, ``Solution.Mode`` — benchmark bookkeeping, not ``Solve()``)",
+        flush=True,
+    )
+    print(
+        "OpenDSS Solve() only: total "
+        f"{open_solve_only_s_total:.4f}s | mean {_po(open_solve_only_s_total):.3f} ms/ok-step  "
+        "(primary OD metric — what a surrogate replaces)",
+        flush=True,
+    )
+    print(
+        "OpenDSS collect V mag (benchmarking only): total "
+        f"{open_get_s_total:.4f}s | mean {_po(open_get_s_total):.3f} ms/ok-step  "
+        "(ground truth for MAE — not run in a pure Log(v) deployment)",
+        flush=True,
+    )
+    print(
+        "stock Log(v) solve: total "
+        f"{logv_stock_s_total:.4f}s | mean {_po(logv_stock_s_total):.3f} ms/ok-step  "
+        "(sync path: ``run_case`` / autonomous RegControl)",
+        flush=True,
+    )
+    print(
+        "FastLogv online solve only: total "
+        f"{fast_forward_s_total:.4f}s | mean {_po(fast_forward_s_total):.3f} ms/ok-step  "
+        "(RHS + cached factor only — init/refresh excluded)",
+        flush=True,
+    )
+    if fast_refresh_s_total > 0.0 and n_fast_refresh > 0:
+        print(
+            "FastLogv refresh (tap/cap): total "
+            f"{fast_refresh_s_total:.4f}s | mean {_po(fast_refresh_s_total):.3f} ms/ok-step  "
+            f"(n={n_fast_refresh}; outside Fast online timer)",
+            flush=True,
+        )
+    print(f"Timesteps converged: {n_ok}/{npts}  (nonconv={n_nonconv})", flush=True)
+
+    pipeline_metrics = compute_mv_daily_timing_metrics(
+        n_ok=n_ok,
+        open_apply_s_total=open_apply_s_total,
+        open_solve_only_s_total=open_solve_only_s_total,
+        open_get_s_total=open_get_s_total,
+        feature_build_s_total=0.0,
+        gnn_forward_only_s_total=fast_forward_s_total,
+    )
+    stock_ms = _po(logv_stock_s_total)
+    fast_ms = _po(fast_forward_s_total)
+    print(
+        f"\n=== {log_prefix} Pipeline timing (mean ms / converged step) ===",
+        flush=True,
+    )
+    print(
+        f"  DSS  apply_ms={pipeline_metrics['dss_apply_ms']:.3f}  "
+        f"solve_ms={pipeline_metrics['dss_solve_ms']:.3f}  "
+        f"collect_ms={pipeline_metrics['dss_collect_ms']:.3f}  "
+        f"total_ms={pipeline_metrics['dss_total_ms']:.3f}  (apply+solve+collect)",
+        flush=True,
+    )
+    print(
+        f"  Log(v) stock_ms={stock_ms:.3f}  FastLogv_ms={fast_ms:.3f}  "
+        f"(stock autonomous / Fast online only)",
+        flush=True,
+    )
+    print(f"\n=== {log_prefix} Speedup ratios (OpenDSS / FastLogv) ===", flush=True)
+    print(
+        f"  true_speedup     (apply+solve+collect / Fast online):  "
+        f"{_fmt_speedup(pipeline_metrics['true_speedup'])}  [DSS full vs Fast]",
+        flush=True,
+    )
+    print(
+        f"  net_speedup      (solve / Fast online):                "
+        f"{_fmt_speedup(pipeline_metrics['net_speedup'])}  [primary OD Solve() vs Fast]",
+        flush=True,
+    )
+    print(
+        f"  apply_solve_speedup (apply+solve / Fast online):       "
+        f"{_fmt_speedup(pipeline_metrics['apply_solve_speedup'])}  [excludes collect]",
+        flush=True,
+    )
+    if stock_ms > 1e-6:
+        print(
+            f"  stock/Fast       (stock Log(v) / Fast online):        "
+            f"{_fmt_speedup(stock_ms / fast_ms)}  [reference only]",
+            flush=True,
+        )
+    return pipeline_metrics
+
+
+def print_logv_extra_od_probes(
+    *,
+    n_ok: int,
+    warm_daily_s_total: float | None = None,
+    cold_snapshot_s_total: float | None = None,
+    log_prefix: str = "[logv_daily_compare]",
+) -> None:
+    """Optional legacy OD timers — not primary metrics (snapshot Solve() only is primary)."""
+
+    def _po(total: float) -> float:
+        return per_ok_ms(total, n_ok)
+
+    print(f"\n=== {log_prefix} Extra OD probes (not primary; snapshot Solve() above) ===", flush=True)
+    if warm_daily_s_total is not None and warm_daily_s_total > 0.0:
+        print(
+            f"  OD warm daily Solve (Mode=Daily march): mean {_po(warm_daily_s_total):.3f} ms/ok-step",
+            flush=True,
+        )
+    if cold_snapshot_s_total is not None and cold_snapshot_s_total > 0.0:
+        print(
+            f"  OD cold InitSnap+Solve probe: mean {_po(cold_snapshot_s_total):.3f} ms/ok-step  "
+            "(reset taps + flat start; diagnostic only)",
+            flush=True,
+        )
 
 
 def amortize_gnn_timing_to_display_grid(
