@@ -8092,7 +8092,9 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 best_val_r2_min = val_r2_min
                 bad = 0
             else:
-                bad += 1
+                # Epochs since last improvement (not eval-step count), so --patience
+                # matches calendar epochs even when --eval_every > 1.
+                bad = int(ep - best_epoch) if best_epoch > 0 else bad + 1
             _le = int(args.log_every)
             _log_detail = _le > 0 and (ep == 1 or ep % _le == 0)
             _log = (
@@ -8275,7 +8277,12 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if do_eval and not args.no_early_stop and bad >= args.patience:
-            print(f"[da_gps chunk_parent] early stop at epoch {ep}", flush=True)
+            print(
+                f"[da_gps chunk_parent] early stop at epoch {ep}, "
+                f"best={best_val:.4f} @ epoch {best_epoch} "
+                f"(patience={int(args.patience)}, early_stop_on={args.early_stop_on})",
+                flush=True,
+            )
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
                 _save_periodic_training_checkpoint(
@@ -8559,7 +8566,13 @@ def parse_args() -> argparse.Namespace:
         help="Regulator tap loss: mse or mae on z-scored tap_pu; ce (cce) = cross-entropy on discrete tap "
         "classes (rounded unique tap_pu per reg column, requires --per_device_reg_head). Caps use BCE.",
     )
-    p.add_argument("--patience", type=int, default=30)
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=30,
+        help="Early-stop after this many epochs without improving the --early_stop_on val metric "
+        "(checked on eval epochs; counts calendar epochs, not eval steps).",
+    )
     p.add_argument(
         "--no_early_stop",
         action="store_true",
@@ -9760,7 +9773,9 @@ def main() -> None:
                 best_val_r2_min = val_r2_min
                 bad = 0
             else:
-                bad += 1
+                # Epochs since last improvement (not eval-step count), so --patience
+                # matches calendar epochs even when --eval_every > 1.
+                bad = int(ep - best_epoch) if best_epoch > 0 else bad + 1
             _le = int(args.log_every)
             _log_detail = _le > 0 and (ep == 1 or ep % _le == 0)
             _log = (
@@ -9841,7 +9856,12 @@ def main() -> None:
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if do_eval and not args.no_early_stop and bad >= args.patience:
-            print(f"[da_gps] early stop at epoch {ep}", flush=True)
+            print(
+                f"[da_gps] early stop at epoch {ep}, "
+                f"best={best_val:.4f} @ epoch {best_epoch} "
+                f"(patience={int(args.patience)}, early_stop_on={args.early_stop_on})",
+                flush=True,
+            )
             if int(args.checkpoint_every) > 0:
                 _ck = out_dir / "training_last.pt"
                 _save_periodic_training_checkpoint(
