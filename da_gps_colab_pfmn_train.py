@@ -6,6 +6,9 @@ preflight print, subprocess to ``train_powerflowmultinet.py``.
 Paper-faithful defaults (arXiv:2403.00892v3): epochs=1000, lambda_sub=1.0 (joint
 V/φ + substation P/Q), hidden=128, L=12 for ieee34/906/8500, effective batch≈128.
 
+Speed defaults: feeder-aware ``batch_size`` / ``grad_accum``, ``interactive_pause=False``,
+and on Colab ``cache_local=True`` (copy Drive caches → ``/content/pfmn_cache`` then train).
+
 Artifacts: ``pfmn_oracle_best.pt``, ``training_last.pt``, ``pfmn_report.json``,
 ``run_manifest.json``. Cache schema ``__pfmn_oracle_v2.pt`` (delete old v1 caches).
 """
@@ -14,8 +17,10 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -27,6 +32,8 @@ from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
 _FULL_CHUNK_MIN_SCEN = 50
+_CACHE_SUFFIX = "__pfmn_oracle_v2.pt"
+_COLAB_LOCAL_CACHE_ROOT = Path("/content/pfmn_cache")
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,9 @@ class FeederPfmnTrainConfig:
     # Implementation choices (paper silent on exact L/hidden; unified across feeders).
     hidden: int
     layers: int
+    # Feeder-aware microbatch; keep batch×accum ≈128.
+    batch_size: int
+    grad_accum: int
     use_full_span_glob: bool = True
 
 
@@ -61,6 +71,8 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_8500_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
+        batch_size=16,
+        grad_accum=8,
         use_full_span_glob=False,
     ),
     "ieee34": FeederPfmnTrainConfig(
@@ -74,6 +86,8 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_ieee34_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
+        batch_size=64,
+        grad_accum=2,
         use_full_span_glob=True,
     ),
     "906": FeederPfmnTrainConfig(
@@ -87,6 +101,8 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_906_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
+        batch_size=32,
+        grad_accum=4,
         use_full_span_glob=True,
     ),
 }
@@ -214,6 +230,57 @@ def _configure_device(device: str) -> str:
     return dev
 
 
+def _estimate_n_samples(chunks: list[Path]) -> int:
+    """Estimate sample count from run_* scen spans (fallback 50 per chunk)."""
+    total = 0
+    for p in chunks:
+        span = _parse_run_scen_span(p.name)
+        total += span if span is not None else 50
+    return total
+
+
+def _sync_cache_files(src_dir: Path, dst_dir: Path, *, label: str) -> int:
+    """Copy ``*__pfmn_oracle_v2.pt`` from src→dst when missing or newer. Returns count."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    if not src_dir.is_dir():
+        return 0
+    for src in sorted(src_dir.glob(f"*{_CACHE_SUFFIX}")):
+        dst = dst_dir / src.name
+        if not dst.is_file() or src.stat().st_mtime > dst.stat().st_mtime + 1e-6:
+            shutil.copy2(src, dst)
+            n += 1
+    if n:
+        print(f"[pfmn cache_local] {label}: copied {n} file(s) {src_dir} -> {dst_dir}", flush=True)
+    return n
+
+
+def _prepare_train_cache(
+    drive_cache: Path,
+    *,
+    cache_name: str,
+    cache_local: bool,
+    on_colab: bool,
+) -> tuple[Path, Path | None]:
+    """Return (train_cache_dir, drive_dir_to_sync_back_or_None).
+
+    On Colab with ``cache_local=True``: copy existing Drive caches to
+    ``/content/pfmn_cache/<name>`` once, train from local SSD, sync new caches back after.
+    """
+    drive_cache.mkdir(parents=True, exist_ok=True)
+    if not (cache_local and on_colab):
+        return drive_cache, None
+    local = _COLAB_LOCAL_CACHE_ROOT / cache_name
+    local.mkdir(parents=True, exist_ok=True)
+    n = _sync_cache_files(drive_cache, local, label="Drive→local")
+    print(
+        f"[pfmn cache_local] training I/O from {local} "
+        f"(Drive mirror={drive_cache}; pre-copied={n})",
+        flush=True,
+    )
+    return local, drive_cache
+
+
 @dataclass
 class PfmnTrainLaunchResult:
     feeder: str
@@ -238,20 +305,26 @@ def launch_pfmn_training(
     seed: int = 42,
     hidden: int | None = None,
     layers: int | None = None,
-    batch_size: int = 8,
-    grad_accum: int = 16,
+    batch_size: int | None = None,
+    grad_accum: int | None = None,
     lambda_sub: float = 1.0,
     mount_drive: bool = True,
-    interactive_pause: bool = True,
+    interactive_pause: bool = False,
+    cache_local: bool | None = None,
 ) -> PfmnTrainLaunchResult:
     """Preflight + subprocess train for one feeder (oracle tap/cap PFMN baseline).
 
     Unified defaults for ieee34 / 906 / 8500: L=12, hidden=128, epochs=1000,
     lambda_sub=1.0 (joint V/φ + substation P/Q), effective batch ≈128.
+    Feeder-aware microbatch (ieee34 64×2, 906 32×4, 8500 16×8).
     OUT_DIR: ``pfmn_oracle_{feeder}_l{L}_h{H}_{timestamp}``.
 
-    ``interactive_pause`` (default True): after each eval_every=10 checkpoint, pause for
-    continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or ``STOP`` under OUT_DIR.
+    ``interactive_pause`` (default False): if True, after each eval_every=10 checkpoint
+    pause for continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or
+    ``STOP`` under OUT_DIR.
+
+    ``cache_local`` (default True on Colab): copy Drive ``*__pfmn_oracle_v2.pt`` caches
+    to ``/content/pfmn_cache/...``, train from local disk, sync new caches back to Drive.
     """
     key = normalize_feeder_key(feeder)
     cfg = FEEDER_PFMN_CONFIGS[key]
@@ -259,7 +332,13 @@ def launch_pfmn_training(
         hidden = cfg.hidden
     if layers is None:
         layers = cfg.layers
+    if batch_size is None:
+        batch_size = cfg.batch_size
+    if grad_accum is None:
+        grad_accum = cfg.grad_accum
     on_colab = is_colab()
+    if cache_local is None:
+        cache_local = on_colab
     if on_colab and mount_drive and not _drive_mounted():
         from google.colab import drive
 
@@ -272,16 +351,20 @@ def launch_pfmn_training(
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ.setdefault("GNN2_REPO_ROOT", str(repo_path))
 
+    # Never inherit TRAIN_INTERACTIVE=1 from a prior cell unless user asks to pause.
+    if not interactive_pause:
+        os.environ.pop("TRAIN_INTERACTIVE", None)
+
     dev = _configure_device(device)
 
     if on_colab:
         chunk_parent_raw = cfg.chunk_parent_colab
-        cache_raw = MYDRIVE_DATA / f"cache/{cfg.cache_name}"
+        drive_cache_raw = MYDRIVE_DATA / f"cache/{cfg.cache_name}"
         runs_parent_raw = cfg.runs_parent_colab
         colab_fb = cfg.chunk_parent_colab
     elif os.name == "nt":
         chunk_parent_raw = cfg.chunk_parent_win
-        cache_raw = cfg.chunk_parent_win.parent / "cache" / cfg.cache_name
+        drive_cache_raw = cfg.chunk_parent_win.parent / "cache" / cfg.cache_name
         if key == "8500":
             runs_parent_raw = repo_path / "gnn2_architecture_search/attention checkpoints"
         else:
@@ -289,7 +372,7 @@ def launch_pfmn_training(
         colab_fb = None
     else:
         chunk_parent_raw = repo_path / cfg.chunk_parent_repo_rel
-        cache_raw = repo_path / "datasets_gnn2_from pc/cache" / cfg.cache_name
+        drive_cache_raw = repo_path / "datasets_gnn2_from pc/cache" / cfg.cache_name
         if key == "8500":
             runs_parent_raw = repo_path / "gnn2_architecture_search/attention checkpoints"
         else:
@@ -297,8 +380,8 @@ def launch_pfmn_training(
         colab_fb = None
 
     chunk_parent = _resolve_data_path(chunk_parent_raw, label="CHUNK_PARENT", colab_fallback=colab_fb)
-    cache_root = _resolve_data_path(
-        cache_raw,
+    drive_cache = _resolve_data_path(
+        drive_cache_raw,
         label="PFMN_CACHE_ROOT",
         colab_fallback=MYDRIVE_DATA / f"cache/{cfg.cache_name}" if on_colab else None,
     )
@@ -306,6 +389,12 @@ def launch_pfmn_training(
         runs_parent_raw,
         label="RUNS_PARENT",
         colab_fallback=MYDRIVE_DATA / "runs" if on_colab else None,
+    )
+    cache_root, cache_sync_back = _prepare_train_cache(
+        drive_cache,
+        cache_name=cfg.cache_name,
+        cache_local=bool(cache_local),
+        on_colab=on_colab,
     )
 
     if smoke_test:
@@ -342,6 +431,11 @@ def launch_pfmn_training(
         cfg.run_name_prefix.format(layers=layers, hidden=hidden) + f"{smoke_suffix}_{tag}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_est = _estimate_n_samples(chunks)
+    n_train_est = max(1, int(round(n_est * 0.80)))
+    micro_per_epoch = max(1, math.ceil(n_train_est / max(1, batch_size)))
+    opt_steps_per_epoch = max(1, math.ceil(micro_per_epoch / max(1, grad_accum)))
 
     num_workers = 0 if os.name == "nt" else 4
     cmd = [
@@ -412,10 +506,22 @@ def launch_pfmn_training(
     print(f"HIDDEN/LAYERS:  {hidden}/{layers}  (unified; paper silent on exact sizes)")
     print(f"EPOCHS:         {epochs}  (paper=1000; smoke uses {smoke_epochs})")
     print(f"LAMBDA_SUB:     {lambda_sub}  (1=joint V/φ+sub P/Q; 0=volt-only)")
-    print(f"EFF_BATCH:      ~{batch_size * grad_accum}  (batch={batch_size} × accum={grad_accum})")
+    print(
+        f"EFF_BATCH:      ~{batch_size * grad_accum}  "
+        f"(feeder default batch={batch_size} × accum={grad_accum})"
+    )
+    print(f"EST_SAMPLES:    ~{n_est}  (~{n_train_est} train @ train_frac=0.80)")
+    print(
+        f"STEPS/EPOCH:    ~{micro_per_epoch} microbatches  "
+        f"(~{opt_steps_per_epoch} optimizer steps)"
+    )
     print(f"CHUNK_PARENT:   {chunk_parent}")
     print(f"CHUNK_GLOB:     {chunk_glob}")
-    print(f"PFMN_CACHE:     {cache_root}  (schema __pfmn_oracle_v2.pt)")
+    print(f"PFMN_CACHE:     {cache_root}  (schema {_CACHE_SUFFIX})")
+    if cache_sync_back is not None:
+        print(f"CACHE_LOCAL:    True  (Drive mirror={cache_sync_back})")
+    else:
+        print(f"CACHE_LOCAL:    False")
     print(f"RUNS_PARENT:    {runs_parent}")
     print(f"OUT_DIR:        {out_dir}")
     print(f"INTERACTIVE_PAUSE: {interactive_pause}")
@@ -425,6 +531,10 @@ def launch_pfmn_training(
             "(Colab subprocess has no TTY). Or type c/s if running trainer in a terminal."
         )
         print(f"  e.g.  !touch '{out_dir / 'STOP'}'   /   !touch '{out_dir / 'CONTINUE'}'")
+    else:
+        print(
+            "  Pause off (default). Pass interactive_pause=True to stop every eval_every=10."
+        )
     print(f"Found {len(chunks)} chunk(s)")
     print("Artifacts: pfmn_oracle_best.pt, training_last.pt, pfmn_report.json, run_manifest.json")
     print("=================")
@@ -445,6 +555,9 @@ def launch_pfmn_training(
 
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
+
+    if cache_sync_back is not None:
+        _sync_cache_files(cache_root, cache_sync_back, label="local→Drive")
 
     print("\nTraining completed.")
     print("Run dir:", out_dir.resolve())

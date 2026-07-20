@@ -548,11 +548,14 @@ def train(args: argparse.Namespace) -> Path:
     ds_test = PfmnOracleDataset(packs, test_pairs, **norms)
 
     nw = int(args.num_workers)
-    loader_kw = dict(
+    loader_kw: dict = dict(
         batch_size=int(args.batch_size),
         num_workers=nw,
-        pin_memory=device.type == "cuda",
+        pin_memory=(device.type == "cuda"),
     )
+    if nw > 0:
+        loader_kw["persistent_workers"] = True
+        loader_kw["prefetch_factor"] = 2
     train_loader = DataLoader(ds_train, shuffle=True, **loader_kw)
     val_loader = DataLoader(ds_val, shuffle=False, **loader_kw)
     test_loader = DataLoader(ds_test, shuffle=False, **loader_kw)
@@ -946,8 +949,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--val_frac", type=float, default=0.10)
     p.add_argument("--sample_frac", type=float, default=1.0)
     p.add_argument("--epochs", type=int, default=1000, help="Paper: 1000")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--grad_accum", type=int, default=16, help="Toward effective batch ≈128")
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Per-step graphs; launcher sets feeder-aware (ieee34=64, 906=32, 8500=16)",
+    )
+    p.add_argument(
+        "--grad_accum",
+        type=int,
+        default=2,
+        help="Toward effective batch ≈128 (launcher: ieee34×2, 906×4, 8500×8)",
+    )
     p.add_argument("--hidden", type=int, default=128, help="Implementation choice (paper silent)")
     p.add_argument("--layers", type=int, default=12, help="Unified L=12 across feeders")
     p.add_argument("--dropout", type=float, default=0.1)
