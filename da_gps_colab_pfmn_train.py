@@ -31,7 +31,7 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed"
+PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed.fileid"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
@@ -352,6 +352,22 @@ def launch_pfmn_training(
     ``cache_local`` (default True on Colab): copy Drive ``*__pfmn_oracle_v2.pt`` caches
     to ``/content/pfmn_cache/...``, train from local disk, sync new caches back to Drive.
     """
+    # Ultra-loud identity: proves which on-disk file Colab actually imported.
+    _abs_file = str(Path(__file__).resolve())
+    _cfg200 = (
+        f"PFMN_LAUNCHER_VERSION={PFMN_LAUNCHER_VERSION!r} "
+        f"defaults={{layers={_PFMN_LAYERS}, hidden={_PFMN_HIDDEN}, "
+        f"full_epochs={full_epochs}, lambda_sub={lambda_sub}, "
+        f"interactive_pause={interactive_pause}, "
+        f"ieee34_batch={FEEDER_PFMN_CONFIGS['ieee34'].batch_size}}} "
+        f"__file__={_abs_file}"
+    )[:200]
+    print("=" * 72, flush=True)
+    print(f"PFMN_LAUNCHER_FILEID: {PFMN_LAUNCHER_VERSION}", flush=True)
+    print(f"PFMN_LAUNCHER_FILE:   {_abs_file}", flush=True)
+    print(f"PFMN_LAUNCHER_CFG200: {_cfg200}", flush=True)
+    print("=" * 72, flush=True)
+
     key = normalize_feeder_key(feeder)
     cfg = FEEDER_PFMN_CONFIGS[key]
     if hidden is None:
