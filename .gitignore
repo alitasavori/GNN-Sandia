@@ -26,3 +26,15 @@ datasets_gnn2/
 gnn2_daily_compare_8500_output/
 gnn2_daily_compare_8500_output_*/
 
+# Full OpenDSS-master tree is huge (archives/docs/source); track only LVTestCase feeder files
+906 bus system/**
+!906 bus system/OpenDSS-master/
+!906 bus system/OpenDSS-master/OpenDSS-master/
+!906 bus system/OpenDSS-master/OpenDSS-master/Distrib/
+!906 bus system/OpenDSS-master/OpenDSS-master/Distrib/IEEETestCases/
+!906 bus system/OpenDSS-master/OpenDSS-master/Distrib/IEEETestCases/LVTestCase/
+!906 bus system/OpenDSS-master/OpenDSS-master/Distrib/IEEETestCases/LVTestCase/**
+# Demand-interval / solve outputs under LVTestCase (not needed to compile)
+906 bus system/OpenDSS-master/OpenDSS-master/Distrib/IEEETestCases/LVTestCase/LVTest/
+906 bus system/OpenDSS-master/OpenDSS-master/Distrib/IEEETestCases/LVTestCase/DI_yr_*/
+
