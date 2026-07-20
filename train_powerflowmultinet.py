@@ -1,15 +1,19 @@
 """Train PowerFlowMultiNet — oracle device states (GENConv baseline).
 
-Not DA-GPS: taps/caps are inputs; targets are Vmag/Vang (and optional substation P/Q).
+Faithful to arXiv:2403.00892v3 framing where possible:
+  - Physical-bus multigraph; taps/caps are OpenDSS-settled *inputs* (not predicted).
+  - Joint MSE on bus V/φ and substation P/Q (default ``--lambda_sub 1``).
+  - Adam + MultiStepLR at 50%% / 80%% of max epochs (gamma=0.1; schedule is an
+    implementation assumption — paper says Adam lr=0.001).
+  - Default epochs=1000, effective batch ≈128 (batch_size × grad_accum).
 
 Artifacts (per OUT_DIR):
   - pfmn_oracle_best.pt
   - training_last.pt
   - pfmn_report.json
-  - run_manifest.json
+  - run_manifest.json (+ pfmn_run_manifest.json alias)
 
-Default loss is volt-only (``--lambda_sub 0``). Paper epochs=1000; Colab default 200
-via launcher (``--epochs`` exposed).
+Logging mirrors DA-GPS chunk_parent style (``[pfmn chunk_parent]`` + train_pool_eval).
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ import datetime as _dt
 import fnmatch
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -51,6 +54,9 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
+
+# Bump when tensor / feature schema changes so Colab Drive caches rebuild.
+_CACHE_SUFFIX = "__pfmn_oracle_v2.pt"
 
 
 def _configure_stdout() -> None:
@@ -98,7 +104,7 @@ def _sorted_run_chunks(chunk_parent: Path, glob_pat: str) -> list[Path]:
 
 
 def _cache_path(cache_dir: Path, chunk_dir: Path) -> Path:
-    return cache_dir / f"{chunk_dir.name}__pfmn_oracle.pt"
+    return cache_dir / f"{chunk_dir.name}{_CACHE_SUFFIX}"
 
 
 def _load_or_build_chunk(
@@ -124,6 +130,7 @@ def _load_or_build_chunk(
     print(f"[pfmn cache] build {chunk_dir.name}", flush=True)
     pack = load_pfmn_chunk_tensors(nodes, edges, meta)
     pack["chunk_name"] = chunk_dir.name
+    pack["cache_schema"] = "pfmn_oracle_v2"
     torch.save(pack, cp)
     print(f"[pfmn cache] wrote {cp}", flush=True)
     return pack
@@ -261,6 +268,29 @@ def _denorm(y_n: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.T
     return y_n * std + mean
 
 
+def _batch_y_sub(batch) -> torch.Tensor:
+    ys = batch.y_sub
+    if ys.dim() == 1:
+        ys = ys.view(-1, 6)
+    return ys
+
+
+def _joint_loss(
+    pred_v: torch.Tensor,
+    pred_sub: torch.Tensor | None,
+    batch,
+    *,
+    lambda_sub: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (total, volt, sub) losses. Sub term is 0 when λ_sub=0 or no head."""
+    loss_v = _masked_mse(pred_v, batch.y, batch.y_mask)
+    loss_s = pred_v.new_zeros(())
+    if pred_sub is not None:
+        loss_s = F.mse_loss(pred_sub, _batch_y_sub(batch))
+    loss = loss_v + float(lambda_sub) * loss_s if float(lambda_sub) > 0 else loss_v
+    return loss, loss_v, loss_s
+
+
 @torch.no_grad()
 def evaluate(
     model: PowerFlowMultiNet,
@@ -273,15 +303,18 @@ def evaluate(
     model.eval()
     tot_loss = 0.0
     volt_loss = 0.0
+    sub_loss = 0.0
     n_batches = 0
-    # Accumulators for physical metrics
-    abs_vmag = []
-    abs_ang = []
-    mse_re = []
-    mse_im = []
-    # R2 over flattened masked mag
-    y_true_mag = []
-    y_pred_mag = []
+    abs_vmag: list[torch.Tensor] = []
+    abs_ang: list[torch.Tensor] = []
+    mse_re: list[torch.Tensor] = []
+    mse_im: list[torch.Tensor] = []
+    mse_re_n: list[torch.Tensor] = []
+    mse_im_n: list[torch.Tensor] = []
+    abs_sub_p: list[torch.Tensor] = []
+    abs_sub_q: list[torch.Tensor] = []
+    y_true_mag: list[torch.Tensor] = []
+    y_pred_mag: list[torch.Tensor] = []
 
     y_mean = norms["y_mean"].to(device)
     y_std = norms["y_std"].to(device)
@@ -293,22 +326,15 @@ def evaluate(
         pred_v, pred_sub = model(
             batch.x, batch.edge_index, batch.edge_attr, batch.device_state, batch.batch
         )
-        loss_v = _masked_mse(pred_v, batch.y, batch.y_mask)
-        loss = loss_v
-        if lambda_sub > 0 and pred_sub is not None:
-            # batch.y_sub is [B,6] after PyG stacking
-            ys = batch.y_sub
-            if ys.dim() == 1:
-                ys = ys.view(-1, 6)
-            loss = loss + float(lambda_sub) * F.mse_loss(pred_sub, ys)
+        loss, loss_v, loss_s = _joint_loss(pred_v, pred_sub, batch, lambda_sub=lambda_sub)
         tot_loss += float(loss.item())
         volt_loss += float(loss_v.item())
+        sub_loss += float(loss_s.item())
         n_batches += 1
 
         pred_phys = _denorm(pred_v, y_mean, y_std)
         true_phys = _denorm(batch.y, y_mean, y_std)
         m = batch.y_mask > 0.5
-        # mag channels 0,2,4 ; angle 1,3,5
         for ph in range(3):
             mm = m[:, 2 * ph]
             ma = m[:, 2 * ph + 1]
@@ -318,21 +344,33 @@ def evaluate(
                 abs_vmag.append((pv - tv).abs())
                 y_pred_mag.append(pv)
                 y_true_mag.append(tv)
-                # reconstruct re/im
-                pa = pred_phys[ma, 2 * ph + 1] if ma.any() else None
-                ta = true_phys[ma, 2 * ph + 1] if ma.any() else None
-                if pa is not None and ta is not None and pa.numel() == pv.numel():
+                if ma.any() and int(ma.sum()) == int(mm.sum()):
+                    pa = pred_phys[ma, 2 * ph + 1]
+                    ta = true_phys[ma, 2 * ph + 1]
                     pr = pv * torch.cos(pa)
                     pi_ = pv * torch.sin(pa)
                     tr = tv * torch.cos(ta)
                     ti = tv * torch.sin(ta)
                     mse_re.append((pr - tr).pow(2))
                     mse_im.append((pi_ - ti).pow(2))
+                    pvn = pred_v[mm, 2 * ph]
+                    tvn = batch.y[mm, 2 * ph]
+                    pan = pred_v[ma, 2 * ph + 1]
+                    tan = batch.y[ma, 2 * ph + 1]
+                    mse_re_n.append((pvn * torch.cos(pan) - tvn * torch.cos(tan)).pow(2))
+                    mse_im_n.append((pvn * torch.sin(pan) - tvn * torch.sin(tan)).pow(2))
             if ma.any():
-                # wrap-aware angle error
                 d = pred_phys[ma, 2 * ph + 1] - true_phys[ma, 2 * ph + 1]
                 d = (d + math.pi) % (2 * math.pi) - math.pi
                 abs_ang.append(d.abs() * (180.0 / math.pi))
+
+        if pred_sub is not None:
+            ys = _batch_y_sub(batch)
+            pred_s = _denorm(pred_sub, sub_mean, sub_std)
+            true_s = _denorm(ys, sub_mean, sub_std)
+            # channels: P_a,Q_a,P_b,Q_b,P_c,Q_c
+            abs_sub_p.append((pred_s[:, 0::2] - true_s[:, 0::2]).abs().reshape(-1))
+            abs_sub_q.append((pred_s[:, 1::2] - true_s[:, 1::2]).abs().reshape(-1))
 
     def _cat_mean(xs: list[torch.Tensor]) -> float:
         if not xs:
@@ -344,6 +382,9 @@ def evaluate(
     mse_ri = float("nan")
     if mse_re and mse_im:
         mse_ri = float(0.5 * (torch.cat(mse_re).mean() + torch.cat(mse_im).mean()).item())
+    mse_ri_n = float("nan")
+    if mse_re_n and mse_im_n:
+        mse_ri_n = float(0.5 * (torch.cat(mse_re_n).mean() + torch.cat(mse_im_n).mean()).item())
 
     r2 = float("nan")
     if y_true_mag:
@@ -357,18 +398,27 @@ def evaluate(
     return {
         "loss_total": tot_loss / nb,
         "loss_volt": volt_loss / nb,
+        "loss_sub": sub_loss / nb,
+        "loss_tot": tot_loss / nb,
         "mae_vmag_pu": mae_vmag,
         "mae_angle_deg": mae_ang,
+        "mae_sub_p": _cat_mean(abs_sub_p),
+        "mae_sub_q": _cat_mean(abs_sub_q),
         "mse_ri": mse_ri,
+        "mse_ri_normalized": mse_ri_n if mse_ri_n == mse_ri_n else mse_ri,
         "r2_vmag_mean": r2,
     }
 
 
 def _print_metrics_line(tag: str, met: dict[str, float]) -> None:
+    mse_ri = float(met.get("mse_ri_normalized", met.get("mse_ri", float("nan"))))
+    sub_p = float(met.get("mae_sub_p", float("nan")))
+    sub_q = float(met.get("mae_sub_q", float("nan")))
     print(
         f"{tag} |V| MAE={met['mae_vmag_pu']:.6f}  angle MAE={met['mae_angle_deg']:.6f}  "
-        f"Re/Im MSE={met['mse_ri']:.6f}  r2_mean={met['r2_vmag_mean']:.6f}  "
-        f"tot={met['loss_total']:.6f}  volt={met['loss_volt']:.6f}",
+        f"sub P MAE={sub_p:.6f}  sub Q MAE={sub_q:.6f}  "
+        f"Re/Im MSE(nrm)={mse_ri:.6f}  r2_mean={met['r2_vmag_mean']:.6f}  "
+        f"tot={met['loss_total']:.6f}  volt={met['loss_volt']:.6f}  sub={met.get('loss_sub', float('nan')):.6f}",
         flush=True,
     )
 
@@ -379,11 +429,55 @@ def _print_eval_section(label: str, phase: str, val_met: dict, test_met: dict) -
     _print_metrics_line("Test", test_met)
 
 
+def _format_epoch_log(
+    *,
+    epoch: int,
+    epochs: int,
+    train_tot: float,
+    train_volt: float,
+    train_sub: float,
+    val_met: dict[str, float] | None,
+    best_val: float,
+    best_epoch: int,
+    bad: int,
+    patience: int,
+    min_delta: float,
+    lr: float,
+) -> str:
+    line = (
+        f"[pfmn chunk_parent] epoch {epoch:4d}/{epochs} "
+        f"| train_tot={train_tot:.6f} train_volt={train_volt:.6f} train_sub={train_sub:.6f}"
+    )
+    if val_met is not None:
+        line += (
+            f" | val_tot={val_met['loss_total']:.6f} val_volt={val_met['loss_volt']:.6f} "
+            f"val_sub={val_met.get('loss_sub', float('nan')):.6f} "
+            f"| val_r2_mean={val_met['r2_vmag_mean']:.6f} "
+            f"val_|V|_MAE={val_met['mae_vmag_pu']:.6f} "
+            f"val_ang_MAE={val_met['mae_angle_deg']:.6f}"
+        )
+    best_s = f"{best_val:.6f}" if best_val < float("inf") else "inf"
+    line += (
+        f" | best={best_s} @ epoch {best_epoch} "
+        f"| epochs_since_best={bad} patience={patience} min_delta={min_delta:g} "
+        f"| lr={lr:.2e}"
+    )
+    return line
+
+
 def _atomic_torch_save(obj: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
+
+
+def _multistep_milestones(epochs: int) -> list[int]:
+    """Paper-faithful assumption: drop LR at 50% and 80% of max epochs."""
+    e = max(1, int(epochs))
+    m1 = max(1, int(round(0.5 * e)))
+    m2 = max(m1 + 1, int(round(0.8 * e)))
+    return [m1, m2]
 
 
 def train(args: argparse.Namespace) -> Path:
@@ -419,7 +513,6 @@ def train(args: argparse.Namespace) -> Path:
         n_s = int(pack["x"].shape[0])
         all_pairs.extend((ci, s) for s in range(n_s))
 
-    # Optional subsample
     if 0 < float(args.sample_frac) < 1.0:
         rng = np.random.default_rng(int(args.seed))
         k = max(3, int(round(len(all_pairs) * float(args.sample_frac))))
@@ -474,39 +567,66 @@ def train(args: argparse.Namespace) -> Path:
         predict_substation=True,
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    milestones = _multistep_milestones(int(args.epochs))
+    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=milestones, gamma=float(args.lr_gamma))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.no_amp))
     use_amp = device.type == "cuda" and not args.no_amp
 
     accum = max(1, int(args.grad_accum))
     effective_bs = int(args.batch_size) * accum
     print(
-        f"[pfmn] batch_size={args.batch_size} grad_accum={accum} effective_batch~={effective_bs} amp={use_amp}",
+        f"[pfmn] batch_size={args.batch_size} grad_accum={accum} effective_batch~={effective_bs} "
+        f"amp={use_amp} MultiStepLR milestones={milestones} gamma={args.lr_gamma}",
         flush=True,
     )
 
     best_val = float("inf")
+    best_es = float("inf")
     best_epoch = 0
+    best_ckpt_epoch = 0
+    best_val_r2 = float("nan")
     bad = 0
     history: list[dict] = []
+    train_pool_epoch_history: list[dict] = []
+    last_val_met: dict[str, float] | None = None
     t0 = time.time()
+    min_delta = float(args.min_delta)
+    log_every = int(args.log_every)
+    no_early_stop = bool(args.no_early_stop)
+    lam_sub = float(args.lambda_sub)
 
     manifest = {
+        "task": "PowerFlowMultiNet oracle chunk_parent",
         "model": "PowerFlowMultiNet — oracle device states",
+        "paper": "arXiv:2403.00892v3 PowerFlowMultiNet",
         "not_da_gps": True,
+        "oracle_device_states": True,
         "chunk_parent": str(chunk_parent),
         "chunks": [c.name for c in chunks],
-        "cache_dir": str(cache_dir),
+        "n_chunks": len(chunks),
+        "chunk_tensor_cache_dir": str(cache_dir),
+        "cache_schema": "pfmn_oracle_v2",
         "out_dir": str(out_dir),
         "seed": int(args.seed),
         "train_frac": float(args.train_frac),
         "val_frac": float(args.val_frac),
+        "n_train": len(train_pairs),
+        "n_val": len(val_pairs),
+        "n_test": len(test_pairs),
         "hidden": int(args.hidden),
         "layers": int(args.layers),
         "epochs": int(args.epochs),
         "lr": float(args.lr),
+        "lr_schedule": {
+            "type": "MultiStepLR",
+            "milestones": milestones,
+            "gamma": float(args.lr_gamma),
+            "note": "implementation assumption — paper states Adam lr=0.001 without schedule details",
+        },
         "batch_size": int(args.batch_size),
         "grad_accum": accum,
-        "lambda_sub": float(args.lambda_sub),
+        "effective_batch": effective_bs,
+        "lambda_sub": lam_sub,
         "dropout": float(args.dropout),
         "n_bus": n_bus,
         "n_edge": n_edge,
@@ -515,39 +635,87 @@ def train(args: argparse.Namespace) -> Path:
         "state_dim": state_dim,
         "reg_cols": packs[0].get("reg_cols", []),
         "cap_cols": packs[0].get("cap_cols", []),
-        "implementation_notes": {
-            "hidden_layers": "implementation choice (paper does not clearly report hidden/L)",
-            "epochs_default": "200 for Colab practicality; paper cites 1000 — override with --epochs",
-            "edge_attrs": "paper-style minimum: phase one-hot, type one-hot, tap, switch_closed",
-            "8500_secondary": "A/B/C multigraph from existing edge CSV only; no extra secondary graph",
-            "net_injection": "P = p_load_kw - p_pv_kw, Q = q_load_kvar",
-            "source_bus": "bus with smallest node_idx",
-            "volt_only": "lambda_sub=0 by default; substation head still constructed",
+        "hyperparameters": vars(args),
+        "manifest_stage": "pre_train",
+        "paper_fidelity": {
+            "matches": [
+                "physical buses as nodes; parallel phase edges (multigraph)",
+                "node features P,Q per phase + phase masks + source + bus caps",
+                "edge features phase / type / tap / switch_closed",
+                "capacitor (and switch) states via separate state MLP — oracle OpenDSS inputs",
+                "targets: bus Vmag/Vang and substation P/Q per phase",
+                "GENConv DeeperGCN: powermean, learn_p, msg_norm, learn_msg_scale, residual res+",
+                "joint MSE on voltage + substation heads (default lambda_sub=1)",
+                "Adam lr=0.001; epochs default 1000; effective batch ≈128",
+            ],
+            "implementation_choices": [
+                "hidden=128, L=12 unified across ieee34/906/8500 (paper silent on exact L/hidden)",
+                "MultiStepLR at 50%/80% of max epochs, gamma=0.1 (not specified in paper)",
+                "80/10/10 split on pooled chunk scenarios (paper used 8k/2k)",
+                "DeepGCNLayer first block=plain, subsequent=res+",
+                "source bus = physical bus with smallest node_idx",
+            ],
+            "gaps_vs_paper": [
+                "8500 secondary / split-phase not modeled beyond A/B/C edges in edge CSV",
+                "dataset scale differs from paper's 8k/2k synthetic set",
+                "exact paper residual-block hyperparameters may differ from torch_geometric defaults",
+            ],
         },
         "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _manifest_text = json.dumps(manifest, indent=2, default=str)
+    (out_dir / "run_manifest.json").write_text(_manifest_text, encoding="utf-8")
+    (out_dir / "pfmn_run_manifest.json").write_text(_manifest_text, encoding="utf-8")
+    print(f"Wrote run manifest: {out_dir / 'run_manifest.json'}", flush=True)
 
     def _bundle(epoch: int, *, best: bool = False) -> dict:
         return {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
             "epoch": int(epoch),
             "best": bool(best),
+            "best_val": float(best_val) if best_val < float("inf") else None,
+            "best_epoch": int(best_ckpt_epoch),
+            "best_val_r2_mean": float(best_val_r2) if best_val_r2 == best_val_r2 else None,
             "hidden": int(args.hidden),
             "layers": int(args.layers),
             "node_dim": node_dim,
             "edge_dim": edge_dim,
             "state_dim": state_dim,
             "dropout": float(args.dropout),
-            "norms": {k: v.cpu() for k, v in norms.items()},
+            "n_bus": n_bus,
+            "n_edge": n_edge,
+            "lambda_sub": lam_sub,
+            "norms": {k: v.detach().cpu().clone() for k, v in norms.items()},
+            "args": vars(args),
             "manifest": manifest,
             "model_name": "powerflowmultinet_oracle",
+            "chunk_parent": str(chunk_parent),
+            "chunk_folders": [c.name for c in chunks],
+            "cache_schema": "pfmn_oracle_v2",
         }
+
+    def _save_training_last(epoch: int, *, reason: str = "") -> Path:
+        ck = out_dir / "training_last.pt"
+        _atomic_torch_save(
+            {
+                **_bundle(epoch, best=False),
+                "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": sch.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if use_amp else None,
+                "bad": int(bad),
+                "checkpoint_type": "training_last",
+            },
+            ck,
+        )
+        tag = f" ({reason})" if reason else ""
+        print(f"  periodic checkpoint{tag} -> {ck}", flush=True)
+        return ck
 
     for epoch in range(1, int(args.epochs) + 1):
         model.train()
         running = 0.0
         running_v = 0.0
+        running_s = 0.0
         n_seen = 0
         opt.zero_grad(set_to_none=True)
         it = train_loader
@@ -559,13 +727,7 @@ def train(args: argparse.Namespace) -> Path:
                 pred_v, pred_sub = model(
                     batch.x, batch.edge_index, batch.edge_attr, batch.device_state, batch.batch
                 )
-                loss_v = _masked_mse(pred_v, batch.y, batch.y_mask)
-                loss = loss_v
-                if float(args.lambda_sub) > 0 and pred_sub is not None:
-                    ys = batch.y_sub
-                    if ys.dim() == 1:
-                        ys = ys.view(-1, 6)
-                    loss = loss + float(args.lambda_sub) * F.mse_loss(pred_sub, ys)
+                loss, loss_v, loss_s = _joint_loss(pred_v, pred_sub, batch, lambda_sub=lam_sub)
                 loss = loss / float(accum)
             scaler.scale(loss).backward()
             if step % accum == 0 or step == len(train_loader):
@@ -574,45 +736,107 @@ def train(args: argparse.Namespace) -> Path:
                 opt.zero_grad(set_to_none=True)
             running += float(loss.item()) * float(accum)
             running_v += float(loss_v.item())
+            running_s += float(loss_s.item())
             n_seen += 1
 
         tr_loss = running / max(n_seen, 1)
         tr_volt = running_v / max(n_seen, 1)
-        print(
-            f"[pfmn chunk_parent] epoch {epoch}/{args.epochs} "
-            f"loss={tr_loss:.6f} volt={tr_volt:.6f} lr={opt.param_groups[0]['lr']:.2e}",
-            flush=True,
+        tr_sub = running_s / max(n_seen, 1)
+        sch.step()
+        history.append(
+            {
+                "epoch": int(epoch),
+                "train_tot": tr_loss,
+                "train_volt": tr_volt,
+                "train_sub": tr_sub,
+                "train_loss": tr_loss,
+                "lr": float(opt.param_groups[0]["lr"]),
+            }
         )
 
-        do_eval = (epoch == 1) or (epoch % int(args.eval_every) == 0) or (epoch == int(args.epochs))
-        if do_eval:
-            val_met = evaluate(model, val_loader, device, norms, lambda_sub=float(args.lambda_sub))
-            test_met = evaluate(model, test_loader, device, norms, lambda_sub=float(args.lambda_sub))
-            _print_eval_section("train_pool_eval", f"epoch {epoch}", val_met, test_met)
-            history.append({"epoch": epoch, "train_loss": tr_loss, "val": val_met, "test": test_met})
-            score = float(val_met["loss_total"])
-            if score < best_val - 1e-8:
-                best_val = score
-                best_epoch = epoch
-                bad = 0
-                _atomic_torch_save(_bundle(epoch, best=True), out_dir / "pfmn_oracle_best.pt")
-                print(f"Saved {out_dir / 'pfmn_oracle_best.pt'}", flush=True)
-            else:
-                bad += 1
+        do_eval = (
+            (epoch == 1)
+            or (epoch % int(args.eval_every) == 0)
+            or (epoch == int(args.epochs))
+        )
+        do_log = (
+            do_eval
+            or (log_every > 0 and (epoch == 1 or epoch % log_every == 0))
+            or (epoch == int(args.epochs))
+        )
 
-        if epoch % int(args.checkpoint_every) == 0 or epoch == int(args.epochs):
-            _atomic_torch_save(
+        val_met: dict[str, float] | None = None
+        test_met: dict[str, float] | None = None
+        if do_eval:
+            val_met = evaluate(model, val_loader, device, norms, lambda_sub=lam_sub)
+            test_met = evaluate(model, test_loader, device, norms, lambda_sub=lam_sub)
+            last_val_met = val_met
+            history[-1].update(
                 {
-                    **_bundle(epoch, best=False),
-                    "optimizer_state_dict": opt.state_dict(),
-                    "best_val": best_val,
-                    "best_epoch": best_epoch,
-                },
-                out_dir / "training_last.pt",
+                    "val": val_met,
+                    "test": test_met,
+                    "val_tot": float(val_met["loss_total"]),
+                    "val_volt": float(val_met["loss_volt"]),
+                    "val_sub": float(val_met["loss_sub"]),
+                    "val_r2_mean": float(val_met["r2_vmag_mean"]),
+                }
+            )
+            train_pool_epoch_history.append(
+                {"epoch": int(epoch), "val_metrics": val_met, "test_metrics": test_met}
             )
 
-        if bad >= int(args.patience):
-            print(f"[pfmn] early stop at epoch {epoch} (patience={args.patience})", flush=True)
+            score = float(val_met["loss_total"])
+            if score < best_val:
+                best_val = score
+                best_ckpt_epoch = epoch
+                best_val_r2 = float(val_met["r2_vmag_mean"])
+                _atomic_torch_save(_bundle(epoch, best=True), out_dir / "pfmn_oracle_best.pt")
+                print(f"Saved {out_dir / 'pfmn_oracle_best.pt'}", flush=True)
+
+            # Calendar-epoch early stop (min_delta), matching DA-GPS
+            if best_es == float("inf") or (best_es - score) >= min_delta:
+                best_es = score
+                best_epoch = epoch
+                bad = 0
+            else:
+                bad = int(epoch - best_epoch) if best_epoch > 0 else bad + 1
+
+        if do_log:
+            print(
+                _format_epoch_log(
+                    epoch=epoch,
+                    epochs=int(args.epochs),
+                    train_tot=tr_loss,
+                    train_volt=tr_volt,
+                    train_sub=tr_sub,
+                    val_met=val_met if do_eval else None,
+                    best_val=best_val,
+                    best_epoch=best_ckpt_epoch if best_ckpt_epoch > 0 else best_epoch,
+                    bad=bad,
+                    patience=int(args.patience),
+                    min_delta=min_delta,
+                    lr=float(opt.param_groups[0]["lr"]),
+                ),
+                flush=True,
+            )
+
+        if do_eval and val_met is not None and test_met is not None:
+            _print_eval_section("train_pool_eval", f"epoch {epoch}", val_met, test_met)
+
+        _ce = int(args.checkpoint_every)
+        if _ce > 0 and (epoch % _ce == 0 or epoch == int(args.epochs)):
+            _save_training_last(epoch)
+
+        if do_eval and not no_early_stop and bad >= int(args.patience):
+            print(
+                f"[pfmn chunk_parent] early stop at epoch {epoch}, "
+                f"best={best_val:.6f} @ epoch {best_ckpt_epoch} "
+                f"(epochs_since_best={bad}, patience={int(args.patience)}, "
+                f"min_delta={min_delta:g})",
+                flush=True,
+            )
+            if _ce > 0:
+                _save_training_last(epoch, reason="early stop")
             break
 
         if should_interactive_pause(epoch, args):
@@ -621,50 +845,89 @@ def train(args: argparse.Namespace) -> Path:
                 epoch=epoch,
                 epochs=int(args.epochs),
                 best_val=float(best_val) if best_val < float("inf") else None,
-                best_epoch=int(best_epoch),
+                best_epoch=int(best_ckpt_epoch),
             )
             if _choice == "stop":
                 print(
-                    f"[pfmn] interactive stop at epoch {epoch}, "
-                    f"best={best_val:.6g} @ epoch {best_epoch}",
+                    f"[pfmn chunk_parent] interactive stop at epoch {epoch}, "
+                    f"best={best_val:.6f} @ epoch {best_ckpt_epoch}",
                     flush=True,
                 )
-                _atomic_torch_save(
-                    {
-                        **_bundle(epoch, best=False),
-                        "optimizer_state_dict": opt.state_dict(),
-                        "best_val": best_val,
-                        "best_epoch": best_epoch,
-                    },
-                    out_dir / "training_last.pt",
-                )
-                print(f"  checkpoint (interactive stop) -> {out_dir / 'training_last.pt'}", flush=True)
+                if _ce > 0:
+                    _save_training_last(epoch, reason="interactive stop")
                 break
 
-    # Final / best eval
     best_path = out_dir / "pfmn_oracle_best.pt"
     if best_path.is_file():
         ckpt = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-    val_met = evaluate(model, val_loader, device, norms, lambda_sub=float(args.lambda_sub))
-    test_met = evaluate(model, test_loader, device, norms, lambda_sub=float(args.lambda_sub))
-    _print_eval_section("train_pool_eval", f"best epoch {best_epoch}", val_met, test_met)
+    val_met = evaluate(model, val_loader, device, norms, lambda_sub=lam_sub)
+    test_met = evaluate(model, test_loader, device, norms, lambda_sub=lam_sub)
+    _print_eval_section("train_pool_eval", f"best epoch {best_ckpt_epoch}", val_met, test_met)
 
+    if not (out_dir / "training_last.pt").is_file():
+        _save_training_last(int(best_ckpt_epoch) if best_ckpt_epoch > 0 else int(args.epochs))
+
+    train_seconds = time.time() - t0
     report = {
+        "task": "PowerFlowMultiNet oracle chunk_parent",
         "model": "PowerFlowMultiNet — oracle device states",
+        "paper": "arXiv:2403.00892v3 PowerFlowMultiNet",
+        "not_da_gps": True,
+        "oracle_device_states": True,
+        "chunk_parent": str(chunk_parent),
+        "chunks": [c.name for c in chunks],
+        "n_chunks": len(chunks),
+        "chunk_tensor_cache_dir": str(cache_dir),
         "out_dir": str(out_dir),
-        "best_epoch": best_epoch,
-        "best_val_loss": best_val,
-        "elapsed_sec": time.time() - t0,
+        "hyperparameters": vars(args),
+        "best_epoch": int(best_ckpt_epoch),
+        "best_val": float(best_val) if best_val < float("inf") else None,
+        "best_val_loss": float(best_val) if best_val < float("inf") else None,
+        "best_val_r2_mean": float(best_val_r2) if best_val_r2 == best_val_r2 else None,
         "val_metrics": val_met,
         "test_metrics": test_met,
+        "train_pool_eval": {
+            "label": "train_pool_eval",
+            "chunk_parent": str(chunk_parent),
+            "chunks": [c.name for c in chunks],
+            "split_seed": int(args.seed),
+            "n_chunks": len(chunks),
+            "best_epoch": int(best_ckpt_epoch),
+            "final_val_metrics": val_met,
+            "final_test_metrics": test_met,
+            "epoch_history": train_pool_epoch_history,
+        },
         "history": history,
+        "train_seconds": train_seconds,
+        "elapsed_sec": train_seconds,
+        "checkpoint": str(best_path.resolve()) if best_path.is_file() else None,
+        "checkpoint_last": str((out_dir / "training_last.pt").resolve()),
         "manifest": manifest,
     }
-    (out_dir / "pfmn_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"Report: {out_dir / 'pfmn_report.json'}", flush=True)
+    report_path = out_dir / "pfmn_report.json"
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+
+    print(
+        f"Val  |V| MAE={val_met['mae_vmag_pu']:.6f}  angle MAE={val_met['mae_angle_deg']:.6f}  "
+        f"sub P MAE={val_met['mae_sub_p']:.6f}  sub Q MAE={val_met['mae_sub_q']:.6f}  "
+        f"Re/Im MSE(nrm)={val_met.get('mse_ri_normalized', val_met['mse_ri']):.6f}  "
+        f"r2_mean={val_met['r2_vmag_mean']:.6f}",
+        flush=True,
+    )
+    print(
+        f"Test |V| MAE={test_met['mae_vmag_pu']:.6f}  angle MAE={test_met['mae_angle_deg']:.6f}  "
+        f"sub P MAE={test_met['mae_sub_p']:.6f}  sub Q MAE={test_met['mae_sub_q']:.6f}  "
+        f"Re/Im MSE(nrm)={test_met.get('mse_ri_normalized', test_met['mse_ri']):.6f}  "
+        f"r2_mean={test_met['r2_vmag_mean']:.6f}  time={train_seconds:.1f}s",
+        flush=True,
+    )
+    if best_path.is_file():
+        print(f"Saved {best_path}", flush=True)
+    print(f"Run dir: {out_dir}", flush=True)
     print(f"Checkpoint (best): {best_path}", flush=True)
     print(f"Checkpoint (last): {out_dir / 'training_last.pt'}", flush=True)
+    print(f"Report: {report_path}", flush=True)
     return out_dir
 
 
@@ -682,19 +945,28 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--train_frac", type=float, default=0.80)
     p.add_argument("--val_frac", type=float, default=0.10)
     p.add_argument("--sample_frac", type=float, default=1.0)
-    p.add_argument("--epochs", type=int, default=200, help="Paper cites 1000; default 200 for Colab")
+    p.add_argument("--epochs", type=int, default=1000, help="Paper: 1000")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=16, help="Toward effective batch ≈128")
-    p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--layers", type=int, default=8)
+    p.add_argument("--hidden", type=int, default=128, help="Implementation choice (paper silent)")
+    p.add_argument("--layers", type=int, default=12, help="Unified L=12 across feeders")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr_gamma", type=float, default=0.1, help="MultiStepLR gamma")
     p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--patience", type=int, default=40)
+    p.add_argument("--patience", type=int, default=80, help="Calendar epochs (paper-scale runs)")
+    p.add_argument("--min_delta", type=float, default=0.0)
+    p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--eval_every", type=int, default=10)
+    p.add_argument("--log_every", type=int, default=1, help="Epoch summary line frequency")
     add_interactive_pause_args(p)
     p.add_argument("--checkpoint_every", type=int, default=10)
-    p.add_argument("--lambda_sub", type=float, default=0.0, help="0 = volt-only baseline")
+    p.add_argument(
+        "--lambda_sub",
+        type=float,
+        default=1.0,
+        help="Weight on substation P/Q MSE (paper joint training; 0=volt-only)",
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--rebuild_cache", action="store_true")
     p.add_argument("--no_amp", action="store_true")

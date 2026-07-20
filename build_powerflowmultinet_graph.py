@@ -1,10 +1,11 @@
 """Convert DA-GPS phase-node chunk CSVs → PowerFlowMultiNet physical-bus tensors.
 
-Oracle device-state baseline: settled regulator taps and capacitor states are
-inputs (edge tap attrs + bus cap features + flattened ``device_state``), not targets.
+Oracle device-state baseline (arXiv:2403.00892v3 framing): settled regulator taps
+and capacitor states are inputs (edge tap attrs + bus cap features + flattened
+``device_state``), not targets. Targets include bus V/φ and substation P/Q.
 
-8500 note: secondary / split-phase complexity is not modeled beyond A/B/C phase
-edges present in ``gnn_edges_phase_static.csv``.
+8500 gap vs paper: secondary / split-phase complexity is not modeled beyond A/B/C
+phase edges present in ``gnn_edges_phase_static.csv``.
 """
 
 from __future__ import annotations

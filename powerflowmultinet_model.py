@@ -1,14 +1,17 @@
-"""PowerFlowMultiNet — oracle device-state baseline (GENConv).
+"""PowerFlowMultiNet — oracle device-state baseline (GENConv / DeeperGCN).
 
-Implementation choices (not claimed as the paper's exact hidden/L):
-  - hidden=128 by default
-  - residual GENConv via torch_geometric ``GENConv`` + ``DeepGCNLayer`` (res+)
-  - aggr=powermean, learn_p, msg_norm, learn_msg_scale
-  - separate node / edge / device-state MLPs; voltage head sees ``[h || g_s]``
-  - optional substation head (disabled in loss when ``lambda_sub=0``)
+Aligned with arXiv:2403.00892v3 where practical:
+  - node / edge / state MLPs → L× GENConv (powermean, learn_p, msg_norm, learn_msg_scale)
+  - residual DeepGCNLayer (plain then res+)
+  - after L layers: concat state embedding → voltage readout (per bus) AND substation P/Q head
 
-This baseline receives settled regulator taps and capacitor states as *inputs*
-and does **not** predict device states (contrast with DA-GPS).
+Implementation choices (paper silent on exact sizes):
+  - hidden=128, num_layers=12 (unified across ieee34 / 906 / 8500)
+  - voltage head sees ``[h || g_s]``; substation head sees ``[pool(h) || g_s]``
+
+Oracle framing: settled regulator taps and capacitor states are *inputs*
+(not predicted — contrast with DA-GPS). Joint MSE on V/φ + substation P/Q
+is controlled by ``lambda_sub`` in the trainer (default 1.0).
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ class PowerFlowMultiNet(nn.Module):
         state_dim: int,
         *,
         hidden: int = 128,
-        num_layers: int = 8,
+        num_layers: int = 12,
         dropout: float = 0.1,
         predict_substation: bool = True,
     ):

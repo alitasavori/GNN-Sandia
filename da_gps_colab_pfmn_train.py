@@ -3,7 +3,11 @@
 Mirrors ``da_gps_colab_mlp_train.py`` UX: Drive mount, chunk selection (span>=50),
 preflight print, subprocess to ``train_powerflowmultinet.py``.
 
-Artifacts: ``pfmn_oracle_best.pt``, ``training_last.pt``, ``pfmn_report.json``.
+Paper-faithful defaults (arXiv:2403.00892v3): epochs=1000, lambda_sub=1.0 (joint
+V/φ + substation P/Q), hidden=128, L=12 for ieee34/906/8500, effective batch≈128.
+
+Artifacts: ``pfmn_oracle_best.pt``, ``training_last.pt``, ``pfmn_report.json``,
+``run_manifest.json``. Cache schema ``__pfmn_oracle_v2.pt`` (delete old v1 caches).
 """
 
 from __future__ import annotations
@@ -35,11 +39,15 @@ class FeederPfmnTrainConfig:
     runs_parent_colab: Path
     runs_parent_win: Path
     run_name_prefix: str
-    # Implementation choices (paper does not clearly report hidden/L).
+    # Implementation choices (paper silent on exact L/hidden; unified across feeders).
     hidden: int
     layers: int
     use_full_span_glob: bool = True
 
+
+# Unified architecture across feeders (paper silent on exact L/hidden).
+_PFMN_HIDDEN = 128
+_PFMN_LAYERS = 12
 
 FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
     "8500": FeederPfmnTrainConfig(
@@ -47,13 +55,12 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40",
-        cache_name="pfmn_chunked_8500_oracle",
+        cache_name="pfmn_chunked_8500_oracle_v2",
         runs_parent_colab=Path("/content/GNN-Sandia/gnn2_architecture_search/attention checkpoints"),
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
-        # L=12 for large feeder (could raise to 16); same hidden=128 as others.
         run_name_prefix="pfmn_oracle_8500_l{layers}_h{hidden}",
-        hidden=128,
-        layers=12,
+        hidden=_PFMN_HIDDEN,
+        layers=_PFMN_LAYERS,
         use_full_span_glob=False,
     ),
     "ieee34": FeederPfmnTrainConfig(
@@ -61,12 +68,12 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_ieee34_mirzaei_chunked",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_ieee34_mirzaei_chunked"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_ieee34_mirzaei_chunked",
-        cache_name="pfmn_chunked_ieee34_oracle",
+        cache_name="pfmn_chunked_ieee34_oracle_v2",
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="pfmn_oracle_ieee34_l{layers}_h{hidden}",
-        hidden=128,
-        layers=8,
+        hidden=_PFMN_HIDDEN,
+        layers=_PFMN_LAYERS,
         use_full_span_glob=True,
     ),
     "906": FeederPfmnTrainConfig(
@@ -74,12 +81,12 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_906_lvtestcase_chunked",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_906_lvtestcase_chunked"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_906_lvtestcase_chunked",
-        cache_name="pfmn_chunked_906_oracle",
+        cache_name="pfmn_chunked_906_oracle_v2",
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="pfmn_oracle_906_l{layers}_h{hidden}",
-        hidden=128,
-        layers=12,
+        hidden=_PFMN_HIDDEN,
+        layers=_PFMN_LAYERS,
         use_full_span_glob=True,
     ),
 }
@@ -226,20 +233,21 @@ def launch_pfmn_training(
     smoke_chunk_count: int = 3,
     smoke_epochs: int = 15,
     smoke_patience: int = 5,
-    full_epochs: int = 200,
-    full_patience: int = 40,
+    full_epochs: int = 1000,
+    full_patience: int = 80,
     seed: int = 42,
     hidden: int | None = None,
     layers: int | None = None,
     batch_size: int = 8,
     grad_accum: int = 16,
-    lambda_sub: float = 0.0,
+    lambda_sub: float = 1.0,
     mount_drive: bool = True,
     interactive_pause: bool = True,
 ) -> PfmnTrainLaunchResult:
     """Preflight + subprocess train for one feeder (oracle tap/cap PFMN baseline).
 
-    Defaults: ieee34 L=8 h=128; 906 L=12 h=128; 8500 L=12 h=128.
+    Unified defaults for ieee34 / 906 / 8500: L=12, hidden=128, epochs=1000,
+    lambda_sub=1.0 (joint V/φ + substation P/Q), effective batch ≈128.
     OUT_DIR: ``pfmn_oracle_{feeder}_l{L}_h{H}_{timestamp}``.
 
     ``interactive_pause`` (default True): after each eval_every=10 checkpoint, pause for
@@ -401,11 +409,13 @@ def launch_pfmn_training(
     print(f"REPO:           {repo_path}")
     print(f"DEVICE:         {dev}")
     print(f"SMOKE_TEST:     {smoke_test}")
-    print(f"HIDDEN/LAYERS:  {hidden}/{layers}  (implementation choice)")
-    print(f"LAMBDA_SUB:     {lambda_sub}  (0=volt-only)")
+    print(f"HIDDEN/LAYERS:  {hidden}/{layers}  (unified; paper silent on exact sizes)")
+    print(f"EPOCHS:         {epochs}  (paper=1000; smoke uses {smoke_epochs})")
+    print(f"LAMBDA_SUB:     {lambda_sub}  (1=joint V/φ+sub P/Q; 0=volt-only)")
+    print(f"EFF_BATCH:      ~{batch_size * grad_accum}  (batch={batch_size} × accum={grad_accum})")
     print(f"CHUNK_PARENT:   {chunk_parent}")
     print(f"CHUNK_GLOB:     {chunk_glob}")
-    print(f"PFMN_CACHE:     {cache_root}")
+    print(f"PFMN_CACHE:     {cache_root}  (schema __pfmn_oracle_v2.pt)")
     print(f"RUNS_PARENT:    {runs_parent}")
     print(f"OUT_DIR:        {out_dir}")
     print(f"INTERACTIVE_PAUSE: {interactive_pause}")
@@ -416,6 +426,7 @@ def launch_pfmn_training(
         )
         print(f"  e.g.  !touch '{out_dir / 'STOP'}'   /   !touch '{out_dir / 'CONTINUE'}'")
     print(f"Found {len(chunks)} chunk(s)")
+    print("Artifacts: pfmn_oracle_best.pt, training_last.pt, pfmn_report.json, run_manifest.json")
     print("=================")
     print("\nRunning:\n ", " ".join(cmd), "\n", flush=True)
 
@@ -440,6 +451,7 @@ def launch_pfmn_training(
     print("Checkpoint (best):", (out_dir / "pfmn_oracle_best.pt").resolve())
     print("Checkpoint (last):", (out_dir / "training_last.pt").resolve())
     print("Report:", (out_dir / "pfmn_report.json").resolve())
+    print("Manifest:", (out_dir / "run_manifest.json").resolve())
 
     return PfmnTrainLaunchResult(
         feeder=key,
