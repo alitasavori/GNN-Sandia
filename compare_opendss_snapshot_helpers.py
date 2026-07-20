@@ -73,13 +73,24 @@ def neutralize_pv_irrad_loadshape_for_snapshot(*, npts: int, step_min: float = 5
     ``mode=daily`` even when ``hour``/``sec`` are set after ``reassert_snapshot``. Explicit
     ``Pmpp = Pmpp0 × m_irr[t]`` per step (``compare_daily_8500_mlp_gnn`` style) is required;
     leaving the real profile on ``IrradDay001`` would double-count irradiance.
+
+    No-op when ``IrradDay001`` is absent (ieee34 / 906 and other non-8500 masters).
     """
+    try:
+        names = {str(x).strip().lower() for x in (dss.LoadShapes.AllNames() or [])}
+    except Exception:
+        names = set()
+    if "irradday001" not in names:
+        return
     n = int(max(1, npts))
     interval_h = float(step_min) / 60.0
     ones = ",".join("1" for _ in range(n))
-    dss.Text.Command(
-        f"Edit Loadshape.IrradDay001 npts={n} interval={interval_h} mult=({ones})"
-    )
+    try:
+        dss.Text.Command(
+            f"Edit Loadshape.IrradDay001 npts={n} interval={interval_h} mult=({ones})"
+        )
+    except Exception:
+        return
 
 
 def rebind_irradiance_loadshape_irradday001(

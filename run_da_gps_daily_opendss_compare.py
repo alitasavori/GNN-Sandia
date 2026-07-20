@@ -9,23 +9,14 @@ Supports:
 
 What counts as a “daily run” here
 ----------------------------------
-We mirror ``compare_homo_mv_daily`` / ``compare_hetero_mv_daily`` timing style, but compile the **same**
-PV/unbalanced feeder as ``run_original_style_dataset_8500_unbalanced``: always
-``<repo>/8500 nodes with solar unbalanced/Master-PV2MW-inv.dss`` (``run_daily_aggregate_dataset_8500``).
-``--load-profile-path``, ``--pv-irradiance-profile-path``, and ``--der-*`` do **not** switch to another master
-(e.g. not ``8500-node/Master.dss``). Loads / DER are applied in Python (and optional ``New Generator``).
-For irradiance, Python ``m_irr`` comes from the chosen CSV; the driver also **rebinds** OpenDSS
-``Loadshape.IrradDay001`` to that same file so **post-solve PV P** tracks the profile you passed, not only
-the default ``irr_day_001.csv`` baked into ``PV_preinstalled_2MW_inv.dss``.
-Then **detach**
-    ``Load..Daily`` shapes so per-step ``kW`` / ``kvar`` are not scaled twice.
-    PV keeps ``Daily=IrradDay001`` but that loadshape is set to **unity** before snapshot solves
-    (``mode=snapshot`` does not apply irradiance ``Daily=`` like native daily marching). Each step sets
-    ``Pmpp = Pmpp0 × m_irr[i]`` explicitly — same effective PV as daily mode and as
-    ``compare_daily_8500_mlp_gnn`` — then ``reassert_snapshot_before_each_solve()``, ``set hour`` / ``sec``
-    (after reassert), and ``dss.Solution.Solve()``. This matches the DA-GPS timing path while keeping
-    post-solve PV P aligned with ``mode=daily``. The GNN node feature ``p_pv_kw`` still uses
-    ``pmpp_set × m_pv_t`` with ``m_pv_t`` from column 2 of the chosen irradiance CSV (here ``m_irr``).
+We mirror ``compare_homo_mv_daily`` / ``compare_hetero_mv_daily`` timing style. Default feeder is
+**8500** solar-unbalanced (``Master-PV2MW-inv.dss``). Pass ``--feeder ieee34`` or ``--feeder 906`` to
+compile Mirzaei ``IEEE34_PV.dss`` or LVTestCase ``Master.dss`` instead. Profile CLI args scale loads /
+PV in Python; they do **not** switch the DSS master (use ``--feeder`` for that).
+
+For **8500**, irradiance also rebinds ``Loadshape.IrradDay001`` then neutralizes it for snapshot
+solves; each step sets ``Pmpp = Pmpp0 × m_irr[i]`` explicitly. ``Load..Daily`` shapes are detached
+so per-step ``kW`` / ``kvar`` are not scaled twice. ieee34 / 906 skip IrradDay001 when absent.
   - Read OpenDSS |V| and voltage angle (deg) for all ``*.[123]`` buses; build DA-GPS node inputs, run the
     checkpoint once, denormalize the complex voltage head, scatter predicted |V| and angle (``atan2``).
     Node ``p_pv_kw`` is recomputed each step as ``Pmpp0 × m_irr[i]`` on bus phases — same as dataset
@@ -158,6 +149,101 @@ from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+_FEEDER_ALIASES = {
+    "8500": "8500",
+    "ieee8500": "8500",
+    "ieee34": "ieee34",
+    "34": "ieee34",
+    "ieee34_mirzaei": "ieee34",
+    "906": "906",
+    "lvtestcase": "906",
+    "906_lvtestcase": "906",
+}
+
+
+def normalize_feeder(feeder: str | None) -> str:
+    key = str(feeder or "8500").strip().lower()
+    if key not in _FEEDER_ALIASES:
+        raise ValueError(
+            f"Unknown feeder={feeder!r}. Expected one of: 8500, ieee34, 906 "
+            f"(aliases: {sorted(set(_FEEDER_ALIASES) - {'8500', 'ieee34', '906'})})."
+        )
+    return _FEEDER_ALIASES[key]
+
+
+def _ieee34_dss_path() -> Path:
+    return (REPO_ROOT / "new dss from dr mirzaei" / "IEEE34_PV.dss").resolve()
+
+
+def _compile_feeder_master(feeder: str) -> dict[str, str]:
+    """Compile the OpenDSS master for ``feeder`` ∈ {8500, ieee34, 906}. Returns path metadata."""
+    key = normalize_feeder(feeder)
+    if key == "8500":
+        rd8500._compile_8500_solar_unbalanced_pv_daily_setup()
+        return {
+            "feeder": key,
+            "master_dss": str(rd8500.MASTER_PV2_INV_DSS.resolve()),
+            "model_dir": str(rd8500.SOLAR_UNBAL_8500_DIR.resolve()),
+        }
+    if key == "ieee34":
+        dss_path = _ieee34_dss_path()
+        if not dss_path.is_file():
+            raise FileNotFoundError(f"Missing IEEE34 Mirzaei DSS: {dss_path}")
+        inj.compile_once()
+        try:
+            dss.Text.Command("Set ControlMode=Static")
+            dss.Text.Command(f"Set MaxControlIter={int(getattr(inj, 'MAX_CONTROL_ITER', 200))}")
+        except Exception:
+            pass
+        return {
+            "feeder": key,
+            "master_dss": str(dss_path),
+            "model_dir": str(dss_path.parent),
+        }
+    # 906 LVTestCase
+    import run_original_style_dataset_906_lvtestcase as ds906
+
+    ds906._compile_906_lvtestcase_snapshot_setup()
+    try:
+        ds906._detach_yearly_daily_from_loads()
+    except Exception:
+        pass
+    return {
+        "feeder": key,
+        "master_dss": str(Path(ds906.MASTER_DSS).resolve()),
+        "model_dir": str(Path(ds906.MODEL_DIR).resolve()),
+    }
+
+
+def _default_feeder_profiles(feeder: str, *, out_dir: Path, npts: int, step_min: float) -> tuple[Path, Path]:
+    """Default (load_csv, irr_csv) when CLI profile paths are empty."""
+    key = normalize_feeder(feeder)
+    day1 = REPO_ROOT / "a representativ days"
+    if key == "ieee34":
+        mir = REPO_ROOT / "new dss from dr mirzaei"
+        load_p = mir / "5minDayShape.csv"
+        irr_p = mir / "5MinuteIrradiance.csv"
+        if load_p.is_file() and irr_p.is_file():
+            return load_p.resolve(), irr_p.resolve()
+    if key == "906":
+        load_p = day1 / "load_day_004.csv"
+        if not load_p.is_file():
+            load_p = REPO_ROOT / "8500-node" / "5minDayShape.csv"
+        # No PV on LVTestCase — unity irradiance multiplier CSV for prepare_parity_profiles.
+        irr_p = out_dir / f"_unity_irr_npts{int(npts)}.csv"
+        t = np.arange(int(npts), dtype=np.float64) * (float(step_min) / 60.0)
+        ones = np.ones(int(npts), dtype=np.float64)
+        irr_p.parent.mkdir(parents=True, exist_ok=True)
+        np.savetxt(irr_p, np.column_stack([t, ones]), delimiter=",", fmt="%.8g")
+        if load_p.is_file():
+            return load_p.resolve(), irr_p.resolve()
+    # 8500 (and fallbacks)
+    load_p = rd8500._resolve_daily_profile_csv(None)
+    irr_p = (rd8500.SOLAR_UNBAL_8500_DIR / "irr_day_001.csv").resolve()
+    if not irr_p.is_file():
+        irr_p = (day1 / "irr_day_004.csv").resolve()
+    return Path(load_p).resolve(), Path(irr_p).resolve()
 
 
 def _state_dict_is_legacy_edgeattn(state_dict: dict[str, torch.Tensor]) -> bool:
@@ -578,11 +664,8 @@ def _fill_p_pv_kw_from_pmpp_and_irr(
 def _circuit_losses_kw_kvar() -> tuple[float, float]:
     """Same scaling convention as ``run_original_style_dataset_8500_unbalanced``."""
     loss = dss.Circuit.Losses()
-    p_l, q_l = float(loss[0]), float(loss[1])
-    if abs(p_l) > 1000.0 or abs(q_l) > 1000.0:
-        p_l /= 1000.0
-        q_l /= 1000.0
-    return p_l, q_l
+    # OpenDSS Circuit.Losses() is W/var; other power APIs are kW/kvar.
+    return float(loss[0]) / 1000.0, float(loss[1]) / 1000.0
 
 
 def _pq_from_ckt_total_powers(pwr) -> tuple[float, float] | None:
@@ -1601,7 +1684,9 @@ def run(
     voltages_only: bool = False,
     skip_opendss_solve: bool = False,
     gnn_batch_steps: int | None = None,
+    feeder: str = "8500",
 ) -> dict[str, np.ndarray] | None:
+    feeder_key = normalize_feeder(feeder)
     run_dir = Path(run_dir).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     if not run_dir.is_dir():
@@ -2006,30 +2091,37 @@ def run(
         pv_std_d = pv_std.to(dev)
 
     mpath = mv_sx_mapping if mv_sx_mapping is not None else (REPO_ROOT / "8500-node" / "mv_x_sx_node_mapping_8500.csv")
-    mv_rules: list[dict[str, str]] = _load_mv_sx_mapping(mpath) if mpath.is_file() else []
+    mv_rules: list[dict[str, str]] = []
+    if feeder_key == "8500" and mpath.is_file():
+        mv_rules = _load_mv_sx_mapping(mpath)
     if mv_rules:
         print(f"[da_gps_daily] mv↔sx mapping: {len(mv_rules)} rules from {mpath}", flush=True)
-    else:
+    elif feeder_key == "8500":
         print(f"[da_gps_daily] WARNING: no MV↔sx mapping at {mpath} (using direct bus.phase P/Q)", flush=True)
+    else:
+        print(f"[da_gps_daily] feeder={feeder_key}: skipping 8500 MV↔sx mapping (direct bus.phase P/Q)", flush=True)
 
-    rd8500._compile_8500_solar_unbalanced_pv_daily_setup()
+    compile_meta = _compile_feeder_master(feeder_key)
     if skip_opendss_solve:
         print(
-            f"[da_gps_daily] OpenDSS compile (static maps only): {rd8500.MASTER_PV2_INV_DSS} "
-            f"(cwd {rd8500.SOLAR_UNBAL_8500_DIR}); **no** per-step Solve()",
+            f"[da_gps_daily] OpenDSS compile (static maps only): {compile_meta['master_dss']} "
+            f"(cwd {compile_meta['model_dir']}); **no** per-step Solve()",
             flush=True,
         )
     else:
         print(
-            f"[da_gps_daily] OpenDSS compile: {rd8500.MASTER_PV2_INV_DSS} (cwd {rd8500.SOLAR_UNBAL_8500_DIR})",
+            f"[da_gps_daily] OpenDSS compile feeder={feeder_key}: {compile_meta['master_dss']} "
+            f"(cwd {compile_meta['model_dir']})",
             flush=True,
         )
     print(
-        "[da_gps_daily] Feeder master is **fixed** to the solar-unbalanced tree above "
-        "(``Master-PV2MW-inv.dss``). Load / irradiance / DER profile CLI args do not change which DSS master is redirected.",
+        f"[da_gps_daily] Feeder master selected via --feeder={feeder_key}. "
+        "Load / irradiance / DER profile CLI args scale injections; they do not redirect another DSS master.",
         flush=True,
     )
-    fb_irr_default = (rd8500.SOLAR_UNBAL_8500_DIR / "irr_day_001.csv").resolve()
+    fb_load_default, fb_irr_default = _default_feeder_profiles(
+        feeder_key, out_dir=out_dir, npts=int(npts), step_min=float(step_min)
+    )
     if str(pv_irradiance_profile_path or "").strip():
         irr_csv = _resolve_profile_csv_path(
             pv_irradiance_profile_path,
@@ -2042,12 +2134,15 @@ def run(
         prof_resolved = _resolve_profile_csv_path(
             load_profile_path,
             default_if_dir=str(load_profile_filename),
-            fallback_file=rd8500._resolve_daily_profile_csv(None),
+            fallback_file=fb_load_default,
         )
         print(f"[da_gps_daily] daily load profile (override): {prof_resolved}", flush=True)
-    else:
+    elif str(daily_profile_csv or "").strip() and feeder_key == "8500":
         prof_resolved = rd8500._resolve_daily_profile_csv(daily_profile_csv)
         print(f"[da_gps_daily] daily load profile: {prof_resolved}", flush=True)
+    else:
+        prof_resolved = fb_load_default
+        print(f"[da_gps_daily] daily load profile (feeder default): {prof_resolved}", flush=True)
     parity_profiles = prepare_parity_profiles(
         prof_resolved,
         irr_csv,
@@ -3103,9 +3198,11 @@ def run(
         },
         "speedup": {
             "true_speedup": pipeline_metrics["true_speedup"],
-            "true_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
+            "true_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
             "full_dss_speedup": pipeline_metrics["full_dss_speedup"],
             "full_dss_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
+            "apply_solve_speedup": pipeline_metrics["apply_solve_speedup"],
+            "apply_solve_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
             "deploy_speedup": pipeline_metrics["deploy_speedup"],
             "deploy_speedup_basis": "dss_apply_plus_solve_ms / (dss_apply_ms + gnn_feature_plus_forward_ms)",
             "net_speedup": pipeline_metrics["net_speedup"],
@@ -3124,9 +3221,10 @@ def run(
         "voltage_ylim": "fixed" if v_ylim_fixed else "auto_from_data",
         "voltage_ylim_fixed_bounds_pu": [float(ymin), float(ymax)] if v_ylim_fixed else None,
         "opendss_compile": {
-            "master_dss": str(rd8500.MASTER_PV2_INV_DSS.resolve()),
-            "model_dir": str(rd8500.SOLAR_UNBAL_8500_DIR.resolve()),
-            "pv_irradiance_profile_csv": str(irr_csv.resolve()),
+            "feeder": feeder_key,
+            "master_dss": str(compile_meta["master_dss"]),
+            "model_dir": str(compile_meta["model_dir"]),
+            "pv_irradiance_profile_csv": str(Path(irr_csv).resolve()),
         },
     }
     (out_dir / "da_gps_daily_run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -3283,6 +3381,12 @@ def main() -> None:
     p.add_argument("--show-plots", action="store_true")
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
+        "--feeder",
+        type=str,
+        default="8500",
+        help="OpenDSS master: 8500 (solar-unbalanced PV), ieee34 (Mirzaei IEEE34_PV.dss), or 906 (LVTestCase).",
+    )
+    p.add_argument(
         "--meta-debug",
         action="store_true",
         help="Log meta-aux: DSS row, GNN pred in normalized + denormalized space, clock, m_eff/m_irr, x_n means "
@@ -3346,6 +3450,7 @@ def main() -> None:
         show_plots=bool(args.show_plots),
         device=args.device,
         meta_debug=meta_dbg,
+        feeder=str(args.feeder),
     )
 
 
