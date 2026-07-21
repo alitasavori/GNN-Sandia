@@ -22,11 +22,13 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import fnmatch
+import gc
 import json
 import math
 import random
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -137,6 +139,43 @@ def _load_or_build_chunk(
     return pack
 
 
+class PackLRU:
+    """Load chunk caches on demand so 8500 does not keep all packs in RAM."""
+
+    def __init__(self, paths: list[Path], *, max_open: int = 2):
+        self.paths = [Path(p) for p in paths]
+        self.max_open = max(1, int(max_open))
+        self._cache: OrderedDict[int, dict] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def get(self, i: int) -> dict:
+        i = int(i)
+        if i in self._cache:
+            self._cache.move_to_end(i)
+            return self._cache[i]
+        while len(self._cache) >= self.max_open:
+            self._cache.popitem(last=False)
+            gc.collect()
+        pack = torch.load(self.paths[i], map_location="cpu", weights_only=False)
+        self._cache[i] = pack
+        self._cache.move_to_end(i)
+        return pack
+
+    def peek_meta(self, i: int) -> dict:
+        """Load pack once to read shapes, then drop if not caching permanently."""
+        p = self.get(i)
+        return {
+            "n_samples": int(p["x"].shape[0]),
+            "n_bus": int(p["x"].shape[1]),
+            "n_edge": int(p["edge_index"].shape[1]),
+            "node_dim": int(p.get("node_dim", p["x"].shape[-1])),
+            "edge_dim": int(p.get("edge_dim", EDGE_FEAT_DIM)),
+            "state_dim": int(p.get("state_dim", p["device_state"].shape[-1])),
+        }
+
+
 class PfmnData(Data):
     """Stack graph-level tensors on a new batch dim (device_state, y_sub)."""
 
@@ -149,7 +188,7 @@ class PfmnData(Data):
 class PfmnOracleDataset(Dataset):
     def __init__(
         self,
-        packs: list[dict],
+        packs: PackLRU,
         sample_index: list[tuple[int, int]],
         *,
         x_mean: torch.Tensor,
@@ -173,7 +212,7 @@ class PfmnOracleDataset(Dataset):
 
     def __getitem__(self, i: int) -> PfmnData:
         pi, si = self.sample_index[i]
-        p = self.packs[pi]
+        p = self.packs.get(pi)
         x = p["x"][si].clone()
         for j in NODE_CONT_IDX:
             x[:, j] = (x[:, j] - self.x_mean[j]) / self.x_std[j]
@@ -213,40 +252,84 @@ def _split_indices(n: int, train_frac: float, val_frac: float, seed: int) -> tup
     return tr, va, te
 
 
-def _fit_norm_stats(packs: list[dict], train_pairs: list[tuple[int, int]]) -> dict[str, torch.Tensor]:
-    xs = []
-    ys = []
-    eas = []
-    subs = []
-    for pi, si in train_pairs:
-        p = packs[pi]
-        xs.append(p["x"][si])
-        ys.append(p["y_voltage"][si])
-        subs.append(p["y_substation"][si])
-        ea = materialize_edge_attr(p["edge_attr_static"], p["edge_tap_reg_idx"], p["reg_taps"][si])
-        eas.append(ea)
-    x_cat = torch.cat(xs, dim=0)
-    y_cat = torch.cat(ys, dim=0)
-    e_cat = torch.cat(eas, dim=0)
-    sub_cat = torch.stack(subs, dim=0)
+def _fit_norm_stats(
+    packs: PackLRU,
+    train_pairs: list[tuple[int, int]],
+    *,
+    max_samples: int = 4096,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Stream means/stds without concatenating all graphs (avoids Colab OOM)."""
+    pairs = train_pairs
+    if len(pairs) > int(max_samples) > 0:
+        rng = np.random.default_rng(int(seed))
+        pick = rng.choice(len(pairs), size=int(max_samples), replace=False)
+        pairs = [pairs[int(i)] for i in pick]
+        print(
+            f"[pfmn] norm stats on {len(pairs)}/{len(train_pairs)} train samples "
+            f"(cap={max_samples})",
+            flush=True,
+        )
+
+    x_sum = torch.zeros(NODE_FEAT_DIM, dtype=torch.float64)
+    x_sumsq = torch.zeros(NODE_FEAT_DIM, dtype=torch.float64)
+    x_count = 0
+    y_sum = torch.zeros(6, dtype=torch.float64)
+    y_sumsq = torch.zeros(6, dtype=torch.float64)
+    y_count = 0
+    e_sum = torch.zeros(EDGE_FEAT_DIM, dtype=torch.float64)
+    e_sumsq = torch.zeros(EDGE_FEAT_DIM, dtype=torch.float64)
+    e_count = 0
+    sub_sum = torch.zeros(6, dtype=torch.float64)
+    sub_sumsq = torch.zeros(6, dtype=torch.float64)
+    sub_count = 0
+
+    for pi, si in pairs:
+        p = packs.get(pi)
+        x = p["x"][si].double()
+        y = p["y_voltage"][si].double()
+        sub = p["y_substation"][si].double()
+        ea = materialize_edge_attr(p["edge_attr_static"], p["edge_tap_reg_idx"], p["reg_taps"][si]).double()
+        x_sum += x.sum(dim=0)
+        x_sumsq += x.pow(2).sum(dim=0)
+        x_count += int(x.shape[0])
+        y_sum += y.sum(dim=0)
+        y_sumsq += y.pow(2).sum(dim=0)
+        y_count += int(y.shape[0])
+        e_sum += ea.sum(dim=0)
+        e_sumsq += ea.pow(2).sum(dim=0)
+        e_count += int(ea.shape[0])
+        sub_sum += sub
+        sub_sumsq += sub.pow(2)
+        sub_count += 1
+
+    def _mean_std(sum_, sumsq, n: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        n = max(n, 1)
+        mean = (sum_ / n).float()
+        var = (sumsq / n - (sum_ / n).pow(2)).clamp_min(0.0)
+        std = var.sqrt().float().clamp_min(1e-6)
+        if mean.numel() != dim:
+            mean = mean.view(dim)
+            std = std.view(dim)
+        return mean, std
 
     x_mean = torch.zeros(NODE_FEAT_DIM)
     x_std = torch.ones(NODE_FEAT_DIM)
+    xm, xs = _mean_std(x_sum, x_sumsq, x_count, NODE_FEAT_DIM)
     for j in NODE_CONT_IDX:
-        x_mean[j] = x_cat[:, j].mean()
-        x_std[j] = x_cat[:, j].std(unbiased=False).clamp_min(1e-6)
+        x_mean[j] = xm[j]
+        x_std[j] = xs[j]
 
-    y_mean = y_cat.mean(dim=0)
-    y_std = y_cat.std(dim=0, unbiased=False).clamp_min(1e-6)
+    y_mean, y_std = _mean_std(y_sum, y_sumsq, y_count, 6)
 
     e_mean = torch.zeros(EDGE_FEAT_DIM)
     e_std = torch.ones(EDGE_FEAT_DIM)
+    em, es = _mean_std(e_sum, e_sumsq, e_count, EDGE_FEAT_DIM)
     for j in EDGE_CONT_IDX:
-        e_mean[j] = e_cat[:, j].mean()
-        e_std[j] = e_cat[:, j].std(unbiased=False).clamp_min(1e-6)
+        e_mean[j] = em[j]
+        e_std[j] = es[j]
 
-    sub_mean = sub_cat.mean(dim=0)
-    sub_std = sub_cat.std(dim=0, unbiased=False).clamp_min(1e-6)
+    sub_mean, sub_std = _mean_std(sub_sum, sub_sumsq, sub_count, 6)
     return {
         "x_mean": x_mean,
         "x_std": x_std,
@@ -499,8 +582,8 @@ def train(args: argparse.Namespace) -> Path:
         flush=True,
     )
 
-    packs: list[dict] = []
-    all_pairs: list[tuple[int, int]] = []
+    packs_paths: list[Path] = []
+    n_per_chunk: list[int] = []
     for ci, ch in enumerate(chunks):
         pack = _load_or_build_chunk(
             ch,
@@ -510,9 +593,18 @@ def train(args: argparse.Namespace) -> Path:
             meta_csv=args.meta_csv,
             rebuild=bool(args.rebuild_cache),
         )
-        packs.append(pack)
-        n_s = int(pack["x"].shape[0])
-        all_pairs.extend((ci, s) for s in range(n_s))
+        cp = _cache_path(cache_dir, ch)
+        packs_paths.append(cp)
+        n_per_chunk.append(int(pack["x"].shape[0]))
+        # Drop in-memory pack immediately — PackLRU reloads from disk as needed.
+        del pack
+        gc.collect()
+
+    pack_lru = max(1, int(getattr(args, "pack_lru", 2)))
+    packs = PackLRU(packs_paths, max_open=pack_lru)
+    all_pairs: list[tuple[int, int]] = []
+    for ci, n_s in enumerate(n_per_chunk):
+        all_pairs.extend((ci, s) for s in range(int(n_s)))
 
     if 0 < float(args.sample_frac) < 1.0:
         rng = np.random.default_rng(int(args.seed))
@@ -527,16 +619,30 @@ def train(args: argparse.Namespace) -> Path:
     print(
         f"[pfmn chunk_parent] samples total={len(all_pairs)} "
         f"train={len(train_pairs)} val={len(val_pairs)} test={len(test_pairs)} "
-        f"split_seed={args.seed}",
+        f"split_seed={args.seed} pack_lru={pack_lru}",
         flush=True,
     )
+    if len(all_pairs) > 5000:
+        print(
+            f"[pfmn] WARNING: {len(all_pairs)} samples across {len(chunks)} chunks "
+            f"(mean {len(all_pairs)/max(len(chunks),1):.0f}/chunk). "
+            f"Folder name may imply ~50/chunk — check for duplicate scenarios in CSVs. "
+            f"Using lazy pack LRU + streamed norms to limit RAM.",
+            flush=True,
+        )
 
-    norms = _fit_norm_stats(packs, train_pairs)
-    node_dim = int(packs[0]["node_dim"])
-    edge_dim = int(packs[0]["edge_dim"])
-    state_dim = int(packs[0]["state_dim"])
-    n_bus = int(packs[0]["x"].shape[1])
-    n_edge = int(packs[0]["edge_index"].shape[1])
+    norms = _fit_norm_stats(
+        packs,
+        train_pairs,
+        max_samples=int(getattr(args, "norm_max_samples", 4096)),
+        seed=int(args.seed),
+    )
+    meta0 = packs.peek_meta(0)
+    node_dim = int(meta0["node_dim"])
+    edge_dim = int(meta0["edge_dim"])
+    state_dim = int(meta0["state_dim"])
+    n_bus = int(meta0["n_bus"])
+    n_edge = int(meta0["n_edge"])
     print(
         f"[pfmn] graph n_bus={n_bus} n_edge={n_edge} "
         f"node_dim={node_dim} edge_dim={edge_dim} state_dim={state_dim} "
@@ -549,6 +655,14 @@ def train(args: argparse.Namespace) -> Path:
     ds_test = PfmnOracleDataset(packs, test_pairs, **norms)
 
     nw = int(args.num_workers)
+    # Lazy pack store is process-local; workers would each reload caches → RAM blowup.
+    if nw > 0 and pack_lru < len(packs_paths):
+        print(
+            f"[pfmn] forcing num_workers=0 (was {nw}) with pack_lru={pack_lru} "
+            f"to avoid per-worker cache copies",
+            flush=True,
+        )
+        nw = 0
     use_persistent = bool(getattr(args, "persistent_workers", False)) and nw > 0
     loader_kw: dict = dict(
         batch_size=int(args.batch_size),
@@ -645,8 +759,8 @@ def train(args: argparse.Namespace) -> Path:
         "node_dim": node_dim,
         "edge_dim": edge_dim,
         "state_dim": state_dim,
-        "reg_cols": packs[0].get("reg_cols", []),
-        "cap_cols": packs[0].get("cap_cols", []),
+        "reg_cols": packs.get(0).get("reg_cols", []),
+        "cap_cols": packs.get(0).get("cap_cols", []),
         "hyperparameters": vars(args),
         "manifest_stage": "pre_train",
         "paper_fidelity": {
@@ -959,6 +1073,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--train_frac", type=float, default=0.80)
     p.add_argument("--val_frac", type=float, default=0.10)
     p.add_argument("--sample_frac", type=float, default=1.0)
+    p.add_argument(
+        "--pack_lru",
+        type=int,
+        default=2,
+        help="Max chunk caches held in RAM (lazy load). Keep small on 8500/Colab.",
+    )
+    p.add_argument(
+        "--norm_max_samples",
+        type=int,
+        default=4096,
+        help="Cap train samples used for mean/std (streamed; avoids OOM).",
+    )
     p.add_argument("--epochs", type=int, default=50, help="Max epochs (launcher default 50)")
     p.add_argument(
         "--batch_size",

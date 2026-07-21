@@ -34,7 +34,7 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-21.derive_bus_from_node.oom906"
+PFMN_LAUNCHER_VERSION = "2026-07-21.lazy_pack_lru.oom906"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
@@ -102,10 +102,10 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_8500_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
-        # Huge graph: prefer smaller microbatch over killing all workers.
+        # Huge graph: lazy pack LRU in trainer; no DataLoader workers (avoid RAM copies).
         batch_size=8,
         grad_accum=16,
-        num_workers=1,
+        num_workers=0,
         persistent_workers=False,
         use_full_span_glob=False,
     ),
@@ -556,6 +556,10 @@ def launch_pfmn_training(
         "1.0",
         "--num_workers",
         str(num_workers),
+        "--pack_lru",
+        "2" if key == "8500" else "8",
+        "--norm_max_samples",
+        "4096",
         "--eval_every",
         "10",
         "--checkpoint_every",
