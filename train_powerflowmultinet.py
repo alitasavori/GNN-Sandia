@@ -58,8 +58,10 @@ try:
 except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
 
-# Bump when tensor / feature schema changes so Colab Drive caches rebuild.
+# Preferred on-disk suffix for newly built packs. Legacy v2 packs are reused
+# (node feats sliced to paper P/Q-only at load) so Colab does not rebuild 40 chunks.
 _CACHE_SUFFIX = "__pfmn_oracle_v3.pt"
+_CACHE_LEGACY_SUFFIXES = ("__pfmn_oracle_v2.pt",)
 
 
 def _configure_stdout() -> None:
@@ -106,8 +108,54 @@ def _sorted_run_chunks(chunk_parent: Path, glob_pat: str) -> list[Path]:
     )
 
 
-def _cache_path(cache_dir: Path, chunk_dir: Path) -> Path:
-    return cache_dir / f"{chunk_dir.name}{_CACHE_SUFFIX}"
+def _cache_path(cache_dir: Path, chunk_dir: Path, *, suffix: str | None = None) -> Path:
+    return cache_dir / f"{chunk_dir.name}{suffix or _CACHE_SUFFIX}"
+
+
+def _resolve_existing_cache(cache_dir: Path, chunk_dir: Path) -> Path | None:
+    """Prefer v3, else reuse legacy v2 packs already on Drive/Colab SSD."""
+    for suf in (_CACHE_SUFFIX, *_CACHE_LEGACY_SUFFIXES):
+        cp = _cache_path(cache_dir, chunk_dir, suffix=suf)
+        if cp.is_file():
+            return cp
+    return None
+
+
+_LEGACY_SLICE_LOGGED = False
+
+
+def _normalize_pack_node_feats(pack: dict, *, src_name: str = "") -> dict:
+    """Ensure ``x`` is paper P/Q-only (NODE_FEAT_DIM=6).
+
+    Legacy v2 packs stored 13-D nodes [P/Q | masks | source | caps]. The first 6
+    dims are still P/Q, so we slice in-memory and keep using the same .pt files.
+    """
+    global _LEGACY_SLICE_LOGGED
+    x = pack["x"]
+    d = int(x.shape[-1])
+    if d == int(NODE_FEAT_DIM):
+        pack["node_dim"] = int(NODE_FEAT_DIM)
+        return pack
+    if d > int(NODE_FEAT_DIM):
+        # Shallow-copy dict so PackLRU can hold the trimmed view without rewriting disk.
+        out = dict(pack)
+        out["x"] = x[..., : int(NODE_FEAT_DIM)].contiguous()
+        out["node_dim"] = int(NODE_FEAT_DIM)
+        out["cache_schema_source"] = str(pack.get("cache_schema", ""))
+        out["cache_schema"] = "pfmn_oracle_v3_from_legacy"
+        if not _LEGACY_SLICE_LOGGED:
+            tag = f" ({src_name})" if src_name else ""
+            print(
+                f"[pfmn cache] reuse legacy pack{tag}: x[..., {d}] -> x[..., {NODE_FEAT_DIM}] "
+                f"(paper P/Q-only; caps remain in device_state; same for all packs)",
+                flush=True,
+            )
+            _LEGACY_SLICE_LOGGED = True
+        return out
+    raise ValueError(
+        f"PFMN cache node feature dim={d} < NODE_FEAT_DIM={NODE_FEAT_DIM} "
+        f"(file={src_name!r})"
+    )
 
 
 def _load_or_build_chunk(
@@ -120,20 +168,22 @@ def _load_or_build_chunk(
     rebuild: bool,
 ) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cp = _cache_path(cache_dir, chunk_dir)
-    if cp.is_file() and not rebuild:
-        print(f"[pfmn cache] load {cp.name}", flush=True)
-        return torch.load(cp, map_location="cpu", weights_only=False)
+    existing = None if rebuild else _resolve_existing_cache(cache_dir, chunk_dir)
+    if existing is not None:
+        print(f"[pfmn cache] load {existing.name}", flush=True)
+        pack = torch.load(existing, map_location="cpu", weights_only=False)
+        return _normalize_pack_node_feats(pack, src_name=existing.name)
     nodes = chunk_dir / nodes_csv
     edges = chunk_dir / edges_csv
     meta = chunk_dir / meta_csv
-    for p in (nodes, edges, meta):
-        if not p.is_file():
-            raise FileNotFoundError(p)
+    for pth in (nodes, edges, meta):
+        if not pth.is_file():
+            raise FileNotFoundError(pth)
     print(f"[pfmn cache] build {chunk_dir.name}", flush=True)
     pack = load_pfmn_chunk_tensors(nodes, edges, meta)
     pack["chunk_name"] = chunk_dir.name
     pack["cache_schema"] = "pfmn_oracle_v3"
+    cp = _cache_path(cache_dir, chunk_dir)
     torch.save(pack, cp)
     print(f"[pfmn cache] wrote {cp}", flush=True)
     return pack
@@ -172,6 +222,7 @@ class PackLRU:
             if self.n_evictions % self.gc_every == 0:
                 gc.collect()
         pack = torch.load(self.paths[i], map_location="cpu", weights_only=False)
+        pack = _normalize_pack_node_feats(pack, src_name=self.paths[i].name)
         self._cache[i] = pack
         self._cache.move_to_end(i)
         self.n_loads += 1
@@ -698,7 +749,7 @@ def train(args: argparse.Namespace) -> Path:
             meta_csv=args.meta_csv,
             rebuild=bool(args.rebuild_cache),
         )
-        cp = _cache_path(cache_dir, ch)
+        cp = _resolve_existing_cache(cache_dir, ch) or _cache_path(cache_dir, ch)
         packs_paths.append(cp)
         packs_meta.append(
             {
