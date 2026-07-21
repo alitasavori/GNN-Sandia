@@ -4101,10 +4101,15 @@ class DAGPSBlock(nn.Module):
         edge_dim: int,
         dropout: float,
         n_nodes: int,
+        global_attn_mode: str = "tokens",
     ):
         super().__init__()
         if hidden % heads != 0:
             raise ValueError("hidden must divide heads")
+        mode = str(global_attn_mode).strip().lower()
+        if mode not in ("tokens", "full_node"):
+            raise ValueError(f"global_attn_mode must be 'tokens' or 'full_node', got {global_attn_mode!r}")
+        self.global_attn_mode = mode
         self.n_nodes = int(n_nodes)
         self.hidden = hidden
         self.heads = heads
@@ -4112,14 +4117,25 @@ class DAGPSBlock(nn.Module):
         self.n_cap = 0
         self.reg_territory_beta = 0.0
         self.reg_territory_mask: torch.Tensor | None = None
+        # Token ← node (always kept so aux token heads stay usable).
         self.wq_nt = nn.Linear(hidden, hidden)
         self.wk_nt = nn.Linear(hidden, hidden)
         self.wv_nt = nn.Linear(hidden, hidden)
         self.wo_nt = nn.Linear(hidden, hidden)
-        self.wq_tn = nn.Linear(hidden, hidden)
-        self.wk_tn = nn.Linear(hidden, hidden)
-        self.wv_tn = nn.Linear(hidden, hidden)
-        self.wo_tn = nn.Linear(hidden, hidden)
+        if self.global_attn_mode == "tokens":
+            # Node ← token (Perceiver / DA-GPS default global channel).
+            self.wq_tn = nn.Linear(hidden, hidden)
+            self.wk_tn = nn.Linear(hidden, hidden)
+            self.wv_tn = nn.Linear(hidden, hidden)
+            self.wo_tn = nn.Linear(hidden, hidden)
+            self.wq_nn = self.wk_nn = self.wv_nn = self.wo_nn = None
+        else:
+            # Node ← node self-attention (GPS-style full attention ablation).
+            self.wq_nn = nn.Linear(hidden, hidden)
+            self.wk_nn = nn.Linear(hidden, hidden)
+            self.wv_nn = nn.Linear(hidden, hidden)
+            self.wo_nn = nn.Linear(hidden, hidden)
+            self.wq_tn = self.wk_tn = self.wv_tn = self.wo_tn = None
         self.norm_t1 = nn.LayerNorm(hidden)
         self.norm_t2 = nn.LayerNorm(hidden)
         self.ffn_t = nn.Sequential(
@@ -4182,16 +4198,26 @@ class DAGPSBlock(nn.Module):
         T_mid = self.norm_t1(T_in + F.dropout(zt, self.dropout_p, self.training))
         T_mid = self.norm_t2(T_mid + self.ffn_t(T_mid))
 
-        attn_bias = self._reg_territory_attn_bias(h_dense, T_mid)
-
-        q2 = self.wq_tn(h_dense)
-        k2 = self.wk_tn(T_mid)
-        v2 = self.wv_tn(T_mid)
-        zh = _multihead_cross_attn(
-            q2, k2, v2, n_heads=self.heads, dropout_p=self.dropout_p, training=self.training,
-            key_padding_mask=None, attn_bias=attn_bias, query_padding_mask=node_mask if has_padding else None,
-        )
-        zh = self.wo_tn(zh)
+        if self.global_attn_mode == "tokens":
+            attn_bias = self._reg_territory_attn_bias(h_dense, T_mid)
+            q2 = self.wq_tn(h_dense)
+            k2 = self.wk_tn(T_mid)
+            v2 = self.wv_tn(T_mid)
+            zh = _multihead_cross_attn(
+                q2, k2, v2, n_heads=self.heads, dropout_p=self.dropout_p, training=self.training,
+                key_padding_mask=None, attn_bias=attn_bias, query_padding_mask=node_mask if has_padding else None,
+            )
+            zh = self.wo_tn(zh)
+        else:
+            # All-to-all node self-attention (quadratic in N); tokens still updated above for aux heads.
+            q2 = self.wq_nn(h_dense)
+            k2 = self.wk_nn(h_dense)
+            v2 = self.wv_nn(h_dense)
+            zh = _multihead_cross_attn(
+                q2, k2, v2, n_heads=self.heads, dropout_p=self.dropout_p, training=self.training,
+                key_padding_mask=key_pad, attn_bias=None, query_padding_mask=node_mask if has_padding else None,
+            )
+            zh = self.wo_nn(zh)
         z_flat = zh[node_mask] if has_padding else zh.reshape(-1, zh.size(-1))
 
         h_loc = self.mpnn(h_in, edge_index, edge_attr)
@@ -4221,7 +4247,10 @@ class DAGPSBlock(nn.Module):
         has_padding: bool,
     ) -> torch.Tensor:
         """Second cross-attn in the block: queries = nodes, keys = tokens.
-        Returns (B, heads, n_nodes, n_tokens) — distribution over tokens per node."""
+        Returns (B, heads, n_nodes, n_tokens) — distribution over tokens per node.
+        Not defined for global_attn_mode=full_node (node self-attn); returns empty."""
+        if self.global_attn_mode != "tokens" or self.wq_tn is None:
+            return h_dense.new_zeros(h_dense.size(0), self.heads, h_dense.size(1), T_mid.size(1))
         q2 = self.wq_tn(h_dense)
         k2 = self.wk_tn(T_mid)
         qpm = node_mask if has_padding else None
@@ -4332,6 +4361,7 @@ class DAGPSModel(nn.Module):
         per_device_reg_head: bool = False,
         n_pv_aux: int = 0,
         reg_nclasses: list[int] | None = None,
+        global_attn_mode: str = "tokens",
     ):
         super().__init__()
         self.n_nodes = int(n_nodes)
@@ -4342,6 +4372,10 @@ class DAGPSModel(nn.Module):
         self.n_reg = int(n_reg)
         self.n_system = int(n_system)
         self.n_pv_aux = int(n_pv_aux)
+        mode = str(global_attn_mode).strip().lower()
+        if mode not in ("tokens", "full_node"):
+            raise ValueError(f"global_attn_mode must be 'tokens' or 'full_node', got {global_attn_mode!r}")
+        self.global_attn_mode = mode
         if self.n_pv_aux > 0 and self.n_pv_aux > self.n_system:
             raise ValueError(f"n_pv_aux={self.n_pv_aux} exceeds n_system={self.n_system}")
         self.node_in_dim = int(node_in_dim)
@@ -4382,6 +4416,7 @@ class DAGPSModel(nn.Module):
                     edge_dim=eff_edge_dim,
                     dropout=dropout,
                     n_nodes=int(n_nodes),
+                    global_attn_mode=self.global_attn_mode,
                 )
                 for _ in range(int(n_layers))
             ]
@@ -5844,6 +5879,14 @@ def _build_da_gps_base_model(
             flush=True,
         )
         return PlainNodeMLP(**common_kw)
+    global_attn_mode = str(getattr(args, "global_attn_mode", "tokens") or "tokens").strip().lower()
+    if global_attn_mode not in ("tokens", "full_node"):
+        raise ValueError(f"--global_attn_mode must be 'tokens' or 'full_node', got {global_attn_mode!r}")
+    print(
+        f"model=gine: DA-GPS GINE + global_attn_mode={global_attn_mode} "
+        f"(L={int(args.layers)}, h={int(args.hidden)}, heads={int(args.heads)})",
+        flush=True,
+    )
     return DAGPSModel(
         num_edges=int(num_edges),
         heads=int(args.heads),
@@ -5854,6 +5897,7 @@ def _build_da_gps_base_model(
         per_device_cap_head=bool(args.per_device_cap_head),
         per_device_reg_head=bool(args.per_device_reg_head),
         reg_nclasses=reg_nclasses if reg_loss == "ce" else None,
+        global_attn_mode=global_attn_mode,
         **common_kw,
     )
 
@@ -5882,10 +5926,12 @@ def _da_gps_ckpt_meta(
     chunk_parent: str | None = None,
     chunk_folders: list[str] | None = None,
     model_type: str = "gine",
+    global_attn_mode: str = "tokens",
 ) -> dict[str, object]:
     """Architecture / target metadata shared by ``da_gps_multitask_best.pt`` and ``training_last.pt``."""
     meta: dict[str, object] = {
         "model_type": str(model_type),
+        "global_attn_mode": str(global_attn_mode),
         "n_nodes": int(n_nodes),
         "hidden": int(hidden),
         "layers": int(layers),
@@ -7354,6 +7400,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
         chunk_parent=str(chunk_parent),
         chunk_folders=[str(p) for p in chunk_dirs],
         model_type=model_type,
+        global_attn_mode=str(getattr(args, "global_attn_mode", "tokens") or "tokens"),
     )
     model = base_model
     if device.type == "cuda" and not args.no_compile and model_type != "mlp":
@@ -8594,6 +8641,14 @@ def parse_args() -> argparse.Namespace:
         "(forces lambda_cap/lambda_reg/lambda_pv=0 and no aux tokens).",
     )
     p.add_argument(
+        "--global_attn_mode",
+        type=str,
+        default="tokens",
+        choices=("tokens", "full_node"),
+        help="Global channel after GINE: 'tokens' = Perceiver node↔token cross-attn (DA-GPS default); "
+        "'full_node' = all-to-all node self-attention (GPS-style ablation; keep tokens for aux heads).",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -9433,6 +9488,7 @@ def main() -> None:
         reg_target_cols=reg_cols,
         reg_loss=reg_loss,
         model_type=model_type,
+        global_attn_mode=str(getattr(args, "global_attn_mode", "tokens") or "tokens"),
     )
     model = base_model
     if device.type == "cuda" and not args.no_compile and model_type != "mlp":
