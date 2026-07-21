@@ -14,7 +14,7 @@ Speed defaults: feeder-aware ``batch_size`` / ``grad_accum`` / ``num_workers``,
 and fewer DataLoader workers to avoid Colab OOM while keeping effective batch ≈128.
 
 Artifacts: ``pfmn_oracle_best.pt``, ``training_last.pt``, ``pfmn_report.json``,
-``run_manifest.json``. Cache schema ``__pfmn_oracle_v2.pt`` (delete old v1 caches).
+``run_manifest.json``. Cache schema ``__pfmn_oracle_v3.pt`` (delete old v1/v2 caches (node_dim changed)).
 """
 
 from __future__ import annotations
@@ -34,12 +34,12 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-21.pack_locality.dedupe"
+PFMN_LAUNCHER_VERSION = "2026-07-21.paper_pq_volt_head.v3"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
 _FULL_CHUNK_MIN_SCEN = 50
-_CACHE_SUFFIX = "__pfmn_oracle_v2.pt"
+_CACHE_SUFFIX = "__pfmn_oracle_v3.pt"
 _COLAB_LOCAL_CACHE_ROOT = Path("/content/pfmn_cache")
 
 
@@ -96,7 +96,7 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_8500_unbalanced_chunked_no_bess_new_diverse_2000_40",
-        cache_name="pfmn_chunked_8500_oracle_v2",
+        cache_name="pfmn_chunked_8500_oracle_v3",
         runs_parent_colab=Path("/content/GNN-Sandia/gnn2_architecture_search/attention checkpoints"),
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="pfmn_oracle_8500_l{layers}_h{hidden}",
@@ -114,7 +114,7 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_ieee34_mirzaei_chunked",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_ieee34_mirzaei_chunked"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_ieee34_mirzaei_chunked",
-        cache_name="pfmn_chunked_ieee34_oracle_v2",
+        cache_name="pfmn_chunked_ieee34_oracle_v3",
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="pfmn_oracle_ieee34_l{layers}_h{hidden}",
@@ -131,7 +131,7 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         chunk_parent_colab=MYDRIVE_DATA / "original_906_lvtestcase_chunked",
         chunk_parent_win=Path(r"K:\My Drive\datasets_gnn2\original_906_lvtestcase_chunked"),
         chunk_parent_repo_rel="datasets_gnn2_from pc/original_906_lvtestcase_chunked",
-        cache_name="pfmn_chunked_906_oracle_v2",
+        cache_name="pfmn_chunked_906_oracle_v3",
         runs_parent_colab=MYDRIVE_DATA / "runs",
         runs_parent_win=Path(r"K:\My Drive\datasets_gnn2\runs"),
         run_name_prefix="pfmn_oracle_906_l{layers}_h{hidden}",
@@ -337,7 +337,7 @@ def _estimate_unique_after_dedupe(chunks: list[Path], cache_dir: Path | None = N
 
 
 def _sync_cache_files(src_dir: Path, dst_dir: Path, *, label: str) -> int:
-    """Copy ``*__pfmn_oracle_v2.pt`` from src→dst when missing or newer. Returns count."""
+    """Copy ``*__pfmn_oracle_v3.pt`` from src→dst when missing or newer. Returns count."""
     dst_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     if not src_dir.is_dir():
@@ -427,7 +427,7 @@ def launch_pfmn_training(
     pause for continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or
     ``STOP`` under OUT_DIR.
 
-    ``cache_local`` (default True on Colab): copy Drive ``*__pfmn_oracle_v2.pt`` caches
+    ``cache_local`` (default True on Colab): copy Drive ``*__pfmn_oracle_v3.pt`` caches
     to ``/content/pfmn_cache/...``, train from local disk, sync new caches back to Drive.
     """
     # Ultra-loud identity: proves which on-disk file Colab actually imported.

@@ -1,13 +1,12 @@
 """Convert DA-GPS phase-node chunk CSVs → PowerFlowMultiNet physical-bus tensors.
 
-Oracle device-state baseline (arXiv:2403.00892v3 framing — not a full paper clone):
-settled regulator taps and capacitor states are inputs (edge tap attrs + bus cap
-features + flattened ``device_state``), not targets. Targets include bus V/φ and
-substation P/Q.
+Oracle device-state baseline (arXiv:2403.00892v3 framing):
+settled regulator taps and capacitor states are inputs (edge tap attrs + flattened
+``device_state`` for caps/switches), not targets. Node features are paper-style
+P/Q per phase only. Targets include bus V/φ and substation P/Q.
 
 Gaps vs paper: ieee34/8500 are not paper cases; 8500 secondary / split-phase is
-not modeled beyond A/B/C phase edges in ``gnn_edges_phase_static.csv``; node
-feature vector adds masks/source/caps beyond paper's P,Q-per-phase description.
+not modeled beyond A/B/C phase edges in ``gnn_edges_phase_static.csv``.
 If a nodes CSV omits ``bus``/``phase``, they are derived from ``node`` (``bus.phase``).
 ``p_pv_kw`` is optional (treated as 0 when absent).
 """
@@ -22,9 +21,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-# Node feature layout (documented implementation choice):
-# [P_A,Q_A,P_B,Q_B,P_C,Q_C, m_A,m_B,m_C, source, cap_A,cap_B,cap_C]
-NODE_FEAT_DIM = 13
+# Node feature layout (paper II-A): [P_A, Q_A, P_B, Q_B, P_C, Q_C]
+NODE_FEAT_DIM = 6
 NODE_CONT_IDX = (0, 1, 2, 3, 4, 5)  # z-score these
 # Edge: [phA,phB,phC, is_line,is_xfmr,is_reg,is_sw, tap, switch_closed]
 EDGE_FEAT_DIM = 9
@@ -363,16 +361,12 @@ def load_pfmn_chunk_tensors(
     sid_to_i = {s: i for i, s in enumerate(sample_ids)}
     S = len(sample_ids)
 
-    # x: P/Q + masks + source + caps
+    # x: paper node features = P/Q per phase only. y_mask is for loss (missing phases), not an input.
     x_np = np.zeros((S, n_bus, NODE_FEAT_DIM), dtype=np.float32)
     y_np = np.zeros((S, n_bus, 6), dtype=np.float32)
     mask_np = np.zeros((S, n_bus, 6), dtype=np.float32)
 
-    # static masks / source
     for bi in range(n_bus):
-        x_np[:, bi, 6:9] = phase_present[bi]
-        if bi == g.source_bus_local:
-            x_np[:, bi, 9] = 1.0
         for ph in range(3):
             if phase_present[bi, ph] > 0.5:
                 mask_np[:, bi, 2 * ph] = 1.0
@@ -452,17 +446,7 @@ def load_pfmn_chunk_tensors(
                 continue
             cap_np[:, j] = (meta[col].to_numpy(dtype=np.float64)[order] > 0.5).astype(np.float32)
 
-    # Stamp caps onto bus features
-    for j, (bi, phase) in enumerate(g.cap_bus_phase):
-        if bi < 0 or j >= n_cap:
-            continue
-        if phase is None:
-            for ph in range(3):
-                x_np[:, bi, 10 + ph] = np.maximum(x_np[:, bi, 10 + ph], cap_np[:, j])
-        else:
-            x_np[:, bi, 10 + int(phase)] = np.maximum(x_np[:, bi, 10 + int(phase)], cap_np[:, j])
-
-    # device_state = capacitor (and future switch) vector
+    # Caps/switches enter only via device_state → state MLP (paper Fig. 2 step 1), not node features.
     if n_cap:
         device_state = cap_np[:, :n_cap]
     else:

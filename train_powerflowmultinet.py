@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
 
 # Bump when tensor / feature schema changes so Colab Drive caches rebuild.
-_CACHE_SUFFIX = "__pfmn_oracle_v2.pt"
+_CACHE_SUFFIX = "__pfmn_oracle_v3.pt"
 
 
 def _configure_stdout() -> None:
@@ -133,7 +133,7 @@ def _load_or_build_chunk(
     print(f"[pfmn cache] build {chunk_dir.name}", flush=True)
     pack = load_pfmn_chunk_tensors(nodes, edges, meta)
     pack["chunk_name"] = chunk_dir.name
-    pack["cache_schema"] = "pfmn_oracle_v2"
+    pack["cache_schema"] = "pfmn_oracle_v3"
     torch.save(pack, cp)
     print(f"[pfmn cache] wrote {cp}", flush=True)
     return pack
@@ -865,7 +865,7 @@ def train(args: argparse.Namespace) -> Path:
         "chunks": [c.name for c in chunks],
         "n_chunks": len(chunks),
         "chunk_tensor_cache_dir": str(cache_dir),
-        "cache_schema": "pfmn_oracle_v2",
+        "cache_schema": "pfmn_oracle_v3",
         "out_dir": str(out_dir),
         "seed": int(args.seed),
         "train_frac": float(args.train_frac),
@@ -900,9 +900,11 @@ def train(args: argparse.Namespace) -> Path:
         "paper_fidelity": {
             "matches": [
                 "physical buses as nodes; parallel phase edges (multigraph)",
-                "node features P,Q per phase + phase masks + source + bus caps",
+                "node features P/Q per phase only (paper II-A)",
                 "edge features phase / type / tap / switch_closed",
-                "capacitor (and switch) states via separate state MLP — oracle OpenDSS inputs",
+                "capacitor (and switch) states via separate state MLP only (Fig. 2 step 1)",
+                "voltage head: Linear(h->6) without state concat",
+                "substation head: concat pool(h) with state embedding then Linear->6 (Fig. 2)",
                 "targets: bus Vmag/Vang and substation P/Q per phase",
                 "GENConv DeeperGCN: powermean, learn_p, msg_norm, learn_msg_scale, residual res+",
                 "joint MSE on voltage + substation heads (default lambda_sub=1)",
@@ -951,7 +953,7 @@ def train(args: argparse.Namespace) -> Path:
             "model_name": "powerflowmultinet_oracle",
             "chunk_parent": str(chunk_parent),
             "chunk_folders": [c.name for c in chunks],
-            "cache_schema": "pfmn_oracle_v2",
+            "cache_schema": "pfmn_oracle_v3",
         }
 
     def _save_training_last(epoch: int, *, reason: str = "") -> Path:
