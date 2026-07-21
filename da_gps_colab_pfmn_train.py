@@ -567,8 +567,6 @@ def launch_pfmn_training(
     ]
     if persistent_workers:
         cmd.append("--persistent_workers")
-    else:
-        cmd.append("--no_persistent_workers")
     if interactive_pause:
         cmd.append("--interactive_pause")
         os.environ.setdefault("TRAIN_INTERACTIVE", "1")
