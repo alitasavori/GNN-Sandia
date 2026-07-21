@@ -3,12 +3,15 @@
 Mirrors ``da_gps_colab_mlp_train.py`` UX: Drive mount, chunk selection (span>=50),
 preflight print, subprocess to ``train_powerflowmultinet.py``.
 
-Defaults: epochs=50, lambda_sub=1.0 (joint V/φ + substation P/Q), hidden=128, L=12
-for ieee34/906/8500, effective batch≈128. MultiStepLR at 50%/80% of max epochs
-(→ milestones 25, 40 when epochs=50).
+NOT fully paper-identical (arXiv:2403.00892): speed default epochs=50 (paper: 1000);
+feeders include ieee34/8500 (paper: IEEE 13/123/906). Architecture/loss defaults
+aim for paper framing: lambda_sub=1.0, hidden=128, L=12, effective batch≈128,
+MultiStepLR at 50%/80% of max epochs (→ milestones 25, 40 when epochs=50).
 
-Speed defaults: feeder-aware ``batch_size`` / ``grad_accum``, ``interactive_pause=False``,
-and on Colab ``cache_local=True`` (copy Drive caches → ``/content/pfmn_cache`` then train).
+Speed defaults: feeder-aware ``batch_size`` / ``grad_accum`` / ``num_workers``,
+``interactive_pause=False``, and on Colab ``cache_local=True`` (copy Drive caches →
+``/content/pfmn_cache`` then train). Large feeders (906/8500) use smaller microbatches
+and fewer DataLoader workers to avoid Colab OOM while keeping effective batch ≈128.
 
 Artifacts: ``pfmn_oracle_best.pt``, ``training_last.pt``, ``pfmn_report.json``,
 ``run_manifest.json``. Cache schema ``__pfmn_oracle_v2.pt`` (delete old v1 caches).
@@ -31,7 +34,7 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed.fileid"
+PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed.fileid.oom906"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
@@ -77,6 +80,9 @@ class FeederPfmnTrainConfig:
     # Feeder-aware microbatch; keep batch×accum ≈128.
     batch_size: int
     grad_accum: int
+    # DataLoader workers (Colab Linux). Large graphs: fewer workers + no persistent.
+    num_workers: int
+    persistent_workers: bool = True
     use_full_span_glob: bool = True
 
 
@@ -96,8 +102,11 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_8500_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
-        batch_size=16,
-        grad_accum=8,
+        # Huge graph: prefer smaller microbatch over killing all workers.
+        batch_size=8,
+        grad_accum=16,
+        num_workers=1,
+        persistent_workers=False,
         use_full_span_glob=False,
     ),
     "ieee34": FeederPfmnTrainConfig(
@@ -113,6 +122,8 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         layers=_PFMN_LAYERS,
         batch_size=64,
         grad_accum=2,
+        num_workers=4,
+        persistent_workers=True,
         use_full_span_glob=True,
     ),
     "906": FeederPfmnTrainConfig(
@@ -126,8 +137,11 @@ FEEDER_PFMN_CONFIGS: dict[str, FeederPfmnTrainConfig] = {
         run_name_prefix="pfmn_oracle_906_l{layers}_h{hidden}",
         hidden=_PFMN_HIDDEN,
         layers=_PFMN_LAYERS,
-        batch_size=32,
-        grad_accum=4,
+        # Mid-size graph: half microbatch vs old 32×4, keep 2 workers for throughput.
+        batch_size=16,
+        grad_accum=8,
+        num_workers=2,
+        persistent_workers=False,
         use_full_span_glob=True,
     ),
 }
@@ -332,6 +346,8 @@ def launch_pfmn_training(
     layers: int | None = None,
     batch_size: int | None = None,
     grad_accum: int | None = None,
+    num_workers: int | None = None,
+    persistent_workers: bool | None = None,
     lambda_sub: float = 1.0,
     mount_drive: bool = True,
     interactive_pause: bool = False,
@@ -341,9 +357,13 @@ def launch_pfmn_training(
 
     Unified defaults for ieee34 / 906 / 8500: L=12, hidden=128, epochs=50,
     lambda_sub=1.0 (joint V/φ + substation P/Q), effective batch ≈128.
-    Feeder-aware microbatch (ieee34 64×2, 906 32×4, 8500 16×8).
+    Feeder-aware microbatch / workers (ieee34 64×2 w=4; 906 16×8 w=2;
+    8500 8×16 w=1; large feeders disable persistent_workers).
     MultiStepLR milestones scale with epochs (50 → 25, 40). Patience default 20.
     OUT_DIR: ``pfmn_oracle_{feeder}_l{L}_h{H}_{timestamp}``.
+
+    Override ``num_workers`` / ``batch_size`` / ``grad_accum`` if Colab OOMs
+    (e.g. ``num_workers=0``) or for speed experiments.
 
     ``interactive_pause`` (default False): if True, after each eval_every=10 checkpoint
     pause for continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or
@@ -359,7 +379,9 @@ def launch_pfmn_training(
         f"defaults={{layers={_PFMN_LAYERS}, hidden={_PFMN_HIDDEN}, "
         f"full_epochs={full_epochs}, lambda_sub={lambda_sub}, "
         f"interactive_pause={interactive_pause}, "
-        f"ieee34_batch={FEEDER_PFMN_CONFIGS['ieee34'].batch_size}}} "
+        f"ieee34_batch={FEEDER_PFMN_CONFIGS['ieee34'].batch_size}, "
+        f"906_batch={FEEDER_PFMN_CONFIGS['906'].batch_size}, "
+        f"906_workers={FEEDER_PFMN_CONFIGS['906'].num_workers}}} "
         f"__file__={_abs_file}"
     )[:200]
     print("=" * 72, flush=True)
@@ -378,6 +400,15 @@ def launch_pfmn_training(
         batch_size = cfg.batch_size
     if grad_accum is None:
         grad_accum = cfg.grad_accum
+    if num_workers is None:
+        # Windows spawn is costly; Linux Colab uses feeder-aware defaults.
+        num_workers = 0 if os.name == "nt" else int(cfg.num_workers)
+    else:
+        num_workers = max(0, int(num_workers))
+    if persistent_workers is None:
+        persistent_workers = bool(cfg.persistent_workers) and num_workers > 0
+    else:
+        persistent_workers = bool(persistent_workers) and num_workers > 0
     on_colab = is_colab()
     if cache_local is None:
         cache_local = on_colab
@@ -479,7 +510,6 @@ def launch_pfmn_training(
     micro_per_epoch = max(1, math.ceil(n_train_est / max(1, batch_size)))
     opt_steps_per_epoch = max(1, math.ceil(micro_per_epoch / max(1, grad_accum)))
 
-    num_workers = 0 if os.name == "nt" else 4
     cmd = [
         sys.executable,
         "-u",
@@ -535,6 +565,10 @@ def launch_pfmn_training(
         "--lambda_sub",
         str(lambda_sub),
     ]
+    if persistent_workers:
+        cmd.append("--persistent_workers")
+    else:
+        cmd.append("--no_persistent_workers")
     if interactive_pause:
         cmd.append("--interactive_pause")
         os.environ.setdefault("TRAIN_INTERACTIVE", "1")
@@ -559,6 +593,11 @@ def launch_pfmn_training(
     print(
         f"EFF_BATCH:      ~{batch_size * grad_accum}  "
         f"(feeder default batch={batch_size} × accum={grad_accum})"
+    )
+    print(
+        f"DATALOADER:     num_workers={num_workers}  "
+        f"persistent_workers={persistent_workers}  "
+        f"(override via launch_pfmn_training(..., num_workers=0) if OOM)"
     )
     print(f"EST_SAMPLES:    ~{n_est}  (~{n_train_est} train @ train_frac=0.80)")
     print(

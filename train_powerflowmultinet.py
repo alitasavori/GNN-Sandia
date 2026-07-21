@@ -549,17 +549,25 @@ def train(args: argparse.Namespace) -> Path:
     ds_test = PfmnOracleDataset(packs, test_pairs, **norms)
 
     nw = int(args.num_workers)
+    use_persistent = bool(getattr(args, "persistent_workers", False)) and nw > 0
     loader_kw: dict = dict(
         batch_size=int(args.batch_size),
         num_workers=nw,
         pin_memory=(device.type == "cuda"),
     )
     if nw > 0:
-        loader_kw["persistent_workers"] = True
-        loader_kw["prefetch_factor"] = 2
+        loader_kw["persistent_workers"] = use_persistent
+        # Lower prefetch on large graphs to cut worker RAM (default PyG/torch is 2).
+        loader_kw["prefetch_factor"] = 2 if use_persistent else 1
     train_loader = DataLoader(ds_train, shuffle=True, **loader_kw)
     val_loader = DataLoader(ds_val, shuffle=False, **loader_kw)
     test_loader = DataLoader(ds_test, shuffle=False, **loader_kw)
+    print(
+        f"[pfmn] dataloader num_workers={nw} persistent_workers={use_persistent} "
+        f"pin_memory={loader_kw['pin_memory']} batch_size={args.batch_size} "
+        f"grad_accum={args.grad_accum}",
+        flush=True,
+    )
 
     model = PowerFlowMultiNet(
         node_dim,
@@ -984,6 +992,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Weight on substation P/Q MSE (paper joint training; 0=volt-only)",
     )
     p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument(
+        "--persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep DataLoader workers alive between epochs (extra RAM; off for large feeders).",
+    )
     p.add_argument("--rebuild_cache", action="store_true")
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--show_tqdm", action="store_true")
