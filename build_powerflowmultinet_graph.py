@@ -1,11 +1,15 @@
 """Convert DA-GPS phase-node chunk CSVs → PowerFlowMultiNet physical-bus tensors.
 
-Oracle device-state baseline (arXiv:2403.00892v3 framing): settled regulator taps
-and capacitor states are inputs (edge tap attrs + bus cap features + flattened
-``device_state``), not targets. Targets include bus V/φ and substation P/Q.
+Oracle device-state baseline (arXiv:2403.00892v3 framing — not a full paper clone):
+settled regulator taps and capacitor states are inputs (edge tap attrs + bus cap
+features + flattened ``device_state``), not targets. Targets include bus V/φ and
+substation P/Q.
 
-8500 gap vs paper: secondary / split-phase complexity is not modeled beyond A/B/C
-phase edges present in ``gnn_edges_phase_static.csv``.
+Gaps vs paper: ieee34/8500 are not paper cases; 8500 secondary / split-phase is
+not modeled beyond A/B/C phase edges in ``gnn_edges_phase_static.csv``; node
+feature vector adds masks/source/caps beyond paper's P,Q-per-phase description.
+If a nodes CSV omits ``bus``/``phase``, they are derived from ``node`` (``bus.phase``).
+``p_pv_kw`` is optional (treated as 0 when absent).
 """
 
 from __future__ import annotations
@@ -32,6 +36,59 @@ _PHASE_TO_I = {1: 0, 2: 1, 3: 2, "1": 0, "2": 1, "3": 2, "a": 0, "b": 1, "c": 2}
 
 def _norm_sid(v) -> int:
     return int(float(v))
+
+
+def _bus_phase_from_node(node: str) -> tuple[str | None, int | None]:
+    """Parse OpenDSS ``bus.phase`` node labels → (bus, phase 1..3 | None)."""
+    s = str(node).strip().lower()
+    if "." not in s:
+        return (s or None), None
+    bus, phs = s.rsplit(".", 1)
+    bus = bus.strip() or None
+    letter = {"a": 1, "b": 2, "c": 3, "1": 1, "2": 2, "3": 3}
+    if phs in letter:
+        return bus, letter[phs]
+    try:
+        ph = int(phs)
+    except ValueError:
+        return bus, None
+    if ph in (1, 2, 3):
+        return bus, ph
+    return bus, None
+
+
+def _csv_header_lower(path: Path) -> dict[str, str]:
+    """Map lowercased header → original column name."""
+    hdr = [str(c) for c in pd.read_csv(path, nrows=0).columns.tolist()]
+    return {c.lower(): c for c in hdr}
+
+
+def _ensure_bus_phase_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing ``bus`` / ``phase`` from ``node`` (``bus.phase`` convention).
+
+    Some Drive chunk exports omit ``bus`` (and occasionally ``phase``) even though
+    ``node`` is always ``bus.phase``. Edge CSVs still use ``from_bus`` / ``to_bus``.
+    """
+    out = df.copy()
+    cols_l = {str(c).lower(): c for c in out.columns}
+    has_bus = "bus" in cols_l
+    has_phase = "phase" in cols_l
+    if has_bus and cols_l["bus"] != "bus":
+        out = out.rename(columns={cols_l["bus"]: "bus"})
+        cols_l = {str(c).lower(): c for c in out.columns}
+    if has_phase and cols_l["phase"] != "phase":
+        out = out.rename(columns={cols_l["phase"]: "phase"})
+        cols_l = {str(c).lower(): c for c in out.columns}
+    if "bus" in out.columns and "phase" in out.columns:
+        return out
+    if "node" not in cols_l:
+        raise ValueError("nodes CSV needs 'bus'+'phase' or a 'node' column to derive them")
+    parsed = out[cols_l["node"]].map(_bus_phase_from_node)
+    if "bus" not in out.columns:
+        out["bus"] = [p[0] if p[0] is not None else "" for p in parsed]
+    if "phase" not in out.columns:
+        out["phase"] = [p[1] if p[1] is not None else -1 for p in parsed]
+    return out
 
 
 def _device_stem(name: str) -> str:
@@ -134,11 +191,19 @@ def build_physical_bus_static(
     sample_id_probe: int | None = None,
 ) -> PfmnGraphStatic:
     """Build fixed topology + device column mapping from one chunk."""
-    usecols = ["sample_id", "node", "node_idx", "bus", "phase"]
+    hdr = _csv_header_lower(nodes_csv)
+    required = ["sample_id", "node", "node_idx"]
+    for c in required:
+        if c not in hdr:
+            raise ValueError(f"{nodes_csv} missing required column {c!r} (have {sorted(hdr)})")
+    usecols = [hdr[c] for c in required]
+    for opt in ("bus", "phase"):
+        if opt in hdr:
+            usecols.append(hdr[opt])
     # Probe first sample for bus roster
     sids: list[int] = []
-    for ch in pd.read_csv(nodes_csv, usecols=["sample_id"], chunksize=200_000):
-        sids.extend(int(_norm_sid(s)) for s in ch["sample_id"].tolist())
+    for ch in pd.read_csv(nodes_csv, usecols=[hdr["sample_id"]], chunksize=200_000):
+        sids.extend(int(_norm_sid(s)) for s in ch[hdr["sample_id"]].tolist())
         if sids:
             break
     if not sids:
@@ -147,6 +212,14 @@ def build_physical_bus_static(
 
     parts = []
     for ch in pd.read_csv(nodes_csv, usecols=usecols, chunksize=500_000):
+        # Normalize column names used below
+        rename = {}
+        for want in ("sample_id", "node", "node_idx", "bus", "phase"):
+            if want in hdr and hdr[want] != want and hdr[want] in ch.columns:
+                rename[hdr[want]] = want
+        if rename:
+            ch = ch.rename(columns=rename)
+        ch = _ensure_bus_phase_cols(ch)
         sid = ch["sample_id"].map(_norm_sid)
         sub = ch.loc[sid == sid0]
         if len(sub):
@@ -154,6 +227,7 @@ def build_physical_bus_static(
     if not parts:
         raise RuntimeError(f"sample_id={sid0} missing in {nodes_csv}")
     first = pd.concat(parts, ignore_index=True)
+    first = _ensure_bus_phase_cols(first)
     first["bus"] = first["bus"].astype(str).str.strip().str.lower()
     first["phase"] = first["phase"].map(lambda p: _PHASE_TO_I.get(p, _PHASE_TO_I.get(str(p).lower(), -1)))
     first = first[first["phase"] >= 0].copy()
@@ -304,18 +378,28 @@ def load_pfmn_chunk_tensors(
                 mask_np[:, bi, 2 * ph] = 1.0
                 mask_np[:, bi, 2 * ph + 1] = 1.0
 
-    req = [
-        "sample_id",
-        "bus",
-        "phase",
-        "p_load_kw",
-        "q_load_kvar",
-        "p_pv_kw",
-        "vmag_pu",
-        "vang_deg",
-    ]
+    hdr = _csv_header_lower(nodes_csv)
+    must = ["sample_id", "p_load_kw", "q_load_kvar", "vmag_pu", "vang_deg"]
+    for c in must:
+        if c not in hdr:
+            raise ValueError(f"{nodes_csv} missing required column {c!r} (have {sorted(hdr)})")
+    usecols = [hdr[c] for c in must]
+    for opt in ("bus", "phase", "node", "p_pv_kw"):
+        if opt in hdr and hdr[opt] not in usecols:
+            usecols.append(hdr[opt])
+    if "bus" not in hdr and "phase" not in hdr and "node" not in hdr:
+        raise ValueError(f"{nodes_csv} needs bus+phase or node to derive them (have {sorted(hdr)})")
+
     fill = np.zeros((S, n_bus, 3), dtype=np.int8)
-    for ch in pd.read_csv(nodes_csv, usecols=req, chunksize=csv_chunksize):
+    for ch in pd.read_csv(nodes_csv, usecols=usecols, chunksize=csv_chunksize):
+        # Normalize to lower-case canonical names
+        ren = {hdr[k]: k for k in must if hdr[k] != k}
+        for opt in ("bus", "phase", "node", "p_pv_kw"):
+            if opt in hdr and hdr[opt] != opt:
+                ren[hdr[opt]] = opt
+        if ren:
+            ch = ch.rename(columns=ren)
+        ch = _ensure_bus_phase_cols(ch)
         sid_arr = ch["sample_id"].map(_norm_sid).to_numpy(dtype=np.int64)
         bus_arr = ch["bus"].astype(str).str.strip().str.lower().map(g.bus_to_local).fillna(-1).to_numpy(
             dtype=np.int64
@@ -331,7 +415,10 @@ def load_pfmn_chunk_tensors(
         p_loc = ph_arr[valid]
         p_load = ch.loc[valid, "p_load_kw"].to_numpy(dtype=np.float32)
         q_load = ch.loc[valid, "q_load_kvar"].to_numpy(dtype=np.float32)
-        p_pv = ch.loc[valid, "p_pv_kw"].to_numpy(dtype=np.float32)
+        if "p_pv_kw" in ch.columns:
+            p_pv = ch.loc[valid, "p_pv_kw"].to_numpy(dtype=np.float32)
+        else:
+            p_pv = np.zeros(int(np.count_nonzero(valid)), dtype=np.float32)
         # Net load convention (documented): P = p_load - p_pv, Q = q_load
         x_np[s_loc, b_loc, 2 * p_loc] = p_load - p_pv
         x_np[s_loc, b_loc, 2 * p_loc + 1] = q_load
