@@ -1005,7 +1005,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_argparser().parse_args(argv)
+    # Accept legacy underscore form from stale Colab imports of the launcher.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    raw = [
+        "--no-persistent-workers" if a == "--no_persistent_workers" else a for a in raw
+    ]
+    args = build_argparser().parse_args(raw)
     train(args)
 
 

@@ -34,7 +34,7 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-20.epochs50.speed.fileid.oom906"
+PFMN_LAUNCHER_VERSION = "2026-07-21.persistent_flag.reload.oom906"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
