@@ -239,8 +239,8 @@ def launch_mlp_training(
     smoke_chunk_count: int = 3,
     smoke_epochs: int = 15,
     smoke_patience: int = 5,  # calendar epochs since meaningful best (min_delta)
-    full_epochs: int = 200,
-    # Aggressive MLP-only early stop: flat baselines should die by ~epoch 25–40, not crawl to 200.
+    full_epochs: int = 50,
+    # Aggressive MLP-only early stop: flat baselines should die by ~epoch 25–40, not crawl forever.
     # DA-GPS/GINE keep trainer defaults (patience=30, min_delta=1e-4) unless they pass these flags.
     full_patience: int = 15,
     min_delta: float = 1e-3,  # ignore val_tot noise like 0.9963→0.9956 for patience
@@ -250,14 +250,14 @@ def launch_mlp_training(
     node_emb_dim: int = 2,
     batch_size: int = 64,
     mount_drive: bool = True,
-    interactive_pause: bool = True,
+    interactive_pause: bool = False,
 ) -> MlpTrainLaunchResult:
     """Preflight + subprocess train for one feeder. Mount Drive on Colab when ``mount_drive=True``.
 
     ``hidden`` / ``layers`` default to ``FEEDER_MLP_CONFIGS[feeder]`` (8500: 256/4, 906: 128/3,
     ieee34: 64/2). OUT_DIR embeds size via ``run_name_prefix`` (e.g. ``mlp_8500_l4_h256_...``).
 
-    ``interactive_pause`` (default True): after each eval_every=10 checkpoint, pause for
+    ``interactive_pause`` (default False): if True, after each eval_every=10 checkpoint pause for
     continue/stop. Colab subprocesses are non-TTY — create ``CONTINUE`` or ``STOP`` under OUT_DIR.
     """
     key = normalize_feeder_key(feeder)
