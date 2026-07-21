@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
@@ -142,25 +142,39 @@ def _load_or_build_chunk(
 class PackLRU:
     """Load chunk caches on demand so 8500 does not keep all packs in RAM."""
 
-    def __init__(self, paths: list[Path], *, max_open: int = 2):
+    def __init__(self, paths: list[Path], *, max_open: int = 2, gc_every: int = 8):
         self.paths = [Path(p) for p in paths]
         self.max_open = max(1, int(max_open))
+        self.gc_every = max(1, int(gc_every))
         self._cache: OrderedDict[int, dict] = OrderedDict()
+        self.n_hits = 0
+        self.n_loads = 0
+        self.n_evictions = 0
 
     def __len__(self) -> int:
         return len(self.paths)
+
+    def reset_stats(self) -> None:
+        self.n_hits = 0
+        self.n_loads = 0
+        self.n_evictions = 0
 
     def get(self, i: int) -> dict:
         i = int(i)
         if i in self._cache:
             self._cache.move_to_end(i)
+            self.n_hits += 1
             return self._cache[i]
         while len(self._cache) >= self.max_open:
             self._cache.popitem(last=False)
-            gc.collect()
+            self.n_evictions += 1
+            # Full GC on every miss was catastrophic for shuffle+lru=2; amortize.
+            if self.n_evictions % self.gc_every == 0:
+                gc.collect()
         pack = torch.load(self.paths[i], map_location="cpu", weights_only=False)
         self._cache[i] = pack
         self._cache.move_to_end(i)
+        self.n_loads += 1
         return pack
 
     def peek_meta(self, i: int) -> dict:
@@ -174,6 +188,97 @@ class PackLRU:
             "edge_dim": int(p.get("edge_dim", EDGE_FEAT_DIM)),
             "state_dim": int(p.get("state_dim", p["device_state"].shape[-1])),
         }
+
+
+class PackAwareBatchSampler(Sampler[list[int]]):
+    """Form batches within one chunk pack so PackLRU stays hot.
+
+    Shuffle (optional) happens *within* each pack and across pack order, not
+    by mixing arbitrary (chunk, sample) pairs — that caused silent torch.load
+    thrashing with pack_lru=2 on 8500.
+    """
+
+    def __init__(
+        self,
+        sample_index: list[tuple[int, int]],
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        by_pack: dict[int, list[int]] = {}
+        for di, (pi, _si) in enumerate(sample_index):
+            by_pack.setdefault(int(pi), []).append(int(di))
+        self._by_pack = by_pack
+        self._len = sum(math.ceil(len(v) / self.batch_size) for v in by_pack.values())
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return int(self._len)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch * 10007)
+        packs = list(self._by_pack.keys())
+        if self.shuffle:
+            rng.shuffle(packs)
+        for pi in packs:
+            idxs = list(self._by_pack[pi])
+            if self.shuffle:
+                rng.shuffle(idxs)
+            for i in range(0, len(idxs), self.batch_size):
+                yield idxs[i : i + self.batch_size]
+
+
+def _as_int_list(v) -> list[int] | None:
+    if v is None:
+        return None
+    if torch.is_tensor(v):
+        return [int(x) for x in v.detach().cpu().reshape(-1).tolist()]
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return [int(x) for x in list(v)]
+    return None
+
+
+def _build_sample_pairs(
+    packs_meta: list[dict],
+    *,
+    dedupe_sample_ids: bool,
+) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    """Build (pack_i, local_i) pairs; optionally keep first occurrence of each sample_id."""
+    all_pairs: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    raw = 0
+    dropped = 0
+    missing_sid = 0
+    for ci, meta in enumerate(packs_meta):
+        n_s = int(meta["n_samples"])
+        raw += n_s
+        sids = meta.get("sample_ids")
+        if dedupe_sample_ids and sids is not None and len(sids) == n_s:
+            for si, sid in enumerate(sids):
+                if sid in seen:
+                    dropped += 1
+                    continue
+                seen.add(sid)
+                all_pairs.append((ci, si))
+        else:
+            if dedupe_sample_ids:
+                missing_sid += 1
+            all_pairs.extend((ci, s) for s in range(n_s))
+    stats = {
+        "raw": int(raw),
+        "kept": int(len(all_pairs)),
+        "dropped_dup_sid": int(dropped),
+        "packs_missing_sample_ids": int(missing_sid),
+        "unique_sample_ids": int(len(seen)),
+    }
+    return all_pairs, stats
 
 
 class PfmnData(Data):
@@ -583,7 +688,7 @@ def train(args: argparse.Namespace) -> Path:
     )
 
     packs_paths: list[Path] = []
-    n_per_chunk: list[int] = []
+    packs_meta: list[dict] = []
     for ci, ch in enumerate(chunks):
         pack = _load_or_build_chunk(
             ch,
@@ -595,16 +700,29 @@ def train(args: argparse.Namespace) -> Path:
         )
         cp = _cache_path(cache_dir, ch)
         packs_paths.append(cp)
-        n_per_chunk.append(int(pack["x"].shape[0]))
+        packs_meta.append(
+            {
+                "n_samples": int(pack["x"].shape[0]),
+                "sample_ids": _as_int_list(pack.get("sample_ids")),
+                "chunk_name": str(pack.get("chunk_name", ch.name)),
+            }
+        )
         # Drop in-memory pack immediately — PackLRU reloads from disk as needed.
         del pack
         gc.collect()
 
     pack_lru = max(1, int(getattr(args, "pack_lru", 2)))
     packs = PackLRU(packs_paths, max_open=pack_lru)
-    all_pairs: list[tuple[int, int]] = []
-    for ci, n_s in enumerate(n_per_chunk):
-        all_pairs.extend((ci, s) for s in range(int(n_s)))
+    dedupe = bool(getattr(args, "dedupe_sample_ids", True))
+    all_pairs, dedupe_stats = _build_sample_pairs(packs_meta, dedupe_sample_ids=dedupe)
+    if dedupe:
+        print(
+            f"[pfmn] sample_id dedupe: raw={dedupe_stats['raw']} kept={dedupe_stats['kept']} "
+            f"dropped_dup={dedupe_stats['dropped_dup_sid']} "
+            f"unique_ids={dedupe_stats['unique_sample_ids']} "
+            f"packs_missing_ids={dedupe_stats['packs_missing_sample_ids']}",
+            flush=True,
+        )
 
     if 0 < float(args.sample_frac) < 1.0:
         rng = np.random.default_rng(int(args.seed))
@@ -626,8 +744,8 @@ def train(args: argparse.Namespace) -> Path:
         print(
             f"[pfmn] WARNING: {len(all_pairs)} samples across {len(chunks)} chunks "
             f"(mean {len(all_pairs)/max(len(chunks),1):.0f}/chunk). "
-            f"Folder name may imply ~50/chunk — check for duplicate scenarios in CSVs. "
-            f"Using lazy pack LRU + streamed norms to limit RAM.",
+            f"Folder name may imply ~50/chunk — check CSVs / sample_id coverage. "
+            f"Using pack-local batches + lazy LRU to limit I/O thrashing.",
             flush=True,
         )
 
@@ -664,22 +782,38 @@ def train(args: argparse.Namespace) -> Path:
         )
         nw = 0
     use_persistent = bool(getattr(args, "persistent_workers", False)) and nw > 0
-    loader_kw: dict = dict(
-        batch_size=int(args.batch_size),
+    pack_locality = bool(getattr(args, "pack_locality", True))
+    bs = int(args.batch_size)
+    base_kw: dict = dict(
         num_workers=nw,
         pin_memory=(device.type == "cuda"),
     )
     if nw > 0:
-        loader_kw["persistent_workers"] = use_persistent
-        # Lower prefetch on large graphs to cut worker RAM (default PyG/torch is 2).
-        loader_kw["prefetch_factor"] = 2 if use_persistent else 1
-    train_loader = DataLoader(ds_train, shuffle=True, **loader_kw)
-    val_loader = DataLoader(ds_val, shuffle=False, **loader_kw)
-    test_loader = DataLoader(ds_test, shuffle=False, **loader_kw)
+        base_kw["persistent_workers"] = use_persistent
+        base_kw["prefetch_factor"] = 2 if use_persistent else 1
+
+    train_batch_sampler: PackAwareBatchSampler | None = None
+    if pack_locality:
+        train_batch_sampler = PackAwareBatchSampler(
+            train_pairs, bs, shuffle=True, seed=int(args.seed)
+        )
+        val_batch_sampler = PackAwareBatchSampler(
+            val_pairs, bs, shuffle=False, seed=int(args.seed)
+        )
+        test_batch_sampler = PackAwareBatchSampler(
+            test_pairs, bs, shuffle=False, seed=int(args.seed)
+        )
+        train_loader = DataLoader(ds_train, batch_sampler=train_batch_sampler, **base_kw)
+        val_loader = DataLoader(ds_val, batch_sampler=val_batch_sampler, **base_kw)
+        test_loader = DataLoader(ds_test, batch_sampler=test_batch_sampler, **base_kw)
+    else:
+        train_loader = DataLoader(ds_train, batch_size=bs, shuffle=True, **base_kw)
+        val_loader = DataLoader(ds_val, batch_size=bs, shuffle=False, **base_kw)
+        test_loader = DataLoader(ds_test, batch_size=bs, shuffle=False, **base_kw)
     print(
         f"[pfmn] dataloader num_workers={nw} persistent_workers={use_persistent} "
-        f"pin_memory={loader_kw['pin_memory']} batch_size={args.batch_size} "
-        f"grad_accum={args.grad_accum}",
+        f"pin_memory={base_kw['pin_memory']} batch_size={bs} "
+        f"grad_accum={args.grad_accum} pack_locality={pack_locality}",
         flush=True,
     )
 
@@ -844,6 +978,17 @@ def train(args: argparse.Namespace) -> Path:
         running_s = 0.0
         n_seen = 0
         opt.zero_grad(set_to_none=True)
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch)
+        packs.reset_stats()
+        n_train_batches = len(train_loader)
+        log_steps = int(getattr(args, "log_steps", 50))
+        t_epoch0 = time.time()
+        print(
+            f"[pfmn] epoch {epoch}/{int(args.epochs)} start "
+            f"({n_train_batches} microbatches, train_n={len(train_pairs)})",
+            flush=True,
+        )
         it = train_loader
         if tqdm is not None and args.show_tqdm:
             it = tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
@@ -864,6 +1009,19 @@ def train(args: argparse.Namespace) -> Path:
             running_v += float(loss_v.item())
             running_s += float(loss_s.item())
             n_seen += 1
+            if log_steps > 0 and (step == 1 or step % log_steps == 0 or step == n_train_batches):
+                avg = running / max(n_seen, 1)
+                hit = packs.n_hits
+                load = packs.n_loads
+                tot = max(1, hit + load)
+                print(
+                    f"[pfmn] epoch {epoch} step {step}/{n_train_batches} "
+                    f"loss={avg:.5f} volt={running_v/max(n_seen,1):.5f} "
+                    f"sub={running_s/max(n_seen,1):.5f} "
+                    f"pack_hit={hit/(tot):.2f} loads={load} "
+                    f"elapsed={time.time()-t_epoch0:.0f}s",
+                    flush=True,
+                )
 
         tr_loss = running / max(n_seen, 1)
         tr_volt = running_v / max(n_seen, 1)
@@ -885,6 +1043,8 @@ def train(args: argparse.Namespace) -> Path:
             or (epoch % int(args.eval_every) == 0)
             or (epoch == int(args.epochs))
         )
+        # Defer test until a regular eval cadence (not forced on epoch 1 alone).
+        do_test = (epoch % int(args.eval_every) == 0) or (epoch == int(args.epochs))
         do_log = (
             do_eval
             or (log_every > 0 and (epoch == 1 or epoch % log_every == 0))
@@ -894,8 +1054,11 @@ def train(args: argparse.Namespace) -> Path:
         val_met: dict[str, float] | None = None
         test_met: dict[str, float] | None = None
         if do_eval:
+            print(f"[pfmn] epoch {epoch} eval val (n={len(val_pairs)}) ...", flush=True)
             val_met = evaluate(model, val_loader, device, norms, lambda_sub=lam_sub)
-            test_met = evaluate(model, test_loader, device, norms, lambda_sub=lam_sub)
+            if do_test:
+                print(f"[pfmn] epoch {epoch} eval test (n={len(test_pairs)}) ...", flush=True)
+                test_met = evaluate(model, test_loader, device, norms, lambda_sub=lam_sub)
             last_val_met = val_met
             history[-1].update(
                 {
@@ -948,8 +1111,12 @@ def train(args: argparse.Namespace) -> Path:
                 flush=True,
             )
 
-        if do_eval and val_met is not None and test_met is not None:
-            _print_eval_section("train_pool_eval", f"epoch {epoch}", val_met, test_met)
+        if do_eval and val_met is not None:
+            if test_met is not None:
+                _print_eval_section("train_pool_eval", f"epoch {epoch}", val_met, test_met)
+            else:
+                print(f"\n=== train_pool_eval (epoch {epoch}, val-only) ===", flush=True)
+                _print_metrics_line("Val ", val_met)
 
         _ce = int(args.checkpoint_every)
         if _ce > 0 and (epoch % _ce == 0 or epoch == int(args.epochs)):
@@ -1073,6 +1240,25 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--train_frac", type=float, default=0.80)
     p.add_argument("--val_frac", type=float, default=0.10)
     p.add_argument("--sample_frac", type=float, default=1.0)
+    p.add_argument(
+        "--dedupe_sample_ids",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep first occurrence of each sample_id across chunks (fixes ~40x inflation "
+        "when each chunk CSV embeds the full scenario set).",
+    )
+    p.add_argument(
+        "--pack_locality",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Batch within one chunk pack (avoids PackLRU thrashing under shuffle).",
+    )
+    p.add_argument(
+        "--log_steps",
+        type=int,
+        default=50,
+        help="Print mid-epoch heartbeat every N microbatches (0=off).",
+    )
     p.add_argument(
         "--pack_lru",
         type=int,

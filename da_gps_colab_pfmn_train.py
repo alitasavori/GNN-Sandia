@@ -34,7 +34,7 @@ from pathlib import Path
 from nonunique_notebook_bootstrap import is_colab, normalize_feeder_key, resolve_notebook_repo
 
 # Bump when Colab preflight defaults change so users can verify git pull worked.
-PFMN_LAUNCHER_VERSION = "2026-07-21.lazy_pack_lru.oom906"
+PFMN_LAUNCHER_VERSION = "2026-07-21.pack_locality.dedupe"
 
 DRIVE_ROOT = Path("/content/drive")
 MYDRIVE_DATA = DRIVE_ROOT / "MyDrive/datasets_gnn2"
@@ -269,13 +269,71 @@ def _configure_device(device: str) -> str:
     return dev
 
 
-def _estimate_n_samples(chunks: list[Path]) -> int:
-    """Estimate sample count from run_* scen spans (fallback 50 per chunk)."""
+def _estimate_n_samples(chunks: list[Path], cache_dir: Path | None = None) -> tuple[int, str]:
+    """Estimate sample count from one cache pack × n_chunks, else folder scen spans."""
+    if cache_dir is not None and cache_dir.is_dir():
+        try:
+            import torch
+        except ImportError:
+            torch = None  # type: ignore
+        if torch is not None:
+            for p in chunks:
+                cp = cache_dir / f"{p.name}{_CACHE_SUFFIX}"
+                if not cp.is_file():
+                    continue
+                try:
+                    pack = torch.load(cp, map_location="cpu", weights_only=False)
+                    n0 = int(pack["x"].shape[0])
+                    del pack
+                    est = int(n0 * len(chunks))
+                    return est, f"{n0}/pack × {len(chunks)} chunks (from {cp.name})"
+                except Exception:
+                    continue
     total = 0
     for p in chunks:
         span = _parse_run_scen_span(p.name)
         total += span if span is not None else 50
-    return total
+    return total, "folder scen_*_* spans (fallback)"
+
+
+def _estimate_unique_after_dedupe(chunks: list[Path], cache_dir: Path | None = None) -> int | None:
+    """Probe a few packs' sample_ids to estimate unique count after cross-chunk dedupe."""
+    if cache_dir is None or not cache_dir.is_dir():
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    seen: set[int] = set()
+    n_raw = 0
+    n_hit = 0
+    probe = chunks[: min(5, len(chunks))]
+    for p in probe:
+        cp = cache_dir / f"{p.name}{_CACHE_SUFFIX}"
+        if not cp.is_file():
+            continue
+        try:
+            pack = torch.load(cp, map_location="cpu", weights_only=False)
+            sids = pack.get("sample_ids")
+            if sids is None:
+                del pack
+                return None
+            if hasattr(sids, "tolist"):
+                sids = sids.tolist()
+            n_raw += len(sids)
+            for s in sids:
+                seen.add(int(s))
+            n_hit += 1
+            del pack
+        except Exception:
+            return None
+    if n_hit == 0 or n_raw == 0:
+        return None
+    # Heavy overlap among probed packs ⇒ unique ≈ |seen| already covers most IDs.
+    # Light overlap ⇒ scale by remaining chunks.
+    if len(seen) / n_raw < 0.6:
+        return int(len(seen))
+    return int(round(len(seen) * (len(chunks) / float(n_hit))))
 
 
 def _sync_cache_files(src_dir: Path, dst_dir: Path, *, label: str) -> int:
@@ -505,8 +563,10 @@ def launch_pfmn_training(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_est = _estimate_n_samples(chunks)
-    n_train_est = max(1, int(round(n_est * 0.80)))
+    n_est, est_src = _estimate_n_samples(chunks, cache_root)
+    n_unique = _estimate_unique_after_dedupe(chunks, cache_root)
+    n_train_base = int(n_unique) if n_unique is not None else n_est
+    n_train_est = max(1, int(round(n_train_base * 0.80)))
     micro_per_epoch = max(1, math.ceil(n_train_est / max(1, batch_size)))
     opt_steps_per_epoch = max(1, math.ceil(micro_per_epoch / max(1, grad_accum)))
 
@@ -564,10 +624,15 @@ def launch_pfmn_training(
         "10",
         "--checkpoint_every",
         "10",
+        "--log_steps",
+        "25",
         "--dropout",
         "0.1",
         "--lambda_sub",
         str(lambda_sub),
+        "--dedupe_sample_ids",
+        "--pack_locality",
+        "--show_tqdm",
     ]
     if persistent_workers:
         cmd.append("--persistent_workers")
@@ -601,10 +666,13 @@ def launch_pfmn_training(
         f"persistent_workers={persistent_workers}  "
         f"(override via launch_pfmn_training(..., num_workers=0) if OOM)"
     )
-    print(f"EST_SAMPLES:    ~{n_est}  (~{n_train_est} train @ train_frac=0.80)")
     print(
-        f"STEPS/EPOCH:    ~{micro_per_epoch} microbatches  "
-        f"(~{opt_steps_per_epoch} optimizer steps)"
+        f"EST_SAMPLES:    ~{n_est} raw  (source={est_src})"
+        + (f"; ~{n_unique} unique after sample_id dedupe" if n_unique is not None else "")
+    )
+    print(
+        f"TRAIN_EST:      ~{n_train_est} after dedupe/split  → "
+        f"~{micro_per_epoch} microbatches/epoch  (~{opt_steps_per_epoch} optimizer steps)"
     )
     print(f"CHUNK_PARENT:   {chunk_parent}")
     print(f"CHUNK_GLOB:     {chunk_glob}")
