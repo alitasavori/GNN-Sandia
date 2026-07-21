@@ -801,9 +801,11 @@ def train(args: argparse.Namespace) -> Path:
             if best_es == float("inf") or (best_es - score) >= min_delta:
                 best_es = score
                 best_epoch = epoch
-                bad = 0
-            else:
-                bad = int(epoch - best_epoch) if best_epoch > 0 else bad + 1
+
+        # Always refresh from calendar epoch so log_every lines between evals
+        # are truthful (bad used to stay frozen at 0 until the next eval).
+        if best_epoch > 0:
+            bad = int(epoch - best_epoch)
 
         if do_log:
             print(
