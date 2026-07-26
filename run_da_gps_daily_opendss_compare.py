@@ -145,6 +145,7 @@ from compare_opendss_snapshot_helpers import (
 from train_da_gps_multitask_complex_voltage import DAGPSModel as DAGPSModelEdgeAttn
 from train_da_gps_multitask_complex_voltage_gine import (
     DAGPSModel as DAGPSModelGine,
+    PlainNodeMLP,
     _reg_indices_to_tap_pu,
 )
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
@@ -2116,11 +2117,25 @@ def run(
         )
         n_pv_plot = 0
 
-    use_legacy_edgeattn = _state_dict_is_legacy_edgeattn(state_dict)
-    if use_legacy_edgeattn:
+    model_type = str(bundle.get("model_type", "gine") or "gine").strip().lower()
+    global_attn_mode = str(bundle.get("global_attn_mode", "tokens") or "tokens").strip().lower()
+    if global_attn_mode not in ("tokens", "full_node"):
+        global_attn_mode = "tokens"
+    use_legacy_edgeattn = _state_dict_is_legacy_edgeattn(state_dict) and model_type != "mlp"
+    if model_type == "mlp":
+        print(
+            f"[da_gps_daily] checkpoint backbone: PlainNodeMLP "
+            f"(L={n_layers}, h={hidden}, node_emb_dim={node_emb_dim})",
+            flush=True,
+        )
+    elif use_legacy_edgeattn:
         print("[da_gps_daily] checkpoint backbone: legacy EdgeAttnMPNN (train_da_gps_multitask_complex_voltage.py)", flush=True)
     else:
-        print("[da_gps_daily] checkpoint backbone: GINE (train_da_gps_multitask_complex_voltage_gine.py)", flush=True)
+        print(
+            f"[da_gps_daily] checkpoint backbone: GINE "
+            f"(global_attn_mode={global_attn_mode})",
+            flush=True,
+        )
 
     dev = torch.device(resolve_da_gps_device(device))
     log_da_gps_device(str(dev))
@@ -2131,7 +2146,20 @@ def run(
     if bool(hp.get("disable_dropout", False)):
         dropout = 0.0
 
-    if use_legacy_edgeattn:
+    if model_type == "mlp":
+        base_model = PlainNodeMLP(
+            n_nodes=N,
+            node_in_dim=n_feat,
+            hidden=hidden,
+            n_layers=n_layers,
+            dropout=dropout,
+            node_emb_dim=node_emb_dim,
+            per_node_heads=per_node_heads,
+            n_cap=n_cap,
+            n_reg=n_reg,
+            n_pv_aux=n_pv_aux,
+        )
+    elif use_legacy_edgeattn:
         base_model = DAGPSModelEdgeAttn(
             n_nodes=N,
             num_edges=int(edge_index.shape[1]),
@@ -2172,6 +2200,7 @@ def run(
             per_device_reg_head=per_device_reg_head,
             n_pv_aux=n_pv_aux,
             reg_nclasses=reg_nclasses if reg_loss_mode == "ce" else None,
+            global_attn_mode=global_attn_mode,
         )
     try:
         base_model.load_state_dict(state_dict, strict=True)
@@ -2855,7 +2884,12 @@ def run(
         }
 
     cfg_stem = _safe_stem(ckpt_path.stem)
-    _backbone = "EdgeAttn (legacy)" if use_legacy_edgeattn else "GINE"
+    if model_type == "mlp":
+        _backbone = "PlainNodeMLP"
+    elif use_legacy_edgeattn:
+        _backbone = "EdgeAttn (legacy)"
+    else:
+        _backbone = f"GINE ({global_attn_mode})"
     _timing_title = f"Daily Timing Summary (DA-GPS {_backbone} vs OpenDSS)"
 
     print_mv_daily_timing_summary(
