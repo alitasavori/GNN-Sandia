@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -71,19 +72,85 @@ def _sync(dev: torch.device) -> None:
 
 
 def _find_pack(cache_dir: Path) -> Path:
+    """Pick a PFMN pack under ``cache_dir``.
+
+    Prefer full ``run_001_*_0049_*`` over smoke ``*_0001_*``, then largest file.
+    Lexicographic ``run_001*`` alone wrongly prefers scen_0000_0001.
+    """
     cache_dir = cache_dir.expanduser().resolve()
     if not cache_dir.is_dir():
         raise FileNotFoundError(f"--cache-dir is not a directory: {cache_dir}")
+    cands: list[Path] = []
     for suf in (_CACHE_SUFFIX, *_CACHE_LEGACY_SUFFIXES):
-        hits = sorted(cache_dir.glob(f"run_001*{suf}"))
-        if hits:
-            return hits[0]
-        hits = sorted(cache_dir.glob(f"*{suf}"))
-        if hits:
-            return hits[0]
-    raise FileNotFoundError(
-        f"No PFMN pack (*{_CACHE_SUFFIX} or legacy) under {cache_dir}"
+        cands.extend(cache_dir.glob(f"*{suf}"))
+    # de-dupe
+    seen: set[Path] = set()
+    uniq: list[Path] = []
+    for p in cands:
+        try:
+            rr = p.resolve()
+        except Exception:
+            continue
+        if rr in seen or not rr.is_file():
+            continue
+        seen.add(rr)
+        uniq.append(rr)
+    if not uniq:
+        raise FileNotFoundError(
+            f"No PFMN pack (*{_CACHE_SUFFIX} or legacy) under {cache_dir}"
+        )
+
+    def _score(p: Path) -> tuple[int, int, str]:
+        name = p.name
+        rank = 0
+        if "scen_0000_0049" in name or re.search(r"_0049_", name):
+            rank += 2_000_000_000
+        if name.startswith("run_001"):
+            rank += 100_000_000
+        if "scen_0000_0001" in name or re.search(r"_0001_seed_", name):
+            rank -= 1_500_000_000
+        try:
+            sz = int(p.stat().st_size)
+        except Exception:
+            sz = 0
+        return (rank + sz, sz, name)
+
+    best = max(uniq, key=_score)
+    return best
+
+
+def _expand_pack_x_to_legacy13(pack: dict, *, src_name: str = "") -> dict:
+    """Rebuild legacy 13-D node feats from a paper 6-D pack + static fields.
+
+    Layout: [P/Q×3 | phase_mask×3 | source | cap_A/B/C]. Cap node channels are
+    left 0 (caps still live in ``device_state`` for the state MLP); enough for
+    Method A forward with old ``node_dim=13`` checkpoints.
+    """
+    x = pack["x"]
+    if int(x.shape[-1]) != 6:
+        return pack
+    s, n, _ = x.shape
+    x13 = x.new_zeros((s, n, 13))
+    x13[..., :6] = x
+    pp = pack.get("phase_present")
+    if torch.is_tensor(pp):
+        if pp.dim() == 2:
+            x13[..., 6:9] = pp.to(dtype=x.dtype).unsqueeze(0).expand(s, -1, -1)
+        elif pp.dim() == 3:
+            x13[..., 6:9] = pp.to(dtype=x.dtype)
+    src = int(pack.get("source_bus_local", 0) or 0)
+    if 0 <= src < n:
+        x13[:, src, 9] = 1.0
+    out = dict(pack)
+    out["x"] = x13
+    out["node_dim"] = 13
+    tag = f" ({src_name})" if src_name else ""
+    print(
+        f"[pfmn_method_a] expanded pack x 6→13 for legacy ckpt{tag} "
+        f"(phase/source filled; cap node feats=0)",
+        flush=True,
     )
+    return out
 
 
 def _resolve_pfmn_checkpoint(run_dir: Path, explicit: str = "") -> Path:
@@ -193,6 +260,8 @@ def run_pfmn_method_a(
             raise RuntimeError(
                 f"Pack x dim {pack['x'].shape[-1]} != ckpt node_dim {node_dim} after normalize"
             )
+    elif pack_d == 6 and node_dim == 13:
+        pack = _expand_pack_x_to_legacy13(pack, src_name=pack_path.name)
     else:
         raise RuntimeError(
             f"PFMN pack x dim={pack_d} < ckpt node_dim={node_dim} ({ckpt_path.name})"
