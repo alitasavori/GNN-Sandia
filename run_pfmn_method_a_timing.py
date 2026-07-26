@@ -43,7 +43,7 @@ from compare_opendss_snapshot_helpers import (
     step_load_multiplier,
 )
 from nonunique_opendss_daily import resolve_da_gps_device
-from powerflowmultinet_model import PowerFlowMultiNet
+from powerflowmultinet_model import PowerFlowMultiNet, infer_voltage_head_mode
 from run_da_gps_daily_opendss_compare import (
     _align_method_a_load_bases_for_feeder,
     _compile_feeder_master,
@@ -171,7 +171,18 @@ def run_pfmn_method_a(
     state_dim = int(bundle.get("state_dim", pack.get("state_dim", pack["device_state"].shape[-1])))
     hidden = int(bundle.get("hidden", 128))
     layers = int(bundle.get("layers", 12))
-    dropout = float(bundle.get("dropout", 0.0))
+    # Keep training dropout when building modules so Sequential indices match the
+    # checkpoint (Dropout layers shift Linear keys). model.eval() disables Dropout.
+    dropout = float(bundle.get("dropout", 0.1))
+    state = bundle.get("model_state_dict") or bundle.get("state_dict")
+    if state is None:
+        raise RuntimeError(f"No model_state_dict in {ckpt_path}")
+    head_mode = str(bundle.get("voltage_head_mode") or "").strip() or infer_voltage_head_mode(state)
+    print(
+        f"[pfmn_method_a] arch voltage_head_mode={head_mode} dropout={dropout} "
+        f"L={layers} h={hidden}",
+        flush=True,
+    )
 
     model = PowerFlowMultiNet(
         node_dim,
@@ -179,12 +190,10 @@ def run_pfmn_method_a(
         state_dim,
         hidden=hidden,
         num_layers=layers,
-        dropout=0.0,  # inference
+        dropout=dropout,
         predict_substation=True,
+        voltage_head_mode=head_mode,
     )
-    state = bundle.get("model_state_dict") or bundle.get("state_dict")
-    if state is None:
-        raise RuntimeError(f"No model_state_dict in {ckpt_path}")
     model.load_state_dict(state, strict=True)
     model.eval()
     model.to(dev)
