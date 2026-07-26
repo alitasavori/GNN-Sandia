@@ -649,53 +649,135 @@ def _load_da_gps_report_bundle(
     return _synthesize_report_from_checkpoint(ckpt_path, cache_pt), norm_dir
 
 
+def _datasets_gnn2_search_roots() -> list[Path]:
+    """Local / Colab roots that may hold ``datasets_gnn2`` (incl. Shared-Drive shortcuts)."""
+    roots: list[Path] = []
+    for raw in (
+        Path("/content/drive/MyDrive/datasets_gnn2"),
+        Path(r"K:\My Drive\datasets_gnn2"),
+        REPO_ROOT / "datasets_gnn2",
+        REPO_ROOT / "datasets_gnn2_from pc",
+    ):
+        try:
+            p = raw.expanduser()
+            if p.is_dir():
+                roots.append(p.resolve())
+        except OSError:
+            continue
+    shortcut = Path("/content/drive/.shortcut-targets-by-id")
+    if shortcut.is_dir():
+        for p in shortcut.glob("*/datasets_gnn2"):
+            try:
+                if p.is_dir():
+                    roots.append(p.resolve())
+            except OSError:
+                continue
+    # de-dupe while preserving order
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        k = str(r)
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+def _remap_datasets_gnn2_path(path: Path) -> list[Path]:
+    """Expand a path that contains ``datasets_gnn2`` across local Drive / shortcut roots.
+
+    Training reports often embed Colab absolute paths
+    (``/content/drive/MyDrive/datasets_gnn2/...``). On Windows those resolve under ``C:\\content\\...``
+    and miss; Shared-Drive Colab layouts may also store the same tree only under
+    ``.shortcut-targets-by-id``.
+    """
+    cands: list[Path] = [path]
+    parts = list(Path(path).parts)
+    idx = next((i for i, x in enumerate(parts) if str(x).lower() == "datasets_gnn2"), None)
+    if idx is None:
+        return cands
+    rest_parts = parts[idx + 1 :]
+    for root in _datasets_gnn2_search_roots():
+        cand = root.joinpath(*rest_parts) if rest_parts else root
+        try:
+            cand = cand.resolve()
+        except OSError:
+            continue
+        if cand not in cands:
+            cands.append(cand)
+    return cands
+
+
 def _resolve_default_edge_csv(report: dict, hp: dict, cache_pt: Path) -> Path:
     """Locate ``gnn_edges_phase_static.csv`` (or ``edge_catalog_csv``) for compacted edges.
 
     Training reports often store **absolute** ``chunks[0]`` paths from another machine; if the
     primary path is missing, we fall back to:
 
+    - remapped ``datasets_gnn2`` roots (Colab MyDrive, ``K:\\My Drive``, Shared-Drive shortcuts)
     - ``hyperparameters.chunk_parent`` / ``<chunk_name>`` / edge CSV, with ``chunk_name`` parsed
       from the tensor-cache filename (``<chunk>__full__....pt`` → ``<chunk>``).
     - ``<parent of cache_pt>`` / edge CSV (when caches live inside the chunk folder).
+    - ``original_*`` chunk trees under each ``datasets_gnn2`` root matching ``chunk_name``.
     """
     edge_name = str(hp.get("edge_catalog_csv", "gnn_edges_phase_static.csv"))
     trials: list[Path] = []
 
+    def _add(p: Path) -> None:
+        for cand in _remap_datasets_gnn2_path(p):
+            trials.append(cand)
+
     chunks = report.get("chunks") or []
     if chunks:
         ch0 = Path(str(chunks[0]))
-        trials.append((ch0 / edge_name).resolve())
+        _add((ch0 / edge_name))
 
     es = report.get("edges_csv")
     if es:
-        trials.append(Path(str(es)).resolve())
+        _add(Path(str(es)))
 
-    cp = str(hp.get("chunk_parent", "")).strip()
+    cp = str(hp.get("chunk_parent", "") or report.get("chunk_parent", "")).strip()
     cn = _chunk_name_from_cache_stem(cache_pt)
     if cp and cn:
-        trials.append((Path(cp) / cn / edge_name).resolve())
+        _add(Path(cp) / cn / edge_name)
 
     trials.append((cache_pt.parent / edge_name).resolve())
+
+    # Broader search: datasets_gnn2/**/chunk_name/edge_name (ieee34 / 906 / 8500 chunk trees).
+    if cn:
+        for root in _datasets_gnn2_search_roots():
+            # Common layout: <root>/original_*/<chunk>/gnn_edges_phase_static.csv
+            for hit in root.glob(f"*/{cn}/{edge_name}"):
+                trials.append(hit)
+            direct = root / cn / edge_name
+            trials.append(direct)
 
     seen: set[str] = set()
     uniq: list[Path] = []
     for t in trials:
-        k = str(t)
+        try:
+            k = str(t.resolve()) if t.exists() else str(t)
+        except OSError:
+            k = str(t)
         if k not in seen:
             seen.add(k)
             uniq.append(t)
 
     first_tried = uniq[0] if uniq else None
     for t in uniq:
-        if t.is_file():
-            if first_tried is not None and t.resolve() != first_tried.resolve():
+        try:
+            ok = t.is_file()
+        except OSError:
+            ok = False
+        if ok:
+            if first_tried is not None and t.resolve() != Path(str(first_tried)).resolve():
                 print(f"[da_gps_daily] resolved edge CSV -> {t}", flush=True)
-            return t
+            return t.resolve()
 
     raise FileNotFoundError(
         "Could not find edge catalog CSV for compacted edges. Tried:\n  "
-        + "\n  ".join(str(x) for x in uniq)
+        + "\n  ".join(str(x) for x in uniq[:40])
+        + ("\n  ..." if len(uniq) > 40 else "")
         + "\nFix ``chunks`` paths in da_gps_report.json / da_gps_run_manifest.json, set hyperparameters.chunk_parent, or pass --edge-csv."
     )
 
@@ -1936,6 +2018,16 @@ def run(
             flush=True,
         )
 
+    # Peek model_type early so PlainNodeMLP can proceed without edges when the catalog is missing.
+    model_type_hint = "gine"
+    try:
+        _peek = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(_peek, dict):
+            model_type_hint = str(_peek.get("model_type", "gine") or "gine").strip().lower()
+    except Exception:
+        model_type_hint = "gine"
+
+    edge_path: Path | None = None
     if edge_csv is not None:
         es = str(edge_csv).strip()
         if es in (".", "..") or (len(es) <= 2 and Path(es).name == "."):
@@ -1944,12 +2036,27 @@ def run(
                 "Omit --edge-csv to auto-resolve, or pass a real gnn_edges_phase_static.csv path."
             )
         edge_path = Path(edge_csv).resolve()
+        if not edge_path.is_file():
+            raise FileNotFoundError(edge_path)
+        print(f"[da_gps_daily] using edge CSV: {edge_path}", flush=True)
+        edge_index, edge_attr = _load_compacted_edges(edge_path, node_to_local)
     else:
-        edge_path = _resolve_default_edge_csv(report, hp, Path(cache_pt))
-    print(f"[da_gps_daily] using edge CSV: {edge_path}", flush=True)
-    if not edge_path.is_file():
-        raise FileNotFoundError(edge_path)
-    edge_index, edge_attr = _load_compacted_edges(edge_path, node_to_local)
+        try:
+            edge_path = _resolve_default_edge_csv(report, hp, Path(cache_pt))
+            print(f"[da_gps_daily] using edge CSV: {edge_path}", flush=True)
+            edge_index, edge_attr = _load_compacted_edges(edge_path, node_to_local)
+        except FileNotFoundError as edge_err:
+            if model_type_hint == "mlp":
+                print(
+                    f"[da_gps_daily] MLP checkpoint: edge catalog not found ({edge_err}); "
+                    "using empty edge_index (PlainNodeMLP ignores topology).",
+                    flush=True,
+                )
+                edge_index = torch.zeros((2, 0), dtype=torch.long)
+                edge_attr = torch.zeros((0, 2), dtype=torch.float32)
+                edge_path = None
+            else:
+                raise
 
     x_mean = torch.load(x_mean_path, map_location="cpu", weights_only=False).float()
     x_std = torch.load(x_std_path, map_location="cpu", weights_only=False).float()
@@ -2239,7 +2346,10 @@ def run(
     elif feeder_key == "8500":
         print(f"[da_gps_daily] WARNING: no MV↔sx mapping at {mpath} (using direct bus.phase P/Q)", flush=True)
     else:
-        print(f"[da_gps_daily] feeder={feeder_key}: skipping 8500 MV↔sx mapping (direct bus.phase P/Q)", flush=True)
+        print(
+            f"[da_gps_daily] feeder={feeder_key}: skipping 8500 MV<->sx mapping (direct bus.phase P/Q)",
+            flush=True,
+        )
 
     compile_meta = _compile_feeder_master(feeder_key)
     if skip_opendss_solve:
@@ -3274,7 +3384,7 @@ def run(
         "run_dir": str(run_dir),
         "checkpoint": str(ckpt_path),
         "cache_pt": str(Path(cache_pt).resolve()),
-        "edge_csv": str(edge_path),
+        "edge_csv": str(edge_path) if edge_path is not None else "",
         "daily_profile_csv": str(prof_resolved),
         "load_profile_path_arg": str(load_profile_path or ""),
         "load_profile_filename": str(load_profile_filename),
