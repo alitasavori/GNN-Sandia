@@ -103,8 +103,14 @@ def _resolve_pfmn_checkpoint(run_dir: Path, explicit: str = "") -> Path:
 
 def _build_sample_tensors(pack: dict, norms: dict, sample_i: int, device: torch.device):
     x = pack["x"][sample_i].clone()
+    x_dim = int(x.shape[-1])
+    x_mean = norms["x_mean"]
+    x_std = norms["x_std"]
+    # Legacy 13-D and paper 6-D both z-score the leading P/Q dims only.
     for j in NODE_CONT_IDX:
-        x[:, j] = (x[:, j] - norms["x_mean"][j]) / norms["x_std"][j]
+        if j >= x_dim or j >= int(x_mean.numel()) or j >= int(x_std.numel()):
+            break
+        x[:, j] = (x[:, j] - x_mean[j]) / x_std[j]
     ea = materialize_edge_attr(
         pack["edge_attr_static"], pack["edge_tap_reg_idx"], pack["reg_taps"][sample_i]
     )
@@ -164,9 +170,35 @@ def run_pfmn_method_a(
     norms = {k: v.float() if torch.is_tensor(v) else torch.as_tensor(v).float() for k, v in norms_raw.items()}
 
     pack = torch.load(pack_path, map_location="cpu", weights_only=False)
-    pack = _normalize_pack_node_feats(pack, src_name=pack_path.name)
+    state = bundle.get("model_state_dict") or bundle.get("state_dict")
+    if state is None:
+        raise RuntimeError(f"No model_state_dict in {ckpt_path}")
+
+    # Prefer encoder in_features from weights (authoritative) over pack slicing defaults.
+    enc_w = state.get("node_encoder.0.weight")
+    node_dim_ckpt = int(enc_w.shape[1]) if torch.is_tensor(enc_w) else None
+    node_dim = int(
+        node_dim_ckpt
+        if node_dim_ckpt is not None
+        else bundle.get("node_dim", pack.get("node_dim", pack["x"].shape[-1]))
+    )
+    pack_d = int(pack["x"].shape[-1])
+    if pack_d == node_dim:
+        pack = dict(pack)
+        pack["node_dim"] = node_dim
+    elif pack_d > node_dim:
+        # Paper ckpts (node_dim=6) can reuse legacy 13-D packs by slicing P/Q.
+        pack = _normalize_pack_node_feats(pack, src_name=pack_path.name)
+        if int(pack["x"].shape[-1]) != node_dim:
+            raise RuntimeError(
+                f"Pack x dim {pack['x'].shape[-1]} != ckpt node_dim {node_dim} after normalize"
+            )
+    else:
+        raise RuntimeError(
+            f"PFMN pack x dim={pack_d} < ckpt node_dim={node_dim} ({ckpt_path.name})"
+        )
+
     n_samp = int(pack["x"].shape[0])
-    node_dim = int(bundle.get("node_dim", pack.get("node_dim", pack["x"].shape[-1])))
     edge_dim = int(bundle.get("edge_dim", pack.get("edge_dim", pack["edge_attr_static"].shape[-1])))
     state_dim = int(bundle.get("state_dim", pack.get("state_dim", pack["device_state"].shape[-1])))
     hidden = int(bundle.get("hidden", 128))
@@ -174,13 +206,10 @@ def run_pfmn_method_a(
     # Keep training dropout when building modules so Sequential indices match the
     # checkpoint (Dropout layers shift Linear keys). model.eval() disables Dropout.
     dropout = float(bundle.get("dropout", 0.1))
-    state = bundle.get("model_state_dict") or bundle.get("state_dict")
-    if state is None:
-        raise RuntimeError(f"No model_state_dict in {ckpt_path}")
     head_mode = str(bundle.get("voltage_head_mode") or "").strip() or infer_voltage_head_mode(state)
     print(
         f"[pfmn_method_a] arch voltage_head_mode={head_mode} dropout={dropout} "
-        f"L={layers} h={hidden}",
+        f"L={layers} h={hidden} node_dim={node_dim} (pack_x={pack_d})",
         flush=True,
     )
 
