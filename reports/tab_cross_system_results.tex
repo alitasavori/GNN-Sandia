@@ -1,0 +1,169 @@
+% Cross-system accuracy + Method A latency table (paper).
+% Source of truth for tab:cross_system_results while drafting outside Overleaf.
+% Last 906 GENConv accuracy fill: 2026-07-26 from train_pool_eval @ best val_tot epoch 30
+%   run pfmn_oracle_906_l12_h128_20260721_014053 (no local pfmn_report.json; checkpoint + Colab log).
+\begin{table}[t]
+    \centering
+    \caption{Accuracy and solve or inference latency across the three test
+    systems. Voltage-magnitude errors are reported in p.u., voltage-angle MAE
+    in degrees, and $R^2$ as the mean and minimum across phase-level nodes.
+    Latency is the mean wall-clock time over a 288-step Method~A day:
+    OpenDSS \texttt{Solve()} only, Fast Log(v) online solve, and learned-model
+    forward only. OpenDSS and Log(v) are evaluated on CPU, while learned-model
+    latency is reported on both CPU and GPU. Parenthetical values report the
+    runtime ratio relative to OpenDSS CPU \texttt{Solve()} on the same feeder,
+    with values greater than one indicating acceleration. Oracle configurations
+    receive OpenDSS-settled device states as inputs. Log(v) $|V|$ errors are
+    from daily OpenDSS comparisons (not a train/test split).}
+    \label{tab:cross_system_results}
+    \scriptsize
+    \setlength{\tabcolsep}{1.2pt}
+    \renewcommand{\arraystretch}{1.08}
+    \begin{tabular}{@{}lcccccc@{}}
+        \toprule
+        \textbf{Method}
+        &
+        \makecell{\textbf{$|V|$}\\\textbf{MAE}}
+        &
+        \makecell{\textbf{$|V|$}\\\textbf{RMSE}}
+        &
+        \makecell{\textbf{Angle}\\\textbf{MAE}}
+        &
+        \makecell{\textbf{$R^2$}}
+        &
+        \multicolumn{2}{c}{\textbf{Mean latency (ms)}}
+        \\
+        \cmidrule(lr){6-7}
+        &
+        &
+        &
+        &
+        &
+        \makecell{\textbf{CPU}\\\textbf{(ratio)}}
+        &
+        \makecell{\textbf{GPU}\\\textbf{(ratio)}}
+        \\
+        \midrule
+
+        \multicolumn{7}{@{}l}{\textit{IEEE~34-bus}} \\
+
+        OpenDSS~\cite{dugan2011opendss}
+        & Ref. & Ref. & Ref. & Ref.
+        & 1.93 (1.0$\times$)
+        & --
+        \\
+
+        Log(v), nonsynchronized~\cite{carreno2023logv}
+        & 0.0186 & 0.0256 & [--] & [--]
+        & 0.048 (40.2$\times$)
+        & --
+        \\
+
+        Log(v), synchronized (oracle)~\cite{carreno2023logv}
+        & 0.0102 & 0.0160 & [--] & [--]
+        & 0.054 (35.7$\times$)
+        & --
+        \\
+
+        MLP~\cite{hornik1989multilayer}
+        & 0.00744 & 0.0101 & 0.398 & 0.351/$-$0.008
+        & [--] ([--]$\times$)
+        & 0.271 (7.12$\times$)
+        \\
+
+        GENConv multigraph (oracle)~\cite{powerflowmultinet}
+        & 0.00180 & [--] & 0.0513 & 0.989/[--]
+        & [--] ([--]$\times$)
+        & 12.0 (0.161$\times$)
+        \\
+
+        \textbf{DA-GPS}
+        & \textbf{0.000649}
+        & \textbf{0.00102}
+        & \textbf{0.0161}
+        & \textbf{0.994/0.989}
+        & \textbf{3.29 (0.59$\times$)}
+        & \textbf{0.513 (3.76$\times$)}
+        \\
+
+        \midrule
+        \multicolumn{7}{@{}l}{\textit{European~906-bus}} \\
+
+        OpenDSS~\cite{dugan2011opendss}
+        & Ref. & Ref. & Ref. & Ref.
+        & 9.63 (1.0$\times$)
+        & --
+        \\
+
+        Log(v)~\cite{carreno2023logv}
+        & 0.000251 & 0.000290 & [--] & [--]
+        & 0.944 (10.2$\times$)
+        & --
+        \\
+
+        MLP~\cite{hornik1989multilayer}
+        & 0.00505 & 0.00798 & 0.132 & $-$0.001/$-$0.024
+        & [--] ([--]$\times$)
+        & 0.331 (29.1$\times$)
+        \\
+
+        GENConv multigraph (oracle)~\cite{powerflowmultinet}
+        & 0.00517 & [--] & 0.132 & 0.094/[--]
+        & [--] ([--]$\times$)
+        & 13.1 (0.737$\times$)
+        \\
+
+        \textbf{DA-GPS}
+        & \textbf{0.000310}
+        & \textbf{0.000546}
+        & \textbf{0.0108}
+        & \textbf{0.994/0.979}
+        & \textbf{16.3 (0.59$\times$)}
+        & \textbf{1.28 (7.51$\times$)}
+        \\
+
+        \midrule
+        \multicolumn{7}{@{}l}{\textit{IEEE~8500-node MV}} \\
+
+        OpenDSS~\cite{dugan2011opendss}
+        & Ref. & Ref. & Ref. & Ref.
+        & 122 (1.0$\times$)
+        & --
+        \\
+
+        Log(v), nonsynchronized~\cite{carreno2023logv}
+        & 0.00746 & 0.00955 & [--] & [--]
+        & 4.32 (28.1$\times$)
+        & --
+        \\
+
+        Log(v), synchronized (oracle)~\cite{carreno2023logv}
+        & 0.0141 & 0.0158 & [--] & [--]
+        & 3.81 (31.9$\times$)
+        & --
+        \\
+
+        MLP~\cite{hornik1989multilayer}
+        & 0.0326 & [--] & 4.72 & 0.061/$-$1.01
+        & [--] ([--]$\times$)
+        & 0.615 (198$\times$)
+        \\
+
+        GENConv multigraph (oracle)~\cite{powerflowmultinet}
+        & 0.0319 & [--] & 13.8 & 0.421/[--]
+        & [--] ([--]$\times$)
+        & [--] ([--]$\times$)
+        \\
+
+        \textbf{DA-GPS}
+        & \textbf{0.00387}
+        & \textbf{0.00537}
+        & \textbf{0.198}
+        & \textbf{0.930/0.121}
+        & \textbf{37.3 (3.26$\times$)}
+        & \textbf{3.44 (35.3$\times$)}
+        \\
+
+        \bottomrule
+    \end{tabular}
+\end{table}
