@@ -200,6 +200,8 @@ def main() -> None:
     SMOKE = bool(globals().get("SMOKE", False))
     RUN_DEVICE_DAY = bool(globals().get("RUN_DEVICE_DAY", True))
     N_SAMPLES_AVG = globals().get("N_SAMPLES_AVG", 50 if SMOKE else None)
+    # Attention is ~1 full extract per row; keep capped even when aux uses full cache.
+    N_SAMPLES_ATTN_AVG = globals().get("N_SAMPLES_ATTN_AVG", 16 if SMOKE else 64)
     DEVICE = str(globals().get("DEVICE", "auto"))
     DAY = int(globals().get("DAY", 4))
     NPTS = int(globals().get("NPTS", 12 if SMOKE else 288))
@@ -412,6 +414,7 @@ def main() -> None:
     attn_out = out_dir / "attention_extract"
     knobs = {
         "N_SAMPLES_AVG": N_SAMPLES_AVG,
+        "N_SAMPLES_ATTN_AVG": N_SAMPLES_ATTN_AVG,
         "SAMPLE_IDX_START": 0,
         "RUN_DIR": run_dir,
         "CACHE_PT": cache_pt,
@@ -443,6 +446,7 @@ def main() -> None:
     res = g.get("res")
     hop_df = g.get("hop_df")
     _n_avg = int(g.get("_n_avg", 0) or 0)
+    _n_attn = int(g.get("_n_attn", 0) or 0)
 
     _print_paper_table(aux_meta, reg_df, cap_df, meta_aux_df)
 
@@ -460,7 +464,8 @@ def main() -> None:
             layer=None,
             direction="node_to_token",
         )
-        hop_csv_out = attn_out / f"attention_ratio_vs_hop_avg{_n_avg}.csv"
+        _hop_tag = _n_attn or _n_avg
+        hop_csv_out = attn_out / f"attention_ratio_vs_hop_avg{_hop_tag}.csv"
         hop_vs.to_csv(hop_csv_out, index=False)
         print(f"[aux_paper] wrote {hop_csv_out}", flush=True)
 
@@ -521,6 +526,7 @@ def main() -> None:
         "cache_pt": str(cache_pt),
         "out_dir": str(out_dir),
         "n_samples_avg": _n_avg,
+        "n_samples_attn_avg": _n_attn,
         "aux_meta": aux_meta,
         "device_day": str(day_out) if day_out is not None else None,
     }

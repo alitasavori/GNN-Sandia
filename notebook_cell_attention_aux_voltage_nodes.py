@@ -324,10 +324,16 @@ def _system_token_to_node_rankings_mean_layers(
 # =============================================================================
 # Knobs — edit here
 # =============================================================================
-# How many cache rows to average for aux / voltage / attention (max = cache size).
+# How many cache rows to average for aux / voltage metrics (max = cache size).
 #   None → use every sample in the cache .pt (batch dim), from SAMPLE_IDX_START.
 #   int  → use at most that many consecutive rows (e.g. 50 for a quick run).
 N_SAMPLES_AVG = None
+
+# Attention extract is ~1 full GPS forward + edge build per cache row (very slow on Drive).
+# Cap separately so paper aux can use all rows while attention uses a modest average.
+#   None → same as N_SAMPLES_AVG / full cache (slow if thousands of rows).
+#   int  → at most that many consecutive rows starting at SAMPLE_IDX_START.
+N_SAMPLES_ATTN_AVG = 64
 
 SAMPLE_IDX_START = 0  # starting cache row index when slicing samples
 
@@ -410,6 +416,7 @@ NOTEBOOK_PRESETS: dict[str, dict[str, object]] = {
 
 _KNOB_KEYS = (
     "N_SAMPLES_AVG",
+    "N_SAMPLES_ATTN_AVG",
     "SAMPLE_IDX_START",
     "TOP_K_WORST_BUSES",
     "TOP_K_ATTENTION_NODES",
@@ -621,21 +628,31 @@ if not _sample_indices or _sample_indices[-1] >= _n_cache:
     raise IndexError(
         f"sample range {SAMPLE_IDX_START}..{SAMPLE_IDX_START + _n_avg - 1} out of cache [0,{_n_cache})"
     )
+# Attention-only subsample (defaults to 64; keep aux/voltage on full N_SAMPLES_AVG).
+if N_SAMPLES_ATTN_AVG is None:
+    _n_attn = _n_avg
+else:
+    _n_attn = max(1, min(int(N_SAMPLES_ATTN_AVG), _n_avg))
+_attn_sample_indices = _sample_indices[:_n_attn]
 print(f"cache_pt={CACHE_PT}")
 print(f"  total_samples_in_cache (x batch dim) = {_n_cache}")
 print(
-    f"  n_used_for_average = {_n_avg}  (indices {_sample_indices[0]}..{_sample_indices[-1]} inclusive)"
+    f"  n_used_for_aux_voltage = {_n_avg}  (indices {_sample_indices[0]}..{_sample_indices[-1]} inclusive)"
 )
 print(
-    f"knobs: N_SAMPLES_AVG={N_SAMPLES_AVG!r} → n_used={_n_avg}  |  "
+    f"  n_used_for_attention = {_n_attn}  (indices {_attn_sample_indices[0]}..{_attn_sample_indices[-1]} inclusive)"
+)
+print(
+    f"knobs: N_SAMPLES_AVG={N_SAMPLES_AVG!r} → n_aux={_n_avg}  |  "
+    f"N_SAMPLES_ATTN_AVG={N_SAMPLES_ATTN_AVG!r} → n_attn={_n_attn}  |  "
     f"TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}  |  N_ROWS_PRINT_R2_TABLE={N_ROWS_PRINT_R2_TABLE}  |  "
     f"TOP_K_ATTENTION_NODES_PER_TOKEN={TOP_K_ATTENTION_NODES_PER_TOKEN}"
 )
-if _n_avg > 150:
+if _n_attn > 150:
     print(
-        f"WARNING: attention section below runs ``run_attention_extract`` {_n_avg} times (full model + "
-        f"edges each time). Expect a long run or use e.g. N_SAMPLES_AVG=50 for development; "
-        f"KeyboardInterrupt is normal if you hit Stop.",
+        f"WARNING: attention section runs ``run_attention_extract`` {_n_attn} times (full model + "
+        f"edges each time). Prefer N_SAMPLES_ATTN_AVG=64 (default) or 50; aux/voltage still use "
+        f"N_SAMPLES_AVG={N_SAMPLES_AVG!r}. KeyboardInterrupt is normal if you hit Stop.",
         flush=True,
     )
 
@@ -912,11 +929,16 @@ fig_nd.savefig(_png_nd, dpi=150)
 plt.show()
 print(f"wrote {_png_nd}")
 
-# ----- mean attention over same indices -----
+# ----- mean attention over capped indices (not full aux average) -----
 mh_acc = None
 mhtn_acc = None
 res = None
-for si in _sample_indices:
+_t_attn0 = __import__("time").perf_counter()
+print(
+    f"attention average: {_n_attn} extracts (of {_n_avg} aux rows / {_n_cache} cache) …",
+    flush=True,
+)
+for _ai, si in enumerate(_attn_sample_indices):
     res = run_attention_extract(
         ckpt,
         RUN_DIR,
@@ -942,32 +964,42 @@ for si in _sample_indices:
     else:
         mh_acc += mh
         mhtn_acc += mhtn
+    if (_ai + 1) % 5 == 0 or (_ai + 1) == _n_attn:
+        _elapsed = __import__("time").perf_counter() - _t_attn0
+        _rate = (_ai + 1) / max(_elapsed, 1e-9)
+        _eta = (_n_attn - _ai - 1) / max(_rate, 1e-9)
+        print(
+            f"  attention {_ai + 1}/{_n_attn}  ({_elapsed:.0f}s elapsed, ~{_eta:.0f}s left)",
+            flush=True,
+        )
 
-mh = (mh_acc / float(_n_avg)).astype(np.float32)
-mhtn = (mhtn_acc / float(_n_avg)).astype(np.float32)
+mh = (mh_acc / float(_n_attn)).astype(np.float32)
+mhtn = (mhtn_acc / float(_n_attn)).astype(np.float32)
 L, N, T = mh.shape
 Lt, Tt, Nt = mhtn.shape
 
 np.savez_compressed(
-    OUT_DIR / f"attention_mean_heads_avg{_n_avg}.npz",
+    OUT_DIR / f"attention_mean_heads_avg{_n_attn}.npz",
     probs_nt=mh,
     probs_tn=mhtn,
-    n_samples_averaged=np.int64(_n_avg),
-    sample_indices=np.asarray(_sample_indices, dtype=np.int64),
+    n_samples_averaged=np.int64(_n_attn),
+    sample_indices=np.asarray(_attn_sample_indices, dtype=np.int64),
+    n_samples_aux_voltage=np.int64(_n_avg),
 )
 _manifest_avg = {
     **res["manifest"],
     "attention_averaging": {
-        "n_samples_averaged": _n_avg,
-        "sample_indices": _sample_indices,
+        "n_samples_averaged": _n_attn,
+        "sample_indices": _attn_sample_indices,
+        "n_samples_aux_voltage": _n_avg,
         "note": "mean_heads are arithmetic mean of head-mean attention over listed cache indices",
     },
 }
-(OUT_DIR / f"manifest_attention_avg{_n_avg}.json").write_text(
+(OUT_DIR / f"manifest_attention_avg{_n_attn}.json").write_text(
     json.dumps(_manifest_avg, indent=2), encoding="utf-8"
 )
-print(f"wrote {OUT_DIR / f'attention_mean_heads_avg{_n_avg}.npz'}")
-print(f"wrote {OUT_DIR / f'manifest_attention_avg{_n_avg}.json'}")
+print(f"wrote {OUT_DIR / f'attention_mean_heads_avg{_n_attn}.npz'}")
+print(f"wrote {OUT_DIR / f'manifest_attention_avg{_n_attn}.json'}")
 
 ratios = attention_downstream_ratio_table(
     mh,
@@ -986,8 +1018,8 @@ ratios_tn = attention_downstream_ratio_table_tn(
     downstream_rule=DOWNSTREAM_RULE,
 )
 
-out_csv = OUT_DIR / f"attention_hop_ratios_avg{_n_avg}.csv"
-out_csv_tn = OUT_DIR / f"attention_hop_ratios_token_to_node_avg{_n_avg}.csv"
+out_csv = OUT_DIR / f"attention_hop_ratios_avg{_n_attn}.csv"
+out_csv_tn = OUT_DIR / f"attention_hop_ratios_token_to_node_avg{_n_attn}.csv"
 ratios.to_csv(out_csv, index=False)
 ratios_tn.to_csv(out_csv_tn, index=False)
 
@@ -1004,8 +1036,8 @@ _df_g, _df_per_reg, _attn_map = _regulator_cross_attn_node_tables(
     top_k_global=int(TOP_K_ATTENTION_NODES),
     top_k_per_reg=int(TOP_K_ATTENTION_NODES_PER_REG),
 )
-_csv_g = OUT_DIR / f"reg_cross_attn_node_rank_global_avg{_n_avg}.csv"
-_csv_pr = OUT_DIR / f"reg_cross_attn_top_nodes_per_regulator_avg{_n_avg}.csv"
+_csv_g = OUT_DIR / f"reg_cross_attn_node_rank_global_avg{_n_attn}.csv"
+_csv_pr = OUT_DIR / f"reg_cross_attn_top_nodes_per_regulator_avg{_n_attn}.csv"
 _df_g.to_csv(_csv_g, index=False)
 _df_per_reg.to_csv(_csv_pr, index=False)
 print(f"wrote {_csv_g}")
@@ -1078,7 +1110,7 @@ if len(_df_all_nt) or len(_df_all_tn):
             f"\n--- Node→token: top {_top_k_tok} nodes attending **to** each cap/reg/sys token "
             f"(mean over layers) ---"
         ),
-        csv_path=OUT_DIR / f"gps_all_tokens_node_to_token_mean_layers_avg{_n_avg}.csv",
+        csv_path=OUT_DIR / f"gps_all_tokens_node_to_token_mean_layers_avg{_n_attn}.csv",
     )
     _print_token_attn_block(
         _df_all_tn,
@@ -1086,20 +1118,20 @@ if len(_df_all_nt) or len(_df_all_tn):
             f"\n--- Token→node: top {_top_k_tok} nodes each cap/reg/sys token attends **to** "
             f"(mean over layers) ---"
         ),
-        csv_path=OUT_DIR / f"gps_all_tokens_token_to_node_mean_layers_avg{_n_avg}.csv",
+        csv_path=OUT_DIR / f"gps_all_tokens_token_to_node_mean_layers_avg{_n_attn}.csv",
     )
     _df_sys_nt = _df_all_nt[_df_all_nt["token_group"] == "sys"] if len(_df_all_nt) else _df_all_nt
     _df_sys_tn = _df_all_tn[_df_all_tn["token_group"] == "sys"] if len(_df_all_tn) else _df_all_tn
     if len(_df_sys_nt):
-        _df_sys_nt.to_csv(OUT_DIR / f"aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv", index=False)
-        print(f"wrote {OUT_DIR / f'aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv'} (sys subset)")
+        _df_sys_nt.to_csv(OUT_DIR / f"aux_sys_node_to_token_mean_layers_avg{_n_attn}.csv", index=False)
+        print(f"wrote {OUT_DIR / f'aux_sys_node_to_token_mean_layers_avg{_n_attn}.csv'} (sys subset)")
     if len(_df_sys_tn):
-        _df_sys_tn.to_csv(OUT_DIR / f"aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv", index=False)
-        print(f"wrote {OUT_DIR / f'aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv'} (sys subset)")
+        _df_sys_tn.to_csv(OUT_DIR / f"aux_sys_token_to_node_mean_layers_avg{_n_attn}.csv", index=False)
+        print(f"wrote {OUT_DIR / f'aux_sys_token_to_node_mean_layers_avg{_n_attn}.csv'} (sys subset)")
     for _grp in ("cap", "reg"):
         _sub = _df_all_tn[_df_all_tn["token_group"] == _grp] if len(_df_all_tn) else _df_all_tn
         if len(_sub):
-            _p = OUT_DIR / f"gps_{_grp}_tokens_token_to_node_mean_layers_avg{_n_avg}.csv"
+            _p = OUT_DIR / f"gps_{_grp}_tokens_token_to_node_mean_layers_avg{_n_attn}.csv"
             _sub.to_csv(_p, index=False)
             print(f"wrote {_p}")
 else:
@@ -1126,7 +1158,8 @@ def _print_ratio_block(df: pd.DataFrame, label: str) -> None:
 
 print("\n========== DA-GPS attention + hop ratios ==========")
 print(
-    f"averaged over n={_n_avg} of {_n_cache} cache rows (indices {_sample_indices[0]}..{_sample_indices[-1]})"
+    f"attention averaged over n={_n_attn} of {_n_cache} cache rows "
+    f"(indices {_attn_sample_indices[0]}..{_attn_sample_indices[-1]}; aux/voltage used n={_n_avg})"
 )
 print(f"out_dir={OUT_DIR}")
 print(f"wrote {out_csv}")
@@ -1152,7 +1185,7 @@ if len(ratios):
     ax00.axhline(1.0, color="k", ls="--", lw=1, alpha=0.5)
 ax00.set_xlabel("GPS block (layer)")
 ax00.set_ylabel("ratio")
-ax00.set_title(f"Node → token: {_ratio_title} (mean over {_n_avg} samples)")
+ax00.set_title(f"Node → token: {_ratio_title} (mean over {_n_attn} samples)")
 ax00.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
 ax00.grid(True, alpha=0.3)
 
@@ -1167,7 +1200,7 @@ if len(ratios_tn):
     ax01.axhline(1.0, color="k", ls="--", lw=1, alpha=0.5)
 ax01.set_xlabel("GPS block (layer)")
 ax01.set_ylabel("ratio")
-ax01.set_title(f"Token → node: {_ratio_title} (mean over {_n_avg} samples)")
+ax01.set_title(f"Token → node: {_ratio_title} (mean over {_n_attn} samples)")
 ax01.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
 ax01.grid(True, alpha=0.3)
 
@@ -1181,7 +1214,7 @@ if len(ratios):
         ax10.barh(labels, r_last["ratio"], color="steelblue")
         ax10.axvline(1.0, color="k", ls="--", lw=1, alpha=0.5)
 ax10.set_xlabel("ratio")
-ax10.set_title(f"Node→token final layer ({_last_nt}), mean n={_n_avg}")
+ax10.set_title(f"Node→token final layer ({_last_nt}), mean n={_n_attn}")
 
 ax11 = axes[1, 1]
 _last_tn = "—"
@@ -1193,7 +1226,7 @@ if len(ratios_tn):
         ax11.barh(labels2, r2["ratio"], color="darkorange")
         ax11.axvline(1.0, color="k", ls="--", lw=1, alpha=0.5)
 ax11.set_xlabel("ratio")
-ax11.set_title(f"Token→node final layer ({_last_tn}), mean n={_n_avg}")
+ax11.set_title(f"Token→node final layer ({_last_tn}), mean n={_n_attn}")
 
 plt.show()
 
@@ -1201,14 +1234,14 @@ _ratio_paths = save_attention_ratio_summary_figures(
     ratios,
     ratios_tn,
     reg_cols=reg_cols,
-    n_avg=_n_avg,
+    n_avg=_n_attn,
     out_dir=OUT_DIR,
     dpi=int(HIST_DPI),
     show=False,
 )
 print(f"wrote {len(_ratio_paths)} ratio summary PNGs under {OUT_DIR / 'attention_ratio_summary'}")
 
-_hist_suffix = f"mean over {_n_avg} cache samples"
+_hist_suffix = f"mean over {_n_attn} cache samples"
 _hist_paths = plot_all_regulator_layer_hop_histograms(
     mh,
     mhtn,
