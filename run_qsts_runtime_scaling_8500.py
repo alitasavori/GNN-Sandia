@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Warm-started QSTS runtime scaling on IEEE 8500 (Method B / native daily).
 
-Sweeps display resolutions (24, 48, 96, 144, 288 steps) and devices (cuda/cpu).
+Sweeps display resolutions and devices (cuda/cpu).
 OpenDSS: one compile, sequential daily Solve() with state carry-forward.
 DA-GPS: per-step forward from current inputs (no previous prediction).
 
@@ -31,50 +31,127 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+# Paper sweep: step_min must divide 60 (DailySimConfig). Coarse → fine.
 RESOLUTIONS = (
     # (step_min, npts) — 24h day
     (60, 24),
     (30, 48),
+    (20, 72),
     (15, 96),
     (10, 144),
     (5, 288),
+    (2, 720),
 )
+
+# Match plots/presentation palette
+COLOR_OPENDSS = "#4c78a8"
+COLOR_DAGPS_CUDA = "#e45756"
+COLOR_DAGPS_CPU = "#f58518"
+FONT_FAMILY = "Times New Roman"
+
+
+def _setup_paper_fonts() -> None:
+    import matplotlib as mpl
+    from matplotlib import font_manager
+
+    # Prefer true Times New Roman when present (Windows / Colab with mscorefonts).
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    family = FONT_FAMILY if FONT_FAMILY in available else "serif"
+    mpl.rcParams.update(
+        {
+            "font.family": family,
+            "font.serif": [
+                "Times New Roman",
+                "Times",
+                "Nimbus Roman",
+                "Liberation Serif",
+                "DejaVu Serif",
+            ],
+            "mathtext.fontset": "stix",
+            "font.size": 9,
+            "axes.labelsize": 10,
+            "legend.fontsize": 8,
+            "xtick.labelsize": 9,
+            "ytick.labelsize": 9,
+            "axes.linewidth": 0.8,
+            "lines.linewidth": 1.6,
+            "pdf.fonttype": 42,  # TrueType in PDF (editable in Illustrator)
+            "ps.fonttype": 42,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.02,
+        }
+    )
 
 
 def _plot_scaling(rows: list[dict], out_pdf: Path, out_png: Path) -> None:
     import matplotlib.pyplot as plt
 
-    # Aggregate by resolution (step_min) / device
+    _setup_paper_fonts()
+
     by_dev: dict[str, list[dict]] = {}
     for r in rows:
         by_dev.setdefault(str(r["device"]), []).append(r)
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    # OpenDSS is device-independent; take mean across devices if duplicated
+    # Single-column-ish IEEE width; no title (LaTeX caption).
+    fig, ax = plt.subplots(figsize=(3.5, 2.6), constrained_layout=True)
+
     od_by_res: dict[int, list[float]] = {}
     for r in rows:
         od_by_res.setdefault(int(r["step_min"]), []).append(float(r["opendss_ms_per_eval"]))
-    res_sorted = sorted(od_by_res)  # ascending minutes; inverted below → 60 left, 5 right
+    res_sorted = sorted(od_by_res)  # ascending; inverted → 60 left, 2 right
     od_ms = [float(np.mean(od_by_res[s])) for s in res_sorted]
-    ax.plot(res_sorted, od_ms, "o-", label="OpenDSS CPU (warm daily)", linewidth=2)
+    ax.plot(
+        res_sorted,
+        od_ms,
+        "o-",
+        color=COLOR_OPENDSS,
+        markersize=5,
+        markerfacecolor="white",
+        markeredgewidth=1.2,
+        label="OpenDSS",
+        zorder=3,
+    )
 
+    style_by_dev = {
+        "cuda": ("s-", COLOR_DAGPS_CUDA, "DA-GPS (GPU)"),
+        "gpu": ("s-", COLOR_DAGPS_CUDA, "DA-GPS (GPU)"),
+        "cpu": ("^-", COLOR_DAGPS_CPU, "DA-GPS (CPU)"),
+    }
     for dev, rs in sorted(by_dev.items()):
         rs = sorted(rs, key=lambda x: int(x["step_min"]))
         xs = [int(r["step_min"]) for r in rs]
         ys = [float(r["dagps_ms_per_eval"]) for r in rs]
-        ax.plot(xs, ys, "s-", label=f"DA-GPS ({dev})", linewidth=2)
+        fmt, color, label = style_by_dev.get(
+            str(dev).lower(), ("D-", "#54a24b", f"DA-GPS ({dev})")
+        )
+        ax.plot(
+            xs,
+            ys,
+            fmt,
+            color=color,
+            markersize=5,
+            markerfacecolor="white",
+            markeredgewidth=1.2,
+            label=label,
+            zorder=4,
+        )
 
     ax.set_xlabel("Resolution (min)")
-    ax.set_ylabel("Mean runtime per evaluation (ms)")
-    ax.set_title("Warm-started QSTS runtime — IEEE 8500")
+    ax.set_ylabel("Latency (ms/step)")
     ax.set_xticks(res_sorted)
+    ax.set_xticklabels([str(s) for s in res_sorted])
     ax.invert_xaxis()  # finer resolution (smaller step) to the right
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_ylim(bottom=0)
+    ax.grid(True, which="major", axis="both", linestyle=":", linewidth=0.6, alpha=0.55)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="best", handlelength=1.8, borderaxespad=0.2)
+
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_pdf, dpi=200, bbox_inches="tight")
-    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    fig.savefig(out_pdf, dpi=300, facecolor="white")
+    fig.savefig(out_png, dpi=300, facecolor="white")
     plt.close(fig)
 
 
