@@ -1,8 +1,7 @@
 # Full notebook cell: aux + reg bars + per-bus voltage rank + attention / hop / hist.
-# Also prints **per meta-aux / system token** the top graph nodes by cross-attention (mean over GPS layers,
-# heads in extract, cache samples): **node→token** (nodes attending *to* each aux) and **token→node**
-# (which nodes each aux token attends to). Writes ``aux_sys_node_to_token_mean_layers_avg*.csv`` and
-# ``aux_sys_token_to_node_mean_layers_avg*.csv``.
+# Also prints **per GPS multitask token** (cap, reg, meta-aux/sys) the top graph nodes by cross-attention
+# (mean over GPS layers, heads in extract, cache samples): **node→token** and **token→node**.
+# Writes ``gps_all_tokens_*_mean_layers_avg*.csv`` (all tokens) and legacy ``aux_sys_*`` (sys only).
 # Source of truth: this file (copy entire file into one Jupyter cell, or %run it).
 #
 # --- Two training styles (same script) ---
@@ -51,7 +50,30 @@ import numpy as np
 import pandas as pd
 import torch
 
-REPO_ROOT = Path(r"C:\Users\alita\OneDrive\Desktop\GNN2").resolve()
+def _resolve_repo_root() -> Path:
+    cands: list[Path] = []
+    env = os.environ.get("GNN2_REPO_ROOT", "").strip()
+    if env:
+        cands.append(Path(env))
+    if Path("/content").is_dir():
+        cands.extend([Path("/content/GNN2"), Path("/content/GNN-Sandia")])
+    cands.append(Path(r"C:\Users\alita\OneDrive\Desktop\GNN2"))
+    cands.append(Path.cwd())
+    seen: set[Path] = set()
+    for raw in cands:
+        p = raw.expanduser().resolve()
+        if p in seen:
+            continue
+        seen.add(p)
+        if (p / "extract_da_gps_attention.py").is_file() and (p / "da_gps_hop_attention_ratios.py").is_file():
+            return p
+    raise FileNotFoundError(
+        "GNN2 repo root not found (need extract_da_gps_attention.py). "
+        "Set GNN2_REPO_ROOT or run from the repo folder."
+    )
+
+
+REPO_ROOT = _resolve_repo_root()
 os.chdir(REPO_ROOT)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -76,7 +98,13 @@ from extract_da_gps_attention import (
     eval_voltage_per_node_errors_on_cache_indices,
     run_attention_extract,
 )
-from plot_da_gps_attention_hop_histograms_all import plot_all_regulator_layer_hop_histograms
+import plot_da_gps_attention_hop_histograms_all as _plot_hop_hists
+
+importlib.reload(_plot_hop_hists)
+from plot_da_gps_attention_hop_histograms_all import (
+    plot_all_regulator_layer_hop_histograms,
+    save_attention_ratio_summary_figures,
+)
 
 
 def _regulator_cross_attn_node_tables(
@@ -146,25 +174,26 @@ def _regulator_cross_attn_node_tables(
     return df_g, df_l, attn_map
 
 
-def _meta_aux_token_node_rankings_mean_layers(
+def _gps_token_node_rankings_mean_layers(
     attn: np.ndarray,
     *,
     cross_attn: str,
     token_names: list[str],
     node_names: list[str],
-    n_cap: int,
-    n_reg: int,
-    top_k_per_token: int,
+    cap_cols: list[str],
+    reg_cols: list[str],
     meta_aux_target_cols: list[str] | None = None,
+    top_k_per_token: int,
+    token_groups: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
-    """Rank graph nodes per **meta-aux / system** token (indices after cap+reg), mean over GPS layers.
+    """Rank graph nodes per GPS multitask token (cap / reg / sys), mean over layers.
 
     ``cross_attn``:
 
-    - ``node_to_token``: ``attn`` is ``mh`` (L, N, T); top nodes that **attend to** each aux token.
-    - ``token_to_node``: ``attn`` is ``mhtn`` (L, T, N); top nodes each aux token **attends to**.
+    - ``node_to_token``: ``attn`` is ``mh`` (L, N, T); nodes that **attend to** each token.
+    - ``token_to_node``: ``attn`` is ``mhtn`` (L, T, N); nodes each token **attends to**.
 
-    ``attn`` is head-meaned in ``run_attention_extract`` and sample-averaged in this notebook.
+    ``token_groups``: subset of ``("cap", "reg", "sys")``; default = all three.
     """
     attn = np.asarray(attn, dtype=np.float64)
     if attn.ndim != 3:
@@ -176,26 +205,27 @@ def _meta_aux_token_node_rankings_mean_layers(
         _L, T, N = attn.shape
     else:
         raise ValueError(f"cross_attn must be 'node_to_token' or 'token_to_node', got {cross_attn!r}")
-    t0 = int(n_cap) + int(n_reg)
-    if t0 >= T:
-        return pd.DataFrame()
+    groups_ok = set(token_groups or ("cap", "reg", "sys"))
+    n_cap = len(cap_cols)
+    n_reg = len(reg_cols)
     meta = list(meta_aux_target_cols or [])
     names_t = [str(token_names[i]) if i < len(token_names) else f"tok_{i}" for i in range(T)]
     names_n = [str(node_names[i]) if i < len(node_names) else f"node_{i}" for i in range(N)]
-    n_sys = T - t0
     tk = max(1, min(int(top_k_per_token), N))
     w_mean = np.mean(attn, axis=0)
     rows: list[dict] = []
-    for j, ti in enumerate(range(t0, T)):
+
+    def _append_token(ti: int, group: str, task_label: str) -> None:
+        if group not in groups_ok:
+            return
         ti = int(ti)
-        meta_label = meta[j] if j < len(meta) else ""
-        tok = names_t[ti]
-        label = str(meta_label) if meta_label and len(meta) == n_sys else tok
+        tok = names_t[ti] if ti < len(names_t) else f"tok_{ti}"
         if cross_attn == "node_to_token":
             vec = w_mean[:, ti]
         else:
             vec = w_mean[ti, :]
         order = np.argsort(-vec)[:tk]
+        meta_head = task_label if group == "sys" else ""
         for rank, ni in enumerate(order, start=1):
             ni = int(ni)
             rows.append(
@@ -203,16 +233,66 @@ def _meta_aux_token_node_rankings_mean_layers(
                     "n_gps_layers": L,
                     "layer_aggregate": "mean",
                     "cross_attn": cross_attn,
-                    "token_index": int(ti),
+                    "token_group": group,
+                    "token_index": ti,
                     "token_name": tok,
-                    "meta_aux_head": str(meta_label) if meta_label else "",
-                    "token_label": label,
+                    "task_target_col": str(task_label),
+                    "meta_aux_head": meta_head,
+                    "token_label": str(task_label) or tok,
                     "rank_node": int(rank),
                     "node": names_n[ni],
                     "attn_mass": float(vec[ni]),
                 }
             )
+
+    for j in range(n_cap):
+        lab = cap_cols[j] if j < len(cap_cols) else names_t[j]
+        _append_token(j, "cap", lab)
+    for j in range(n_reg):
+        ti = n_cap + j
+        lab = reg_cols[j] if j < len(reg_cols) else names_t[ti]
+        _append_token(ti, "reg", lab)
+    for j in range(n_cap + n_reg, T):
+        sj = j - n_cap - n_reg
+        lab = meta[sj] if sj < len(meta) else names_t[j]
+        _append_token(j, "sys", lab)
+
     return pd.DataFrame(rows)
+
+
+def _meta_aux_token_node_rankings_mean_layers(
+    attn: np.ndarray,
+    *,
+    cross_attn: str,
+    token_names: list[str],
+    node_names: list[str],
+    n_cap: int,
+    n_reg: int,
+    top_k_per_token: int,
+    meta_aux_target_cols: list[str] | None = None,
+    cap_cols: list[str] | None = None,
+    reg_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Legacy wrapper: system tokens only (same columns as before, plus ``token_group``)."""
+    _nc = int(n_cap)
+    _nr = int(n_reg)
+    _cap = list(cap_cols or [f"cap_{i}" for i in range(_nc)])
+    _reg = list(reg_cols or [f"reg_{i}" for i in range(_nr)])
+    if len(_cap) < _nc:
+        _cap.extend(f"cap_{i}" for i in range(len(_cap), _nc))
+    if len(_reg) < _nr:
+        _reg.extend(f"reg_{i}" for i in range(len(_reg), _nr))
+    return _gps_token_node_rankings_mean_layers(
+        attn,
+        cross_attn=cross_attn,
+        token_names=token_names,
+        node_names=node_names,
+        cap_cols=_cap[:_nc],
+        reg_cols=_reg[:_nr],
+        meta_aux_target_cols=meta_aux_target_cols,
+        top_k_per_token=top_k_per_token,
+        token_groups=("sys",),
+    )
 
 
 def _system_token_to_node_rankings_mean_layers(
@@ -224,6 +304,8 @@ def _system_token_to_node_rankings_mean_layers(
     n_reg: int,
     top_k_per_token: int,
     meta_aux_target_cols: list[str] | None = None,
+    cap_cols: list[str] | None = None,
+    reg_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     return _meta_aux_token_node_rankings_mean_layers(
         mhtn,
@@ -234,6 +316,8 @@ def _system_token_to_node_rankings_mean_layers(
         n_reg=n_reg,
         top_k_per_token=top_k_per_token,
         meta_aux_target_cols=meta_aux_target_cols,
+        cap_cols=cap_cols,
+        reg_cols=reg_cols,
     )
 
 
@@ -254,9 +338,9 @@ TOP_K_WORST_BUSES = 1000
 # Regulator-related cross-attention: how many nodes to list globally and per regulator token.
 TOP_K_ATTENTION_NODES = 200
 TOP_K_ATTENTION_NODES_PER_REG = 50
-# Meta-aux / system tokens (``sys_*`` after cap+reg): top nodes per aux for node→token and token→node;
-# mean over all GPS layers (and heads in extract, cache samples in this cell).
-TOP_K_ATTENTION_NODES_PER_AUX_TOKEN = 10
+# Top nodes listed per GPS multitask token (cap, reg, sys/meta-aux); mean over layers in rankings.
+TOP_K_ATTENTION_NODES_PER_TOKEN = 10
+TOP_K_ATTENTION_NODES_PER_AUX_TOKEN = 10  # alias; overridden by PER_TOKEN if both set in knobs
 
 # Notebook: how many rows to print / display for the R²-sorted table (lowest R² first).
 N_ROWS_PRINT_R2_TABLE = 30
@@ -292,6 +376,10 @@ OUT_DIR = (
 )
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DOWNSTREAM_RULE = "hop_gt_0"
+# Attention hop histograms: one PNG per (layer, regulator, direction); dpi for saved figures.
+HIST_DPI = 300
+# If True, also save legacy L×R mosaic PNGs (in addition to separate panels).
+SAVE_HIST_COMBINED_GRID = False
 # Optional: set to a specific ``.pt`` file. If None, uses ``da_gps_multitask_best.pt`` when present,
 # otherwise ``training_last.pt`` (from ``--checkpoint_every`` saves during training).
 CKPT_PATH = None
@@ -326,6 +414,7 @@ _KNOB_KEYS = (
     "TOP_K_WORST_BUSES",
     "TOP_K_ATTENTION_NODES",
     "TOP_K_ATTENTION_NODES_PER_REG",
+    "TOP_K_ATTENTION_NODES_PER_TOKEN",
     "TOP_K_ATTENTION_NODES_PER_AUX_TOKEN",
     "N_ROWS_PRINT_R2_TABLE",
     "TOP_K_PLOT_H_CAP_IN",
@@ -338,6 +427,8 @@ _KNOB_KEYS = (
     "DEVICE",
     "DOWNSTREAM_RULE",
     "CKPT_PATH",
+    "HIST_DPI",
+    "SAVE_HIST_COMBINED_GRID",
 )
 
 _nbk_raw = globals().get("__NOTEBOOK_KNOBS__")
@@ -364,6 +455,8 @@ if isinstance(_nbk_raw, dict):
     for _k in _KNOB_KEYS:
         if _k in _nbk:
             globals()[_k] = _nbk[_k]
+    if "TOP_K_ATTENTION_NODES_PER_TOKEN" not in _nbk and "TOP_K_ATTENTION_NODES_PER_AUX_TOKEN" in _nbk:
+        TOP_K_ATTENTION_NODES_PER_TOKEN = TOP_K_ATTENTION_NODES_PER_AUX_TOKEN
 else:
     print(
         "note: __NOTEBOOK_KNOBS__ not set or not a dict — using file defaults for paths.",
@@ -536,7 +629,7 @@ print(
 print(
     f"knobs: N_SAMPLES_AVG={N_SAMPLES_AVG!r} → n_used={_n_avg}  |  "
     f"TOP_K_WORST_BUSES={TOP_K_WORST_BUSES}  |  N_ROWS_PRINT_R2_TABLE={N_ROWS_PRINT_R2_TABLE}  |  "
-    f"TOP_K_ATTENTION_NODES_PER_AUX_TOKEN={TOP_K_ATTENTION_NODES_PER_AUX_TOKEN}"
+    f"TOP_K_ATTENTION_NODES_PER_TOKEN={TOP_K_ATTENTION_NODES_PER_TOKEN}"
 )
 if _n_avg > 150:
     print(
@@ -571,7 +664,16 @@ if len(meta_aux_df):
 print(f"wrote {OUT_DIR / f'aux_reg_per_device_avg{_n_avg}.csv'}")
 print(f"wrote {OUT_DIR / f'aux_cap_per_device_avg{_n_avg}.csv'}")
 print(f"wrote {OUT_DIR / f'aux_metrics_meta_avg{_n_avg}.json'}")
-print(f"aggregate reg_mse_tap_pu_all={aux_meta['reg_mse_tap_pu_all']:.8f}  cap_bce_all={aux_meta['cap_bce_all']:.6f}")
+print(
+    f"aggregate reg_mse_tap_pu_all={aux_meta['reg_mse_tap_pu_all']:.8f}  "
+    f"cap_bce_all={aux_meta['cap_bce_all']:.6f}"
+    + (
+        f"  reg_tap_acc={aux_meta['reg_tap_acc_all']:.4f}  "
+        f"reg_tap_mae_pu={aux_meta['reg_tap_mae_pu_all']:.6g}"
+        if "reg_tap_acc_all" in aux_meta
+        else ""
+    )
+)
 if "pv_mse_raw_all" in aux_meta:
     print(
         f"meta_aux: pv_mse_nrm_all={aux_meta.get('pv_mse_nrm_all', float('nan')):.6f}  "
@@ -925,62 +1027,86 @@ try:
 except Exception:
     _meta_aux_cols = []
 
-def _print_meta_aux_attn_block(df: pd.DataFrame, *, title: str, csv_path: Path) -> None:
+def _print_token_attn_block(df: pd.DataFrame, *, title: str, csv_path: Path) -> None:
     if not len(df):
         return
     df.to_csv(csv_path, index=False)
     print(f"wrote {csv_path}")
     print(title)
     print(
-        "(``attn_mass`` = mean over **all GPS layers** × **heads** (extract) × **cache rows** in this run; "
-        "``token_index`` = cap + reg + sys slot; ``sys_j`` ↔ ``meta_aux_target_cols[j]`` when lengths match.)"
+        "(``attn_mass`` = mean over **all GPS layers** × **heads** (extract) × **cache rows**; "
+        "``token_group`` = cap | reg | sys; ``token_index`` = slot in [cap…, reg…, sys…].)"
     )
-    for _tok, _sub in df.groupby("token_label", sort=False):
-        print(f"\n  meta_aux={_tok!r}")
-        print(_sub.drop(columns=["token_label"]).to_string(index=False))
+    for (_grp, _tok), _sub in df.groupby(["token_group", "token_label"], sort=False):
+        print(f"\n  [{_grp}] token={_tok!r}")
+        _cols = [c for c in _sub.columns if c not in ("token_group", "token_label")]
+        print(_sub[_cols].to_string(index=False))
 
 
-_df_aux_nt = _meta_aux_token_node_rankings_mean_layers(
+_top_k_tok = int(TOP_K_ATTENTION_NODES_PER_TOKEN)
+_cap_cols = list(res["manifest"].get("cap_target_cols") or [])
+_token_names = list(res["manifest"]["token_names"])
+if len(_cap_cols) < n_cap:
+    _cap_cols = _cap_cols + [
+        _token_names[i] for i in range(len(_cap_cols), n_cap) if i < len(_token_names)
+    ]
+
+_df_all_nt = _gps_token_node_rankings_mean_layers(
     np.asarray(mh, dtype=np.float64),
     cross_attn="node_to_token",
-    token_names=list(res["manifest"]["token_names"]),
+    token_names=_token_names,
     node_names=node_names_attn,
-    n_cap=n_cap,
-    n_reg=len(reg_cols),
-    top_k_per_token=int(TOP_K_ATTENTION_NODES_PER_AUX_TOKEN),
+    cap_cols=_cap_cols[:n_cap],
+    reg_cols=reg_cols,
     meta_aux_target_cols=_meta_aux_cols,
+    top_k_per_token=_top_k_tok,
 )
-_df_aux_tn = _system_token_to_node_rankings_mean_layers(
+_df_all_tn = _gps_token_node_rankings_mean_layers(
     np.asarray(mhtn, dtype=np.float64),
-    token_names=list(res["manifest"]["token_names"]),
+    cross_attn="token_to_node",
+    token_names=_token_names,
     node_names=node_names_attn,
-    n_cap=n_cap,
-    n_reg=len(reg_cols),
-    top_k_per_token=int(TOP_K_ATTENTION_NODES_PER_AUX_TOKEN),
+    cap_cols=_cap_cols[:n_cap],
+    reg_cols=reg_cols,
     meta_aux_target_cols=_meta_aux_cols,
+    top_k_per_token=_top_k_tok,
 )
-if len(_df_aux_nt) or len(_df_aux_tn):
-    _print_meta_aux_attn_block(
-        _df_aux_nt,
+if len(_df_all_nt) or len(_df_all_tn):
+    _print_token_attn_block(
+        _df_all_nt,
         title=(
-            f"\n--- Node→token (2nd cross-attn): top {TOP_K_ATTENTION_NODES_PER_AUX_TOKEN} **nodes** "
-            f"attending **to** each meta-aux token (mean over layers) ---"
+            f"\n--- Node→token: top {_top_k_tok} nodes attending **to** each cap/reg/sys token "
+            f"(mean over layers) ---"
         ),
-        csv_path=OUT_DIR / f"aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv",
+        csv_path=OUT_DIR / f"gps_all_tokens_node_to_token_mean_layers_avg{_n_avg}.csv",
     )
-    _print_meta_aux_attn_block(
-        _df_aux_tn,
+    _print_token_attn_block(
+        _df_all_tn,
         title=(
-            f"\n--- Token→node (1st cross-attn): top {TOP_K_ATTENTION_NODES_PER_AUX_TOKEN} **nodes** "
-            f"each meta-aux token attends **to** (mean over layers) ---"
+            f"\n--- Token→node: top {_top_k_tok} nodes each cap/reg/sys token attends **to** "
+            f"(mean over layers) ---"
         ),
-        csv_path=OUT_DIR / f"aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv",
+        csv_path=OUT_DIR / f"gps_all_tokens_token_to_node_mean_layers_avg{_n_avg}.csv",
     )
+    _df_sys_nt = _df_all_nt[_df_all_nt["token_group"] == "sys"] if len(_df_all_nt) else _df_all_nt
+    _df_sys_tn = _df_all_tn[_df_all_tn["token_group"] == "sys"] if len(_df_all_tn) else _df_all_tn
+    if len(_df_sys_nt):
+        _df_sys_nt.to_csv(OUT_DIR / f"aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv", index=False)
+        print(f"wrote {OUT_DIR / f'aux_sys_node_to_token_mean_layers_avg{_n_avg}.csv'} (sys subset)")
+    if len(_df_sys_tn):
+        _df_sys_tn.to_csv(OUT_DIR / f"aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv", index=False)
+        print(f"wrote {OUT_DIR / f'aux_sys_token_to_node_mean_layers_avg{_n_avg}.csv'} (sys subset)")
+    for _grp in ("cap", "reg"):
+        _sub = _df_all_tn[_df_all_tn["token_group"] == _grp] if len(_df_all_tn) else _df_all_tn
+        if len(_sub):
+            _p = OUT_DIR / f"gps_{_grp}_tokens_token_to_node_mean_layers_avg{_n_avg}.csv"
+            _sub.to_csv(_p, index=False)
+            print(f"wrote {_p}")
 else:
-    print(
-        "\n(no meta-aux / system tokens: token count equals cap+reg only — skip aux cross-attn rankings)",
-        flush=True,
-    )
+    print("\n(no multitask tokens in attention tensors — skip token rankings)", flush=True)
+
+_df_aux_nt = _df_all_nt
+_df_aux_tn = _df_all_tn
 
 
 def _print_ratio_block(df: pd.DataFrame, label: str) -> None:
@@ -1071,8 +1197,19 @@ ax11.set_title(f"Token→node final layer ({_last_tn}), mean n={_n_avg}")
 
 plt.show()
 
+_ratio_paths = save_attention_ratio_summary_figures(
+    ratios,
+    ratios_tn,
+    reg_cols=reg_cols,
+    n_avg=_n_avg,
+    out_dir=OUT_DIR,
+    dpi=int(HIST_DPI),
+    show=False,
+)
+print(f"wrote {len(_ratio_paths)} ratio summary PNGs under {OUT_DIR / 'attention_ratio_summary'}")
+
 _hist_suffix = f"mean over {_n_avg} cache samples"
-plot_all_regulator_layer_hop_histograms(
+_hist_paths = plot_all_regulator_layer_hop_histograms(
     mh,
     mhtn,
     reg_target_cols=reg_cols,
@@ -1085,10 +1222,14 @@ plot_all_regulator_layer_hop_histograms(
     non_downstream_label="non-downstream (hop≤0): ref bus / outside subtree / other laterals / per CSV",
     suptitle_suffix=_hist_suffix,
     out_dir=OUT_DIR,
-    show=True,
+    save_separate=True,
+    save_combined_grid=bool(SAVE_HIST_COMBINED_GRID),
+    hist_dpi=int(HIST_DPI),
+    show=False,
 )
-print(f"wrote {OUT_DIR / 'attention_hop_hist_all_layers_regs_nt.png'}")
-print(f"wrote {OUT_DIR / 'attention_hop_hist_all_layers_regs_tn.png'}")
+print(f"wrote {len(_hist_paths)} hop histogram PNGs under {OUT_DIR / 'hop_hist_nt'} and hop_hist_tn")
+if SAVE_HIST_COMBINED_GRID:
+    print(f"  combined mosaics: attention_hop_hist_all_layers_regs_nt.png / _tn.png")
 
 try:
     from IPython.display import display
@@ -1102,9 +1243,9 @@ try:
         display(meta_aux_df)
     print("\n--- top buses by regulator cross-attn pool (head) ---")
     display(_df_g.head(20))
-    print("\n--- system/aux tokens: token→node top nodes, **mean over layers+heads**, mean over samples (head) ---")
-    if len(_df_aux_tn):
-        display(_df_aux_tn)
+    print("\n--- all cap/reg/sys tokens: token→node top nodes (head) ---")
+    if len(_df_all_tn):
+        display(_df_all_tn.head(40))
     print("\n--- worst buses voltage only (head) ---")
     display(node_err_df.head(20))
     print("\n--- node→token ratios (head) ---")
@@ -1117,9 +1258,9 @@ except Exception:
     if len(meta_aux_df):
         print(meta_aux_df.to_string(index=False))
     print(_df_g.head(20).to_string(index=False))
-    if len(_df_aux_tn):
-        print("\n--- system/aux tokens: token→node, mean layers+heads, mean samples (full table) ---")
-        print(_df_aux_tn.to_string(index=False))
+    if len(_df_all_tn):
+        print("\n--- all tokens token→node (full table) ---")
+        print(_df_all_tn.to_string(index=False))
     print(node_err_df.head(20).to_string())
     print(ratios.head(24).to_string())
     print(ratios_tn.head(24).to_string())

@@ -451,6 +451,78 @@ def attention_downstream_ratio_table_tn(
     return pd.DataFrame(rows)
 
 
+def attention_ratio_vs_hop_distance(
+    mean_heads: np.ndarray,
+    *,
+    reg_target_cols: list[str],
+    n_cap: int,
+    node_names: list[str],
+    hop_df: pd.DataFrame,
+    layer: int | None = None,
+    max_hop: int | None = None,
+    eps: float = 1e-8,
+    direction: str = "node_to_token",
+) -> pd.DataFrame:
+    """Downstream-to-non-downstream attention ratio as a function of hop distance.
+
+    For each regulator and hop ``h > 0``, ratio =
+    ``mean(attn | hop==h) / (mean(attn | non-downstream hop≤0) + eps)``.
+
+    ``mean_heads``: node→token ``(L,N,T)`` when ``direction='node_to_token'``,
+    else token→node ``(L,T,N)``.
+    """
+    if direction == "node_to_token":
+        attn = _normalize_mean_heads_to_lnt(mean_heads)
+        L = int(attn.shape[0])
+    elif direction == "token_to_node":
+        attn = _normalize_mean_heads_to_ltn(mean_heads)
+        L = int(attn.shape[0])
+    else:
+        raise ValueError(f"direction must be node_to_token or token_to_node, got {direction!r}")
+
+    layers = [int(layer)] if layer is not None else list(range(L))
+    rows: list[dict] = []
+    for reg_col in reg_target_cols:
+        hop_col = REG_COL_TO_HOP_COL.get(reg_col)
+        if hop_col is None:
+            continue
+        tok = int(n_cap) + int(reg_target_cols.index(reg_col))
+        hops, _miss = hops_for_manifest_nodes(hop_df, node_names, hop_col)
+        omask = non_downstream_catalog_mask(hops, rule="hop_gt_0")
+        if not np.any(omask):
+            continue
+        hop_pos = hops[(hops > 0) & np.isfinite(hops)]
+        if hop_pos.size == 0:
+            continue
+        h_max = int(np.nanmax(hop_pos)) if max_hop is None else int(max_hop)
+        for lyr in layers:
+            if direction == "node_to_token":
+                a = attn[lyr, :, tok]
+            else:
+                a = attn[lyr, tok, :]
+            mu_o = float(a[omask].mean())
+            for h in range(1, h_max + 1):
+                m = hops == h
+                if not np.any(m):
+                    continue
+                mu_h = float(a[m].mean())
+                rows.append(
+                    {
+                        "layer": int(lyr),
+                        "reg_col": reg_col,
+                        "hop_col": hop_col,
+                        "hop": int(h),
+                        "mu_at_hop": mu_h,
+                        "mu_other": mu_o,
+                        "ratio": mu_h / (mu_o + float(eps)),
+                        "n_at_hop": int(m.sum()),
+                        "n_other": int(omask.sum()),
+                        "direction": direction,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 __all__ = [
     "TARGET_REG_COLS",
     "REG_COL_TO_HOP_COL",
@@ -464,4 +536,5 @@ __all__ = [
     "worst_nodes_downstream_regulator_table",
     "attention_downstream_ratio_table",
     "attention_downstream_ratio_table_tn",
+    "attention_ratio_vs_hop_distance",
 ]

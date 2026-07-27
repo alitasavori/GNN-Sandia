@@ -442,14 +442,39 @@ def augment_da_gps_pack_for_eval(
     )
 
 
+def _state_dict_uses_reg_ce_heads(sd: dict) -> bool:
+    return any(str(k).startswith("reg_ce_heads.") for k in sd)
+
+
+def _infer_reg_nclasses_from_state_dict(sd: dict, n_reg: int) -> list[int] | None:
+    if not _state_dict_uses_reg_ce_heads(sd):
+        return None
+    out: list[int] = []
+    for j in range(int(n_reg)):
+        w = sd.get(f"reg_ce_heads.{j}.weight")
+        if w is None:
+            return None
+        out.append(int(w.shape[0]))
+    return out
+
+
 def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
     gine = _state_dict_is_gine_da_gps(sd)
     DAGPSModel = _dagps_model_cls() if gine else _dagps_model_cls_legacy()
     hidden = int(ckpt["hidden"])
     node_emb_dim = int(ckpt["node_emb_dim"])
     edge_emb_dim = int(ckpt["edge_emb_dim"])
+    n_reg = int(ckpt["n_reg"])
     node_in_dim, edge_dim = _infer_node_in_edge_dim(
         sd, hidden=hidden, node_emb_dim=node_emb_dim, edge_emb_dim=edge_emb_dim
+    )
+    reg_nclasses = ckpt.get("reg_nclasses")
+    if not (isinstance(reg_nclasses, (list, tuple)) and len(reg_nclasses) == n_reg):
+        reg_nclasses = _infer_reg_nclasses_from_state_dict(sd, n_reg)
+    reg_loss = str(ckpt.get("reg_loss", "") or "").strip().lower()
+    use_ce = (reg_loss in ("ce", "cce", "cross_entropy")) or (reg_nclasses is not None)
+    per_device_reg = bool(ckpt.get("per_device_reg_head", False)) or use_ce or (
+        "reg_W" in sd and sd["reg_W"] is not None
     )
     kw: dict = dict(
         n_nodes=int(ckpt["n_nodes"]),
@@ -458,7 +483,7 @@ def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
         heads=int(ckpt["heads"]),
         n_layers=int(ckpt["layers"]),
         n_cap=int(ckpt["n_cap"]),
-        n_reg=int(ckpt["n_reg"]),
+        n_reg=n_reg,
         n_system=int(ckpt["n_system_tokens"]),
         node_in_dim=node_in_dim,
         node_emb_dim=node_emb_dim,
@@ -468,10 +493,12 @@ def _build_model(ckpt: dict, sd: dict, *, num_edges: int, dropout: float):
         gradient_checkpointing=False,
         per_node_heads=bool(ckpt.get("per_node_heads", False)),
         per_device_cap_head=bool(ckpt.get("per_device_cap_head", False)),
-        per_device_reg_head=bool(ckpt.get("per_device_reg_head", False)),
+        per_device_reg_head=per_device_reg,
     )
     if gine:
         kw["n_pv_aux"] = int(ckpt.get("n_pv_aux", 0))
+        if use_ce and reg_nclasses is not None:
+            kw["reg_nclasses"] = [int(c) for c in reg_nclasses]
     return DAGPSModel(**kw)
 
 
@@ -693,6 +720,9 @@ def eval_aux_per_device_on_cache_indices(
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame]:
     """Run ``model.forward`` on selected cache rows; per-regulator MAE/MSE in **tap pu**; per-cap BCE + accuracy.
 
+    For ``reg_loss=ce`` checkpoints, also reports exact-tap accuracy (class match) and tap-position MAE
+    after decoding class indices with ``reg_class_values.pt`` / ``reg_class_tables.json``.
+
     Returns ``(reg_df, cap_df, meta, meta_aux_df)``. ``meta_aux_df`` is empty unless the checkpoint
     has ``n_pv_aux > 0``, the cache includes ``y_pv``, and ``pv_mean.pt`` / ``pv_std.pt`` exist in ``run_dir``.
     """
@@ -733,9 +763,6 @@ def eval_aux_per_device_on_cache_indices(
     reg_cols = list(pack["reg_target_cols"])
     cap_cols = list(pack["cap_target_cols"])
 
-    reg_mean = torch.load(run_dir / "reg_mean.pt", map_location="cpu", weights_only=True).float()
-    reg_std = torch.load(run_dir / "reg_std.pt", map_location="cpu", weights_only=True).float()
-
     hidden = int(pack["hidden"])
     node_emb_dim = int(pack["node_emb_dim"])
     edge_emb_dim = int(pack["edge_emb_dim"])
@@ -754,6 +781,15 @@ def eval_aux_per_device_on_cache_indices(
     model.load_state_dict(sd, strict=True)
     model.to(dev)
     model.eval()
+
+    use_ce = bool(getattr(model, "reg_classification", False)) or _state_dict_uses_reg_ce_heads(sd)
+    reg_class_values: torch.Tensor | None = None
+    if use_ce:
+        cv_path = run_dir / "reg_class_values.pt"
+        if cv_path.is_file():
+            reg_class_values = torch.load(cv_path, map_location="cpu", weights_only=True).float()
+        elif isinstance(pack.get("reg_class_values"), torch.Tensor):
+            reg_class_values = pack["reg_class_values"].float()
 
     n_pv_aux = int(pack.get("n_pv_aux", 0) or 0)
     meta_aux_cols = list(pack.get("meta_aux_target_cols") or pack.get("pv_target_cols") or [])
@@ -791,23 +827,79 @@ def eval_aux_per_device_on_cache_indices(
     y_reg = y_reg_all.index_select(0, idx_t)
     y_cap = y_cap_all.index_select(0, idx_t)
 
-    rp_denorm = reg_pred_n * reg_std + reg_mean
     reg_rows: list[dict] = []
-    for j, name in enumerate(reg_cols):
-        pred_j = rp_denorm[:, j]
-        tgt_j = y_reg[:, j]
-        err = pred_j - tgt_j
-        abs_e = err.abs()
-        reg_rows.append(
-            {
-                "reg_col": name,
-                "mae_tap_pu": float(abs_e.mean().item()),
-                "mse_tap_pu": float((err * err).mean().item()),
-                "rmse_tap_pu": float(torch.sqrt((err * err).mean()).item()),
-                "frac_abs_err_le_0p01_tap_pu": float((abs_e <= 0.01).float().mean().item()),
-                "frac_abs_err_le_0p02_tap_pu": float((abs_e <= 0.02).float().mean().item()),
-            }
-        )
+    if use_ce:
+        # CE heads return class indices; y_reg is class indices in the multitask cache.
+        pred_idx = reg_pred_n.round().long().clamp(min=0)
+        tgt_idx = y_reg.round().long().clamp(min=0)
+        if reg_class_values is not None and reg_class_values.dim() == 2:
+            # (n_reg, max_classes) tap-pu table
+            n_reg = pred_idx.shape[1]
+            pred_tap = torch.zeros_like(reg_pred_n)
+            true_tap = torch.zeros_like(reg_pred_n)
+            for j in range(n_reg):
+                cvj = reg_class_values[j]
+                n_c = int(cvj.numel())
+                pj = pred_idx[:, j].clamp(0, n_c - 1)
+                tj = tgt_idx[:, j].clamp(0, n_c - 1)
+                pred_tap[:, j] = cvj[pj]
+                true_tap[:, j] = cvj[tj]
+        else:
+            warnings.warn(
+                "CE checkpoint but reg_class_values.pt missing; tap MAE uses class-index distance.",
+                UserWarning,
+                stacklevel=2,
+            )
+            pred_tap = pred_idx.float()
+            true_tap = tgt_idx.float()
+        exact = (pred_idx == tgt_idx).float()
+        for j, name in enumerate(reg_cols):
+            err = pred_tap[:, j] - true_tap[:, j]
+            abs_e = err.abs()
+            reg_rows.append(
+                {
+                    "reg_col": name,
+                    "mae_tap_pu": float(abs_e.mean().item()),
+                    "mse_tap_pu": float((err * err).mean().item()),
+                    "rmse_tap_pu": float(torch.sqrt((err * err).mean()).item()),
+                    "exact_tap_acc": float(exact[:, j].mean().item()),
+                    "frac_abs_err_le_0p01_tap_pu": float((abs_e <= 0.01).float().mean().item()),
+                    "frac_abs_err_le_0p02_tap_pu": float((abs_e <= 0.02).float().mean().item()),
+                }
+            )
+        rp_denorm = pred_tap
+        y_reg_cmp = true_tap
+        meta_reg_extra = {
+            "reg_mode": "ce",
+            "reg_tap_acc_all": float(exact.mean().item()),
+            "reg_tap_mae_pu_all": float((pred_tap - true_tap).abs().mean().item()),
+        }
+    else:
+        reg_mean = torch.load(run_dir / "reg_mean.pt", map_location="cpu", weights_only=True).float()
+        reg_std = torch.load(run_dir / "reg_std.pt", map_location="cpu", weights_only=True).float()
+        rp_denorm = reg_pred_n * reg_std + reg_mean
+        y_reg_cmp = y_reg
+        for j, name in enumerate(reg_cols):
+            pred_j = rp_denorm[:, j]
+            tgt_j = y_reg[:, j]
+            err = pred_j - tgt_j
+            abs_e = err.abs()
+            reg_rows.append(
+                {
+                    "reg_col": name,
+                    "mae_tap_pu": float(abs_e.mean().item()),
+                    "mse_tap_pu": float((err * err).mean().item()),
+                    "rmse_tap_pu": float(torch.sqrt((err * err).mean()).item()),
+                    "exact_tap_acc": float("nan"),
+                    "frac_abs_err_le_0p01_tap_pu": float((abs_e <= 0.01).float().mean().item()),
+                    "frac_abs_err_le_0p02_tap_pu": float((abs_e <= 0.02).float().mean().item()),
+                }
+            )
+        meta_reg_extra = {
+            "reg_mode": "mse",
+            "reg_tap_acc_all": float("nan"),
+            "reg_tap_mae_pu_all": float((rp_denorm - y_reg).abs().mean().item()),
+        }
 
     cap_rows: list[dict] = []
     probs = torch.sigmoid(cap_log)
@@ -823,8 +915,9 @@ def eval_aux_per_device_on_cache_indices(
         "n_evaluated": len(sample_indices),
         "sample_indices": [int(s) for s in sample_indices],
         "cache_pt": str(cache_pt),
-        "reg_mse_tap_pu_all": float(F.mse_loss(rp_denorm, y_reg.to(rp_denorm.dtype)).item()),
+        "reg_mse_tap_pu_all": float(F.mse_loss(rp_denorm, y_reg_cmp.to(rp_denorm.dtype)).item()),
         "cap_bce_all": float(F.binary_cross_entropy_with_logits(cap_log, y_cap.to(cap_log.dtype)).item()),
+        **meta_reg_extra,
     }
 
     meta_aux_rows: list[dict] = []
