@@ -77,10 +77,16 @@ def _find_master_dss(repo: Path) -> Path:
 
 
 def _compile_opendss(master: Path) -> None:
+    """Compile 8500 PV master the same way Method A / daily compare does.
+
+    Newer OpenDSSDirect builds reject ``set datapath=...`` before a circuit exists
+    (error #301). Use ``cd`` + absolute ``redirect`` instead.
+    """
+    master = master.resolve()
     model_dir = master.parent
     dss.Basic.ClearAll()
-    dss.Text.Command(f"set datapath={model_dir}")
-    dss.Text.Command(f"compile [{master.name}]")
+    dss.Text.Command(f'cd "{model_dir}"')
+    dss.Text.Command(f'redirect "{master}"')
     setup_da_gps_snapshot_opendss(npts=288, step_min=5.0)
     try:
         dss.Text.Command("set maxcontroliter=20000")
