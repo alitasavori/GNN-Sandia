@@ -18,7 +18,7 @@ import argparse
 import json
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -545,6 +545,47 @@ def _time_gnn_batched(
     }
 
 
+@torch.no_grad()
+def _mae_gnn_vs_cache(
+    *,
+    model,
+    x_norm: torch.Tensor,
+    y_ri: torch.Tensor,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    sample_idx: np.ndarray,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    device: torch.device,
+) -> dict[str, float]:
+    """|V| / angle MAE of DA-GPS vs cache ``y_ri`` labels (same samples as the timed batch).
+
+    Timing OpenDSS cases use independent load/irr draws and are not paired with these
+    GNN inputs — accuracy here is model-vs-cache-GT on the batched scenarios.
+    """
+    from train_da_gps_multitask_complex_voltage_gine import _metrics_voltage
+
+    xs = [x_norm[int(i)] for i in sample_idx]
+    batch = _make_batch(xs, edge_index, edge_attr, device)
+    sync_inference_device(device)
+    v_n, *_rest = model(batch)
+    sync_inference_device(device)
+    B = int(sample_idx.shape[0])
+    N = int(x_norm.shape[1])
+    v_n = v_n.view(B, N, 2).float()
+    ym = y_mean.reshape(N, 2).to(device=device, dtype=torch.float32)
+    ys = y_std.reshape(N, 2).to(device=device, dtype=torch.float32).clamp_min(1e-12)
+    pred_ri = v_n * ys.unsqueeze(0) + ym.unsqueeze(0)
+    true_ri = y_ri[sample_idx.astype(np.int64)].to(device=device, dtype=torch.float32)
+    if true_ri.ndim == 2:
+        true_ri = true_ri.view(B, N, 2)
+    met = _metrics_voltage(pred_ri.cpu(), true_ri.cpu())
+    del batch
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return met
+
+
 def _is_oom_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return (
@@ -612,6 +653,12 @@ def run(
     x_all = cache["x"].float()
     n_avail = int(x_all.shape[0])
     node_to_local = cache.get("node_to_local") or {}
+    y_ri_all = cache.get("y_ri")
+    if torch.is_tensor(y_ri_all):
+        y_ri_all = y_ri_all.float()
+    else:
+        y_ri_all = None
+        print("[parallel_eval] WARNING: cache missing y_ri — MAE disabled", flush=True)
     if n_avail < 2:
         print(
             f"[parallel_eval] WARNING: cache has only {n_avail} sample(s); "
@@ -634,6 +681,8 @@ def run(
 
     x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=False).float().reshape(-1)
     x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=False).float().reshape(-1)
+    y_mean = torch.load(run_dir / "y_mean.pt", map_location="cpu", weights_only=False).float().reshape(-1)
+    y_std = torch.load(run_dir / "y_std.pt", map_location="cpu", weights_only=False).float().reshape(-1)
 
     model = None
     n_feat = int(x_all.shape[-1])
@@ -759,6 +808,28 @@ def run(
                     gn["batch_size"] = n
                     gn["device"] = str(device_t)
                     max_gnn_batch = n
+                    if y_ri_all is not None:
+                        try:
+                            mae = _mae_gnn_vs_cache(
+                                model=model,
+                                x_norm=x_norm,
+                                y_ri=y_ri_all,
+                                y_mean=y_mean,
+                                y_std=y_std,
+                                sample_idx=sample_idx,
+                                edge_index=edge_index,
+                                edge_attr=edge_attr,
+                                device=device_t,
+                            )
+                            gn["mae"] = mae
+                            print(
+                                f"  DA-GPS MAE vs cache y_ri: |V|={mae['mae_vmag_pu']:.6f} pu  "
+                                f"angle={mae['mae_angle_deg']:.4f} deg  "
+                                f"RMSE|V|={mae['rmse_vmag_pu']:.6f}",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            print(f"  DA-GPS MAE skipped: {e}", flush=True)
                     speedup = (
                         float(od["batch_time_s"]) / float(gn["batch_time_s"])
                         if od is not None and float(gn["batch_time_s"]) > 0
@@ -810,7 +881,7 @@ def run(
         "stop_on_oom": bool(stop_on_oom),
         "max_gnn_batch_ok": max_gnn_batch,
         "rows": rows,
-        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "created_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     out_json = out_dir / "parallel_scenario_eval_8500.json"
     out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -818,7 +889,8 @@ def run(
     print("\n=== Parallel evaluation table (batch-size sweep) ===", flush=True)
     print(
         f"{'B':>6} | {'OD batch s':>10} | {'OD ms/case':>10} | "
-        f"{'GNN batch s':>11} | {'GNN ms/case':>11} | {'speedup':>8} | status",
+        f"{'GNN batch s':>11} | {'GNN ms/case':>11} | {'speedup':>8} | "
+        f"{'|V| MAE':>10} | {'ang MAE':>8} | status",
         flush=True,
     )
     for r in rows:
@@ -827,6 +899,7 @@ def run(
         status = str(gn.get("status", "n/a"))
         od_s = od.get("batch_time_s", float("nan"))
         gn_s = gn.get("batch_time_s", float("nan"))
+        mae = gn.get("mae") or {}
         try:
             sp = float(od_s) / float(gn_s) if float(gn_s) > 0 else float("nan")
         except Exception:
@@ -837,7 +910,9 @@ def run(
             f"{float(od.get('time_per_case_ms', float('nan'))):10.3f} | "
             f"{float(gn_s) if 'batch_time_s' in gn else float('nan'):11.3f} | "
             f"{float(gn.get('time_per_case_ms', float('nan'))):11.3f} | "
-            f"{sp:8.2f} | {status}",
+            f"{sp:8.2f} | "
+            f"{float(mae.get('mae_vmag_pu', float('nan'))):10.6f} | "
+            f"{float(mae.get('mae_angle_deg', float('nan'))):8.4f} | {status}",
             flush=True,
         )
     if max_gnn_batch is not None:
