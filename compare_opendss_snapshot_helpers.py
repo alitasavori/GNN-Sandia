@@ -265,19 +265,33 @@ def _profile_bind_csv(
     step_min: float,
     npts: int,
 ) -> Path:
-    """Return ``source_csv`` when ``mult`` matches col-2 of file; else write a temp CSV."""
+    """Return ``source_csv`` when ``mult`` matches col-2 of file; else write a temp CSV.
+
+    Coarser/finer grids than the native CSV (usually 288×5 min) always get a temp
+    file: OpenDSS loadshapes need exactly ``npts`` multipliers.
+    """
     import run_injection_dataset as inj
 
     fp = source_csv.expanduser().resolve()
     if not fp.is_file():
         raise FileNotFoundError(fp)
-    m_file = np.asarray(
-        inj.read_profile_csv_two_col_noheader(str(fp), npts=int(npts), debug=False),
+    m_use = np.asarray(mult[: int(npts)], dtype=np.float64).ravel()
+    if int(m_use.shape[0]) != int(npts):
+        raise ValueError(f"mult length {m_use.shape[0]} != npts={npts}")
+
+    # Read whatever the CSV actually contains (native grid), then compare only
+    # when lengths already match the requested display grid.
+    m_native = np.asarray(
+        inj.read_profile_csv_two_col_noheader(
+            str(fp), npts=10**9, debug=False, allow_shorter=True
+        ),
         dtype=np.float64,
-    )
-    m_use = np.asarray(mult[: int(npts)], dtype=np.float64)
-    if m_file.shape[0] == m_use.shape[0] and np.allclose(m_file, m_use, rtol=0.0, atol=1e-9):
+    ).ravel()
+    if m_native.shape[0] == m_use.shape[0] and np.allclose(
+        m_native, m_use, rtol=0.0, atol=1e-9
+    ):
         return fp
+
     fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".csv")
     os.close(fd)
     out = Path(tmp_name)

@@ -321,7 +321,7 @@ def resolve_csv_path(csv_token, dss_path):
 # ============================================================
 # Profile reader
 # ============================================================
-def read_profile_csv_two_col_noheader(csv_path, npts=NPTS, debug=False):
+def read_profile_csv_two_col_noheader(csv_path, npts=NPTS, debug=False, allow_shorter=False):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV path not found: {csv_path}")
 
@@ -340,6 +340,8 @@ def read_profile_csv_two_col_noheader(csv_path, npts=NPTS, debug=False):
 
     y = y[mask]
     if len(y) < npts:
+        if allow_shorter:
+            return y
         raise RuntimeError(f"CSV {csv_path} has only {len(y)} valid points < required {npts}")
     return y[:npts]
 
