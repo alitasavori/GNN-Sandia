@@ -31,16 +31,15 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-# Paper sweep: step_min must divide 60 (DailySimConfig). Coarse → fine.
+# Paper sweep: native 5-min profiles only (no upsample). Coarser = stride of real samples.
 RESOLUTIONS = (
-    # (step_min, npts) — 24h day
+    # (step_min, npts) — 24h day from 288×5 min CSV by exact decimation
     (60, 24),
     (30, 48),
     (20, 72),
     (15, 96),
     (10, 144),
     (5, 288),
-    (2, 720),
 )
 
 # Match plots/presentation palette

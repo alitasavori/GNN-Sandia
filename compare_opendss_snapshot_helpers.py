@@ -309,11 +309,10 @@ def _profile_mult_on_grid(
 ) -> np.ndarray:
     """Read a daily profile CSV and map it onto ``(npts, step_min)``.
 
-    Native training/driver CSVs are usually 288 rows at 5-min spacing. Coarser
-    OpenDSS / GNN grids use linear resampling over the 24 h day, not truncation.
+    Native CSVs are 288 rows at 5-min spacing. Coarser grids **decimate** those
+    real samples (stride); finer than native is refused (no interpolation/upsample).
     """
     import run_injection_dataset as inj
-    from nonunique_opendss_daily import resample_daily_profile
 
     fp = csv_path.expanduser().resolve()
     m_full = np.asarray(
@@ -321,17 +320,42 @@ def _profile_mult_on_grid(
             str(fp), npts=int(native_npts), debug=False, allow_shorter=True
         ),
         dtype=np.float64,
-    )
+    ).ravel()
     if m_full.size == 0:
         raise RuntimeError(f"Empty profile CSV: {fp}")
-    if int(npts) == int(m_full.shape[0]) and float(step_min) == float(native_step_min):
-        return m_full
-    return resample_daily_profile(
-        m_full,
-        npts=int(npts),
-        step_min=int(step_min),
-        native_npts=int(m_full.shape[0]),
-    )
+
+    n_native = int(m_full.shape[0])
+    step = float(step_min)
+    native_step = float(native_step_min)
+
+    if int(npts) == n_native and abs(step - native_step) < 1e-9:
+        return m_full.copy()
+
+    if step < native_step - 1e-9:
+        raise ValueError(
+            f"Refusing profile upsample: step_min={step:g} < native {native_step:g} min "
+            f"(CSV has {n_native} real points). Provide real finer-resolution data."
+        )
+
+    ratio = step / native_step
+    if abs(ratio - round(ratio)) > 1e-9:
+        raise ValueError(
+            f"step_min={step:g} must be an integer multiple of native {native_step:g} min "
+            f"(no interpolation)."
+        )
+    stride = int(round(ratio))
+    if stride < 1 or n_native % stride != 0:
+        raise ValueError(
+            f"Cannot decimate {n_native} native points with stride={stride} "
+            f"(step_min={step:g})."
+        )
+    out = m_full[::stride].copy()
+    if int(out.shape[0]) != int(npts):
+        raise ValueError(
+            f"Decimated profile length {out.shape[0]} != requested npts={npts} "
+            f"(step_min={step:g}, native={n_native}@{native_step:g}min)."
+        )
+    return out
 
 
 def prepare_parity_profiles(
