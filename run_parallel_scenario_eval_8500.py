@@ -217,11 +217,19 @@ def _prefer_multisample_cache(repo: Path, preferred: Path, *, want_n_feat: int |
     for root in _datasets_gnn2_roots(repo):
         for drel in dirs:
             folder = root / drel
-            if not folder.is_dir():
+            try:
+                folder_ok = folder.is_dir()
+            except OSError as e:
+                print(f"[parallel_eval] skip unreadable cache dir {folder}: {e}", flush=True)
+                continue
+            if not folder_ok:
                 continue
             for name in names:
                 cands.append(folder / name)
-            cands.extend(sorted(folder.glob("run_001*__full__*.pt")))
+            try:
+                cands.extend(sorted(folder.glob("run_001*__full__*.pt")))
+            except OSError as e:
+                print(f"[parallel_eval] skip glob in {folder}: {e}", flush=True)
         for rel in (
             "datasets_gnn2_from pc/run_001_scen_0000_0049_seed_20420233__full__nobess__regce__mauxb7bd1d58.pt",
             "datasets_gnn2_from pc/run_001_ref0_slim__full__nobess__regce__mauxb7bd1d58.pt",
@@ -234,11 +242,19 @@ def _prefer_multisample_cache(repo: Path, preferred: Path, *, want_n_feat: int |
     for raw in cands:
         try:
             p = raw.expanduser().resolve()
-        except Exception:
+        except OSError as e:
+            print(f"[parallel_eval] skip unresolvable cache cand {raw}: {e}", flush=True)
             continue
-        if p in seen or not p.is_file():
+        if p in seen:
             continue
         seen.add(p)
+        try:
+            if not p.is_file():
+                continue
+        except OSError as e:
+            # Common on Colab Shared-Drive FUSE: Errno 107 Transport endpoint is not connected
+            print(f"[parallel_eval] skip unreadable cache cand {p}: {e}", flush=True)
+            continue
         try:
             z = torch.load(p, map_location="cpu", weights_only=False)
             x = z.get("x")
@@ -252,10 +268,26 @@ def _prefer_multisample_cache(repo: Path, preferred: Path, *, want_n_feat: int |
                 best = p
                 if n_s >= 1000 and feat_ok == 1:
                     break
+        except OSError as e:
+            print(f"[parallel_eval] skip unreadable cache load {p}: {e}", flush=True)
+            continue
         except Exception:
             continue
     if best is None:
-        return preferred.resolve()
+        # Fall back to preferred if still readable; else raise a clear error.
+        try:
+            pref = preferred.expanduser().resolve()
+            if pref.is_file():
+                return pref
+        except OSError as e:
+            raise FileNotFoundError(
+                f"No usable DA-GPS cache pack found (Drive may be disconnected: {e}). "
+                "Remount Drive or set CACHE_PT_OVERRIDE to a local .pt under /content."
+            ) from e
+        raise FileNotFoundError(
+            f"No usable DA-GPS cache pack found near preferred={preferred}. "
+            "Remount Drive or set CACHE_PT_OVERRIDE."
+        )
     if best.resolve() != preferred.resolve():
         print(f"[parallel_eval] using cache pack {best} (score samples/feat={best_score})", flush=True)
     return best
