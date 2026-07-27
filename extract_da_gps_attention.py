@@ -595,7 +595,7 @@ def run_attention_extract(
     model.eval()
 
     x_row = x[si : si + 1]
-    x_n = ((x_row - x_mean) / x_std).to(dtype=torch.float32)
+    x_n = ((x_row - x_mean) / x_std).to(device=dev, dtype=torch.float32)
 
     data = Data(
         x=x_n.view(-1, x_n.size(-1)),
@@ -800,7 +800,7 @@ def eval_aux_per_device_on_cache_indices(
     for si in sample_indices:
         si = int(si)
         x_row = x[si : si + 1]
-        x_n = ((x_row - x_mean) / x_std).to(dtype=torch.float32)
+        x_n = ((x_row - x_mean) / x_std).to(device=dev, dtype=torch.float32)
         data = Data(
             x=x_n.view(-1, x_n.size(-1)),
             edge_index=edge_index.to(dev),
@@ -1114,7 +1114,7 @@ def eval_voltage_per_node_errors_on_cache_indices(
     for si in sample_indices:
         si = int(si)
         x_row = x[si : si + 1]
-        x_n = ((x_row - x_mean) / x_std).to(dtype=torch.float32)
+        x_n = ((x_row - x_mean) / x_std).to(device=dev, dtype=torch.float32)
         data = Data(
             x=x_n.view(-1, x_n.size(-1)),
             edge_index=edge_index.to(dev),

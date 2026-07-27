@@ -252,6 +252,50 @@ def main() -> None:
         if CACHE_PT_OVERRIDE.strip()
         else resolve_cache_pt(repo, "8500")
     )
+    # Guard: slim Method A packs have batch dim 1 — useless for paper aux averages.
+    if not CACHE_PT_OVERRIDE.strip():
+        try:
+            import torch
+            from nonunique_notebook_bootstrap import FEEDER_CACHE_DIRS, _datasets_gnn2_roots
+
+            _probe = torch.load(cache_pt, map_location="cpu", weights_only=False)
+            _n = int(_probe["x"].shape[0]) if isinstance(_probe, dict) and "x" in _probe else 0
+            del _probe
+            if _n <= 1:
+                drive_hits: list[Path] = []
+                for root in _datasets_gnn2_roots(repo):
+                    for drel in FEEDER_CACHE_DIRS.get("8500", ()):
+                        folder = root / drel
+                        if not folder.is_dir():
+                            continue
+                        for hit in folder.glob("run_001*__full__nobess__regce__maux*.pt"):
+                            if "slim" not in hit.name.lower():
+                                drive_hits.append(hit.resolve())
+                    # also flat under datasets_gnn2 roots
+                    for hit in root.glob("run_001*__full__nobess__regce__maux*.pt"):
+                        if "slim" not in hit.name.lower():
+                            drive_hits.append(hit.resolve())
+                # repo local full pack
+                for hit in (repo / "datasets_gnn2_from pc").glob(
+                    "run_001_scen_*__full__nobess__regce__maux*.pt"
+                ):
+                    if "slim" not in hit.name.lower():
+                        drive_hits.append(hit.resolve())
+                if drive_hits:
+                    cache_pt = sorted(drive_hits, key=lambda p: p.stat().st_size, reverse=True)[0]
+                    print(
+                        f"[aux_paper] preferred multi-sample cache over {_n}-row pack: {cache_pt}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[aux_paper] WARNING: cache has only {_n} sample(s): {cache_pt}. "
+                        "Set CACHE_PT_OVERRIDE to a full chunk "
+                        "run_001_scen_*__full__nobess__regce__maux*.pt for paper averages.",
+                        flush=True,
+                    )
+        except Exception as _cache_probe_err:  # noqa: BLE001
+            print(f"[aux_paper] cache probe skipped: {_cache_probe_err}", flush=True)
     ckpt = (
         Path(CKPT_OVERRIDE).expanduser().resolve()
         if CKPT_OVERRIDE.strip()

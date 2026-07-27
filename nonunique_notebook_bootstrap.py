@@ -13,7 +13,9 @@ DEFAULT_CHECKPOINT_SUBDIR = (
     "da_gps_chunked_l4_mvagg_gine_metaaux_regce_20260516_225149_CCE"
 )
 CACHE_CANDIDATES = (
+    # Prefer full chunk caches (many samples) over 1-row slim packs used for Method A timing.
     "datasets_gnn2_from pc/"
+    "run_001_scen_0000_0049_seed_20420233__full__nobess__regce__mauxb7bd1d58.pt",
     "run_001_scen_0000_0049_seed_20420233__full__nobess__regce__mauxb7bd1d58.pt",
     "datasets_gnn2_from pc/run_001_ref0_slim__full__nobess__regce__mauxb7bd1d58.pt",
 )
@@ -134,38 +136,59 @@ def _datasets_gnn2_roots(repo: Path) -> list[Path]:
 
 
 def resolve_cache_pt(repo: Path, feeder: str | None = "8500") -> Path:
+    """Resolve a DA-GPS tensor cache ``.pt``.
+
+    Prefers non-``slim`` packs (many samples) over 1-row Method A timing packs.
+    """
     key = normalize_feeder_key(feeder)
+    found: list[Path] = []
+
+    def _consider(p: Path) -> None:
+        try:
+            rp = p.expanduser().resolve()
+        except OSError:
+            return
+        if rp.is_file() and rp not in found:
+            found.append(rp)
+
     if key == "8500":
         for rel in CACHE_CANDIDATES:
-            p = (repo / rel).resolve()
-            if p.is_file():
-                return p
+            _consider(repo / rel)
     names = FEEDER_CACHE_PT_NAMES.get(key, ())
     dirs = FEEDER_CACHE_DIRS.get(key, ())
-    tried: list[Path] = []
     for root in _datasets_gnn2_roots(repo):
         for drel in dirs:
             for name in names:
-                p = (root / drel / name).resolve()
-                tried.append(p)
-                if p.is_file():
-                    return p
+                _consider(root / drel / name)
         for name in names:
-            p = (root / name).resolve()
-            tried.append(p)
-            if p.is_file():
-                return p
-            # Any matching run_001* under feeder cache dirs
+            _consider(root / name)
             for drel in dirs:
                 folder = root / drel
                 if folder.is_dir():
-                    hits = sorted(folder.glob("run_001*.pt"))
-                    if hits:
-                        return hits[0].resolve()
-    raise FileNotFoundError(
-        f"No DA-GPS cache .pt for feeder={key} under {repo} / Drive. "
-        f"Expected names {list(names)} in {list(dirs)}. Tried {len(tried)} paths."
-    )
+                    for hit in sorted(folder.glob("run_001*.pt")):
+                        _consider(hit)
+
+    if not found:
+        raise FileNotFoundError(
+            f"No DA-GPS cache .pt for feeder={key} under {repo} / Drive. "
+            f"Expected names {list(names)} in {list(dirs)}."
+        )
+
+    def _rank(p: Path) -> tuple[int, int, str]:
+        name = p.name.lower()
+        slim = 1 if "slim" in name else 0
+        # Prefer nobess+regce+maux packs aligned with CCE training when present.
+        pref = 0
+        if "regce" in name:
+            pref -= 2
+        if "maux" in name:
+            pref -= 1
+        if "nobess" in name:
+            pref -= 1
+        return (slim, pref, str(p))
+
+    found.sort(key=_rank)
+    return found[0]
 
 
 def resolve_feeder_run_dir(repo: Path, feeder: str, run_name: str | None = None) -> Path:
