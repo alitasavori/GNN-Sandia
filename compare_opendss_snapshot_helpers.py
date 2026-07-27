@@ -317,9 +317,13 @@ def _profile_mult_on_grid(
 
     fp = csv_path.expanduser().resolve()
     m_full = np.asarray(
-        inj.read_profile_csv_two_col_noheader(str(fp), npts=int(native_npts), debug=False),
+        inj.read_profile_csv_two_col_noheader(
+            str(fp), npts=int(native_npts), debug=False, allow_shorter=True
+        ),
         dtype=np.float64,
     )
+    if m_full.size == 0:
+        raise RuntimeError(f"Empty profile CSV: {fp}")
     if int(npts) == int(m_full.shape[0]) and float(step_min) == float(native_step_min):
         return m_full
     return resample_daily_profile(

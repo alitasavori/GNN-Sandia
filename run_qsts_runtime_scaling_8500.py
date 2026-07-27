@@ -174,13 +174,20 @@ def run_sweep(
 
     from nonunique_da_gps_daily_compare import run_da_gps_daily_compare_and_plot
     from nonunique_opendss_daily import DailySimConfig
-
+    import compare_opendss_snapshot_helpers as _parity_helpers
     import inspect
 
     if "skip_plots" not in inspect.signature(run_da_gps_daily_compare_and_plot).parameters:
         raise RuntimeError(
             "Stale nonunique_da_gps_daily_compare.py (missing skip_plots=). "
-            "Run: cd /content/GNN-Sandia && git pull"
+            "Run: cd /content/GNN-Sandia && git pull --ff-only"
+        )
+    _bind_src = inspect.getsource(_parity_helpers._profile_bind_csv)
+    if "allow_shorter" not in _bind_src:
+        raise RuntimeError(
+            "Stale compare_opendss_snapshot_helpers._profile_bind_csv "
+            "(cannot upsample 288→720). "
+            "Run: cd /content/GNN-Sandia && git fetch origin && git reset --hard origin/main"
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
