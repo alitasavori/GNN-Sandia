@@ -44,29 +44,31 @@ RESOLUTIONS = (
 def _plot_scaling(rows: list[dict], out_pdf: Path, out_png: Path) -> None:
     import matplotlib.pyplot as plt
 
-    # Aggregate by npts / device
+    # Aggregate by resolution (step_min) / device
     by_dev: dict[str, list[dict]] = {}
     for r in rows:
         by_dev.setdefault(str(r["device"]), []).append(r)
 
     fig, ax = plt.subplots(figsize=(7.2, 4.2))
     # OpenDSS is device-independent; take mean across devices if duplicated
-    od_by_n: dict[int, list[float]] = {}
+    od_by_res: dict[int, list[float]] = {}
     for r in rows:
-        od_by_n.setdefault(int(r["npts"]), []).append(float(r["opendss_ms_per_eval"]))
-    npts_sorted = sorted(od_by_n)
-    od_ms = [float(np.mean(od_by_n[n])) for n in npts_sorted]
-    ax.plot(npts_sorted, od_ms, "o-", label="OpenDSS CPU (warm daily)", linewidth=2)
+        od_by_res.setdefault(int(r["step_min"]), []).append(float(r["opendss_ms_per_eval"]))
+    res_sorted = sorted(od_by_res)  # ascending minutes; inverted below → 60 left, 5 right
+    od_ms = [float(np.mean(od_by_res[s])) for s in res_sorted]
+    ax.plot(res_sorted, od_ms, "o-", label="OpenDSS CPU (warm daily)", linewidth=2)
 
     for dev, rs in sorted(by_dev.items()):
-        rs = sorted(rs, key=lambda x: int(x["npts"]))
-        xs = [int(r["npts"]) for r in rs]
+        rs = sorted(rs, key=lambda x: int(x["step_min"]))
+        xs = [int(r["step_min"]) for r in rs]
         ys = [float(r["dagps_ms_per_eval"]) for r in rs]
         ax.plot(xs, ys, "s-", label=f"DA-GPS ({dev})", linewidth=2)
 
-    ax.set_xlabel("Daily evaluations (npts)")
+    ax.set_xlabel("Resolution (min)")
     ax.set_ylabel("Mean runtime per evaluation (ms)")
     ax.set_title("Warm-started QSTS runtime — IEEE 8500")
+    ax.set_xticks(res_sorted)
+    ax.invert_xaxis()  # finer resolution (smaller step) to the right
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
