@@ -49,8 +49,13 @@ from nonunique_notebook_bootstrap import (
 )
 from nonunique_opendss_daily import resolve_da_gps_device
 from run_da_gps_daily_opendss_compare import (
+    _infer_reg_nclasses_from_state_dict,
+    _resolve_da_gps_checkpoint,
     _resolve_default_edge_csv,
+    _resolve_reg_loss_mode,
     _state_dict_is_legacy_edgeattn,
+    _state_dict_per_device_cap,
+    _state_dict_per_device_reg,
 )
 from train_da_gps_multitask_complex_voltage import DAGPSModel as DAGPSModelEdgeAttn
 from train_da_gps_multitask_complex_voltage_gine import DAGPSModel as DAGPSModelGine
@@ -160,45 +165,140 @@ def _time_opendss_solves(
     }
 
 
-def _pick_state_dict(bundle: dict) -> dict:
-    for k in ("best_model_state_dict", "model_state_dict", "state_dict"):
-        sd = bundle.get(k)
-        if isinstance(sd, dict) and sd:
-            return sd
-    raise RuntimeError("checkpoint missing model state dict")
+def _infer_n_layers_from_state(state: dict) -> int | None:
+    idxs: set[int] = set()
+    for k in state:
+        if k.startswith("blocks."):
+            try:
+                idxs.add(int(k.split(".")[1]))
+            except Exception:
+                continue
+    return (max(idxs) + 1) if idxs else None
+
+
+def _align_x_to_n_feat(x: torch.Tensor, n_feat: int) -> torch.Tensor:
+    """Pad/truncate last dim so cache ``x`` matches checkpoint ``node_in`` width."""
+    cur = int(x.shape[-1])
+    if cur == n_feat:
+        return x
+    if cur > n_feat:
+        print(f"[parallel_eval] truncating cache x dim {cur} → {n_feat}", flush=True)
+        return x[..., :n_feat].contiguous()
+    print(
+        f"[parallel_eval] padding cache x dim {cur} → {n_feat} with zeros "
+        "(missing PE/static cols vs training)",
+        flush=True,
+    )
+    pad = torch.zeros(*x.shape[:-1], n_feat - cur, dtype=x.dtype)
+    return torch.cat([x, pad], dim=-1)
+
+
+def _align_edge_attr(edge_attr: torch.Tensor, edge_dim: int) -> torch.Tensor:
+    cur = int(edge_attr.shape[-1]) if edge_attr.numel() else 0
+    if cur == edge_dim:
+        return edge_attr
+    if cur > edge_dim:
+        print(f"[parallel_eval] truncating edge_attr dim {cur} → {edge_dim}", flush=True)
+        return edge_attr[..., :edge_dim].contiguous()
+    if edge_attr.numel() == 0:
+        return torch.zeros((0, edge_dim), dtype=torch.float32)
+    print(f"[parallel_eval] padding edge_attr dim {cur} → {edge_dim}", flush=True)
+    pad = torch.zeros(edge_attr.shape[0], edge_dim - cur, dtype=edge_attr.dtype)
+    return torch.cat([edge_attr, pad], dim=-1)
+
+
+def _prefer_multisample_cache(repo: Path, preferred: Path, *, want_n_feat: int | None) -> Path:
+    """Prefer a multi-sample pack matching training feature width over slim ref0 packs."""
+    cands: list[Path] = [preferred]
+    from nonunique_notebook_bootstrap import FEEDER_CACHE_DIRS, FEEDER_CACHE_PT_NAMES, _datasets_gnn2_roots
+
+    names = FEEDER_CACHE_PT_NAMES.get("8500", ())
+    dirs = FEEDER_CACHE_DIRS.get("8500", ())
+    for root in _datasets_gnn2_roots(repo):
+        for drel in dirs:
+            folder = root / drel
+            if not folder.is_dir():
+                continue
+            for name in names:
+                cands.append(folder / name)
+            cands.extend(sorted(folder.glob("run_001*__full__*.pt")))
+        for rel in (
+            "datasets_gnn2_from pc/run_001_scen_0000_0049_seed_20420233__full__nobess__regce__mauxb7bd1d58.pt",
+            "datasets_gnn2_from pc/run_001_ref0_slim__full__nobess__regce__mauxb7bd1d58.pt",
+        ):
+            cands.append(repo / rel)
+
+    best: Path | None = None
+    best_score = (-1, -1)  # (n_samples, feat_match)
+    seen: set[Path] = set()
+    for raw in cands:
+        try:
+            p = raw.expanduser().resolve()
+        except Exception:
+            continue
+        if p in seen or not p.is_file():
+            continue
+        seen.add(p)
+        try:
+            z = torch.load(p, map_location="cpu", weights_only=False)
+            x = z.get("x")
+            if not torch.is_tensor(x) or x.ndim != 3:
+                continue
+            n_s, _n, f = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+            feat_ok = 1 if (want_n_feat is None or f == int(want_n_feat)) else 0
+            score = (n_s, feat_ok)
+            if score > best_score:
+                best_score = score
+                best = p
+                if n_s >= 1000 and feat_ok == 1:
+                    break
+        except Exception:
+            continue
+    if best is None:
+        return preferred.resolve()
+    if best.resolve() != preferred.resolve():
+        print(f"[parallel_eval] using cache pack {best} (score samples/feat={best_score})", flush=True)
+    return best
 
 
 def _build_model_from_checkpoint(
     *,
     ckpt_path: Path,
+    run_dir: Path,
     cache: dict,
     edge_index: torch.Tensor,
     edge_attr: torch.Tensor,
     device: torch.device,
+    x_mean: torch.Tensor,
 ):
-    bundle = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if not isinstance(bundle, dict):
-        raise RuntimeError(f"unexpected checkpoint type: {type(bundle)}")
-    state = _pick_state_dict(bundle)
+    """Rebuild DAGPSModel using the same metadata path as Method A daily compare."""
+    bundle, state = _resolve_da_gps_checkpoint(ckpt_path, run_dir, run_dir)
     hp = bundle.get("hyperparameters") or {}
     if not isinstance(hp, dict):
         hp = {}
 
     x0 = cache["x"]
     N = int(x0.shape[1])
-    n_feat = int(x0.shape[2])
-    n_layers = int(hp.get("layers", hp.get("n_layers", 4)))
-    hidden = int(hp.get("hidden", 128))
-    heads = int(hp.get("heads", 4))
-    node_emb_dim = int(hp.get("node_emb_dim", 2))
-    edge_emb_dim = int(hp.get("edge_emb_dim", 4))
-    n_cap = int(hp.get("n_cap", bundle.get("n_cap", 10)) or 10)
-    n_reg = int(hp.get("n_reg", bundle.get("n_reg", 12)) or 12)
-    n_sys = int(hp.get("n_system", bundle.get("n_system", 4)) or 4)
-    n_pv_aux = int(hp.get("n_pv_aux", bundle.get("n_pv_aux", 0)) or 0)
-    per_node_heads = bool(hp.get("per_node_heads", True))
-    per_device_cap_head = bool(hp.get("per_device_cap_head", True))
-    per_device_reg_head = bool(hp.get("per_device_reg_head", True))
+
+    # Prefer authoritative fields from checkpoint bundle / state_dict (not silent defaults).
+    n_cap = int(bundle["n_cap"])
+    n_reg = int(bundle["n_reg"])
+    n_sys = int(bundle.get("n_system_tokens", bundle.get("n_system", hp.get("n_system", 4))))
+    hidden = int(bundle.get("hidden", hp.get("hidden", 128)))
+    n_layers = int(bundle.get("layers", hp.get("layers", 4)))
+    inferred_L = _infer_n_layers_from_state(state)
+    if inferred_L is not None and inferred_L != n_layers:
+        print(f"[parallel_eval] layers from state_dict blocks={inferred_L} (meta had {n_layers})", flush=True)
+        n_layers = inferred_L
+    heads = int(bundle.get("heads", hp.get("heads", 4)))
+    node_emb_dim = int(bundle.get("node_emb_dim", hp.get("node_emb_dim", 0)) or 0)
+    edge_emb_dim = int(bundle.get("edge_emb_dim", hp.get("edge_emb_dim", 0)) or 0)
+    n_pv_aux = int(bundle.get("n_pv_aux", 0) or 0)
+    per_node_heads = bool(bundle.get("per_node_heads", False)) or (
+        "volt_W" in state and state["volt_W"] is not None
+    )
+    per_device_cap_head = bool(bundle.get("per_device_cap_head", False)) or _state_dict_per_device_cap(state)
+    per_device_reg_head = bool(bundle.get("per_device_reg_head", False)) or _state_dict_per_device_reg(state)
     dropout = float(hp.get("dropout", 0.1))
     if bool(hp.get("disable_dropout", False)):
         dropout = 0.0
@@ -206,9 +306,39 @@ def _build_model_from_checkpoint(
     global_attn_mode = str(bundle.get("global_attn_mode", "tokens") or "tokens").strip().lower()
     if global_attn_mode not in ("tokens", "full_node"):
         global_attn_mode = "tokens"
-    reg_loss_mode = str(bundle.get("reg_loss_mode", hp.get("reg_loss_mode", "ce")) or "ce").lower()
+    reg_loss_mode = _resolve_reg_loss_mode(bundle, state)
     reg_nclasses = bundle.get("reg_nclasses")
+    if not (isinstance(reg_nclasses, (list, tuple)) and len(reg_nclasses) == n_reg):
+        reg_nclasses = _infer_reg_nclasses_from_state_dict(state, n_reg)
     use_legacy = _state_dict_is_legacy_edgeattn(state) and model_type != "mlp"
+
+    # Feature / edge widths from weights (authoritative).
+    w_in = state.get("node_in.0.weight")
+    n_feat = int(w_in.shape[1]) if torch.is_tensor(w_in) else int(x_mean.reshape(-1).numel())
+    w_e = state.get("blocks.0.mpnn.conv.lin.weight")
+    if torch.is_tensor(w_e) and w_e.ndim == 2:
+        edge_dim = int(w_e.shape[1])
+    else:
+        edge_dim = int(edge_attr.shape[1]) if edge_attr.numel() else 2
+    edge_attr = _align_edge_attr(edge_attr.float(), edge_dim)
+
+    # Infer hidden / node_emb from weights if meta missing or inconsistent.
+    if torch.is_tensor(w_in):
+        hidden = int(w_in.shape[0])
+    ne = state.get("node_emb.weight")
+    if torch.is_tensor(ne) and ne.ndim == 2:
+        node_emb_dim = int(ne.shape[1])
+    tl = state.get("token_latent")
+    if torch.is_tensor(tl) and tl.ndim == 2:
+        n_sys = int(tl.shape[0])
+        hidden = int(tl.shape[1])
+
+    print(
+        f"[parallel_eval] arch L={n_layers} h={hidden} n_feat={n_feat} edge_dim={edge_dim} "
+        f"node_emb={node_emb_dim} n_sys={n_sys} per_node_heads={per_node_heads} "
+        f"global_attn={global_attn_mode} reg_loss={reg_loss_mode}",
+        flush=True,
+    )
 
     if model_type == "mlp":
         model = PlainNodeMLP(
@@ -236,7 +366,7 @@ def _build_model_from_checkpoint(
             node_in_dim=n_feat,
             node_emb_dim=node_emb_dim,
             edge_emb_dim=edge_emb_dim,
-            edge_dim=int(edge_attr.shape[1]),
+            edge_dim=edge_dim,
             dropout=dropout,
             gradient_checkpointing=False,
             per_node_heads=per_node_heads,
@@ -256,7 +386,7 @@ def _build_model_from_checkpoint(
             node_in_dim=n_feat,
             node_emb_dim=node_emb_dim,
             edge_emb_dim=edge_emb_dim,
-            edge_dim=int(edge_attr.shape[1]),
+            edge_dim=edge_dim,
             dropout=dropout,
             gradient_checkpointing=False,
             per_node_heads=per_node_heads,
@@ -270,16 +400,16 @@ def _build_model_from_checkpoint(
     model.eval()
     model = maybe_torch_compile(model, label="parallel_eval", device=device)
     model.to(device)
-    return model, bundle, N, n_feat
+    return model, bundle, N, n_feat, edge_attr
 
 
 def _normalize_x(x: torch.Tensor, x_mean: torch.Tensor, x_std: torch.Tensor) -> torch.Tensor:
-    # Match daily / training: z-score continuous leading dims present in both.
+    """Z-score using training norms; lengths already aligned to ``n_feat``."""
     out = x.clone()
-    d = min(int(out.shape[-1]), int(x_mean.numel()), int(x_std.numel()))
-    mean = x_mean.reshape(-1)[:d]
-    std = torch.clamp(x_std.reshape(-1)[:d], min=1e-6)
-    out[..., :d] = (out[..., :d] - mean) / std
+    mean = x_mean.reshape(-1)
+    std = torch.clamp(x_std.reshape(-1), min=1e-6)
+    d = min(int(out.shape[-1]), int(mean.numel()), int(std.numel()))
+    out[..., :d] = (out[..., :d] - mean[:d]) / std[:d]
     return out
 
 
@@ -410,6 +540,19 @@ def run(
     ckpt = resolve_feeder_checkpoint(run_dir)
     print(f"[parallel_eval] device={device_t} run_dir={run_dir}", flush=True)
     print(f"[parallel_eval] checkpoint={ckpt}", flush=True)
+
+    # Peek wanted feature width from checkpoint weights before choosing a cache pack.
+    want_n_feat: int | None = None
+    try:
+        peek = torch.load(ckpt, map_location="cpu", weights_only=False)
+        sd = peek.get("best_model_state_dict") or peek.get("model_state_dict") or {}
+        w_in = sd.get("node_in.0.weight") if isinstance(sd, dict) else None
+        if torch.is_tensor(w_in):
+            want_n_feat = int(w_in.shape[1])
+    except Exception:
+        want_n_feat = None
+
+    cache_pt = _prefer_multisample_cache(repo, cache_pt, want_n_feat=want_n_feat)
     print(f"[parallel_eval] cache_pt={cache_pt}", flush=True)
 
     cache = torch.load(cache_pt, map_location="cpu", weights_only=False)
@@ -418,6 +561,12 @@ def run(
     x_all = cache["x"].float()
     n_avail = int(x_all.shape[0])
     node_to_local = cache.get("node_to_local") or {}
+    if n_avail < 2:
+        print(
+            f"[parallel_eval] WARNING: cache has only {n_avail} sample(s); "
+            "GNN batching will resample with replacement. Prefer a full run_001* pack.",
+            flush=True,
+        )
 
     # Edges / model
     report = {}
@@ -430,27 +579,44 @@ def run(
     edge_csv = _resolve_default_edge_csv(report, hp, cache_pt)
     edge_index, edge_attr = _load_compacted_edges(edge_csv, node_to_local)
     edge_index = edge_index.to(device_t)
-    edge_attr = edge_attr.float().to(device_t)
+    edge_attr = edge_attr.float()
 
-    x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=False).float()
-    x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=False).float()
+    x_mean = torch.load(run_dir / "x_mean.pt", map_location="cpu", weights_only=False).float().reshape(-1)
+    x_std = torch.load(run_dir / "x_std.pt", map_location="cpu", weights_only=False).float().reshape(-1)
 
     model = None
+    n_feat = int(x_all.shape[-1])
     if not skip_gnn:
-        model, bundle, N, n_feat = _build_model_from_checkpoint(
+        model, bundle, N, n_feat, edge_attr = _build_model_from_checkpoint(
             ckpt_path=ckpt,
+            run_dir=run_dir,
             cache=cache,
             edge_index=edge_index.cpu(),
             edge_attr=edge_attr.cpu(),
             device=device_t,
+            x_mean=x_mean,
         )
+        edge_attr = edge_attr.to(device_t)
+        x_all = _align_x_to_n_feat(x_all, n_feat)
+        if int(x_mean.numel()) != n_feat:
+            print(
+                f"[parallel_eval] aligning x_mean/std length {int(x_mean.numel())} → {n_feat}",
+                flush=True,
+            )
+            if int(x_mean.numel()) < n_feat:
+                x_mean = torch.cat([x_mean, torch.zeros(n_feat - int(x_mean.numel()))])
+                x_std = torch.cat([x_std, torch.ones(n_feat - int(x_std.numel()))])
+            else:
+                x_mean = x_mean[:n_feat]
+                x_std = x_std[:n_feat]
         print(
-            f"[parallel_eval] GNN ready: N={N} n_feat={n_feat} "
+            f"[parallel_eval] GNN ready: N={N} n_feat={n_feat} n_cache_samples={n_avail} "
             f"model_type={bundle.get('model_type', 'gine')}",
             flush=True,
         )
         x_norm = _normalize_x(x_all, x_mean, x_std)
     else:
+        edge_attr = edge_attr.to(device_t)
         x_norm = x_all
 
     # OpenDSS setup
