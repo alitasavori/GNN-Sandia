@@ -537,9 +537,11 @@ def build_fair_timing_summary(
         },
         "speedup": {
             "true_speedup": pipeline["true_speedup"],
-            "true_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
+            "true_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
             "full_dss_speedup": pipeline["full_dss_speedup"],
             "full_dss_speedup_basis": "dss_apply_plus_solve_plus_collect_ms / gnn_feature_plus_forward_ms",
+            "apply_solve_speedup": pipeline["apply_solve_speedup"],
+            "apply_solve_speedup_basis": "dss_apply_plus_solve_ms / gnn_feature_plus_forward_ms",
             "deploy_speedup": pipeline["deploy_speedup"],
             "deploy_speedup_basis": "dss_apply_plus_solve_ms / (dss_apply_ms + gnn_feature_plus_forward_ms)",
             "net_speedup": pipeline["net_speedup"],
@@ -751,6 +753,7 @@ def _da_gps_compare_summary(
         "speedup": {
             "true_speedup": pipeline["true_speedup"],
             "full_dss_speedup": pipeline["full_dss_speedup"],
+            "apply_solve_speedup": pipeline["apply_solve_speedup"],
             "deploy_speedup": pipeline["deploy_speedup"],
             "net_speedup": pipeline["net_speedup"],
         },
@@ -775,6 +778,7 @@ def run_da_gps_daily_compare_and_plot(
     scenario_scale: float = 1.0,
     daily_stress: float = 0.0,
     device: str | None = None,
+    skip_plots: bool = False,
 ) -> dict[str, Any]:
     """Compare DA-GPS GNN voltages vs OpenDSS native daily march truth.
 
@@ -782,12 +786,14 @@ def run_da_gps_daily_compare_and_plot(
     ``MONITOR_CANDIDATES`` monitor nodes (same stacked-voltage / per-device suite as
     cells 0/1 via ``nonunique_plots.plot_all``). Set ``plot_all_cache_nodes=True`` to
     also run inference on all cache∩circuit nodes (full-node MAE printed; voltage plots
-    remain monitor-only).
+    remain monitor-only). Set ``skip_plots=True`` for timing-only sweeps (no ``plot_all``).
     """
     cfg = cfg or DailySimConfig()
     load_csv = Path(load_profile_path or cfg.da_gps_load_profile).resolve()
     irr_csv = Path(pv_profile_path or cfg.da_gps_pv_profile).resolve()
     out_path = Path(out_dir).resolve() if out_dir is not None else None
+    if out_path is not None:
+        out_path.mkdir(parents=True, exist_ok=True)
 
     inline_backend = plt.get_backend()
     cache_nodes = load_cache_node_order(cfg.da_gps_cache_pt)
@@ -884,21 +890,36 @@ def run_da_gps_daily_compare_and_plot(
                 flush=True,
             )
 
-    dss_run = _build_opendss_run_for_plots(cfg, dss, monitor_nodes, collect_nodes)
-    runs = [dss_run]
-    style_lut = {lbl: (ls, lbl) for lbl, ls in DAILY_COMPARE_STYLE}
+    if skip_plots:
+        print("[da_gps_daily_compare] skip_plots=True: timing/MAE only (no plot_all)", flush=True)
+        n_voltage_figures = 0
+        n_reg_figures = 0
+        n_cap_figures = 0
+        n_control_iter_figures = 0
+        n_pf_iter_figures = 0
+    else:
+        dss_run = _build_opendss_run_for_plots(cfg, dss, monitor_nodes, collect_nodes)
+        runs = [dss_run]
+        style_lut = {lbl: (ls, lbl) for lbl, ls in DAILY_COMPARE_STYLE}
 
-    plot_all(
-        cfg,
-        runs,
-        style_lut,
-        da_gps_voltages=gnn_voltages,
-        da_gps_reg_by_name=gnn_reg,
-        da_gps_cap_by_name=gnn_cap,
-        da_gps_hours=gnn["hours"],
-        voltage_suptitle="OpenDSS native daily QSTS vs DA-GPS (monitor |V|)",
-        show=show,
-    )
+        plot_all(
+            cfg,
+            runs,
+            style_lut,
+            da_gps_voltages=gnn_voltages,
+            da_gps_reg_by_name=gnn_reg,
+            da_gps_cap_by_name=gnn_cap,
+            da_gps_hours=gnn["hours"],
+            voltage_suptitle="OpenDSS native daily QSTS vs DA-GPS (monitor |V|)",
+            show=show,
+        )
+        n_reg = len(dss["reg_names"])
+        n_cap = len(dss["cap_names"])
+        n_voltage_figures = 1
+        n_reg_figures = n_reg
+        n_cap_figures = n_cap
+        n_control_iter_figures = 1
+        n_pf_iter_figures = 1
 
     print(
         f"\n[da_gps_daily_compare] OpenDSS daily truth: "
@@ -906,14 +927,6 @@ def run_da_gps_daily_compare_and_plot(
         f"{_final_devices_one_liner(dss['reg_names'], dss['cap_names'], dss['reg_tap'], dss['cap_on'])}",
         flush=True,
     )
-
-    n_reg = len(dss["reg_names"])
-    n_cap = len(dss["cap_names"])
-    n_voltage_figures = 1
-    n_reg_figures = n_reg
-    n_cap_figures = n_cap
-    n_control_iter_figures = 1
-    n_pf_iter_figures = 1
 
     n_ok = int(dss["converged"].sum())
     print_timing_summary(

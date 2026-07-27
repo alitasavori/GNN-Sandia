@@ -211,18 +211,29 @@ def run_sweep(
                     f"(step_min={step_min})"
                 )
 
-            summ = run_da_gps_daily_compare_and_plot(
-                cfg,
-                show=bool(show_plots),
-                plot_all_cache_nodes=False,
-                out_dir=out_dir / f"detail_{device}_step{step_min}_npts{npts}",
-                load_profile_path=load_profile,
-                pv_profile_path=irr_profile,
-                ref_sample_index=0,
-                scenario_scale=1.0,
-                daily_stress=0.0,
-                device=device,
-            )
+            try:
+                summ = run_da_gps_daily_compare_and_plot(
+                    cfg,
+                    show=False,
+                    plot_all_cache_nodes=False,
+                    skip_plots=True,
+                    out_dir=out_dir / f"detail_{device}_step{step_min}_npts{npts}",
+                    load_profile_path=load_profile,
+                    pv_profile_path=irr_profile,
+                    ref_sample_index=0,
+                    scenario_scale=1.0,
+                    daily_stress=0.0,
+                    device=device,
+                )
+            except Exception:
+                import traceback
+
+                print(
+                    f"[qsts_runtime] FAILED device={device} step_min={step_min} npts={npts}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                raise
             tms = summ.get("timing_ms_per_ok_step") or {}
             od_ms = float(tms.get("dss_solve_ms", float("nan")))
             # Prefer forward-only; fall back to feature+forward then wall/npts
@@ -275,7 +286,10 @@ def run_sweep(
         "created_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     jp = out_dir / "qsts_runtime_scaling_8500.json"
-    jp.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    jp.write_text(
+        json.dumps(summary, indent=2, allow_nan=True, default=str),
+        encoding="utf-8",
+    )
 
     # CSV
     csv_path = out_dir / "qsts_runtime_scaling_8500.csv"
