@@ -511,6 +511,20 @@ def _time_gnn_batched(
     n = int(sample_idx.shape[0])
     mb = max(1, int(microbatch))
 
+    # One diagnostic batch: prove we run a true multi-graph forward (not B× serial).
+    xs0 = [x_norm[int(i)] for i in sample_idx[:mb]]
+    b0 = _make_batch(xs0, edge_index, edge_attr, device)
+    n_graphs = int(getattr(b0, "num_graphs", 0) or 0)
+    n_nodes_batch = int(b0.x.shape[0])
+    print(
+        f"  [gnn_batch_check] num_graphs={n_graphs}  nodes_in_batch={n_nodes_batch}  "
+        f"(expect graphs={mb}, nodes≈{mb * int(x_norm.shape[1])})",
+        flush=True,
+    )
+    if n_graphs != mb:
+        raise RuntimeError(f"Batch collapse? num_graphs={n_graphs} != microbatch={mb}")
+    del b0
+
     def _one_pass() -> float:
         t_sum = 0.0
         for s in range(0, n, mb):
@@ -523,8 +537,6 @@ def _time_gnn_batched(
             sync_inference_device(device)
             t_sum += time.perf_counter() - t0
             del batch
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
         return t_sum
 
     # Warmup
@@ -540,6 +552,8 @@ def _time_gnn_batched(
         "time_per_case_ms": 1000.0 * batch_s / max(n, 1),
         "microbatch": mb,
         "n_microbatches": int(math.ceil(n / mb)),
+        "n_graphs_per_forward": n_graphs,
+        "n_nodes_per_forward": n_nodes_batch,
         "repeats": repeats,
         "rep_batch_times_s": totals,
     }
