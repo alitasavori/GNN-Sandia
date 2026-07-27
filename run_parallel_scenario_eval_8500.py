@@ -262,7 +262,8 @@ def _prefer_multisample_cache(repo: Path, preferred: Path, *, want_n_feat: int |
                 continue
             n_s, _n, f = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
             feat_ok = 1 if (want_n_feat is None or f == int(want_n_feat)) else 0
-            score = (n_s, feat_ok)
+            # Feature-width match must dominate sample count (wrong-width packs are truncated).
+            score = (feat_ok, n_s)
             if score > best_score:
                 best_score = score
                 best = p
@@ -345,30 +346,56 @@ def _build_model_from_checkpoint(
     use_legacy = _state_dict_is_legacy_edgeattn(state) and model_type != "mlp"
 
     # Feature / edge widths from weights (authoritative).
-    w_in = state.get("node_in.0.weight")
-    n_feat = int(w_in.shape[1]) if torch.is_tensor(w_in) else int(x_mean.reshape(-1).numel())
-    w_e = state.get("blocks.0.mpnn.conv.lin.weight")
-    if torch.is_tensor(w_e) and w_e.ndim == 2:
-        edge_dim = int(w_e.shape[1])
-    else:
-        edge_dim = int(edge_attr.shape[1]) if edge_attr.numel() else 2
-    edge_attr = _align_edge_attr(edge_attr.float(), edge_dim)
-
-    # Infer hidden / node_emb from weights if meta missing or inconsistent.
-    if torch.is_tensor(w_in):
-        hidden = int(w_in.shape[0])
+    # node_in.0 is Linear(node_in_dim + node_emb_dim → hidden); do NOT treat shape[1] as n_feat alone.
     ne = state.get("node_emb.weight")
     if torch.is_tensor(ne) and ne.ndim == 2:
         node_emb_dim = int(ne.shape[1])
+    elif "node_emb.weight" not in state:
+        node_emb_dim = 0
+
+    w_in = state.get("node_in.0.weight")
+    if torch.is_tensor(w_in):
+        hidden = int(w_in.shape[0])
+        in_combined = int(w_in.shape[1])
+        n_feat = in_combined - int(node_emb_dim)
+        if n_feat <= 0:
+            raise RuntimeError(
+                f"Invalid node_in width={in_combined} with node_emb_dim={node_emb_dim}"
+            )
+    else:
+        n_feat = int(x_mean.reshape(-1).numel())
+
+    # Edge CSV width is the physical edge_dim; edge_emb is concatenated inside the model.
+    ee = state.get("edge_emb.weight")
+    if torch.is_tensor(ee) and ee.ndim == 2:
+        edge_emb_dim = int(ee.shape[1])
+    elif "edge_emb.weight" not in state:
+        edge_emb_dim = 0
+    edge_dim = int(edge_attr.shape[1]) if edge_attr.numel() else 2
+    edge_attr = _align_edge_attr(edge_attr.float(), edge_dim)
+
+    # token_latent rows = n_cap + n_reg + n_system (not n_system alone).
     tl = state.get("token_latent")
     if torch.is_tensor(tl) and tl.ndim == 2:
-        n_sys = int(tl.shape[0])
         hidden = int(tl.shape[1])
+        g_tok = int(tl.shape[0])
+        inferred_sys = g_tok - int(n_cap) - int(n_reg)
+        if inferred_sys < 0:
+            raise RuntimeError(
+                f"token_latent rows={g_tok} < n_cap+n_reg={n_cap + n_reg}"
+            )
+        if inferred_sys != n_sys:
+            print(
+                f"[parallel_eval] n_system from token_latent={inferred_sys} "
+                f"(meta had {n_sys}; g_tokens={g_tok}=cap{n_cap}+reg{n_reg}+sys)",
+                flush=True,
+            )
+        n_sys = inferred_sys
 
     print(
         f"[parallel_eval] arch L={n_layers} h={hidden} n_feat={n_feat} edge_dim={edge_dim} "
-        f"node_emb={node_emb_dim} n_sys={n_sys} per_node_heads={per_node_heads} "
-        f"global_attn={global_attn_mode} reg_loss={reg_loss_mode}",
+        f"node_emb={node_emb_dim} n_sys={n_sys} g_tokens={n_cap + n_reg + n_sys} "
+        f"per_node_heads={per_node_heads} global_attn={global_attn_mode} reg_loss={reg_loss_mode}",
         flush=True,
     )
 
@@ -573,14 +600,27 @@ def run(
     print(f"[parallel_eval] device={device_t} run_dir={run_dir}", flush=True)
     print(f"[parallel_eval] checkpoint={ckpt}", flush=True)
 
-    # Peek wanted feature width from checkpoint weights before choosing a cache pack.
+    # Peek raw feature width from x_mean.pt (matches training cache); fall back to weight math.
     want_n_feat: int | None = None
     try:
-        peek = torch.load(ckpt, map_location="cpu", weights_only=False)
-        sd = peek.get("best_model_state_dict") or peek.get("model_state_dict") or {}
-        w_in = sd.get("node_in.0.weight") if isinstance(sd, dict) else None
-        if torch.is_tensor(w_in):
-            want_n_feat = int(w_in.shape[1])
+        xm = run_dir / "x_mean.pt"
+        if xm.is_file():
+            want_n_feat = int(
+                torch.load(xm, map_location="cpu", weights_only=False).reshape(-1).numel()
+            )
+        else:
+            peek = torch.load(ckpt, map_location="cpu", weights_only=False)
+            sd = peek.get("best_model_state_dict") or peek.get("model_state_dict") or {}
+            if isinstance(sd, dict):
+                emb_d = 0
+                ne = sd.get("node_emb.weight")
+                if torch.is_tensor(ne) and ne.ndim == 2:
+                    emb_d = int(ne.shape[1])
+                w_in = sd.get("node_in.0.weight")
+                if torch.is_tensor(w_in):
+                    want_n_feat = int(w_in.shape[1]) - emb_d
+                    if want_n_feat <= 0:
+                        want_n_feat = None
     except Exception:
         want_n_feat = None
 
