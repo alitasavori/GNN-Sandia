@@ -1,16 +1,15 @@
-"""Parallel scenario evaluation on IEEE 8500: OpenDSS Solve() vs DA-GPS batched GPU forward.
+"""Parallel scenario evaluation on IEEE 8500: OpenDSS Solve() vs DA-GPS batched forward.
 
 Times independent operating points (Monte Carlo / hosting-capacity style):
-  - OpenDSS CPU: sequential independent ``Solve()`` only (apply excluded from timed window
-    is optional; by default we time Solve-only after apply, matching Method A paper line).
-  - DA-GPS GPU: batched ``model(Batch)`` forward; micro-batches if full batch OOMs.
-    Per-case time = total forward wall / N.
+  - OpenDSS: sequential independent ``Solve()`` only — always CPU.
+  - DA-GPS: one forward per batch size B in ``--batch-sizes`` (CUDA or CPU).
+    On CUDA/host OOM, that B is marked OOM and larger B's are skipped for GNN
+    (OpenDSS continues). Per-case time = batch wall / B.
 
 Example:
-  python -u run_parallel_scenario_eval_8500.py \\
-    --run-dir .../da_gps_chunked_l4_mvagg_gine_metaaux_regce_20260516_225149_CCE \\
-    --cache-pt .../run_001_ref0_slim__full__nobess__regce__mauxb7bd1d58.pt \\
-    --batch-sizes 1000,2000,5000 --repeats 3 --device cuda
+  python -u run_parallel_scenario_eval_8500.py \
+    --run-dir .../da_gps_chunked_l4_mvagg_gine_metaaux_regce_20260516_225149_CCE \
+    --batch-sizes 8,16,32,64,128,256,512 --repeats 3 --device cuda
 """
 
 from __future__ import annotations
@@ -546,39 +545,13 @@ def _time_gnn_batched(
     }
 
 
-def _auto_microbatch(
-    *,
-    model,
-    x_norm: torch.Tensor,
-    edge_index: torch.Tensor,
-    edge_attr: torch.Tensor,
-    device: torch.device,
-    want: int,
-    candidates: list[int],
-) -> int:
-    if device.type != "cuda":
-        return min(want, 8)
-    probe = x_norm[:1].detach()
-    for mb in sorted(set(candidates), reverse=True):
-        mb = int(mb)
-        if mb < 1:
-            continue
-        try:
-            xs = [probe[0] for _ in range(mb)]
-            batch = _make_batch(xs, edge_index, edge_attr, device)
-            sync_inference_device(device)
-            _ = model(batch)
-            sync_inference_device(device)
-            del batch
-            torch.cuda.empty_cache()
-            return mb
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            continue
-    return 1
+def _is_oom_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda out of memory" in msg
+        or isinstance(exc, MemoryError)
+    )
 
 
 def run(
@@ -589,13 +562,13 @@ def run(
     batch_sizes: list[int],
     repeats: int,
     device: str,
-    microbatch: int,
     seed: int,
     load_profile: Path | None,
     irr_profile: Path | None,
     out_dir: Path,
     skip_opendss: bool,
     skip_gnn: bool,
+    stop_on_oom: bool = True,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     dev_s = resolve_da_gps_device(device)
@@ -712,12 +685,14 @@ def run(
 
     rows: list[dict] = []
     rng = np.random.default_rng(seed)
+    gnn_oom_stop = False
+    max_gnn_batch: int | None = None
 
     for n in batch_sizes:
         n = int(n)
         if n > n_avail and not skip_gnn:
             print(
-                f"[parallel_eval] WARNING: requested N={n} > cache samples={n_avail}; "
+                f"[parallel_eval] WARNING: requested batch={n} > cache samples={n_avail}; "
                 "sampling with replacement for GNN indices.",
                 flush=True,
             )
@@ -729,7 +704,11 @@ def run(
             irr = rng.uniform(0.0, 1.0, size=n).astype(np.float64)
 
         print("=" * 72, flush=True)
-        print(f"[parallel_eval] N={n} repeats={repeats}", flush=True)
+        print(
+            f"[parallel_eval] batch_size={n}  (OpenDSS: {n} sequential Solve; "
+            f"DA-GPS: one forward of {n})  repeats={repeats}  device={device_t}",
+            flush=True,
+        )
 
         od = None
         if not skip_opendss:
@@ -747,7 +726,7 @@ def run(
                 warmup=3,
             )
             print(
-                f"  OpenDSS Solve: batch={od['batch_time_s']:.3f}s  "
+                f"  OpenDSS Solve (CPU): batch={od['batch_time_s']:.3f}s  "
                 f"per_case={od['time_per_case_ms']:.3f} ms",
                 flush=True,
             )
@@ -755,38 +734,65 @@ def run(
         gn = None
         if not skip_gnn:
             assert model is not None
-            mb = int(microbatch)
-            if mb <= 0:
-                mb = _auto_microbatch(
-                    model=model,
-                    x_norm=x_norm,
-                    edge_index=edge_index,
-                    edge_attr=edge_attr,
-                    device=device_t,
-                    want=min(n, 64),
-                    candidates=[64, 32, 16, 8, 4, 2, 1],
-                )
-                print(f"  GNN auto microbatch={mb}", flush=True)
-            gn = _time_gnn_batched(
-                model=model,
-                x_norm=x_norm,
-                sample_idx=sample_idx,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                device=device_t,
-                microbatch=mb,
-                repeats=repeats,
-                warmup=2,
-            )
-            print(
-                f"  DA-GPS forward: batch={gn['batch_time_s']:.3f}s  "
-                f"per_case={gn['time_per_case_ms']:.3f} ms  "
-                f"(microbatch={gn['microbatch']}, n_mb={gn['n_microbatches']})",
-                flush=True,
-            )
+            if gnn_oom_stop:
+                gn = {
+                    "status": "skipped_after_oom",
+                    "batch_size": n,
+                    "device": str(device_t),
+                }
+                print("  DA-GPS: skipped (prior OOM)", flush=True)
+            else:
+                # Full batch: one forward of size n (no micro-splitting).
+                try:
+                    gn = _time_gnn_batched(
+                        model=model,
+                        x_norm=x_norm,
+                        sample_idx=sample_idx,
+                        edge_index=edge_index,
+                        edge_attr=edge_attr,
+                        device=device_t,
+                        microbatch=n,
+                        repeats=repeats,
+                        warmup=2,
+                    )
+                    gn["status"] = "ok"
+                    gn["batch_size"] = n
+                    gn["device"] = str(device_t)
+                    max_gnn_batch = n
+                    speedup = (
+                        float(od["batch_time_s"]) / float(gn["batch_time_s"])
+                        if od is not None and float(gn["batch_time_s"]) > 0
+                        else float("nan")
+                    )
+                    print(
+                        f"  DA-GPS forward ({device_t}): batch={gn['batch_time_s']:.3f}s  "
+                        f"per_case={gn['time_per_case_ms']:.3f} ms  "
+                        f"speedup_vs_OD={speedup:.2f}x",
+                        flush=True,
+                    )
+                except (RuntimeError, MemoryError) as e:
+                    if not _is_oom_error(e):
+                        raise
+                    if device_t.type == "cuda":
+                        torch.cuda.empty_cache()
+                    gn = {
+                        "status": "oom",
+                        "batch_size": n,
+                        "device": str(device_t),
+                        "error": str(e)[:500],
+                    }
+                    print(f"  DA-GPS: OOM at batch_size={n} ({device_t})", flush=True)
+                    if stop_on_oom:
+                        gnn_oom_stop = True
+                        print(
+                            "  [parallel_eval] stopping further GNN batch sizes after OOM "
+                            "(OpenDSS continues).",
+                            flush=True,
+                        )
 
         row = {
             "n_cases": n,
+            "batch_size": n,
             "opendss": od,
             "da_gps": gn,
         }
@@ -801,45 +807,82 @@ def run(
         "batch_sizes": batch_sizes,
         "repeats": repeats,
         "seed": seed,
+        "stop_on_oom": bool(stop_on_oom),
+        "max_gnn_batch_ok": max_gnn_batch,
         "rows": rows,
         "created_utc": datetime.utcnow().isoformat() + "Z",
     }
     out_json = out_dir / "parallel_scenario_eval_8500.json"
     out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print("\n=== Parallel evaluation table (fill-in) ===", flush=True)
-    print(f"{'Cases':>8} | {'OD batch s':>10} | {'OD ms/case':>10} | {'GNN batch s':>11} | {'GNN ms/case':>11}", flush=True)
+    print("\n=== Parallel evaluation table (batch-size sweep) ===", flush=True)
+    print(
+        f"{'B':>6} | {'OD batch s':>10} | {'OD ms/case':>10} | "
+        f"{'GNN batch s':>11} | {'GNN ms/case':>11} | {'speedup':>8} | status",
+        flush=True,
+    )
     for r in rows:
         od = r.get("opendss") or {}
         gn = r.get("da_gps") or {}
+        status = str(gn.get("status", "n/a"))
+        od_s = od.get("batch_time_s", float("nan"))
+        gn_s = gn.get("batch_time_s", float("nan"))
+        try:
+            sp = float(od_s) / float(gn_s) if float(gn_s) > 0 else float("nan")
+        except Exception:
+            sp = float("nan")
         print(
-            f"{r['n_cases']:>8} | "
-            f"{od.get('batch_time_s', float('nan')):10.3f} | "
-            f"{od.get('time_per_case_ms', float('nan')):10.3f} | "
-            f"{gn.get('batch_time_s', float('nan')):11.3f} | "
-            f"{gn.get('time_per_case_ms', float('nan')):11.3f}",
+            f"{r['batch_size']:>6} | "
+            f"{float(od_s) if od else float('nan'):10.3f} | "
+            f"{float(od.get('time_per_case_ms', float('nan'))):10.3f} | "
+            f"{float(gn_s) if 'batch_time_s' in gn else float('nan'):11.3f} | "
+            f"{float(gn.get('time_per_case_ms', float('nan'))):11.3f} | "
+            f"{sp:8.2f} | {status}",
             flush=True,
         )
-    print(f"\n[parallel_eval] wrote {out_json}", flush=True)
+    if max_gnn_batch is not None:
+        print(f"\n[parallel_eval] max DA-GPS batch that fit: {max_gnn_batch}", flush=True)
+    print(f"[parallel_eval] wrote {out_json}", flush=True)
     return summary
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Parallel scenario eval: OpenDSS Solve vs DA-GPS batched forward")
+    p = argparse.ArgumentParser(
+        description="Parallel scenario eval: OpenDSS Solve (CPU) vs DA-GPS full-batch forward"
+    )
     p.add_argument("--repo", type=str, default="")
     p.add_argument("--run-dir", type=str, default="")
     p.add_argument("--cache-pt", type=str, default="")
-    p.add_argument("--batch-sizes", type=str, default="1000,2000,5000")
+    p.add_argument(
+        "--batch-sizes",
+        type=str,
+        default="8,16,32,64,128,256,512",
+        help="Comma list of full GPU/CPU batch sizes to sweep (one forward each)",
+    )
     p.add_argument("--repeats", type=int, default=3)
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--microbatch", type=int, default=0, help="0 = auto (probe GPU memory)")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="DA-GPS device (cuda or cpu). OpenDSS Solve is always CPU.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--load-profile", type=str, default="")
     p.add_argument("--irr-profile", type=str, default="")
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--skip-opendss", action="store_true")
     p.add_argument("--skip-gnn", action="store_true")
-    p.add_argument("--smoke", action="store_true", help="Use batch sizes 50,100,200 and repeats=1")
+    p.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Quick check: batch sizes 8,16 and repeats=1",
+    )
+    p.add_argument(
+        "--stop-on-oom",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After first GNN OOM, skip larger GNN batches (OpenDSS still runs)",
+    )
     return p
 
 
@@ -856,7 +899,7 @@ def main() -> None:
         cache_pt = resolve_cache_pt(repo, "8500")
 
     if args.smoke:
-        batch_sizes = [50, 100, 200]
+        batch_sizes = [8, 16]
         repeats = 1
     else:
         batch_sizes = [int(x.strip()) for x in str(args.batch_sizes).split(",") if x.strip()]
@@ -884,13 +927,13 @@ def main() -> None:
         batch_sizes=batch_sizes,
         repeats=repeats,
         device=device,
-        microbatch=int(args.microbatch),
         seed=int(args.seed),
         load_profile=load_p,
         irr_profile=irr_p,
         out_dir=out_dir,
         skip_opendss=bool(args.skip_opendss),
         skip_gnn=bool(args.skip_gnn),
+        stop_on_oom=bool(args.stop_on_oom),
     )
 
 
