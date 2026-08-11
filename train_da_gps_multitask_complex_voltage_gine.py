@@ -3066,6 +3066,9 @@ def _configure_reg_territory_bias(
 ) -> dict[str, str] | None:
     if not bool(getattr(args, "attn_reg_territory_bias", False)):
         return None
+    if not reg_cols:
+        print("attn_reg_territory_bias: skipped (no regulator tokens / --reg_cols empty).", flush=True)
+        return None
     hop_csv = _resolve_hop_csv_path(args, repo, chunk_parent)
     rule = str(getattr(args, "attn_reg_territory_downstream_rule", "hop_gt_0"))
     node_names = [n for n, _ in sorted(node_to_local.items(), key=lambda kv: kv[1])]
@@ -3878,6 +3881,21 @@ def _parse_csv_cols(spec: str) -> list[str]:
     if not cols:
         raise ValueError("node feature column list is empty.")
     return cols
+
+
+def _resolve_target_cols(spec: str | None, default: tuple[str, ...] | list[str]) -> list[str]:
+    """Resolve ``--cap_cols`` / ``--reg_cols``.
+
+    - ``None`` (flag omitted): use ``default`` (8500 TARGET_*).
+    - empty / whitespace: no tokens (``[]``).
+    - otherwise: comma-separated column names.
+    """
+    if spec is None:
+        return list(default)
+    s = str(spec).strip()
+    if not s:
+        return []
+    return [c.strip() for c in s.split(",") if c.strip()]
 
 
 def _resolve_pe_cols(pe_df_cols: list[str], pe_spec: str) -> list[str]:
@@ -4721,6 +4739,13 @@ def _load_meta_aux(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import pandas as pd
 
+    n = len(sample_ids)
+    if not cap_cols and not reg_cols:
+        y_cap0 = torch.zeros((n, 0), dtype=torch.float32)
+        if reg_class_tables is not None:
+            return y_cap0, torch.zeros((n, 0), dtype=torch.long)
+        return y_cap0, torch.zeros((n, 0), dtype=torch.float32)
+
     usecols = ["sample_id", *cap_cols, *reg_cols]
     df = pd.read_csv(meta_csv)
     ren = {}
@@ -4732,16 +4757,45 @@ def _load_meta_aux(
                 ren[c] = cl
     if ren:
         df = df.rename(columns=ren)
-    df = df[usecols]
+    # Case-insensitive match for requested cap_/reg_ columns.
+    lower_to_orig = {str(c).lower(): c for c in df.columns}
+    resolved_cap = []
+    for c in cap_cols:
+        cl = str(c).lower()
+        if cl not in lower_to_orig:
+            raise KeyError(f"cap column {c!r} missing from {meta_csv}")
+        resolved_cap.append(lower_to_orig[cl])
+    resolved_reg = []
+    for c in reg_cols:
+        cl = str(c).lower()
+        if cl not in lower_to_orig:
+            raise KeyError(f"reg column {c!r} missing from {meta_csv}")
+        resolved_reg.append(lower_to_orig[cl])
+    sid_col = lower_to_orig.get("sample_id", "sample_id")
+    df = df[[sid_col, *resolved_cap, *resolved_reg]].rename(columns={sid_col: "sample_id"})
+    for old, new in zip(resolved_cap, cap_cols):
+        if old != new:
+            df = df.rename(columns={old: new})
+    for old, new in zip(resolved_reg, reg_cols):
+        if old != new:
+            df = df.rename(columns={old: new})
     lk = {_norm_sid(k): j for j, k in enumerate(df["sample_id"].tolist())}
     miss = [sid for sid in sample_ids if _norm_sid(sid) not in lk]
     if miss:
         raise KeyError(f"{len(miss)} sample_id values missing from {meta_csv} (showing up to 5): {miss[:5]}")
     order = [lk[_norm_sid(sid)] for sid in sample_ids]
-    cap_raw = df[list(cap_cols)].to_numpy(dtype=np.float64)[order]
-    reg_raw = df[list(reg_cols)].to_numpy(dtype=np.float64)[order]
-    y_cap = (cap_raw > 0.5).astype(np.float32)
+    if cap_cols:
+        cap_raw = df[list(cap_cols)].to_numpy(dtype=np.float64)[order]
+        y_cap = (cap_raw > 0.5).astype(np.float32)
+    else:
+        y_cap = np.zeros((n, 0), dtype=np.float32)
+    if reg_cols:
+        reg_raw = df[list(reg_cols)].to_numpy(dtype=np.float64)[order]
+    else:
+        reg_raw = np.zeros((n, 0), dtype=np.float64)
     if reg_class_tables is not None:
+        if not reg_cols:
+            return torch.from_numpy(y_cap), torch.zeros((n, 0), dtype=torch.long)
         y_reg_idx = _encode_reg_class_indices(reg_raw, reg_class_tables)
         return torch.from_numpy(y_cap), torch.from_numpy(y_reg_idx)
     return torch.from_numpy(y_cap), torch.from_numpy(reg_raw.astype(np.float32))
@@ -5410,12 +5464,32 @@ def _ensure_chunk_tensor_cache(
                 y_reg = z["y_reg"].to(dtype=torch.long)
             else:
                 y_reg = z["y_reg"].to(dtype=torch.float32)
-            y_pv = None
-            if pv_cols:
-                y_pv = _maybe_attach_y_pv(z, sids)
-                if y_pv is not None:
-                    y_pv = y_pv.to(dtype=torch.float32)
-            return x, y_ri, y_cap, y_reg, y_pv, sids, ntl
+            stored_cap = [str(c).lower() for c in (z.get("cap_cols") or [])]
+            stored_reg = [str(c).lower() for c in (z.get("reg_cols") or [])]
+            want_cap = [str(c).lower() for c in cap_cols]
+            want_reg = [str(c).lower() for c in reg_cols]
+            if (
+                y_cap.dim() != 2
+                or y_reg.dim() != 2
+                or int(y_cap.shape[1]) != len(cap_cols)
+                or int(y_reg.shape[1]) != len(reg_cols)
+                or (stored_cap and stored_cap != want_cap)
+                or (stored_reg and stored_reg != want_reg)
+            ):
+                print(
+                    f"chunk cache cap/reg target cols or width mismatch "
+                    f"(y_cap={tuple(y_cap.shape)} want_n_cap={len(cap_cols)}; "
+                    f"y_reg={tuple(y_reg.shape)} want_n_reg={len(reg_cols)}); "
+                    f"rebuilding: {cache_pt}",
+                    flush=True,
+                )
+            else:
+                y_pv = None
+                if pv_cols:
+                    y_pv = _maybe_attach_y_pv(z, sids)
+                    if y_pv is not None:
+                        y_pv = y_pv.to(dtype=torch.float32)
+                return x, y_ri, y_cap, y_reg, y_pv, sids, ntl
 
     if bootstrap_gnn_cache_pt is not None and bootstrap_gnn_cache_pt.is_file():
         z = torch.load(bootstrap_gnn_cache_pt, map_location="cpu", weights_only=False)
@@ -5469,6 +5543,8 @@ def _ensure_chunk_tensor_cache(
                 "sample_ids": sample_ids,
                 "node_to_local": node_to_local,
                 "reg_target_mode": want_reg_mode,
+                "cap_cols": list(cap_cols),
+                "reg_cols": list(reg_cols),
             }
             if want_reg_digest:
                 row["reg_class_tables_digest"] = want_reg_digest
@@ -5519,6 +5595,8 @@ def _ensure_chunk_tensor_cache(
         "sample_ids": sample_ids,
         "node_to_local": node_to_local,
         "reg_target_mode": want_reg_mode,
+        "cap_cols": list(cap_cols),
+        "reg_cols": list(reg_cols),
     }
     if want_reg_digest:
         row["reg_class_tables_digest"] = want_reg_digest
@@ -7021,12 +7099,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if bootstrap_gnn_cache_dir is not None:
         print(f"bootstrap GNN cache dir: {bootstrap_gnn_cache_dir}", flush=True)
 
-    cap_cols = list(TARGET_CAP_COLS)
-    reg_cols = list(TARGET_REG_COLS)
+    cap_cols = _resolve_target_cols(getattr(args, "cap_cols", None), TARGET_CAP_COLS)
+    reg_cols = _resolve_target_cols(getattr(args, "reg_cols", None), TARGET_REG_COLS)
     n_cap = len(cap_cols)
     n_reg = len(reg_cols)
     n_sys = int(args.n_system_tokens)
     g_tot = n_cap + n_reg + n_sys
+    print(
+        f"Token layout: n_cap={n_cap} n_reg={n_reg} n_system={n_sys} (total={g_tot}); "
+        f"cap_cols={cap_cols!r}; reg_cols={reg_cols!r}",
+        flush=True,
+    )
     if n_pv_aux > 0:
         print(
             f"Meta aux (sample_meta): {n_pv_aux} column(s); chunk DA caches use suffix __maux{maux_slug} (per chunk name).",
@@ -7051,6 +7134,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     reg_class_tables: list[dict] | None = None
     reg_nclasses: list[int] = []
     if reg_loss == "ce":
+        if not reg_cols:
+            raise ValueError("reg_loss=ce requires non-empty --reg_cols (got none).")
         _loaded_reg_from_init = False
         if init_run_dir is not None:
             _rct_init = init_run_dir / "reg_class_tables.json"
@@ -8622,6 +8707,20 @@ def parse_args() -> argparse.Namespace:
         help="'auto' to use all pe_* columns from node_pe_csv, 'none' to disable, or comma list (e.g. pe_1,pe_2).",
     )
     p.add_argument("--n_system_tokens", type=int, default=10, help="Unsupervised latent tokens after cap+reg tokens.")
+    p.add_argument(
+        "--cap_cols",
+        type=str,
+        default=None,
+        help="Comma-separated capacitor meta columns for cap tokens. "
+        "Empty string = no cap tokens. Omit to use TARGET_CAP_COLS (8500 defaults).",
+    )
+    p.add_argument(
+        "--reg_cols",
+        type=str,
+        default=None,
+        help="Comma-separated regulator tap meta columns for reg tokens. "
+        "Empty string = no reg tokens. Omit to use TARGET_REG_COLS (8500 defaults).",
+    )
     p.add_argument("--out_dir", type=str, default="da_gps_multitask_full_mv")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=64, help="Per-step graphs; A100 can usually fit 32–64+ for N~3.8k, d=256.")
@@ -9265,12 +9364,17 @@ def main() -> None:
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cap_cols = list(TARGET_CAP_COLS)
-    reg_cols = list(TARGET_REG_COLS)
+    cap_cols = _resolve_target_cols(getattr(args, "cap_cols", None), TARGET_CAP_COLS)
+    reg_cols = _resolve_target_cols(getattr(args, "reg_cols", None), TARGET_REG_COLS)
     n_cap = len(cap_cols)
     n_reg = len(reg_cols)
     n_sys = int(args.n_system_tokens)
     g_tot = n_cap + n_reg + n_sys
+    print(
+        f"Token layout: n_cap={n_cap} n_reg={n_reg} n_system={n_sys} (total={g_tot}); "
+        f"cap_cols={cap_cols!r}; reg_cols={reg_cols!r}",
+        flush=True,
+    )
     if n_pv_aux > 0:
         print(f"Meta aux (sample_meta): {n_pv_aux} column(s): {pv_aux_cols}", flush=True)
         for j, cname in enumerate(pv_aux_cols):
