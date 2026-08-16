@@ -114,6 +114,30 @@ def _to_dense_batch_mv(
 from train_homo_gine_global_localres_pq_loadonly import _load_compacted_edges
 
 
+def _maybe_compress_large_edge_attr(edge_attr: torch.Tensor) -> torch.Tensor:
+    """Signed-log1p when |edge_attr| is huge (LV network-Y in Siemens).
+
+    GINE injects ``W_e @ e_ij`` into messages; raw |Y|~1e4–1e5 overflows AMP and
+    yields NaN from epoch 1. Ohm catalogs (|R|,|X|≪1) and IEEE34 Y (~2e2) are unchanged.
+    Applied here as well as in ``_load_compacted_edges`` so Colab stays safe even if
+    the helper module is stale.
+    """
+    if edge_attr is None or edge_attr.numel() == 0:
+        return edge_attr
+    thr = 500.0
+    max_abs = float(edge_attr.detach().float().abs().max().item())
+    if max_abs <= thr:
+        return edge_attr
+    out = edge_attr.sign() * torch.log1p(edge_attr.abs())
+    after = float(out.detach().float().abs().max().item())
+    print(
+        f"  edge_attr: signed_log1p(|e|) applied (raw max|attr|={max_abs:.3g} > {thr:g}; "
+        f"after max|attr|={after:.3g})",
+        flush=True,
+    )
+    return out
+
+
 def _device_stem(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
 
@@ -7239,6 +7263,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
             n_node_features = int(x.shape[2])
             ep = ch / edge_name
             edge_index, edge_attr = _load_compacted_edges(ep, ref_ntl)
+            edge_attr = _maybe_compress_large_edge_attr(edge_attr)
             sum_x = torch.zeros(n_node_features, dtype=torch.float64)
             sum_x2 = torch.zeros(n_node_features, dtype=torch.float64)
             sum_y = torch.zeros(n_nodes * 2, dtype=torch.float64)
@@ -9391,7 +9416,7 @@ def main() -> None:
         if y_ri is not None:
             y_ri = y_ri.to(dtype=torch.float32)
         edge_index = pack["edge_index"]
-        edge_attr = pack["edge_attr"]
+        edge_attr = _maybe_compress_large_edge_attr(pack["edge_attr"])
         sample_ids = pack["sample_ids"]
     else:
         x, y_ri, sample_ids, _node_order, node_to_local = _load_nodes_features_complex_targets(
@@ -9403,6 +9428,7 @@ def main() -> None:
         x = x.to(dtype=torch.float32)
         y_ri = y_ri.to(dtype=torch.float32)
         edge_index, edge_attr = _load_compacted_edges(edges_path, node_to_local)
+        edge_attr = _maybe_compress_large_edge_attr(edge_attr)
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(

@@ -142,6 +142,20 @@ def _load_compacted_edges(edge_csv: Path, node_to_local: dict[str, int]) -> tupl
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_attr = torch.tensor(np.column_stack([rs, xs]), dtype=torch.float32)
+    # Network-Y catalogs store Re/Im admittance in Siemens. On LV feeders |Y| can
+    # reach 1e4–1e5; GINE injects W_e @ e_ij into messages, which overflows AMP/fp16
+    # and yields NaN loss from epoch 1. Ohm catalogs (|R|,|X|≪1) are left unchanged.
+    # IEEE34 Y edges (max |Y|~2e2) stay raw; 906/8500 Y (max |Y|≫ threshold) are compressed.
+    _EDGE_ATTR_LOG_ABS_MAX = 500.0
+    max_abs = float(edge_attr.abs().max().item()) if edge_attr.numel() else 0.0
+    if max_abs > _EDGE_ATTR_LOG_ABS_MAX:
+        edge_attr = edge_attr.sign() * torch.log1p(edge_attr.abs())
+        after_max = float(edge_attr.abs().max().item())
+        print(
+            f"  edge_attr: signed_log1p(|e|) applied (raw max|attr|={max_abs:.3g} > "
+            f"{_EDGE_ATTR_LOG_ABS_MAX:g}; after max|attr|={after_max:.3g})",
+            flush=True,
+        )
     print(
         f"  directed edges: {edge_index.shape[1]}"
         f" (catalog={'directed' if already_directed else 'undirected+mirror'})",
