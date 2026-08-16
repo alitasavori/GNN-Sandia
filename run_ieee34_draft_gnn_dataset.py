@@ -10,8 +10,11 @@ Graph construction (paper §II):
     Terminals from OpenDSS NodeRef; wye/LN vs true LL-delta via ground conductor;
     delta uses diag(V) H^T diag(H V)^{-1} with paper I/Z |HV| factors.
     Model 8 uses ZIPV P/I/Z mix; other models map to one ZIP bin (7 splits P/Q).
+    Model 4 (CVR): when CVRwatts≈1 and CVRvars≈2, encode as P→I bin and Q→Z bin
+    (matches OpenDSS P∝|V|, Q∝|V|^2); not const-P.
     Load.Model sampling + share_m*_p match Mirzaei (randomize_zip_models=True by default).
     p_pv_kw is post-solve actual PV (same as Mirzaei), not available Pmpp.
+    Optional delta_alloc='half' ablates 1φ/3φ delta H-map with equal /2 on each LL end.
   - Laplacian PE: optional freeze via node_pe_from_csv (reuse Mirzaei/original pe_*);
     otherwise |Y|-weighted PE from the new edge graph.
   - Settled taps/caps/aux are meta targets; Y built at regulator tap=1.
@@ -76,7 +79,7 @@ ZIP_FEATURE_COLS = [
 
 
 def _model_to_zip_channel(model_id: int) -> str:
-    """Map a single OpenDSS load model → one ZIP bin (non-Model-8 loads)."""
+    """Map a single OpenDSS load model → one ZIP bin (non-Model-8 / non-Model-4)."""
     m = int(model_id)
     if m == 2:
         return "Z"
@@ -86,8 +89,11 @@ def _model_to_zip_channel(model_id: int) -> str:
         # Const P, fixed-impedance Q: put Q in Z via ZIPV-style split below when possible;
         # fallback whole-load Z would be wrong for P — keep P-bin for undifferentiated use.
         return "P"
-    # 1 = const-P, 3/4/6 ≈ P-dominated; Model 8 handled separately
+    # 1 = const-P, 3/6 ≈ P-dominated; Model 4 handled in _zip_complex_components; Model 8 separate
     return "P"
+
+
+_MODEL4_CVR_WARNED = False
 
 
 def _zip_complex_components(
@@ -100,9 +106,12 @@ def _zip_complex_components(
     Split a load setpoint into paper ZIP complex powers s_P, s_I, s_Z (kW + j kvar).
 
     Model 8 uses OpenDSS ZIPV = [Zp,Ip,Pp, Zq,Iq,Pq, Vcut].
-    Other models place the full setpoint in one bin (1/3/4/6→P, 5→I, 2→Z).
+    Model 4 (CVR): if CVRwatts≈1 and CVRvars≈2 → P in I-bin, Q in Z-bin
+    (OpenDSS P∝|V|^1, Q∝|V|^2). Active load must be selected in DSS.
+    Other models place the full setpoint in one bin (1/3/6→P, 5→I, 2→Z).
     Model 7 (const P, fixed Z Q): P→P bin, Q→Z bin.
     """
+    global _MODEL4_CVR_WARNED
     m = int(model_id)
     z = i = p = complex(0.0, 0.0)
     if m == 8:
@@ -121,6 +130,23 @@ def _zip_complex_components(
         # Fall through if ZIPV missing
     if m == 7:
         return {"P": complex(p_set, 0.0), "I": 0j, "Z": complex(0.0, q_set)}
+    if m == 4:
+        try:
+            cw = float(dss.Loads.CVRwatts())
+            cv = float(dss.Loads.CVRvars())
+        except Exception:
+            cw, cv = 1.0, 2.0
+        # Canonical feeder-mix CVR → I/Z channels (not const-P).
+        if abs(cw - 1.0) <= 0.05 and abs(cv - 2.0) <= 0.05:
+            return {"P": 0j, "I": complex(p_set, 0.0), "Z": complex(0.0, q_set)}
+        if not _MODEL4_CVR_WARNED:
+            _MODEL4_CVR_WARNED = True
+            print(
+                f"[ieee34-draft] WARNING: Model 4 CVRwatts={cw}, CVRvars={cv} "
+                f"(expected ~1,~2); falling back to const-P ZIP bin.",
+                flush=True,
+            )
+        return {"P": complex(p_set, q_set), "I": 0j, "Z": 0j}
     ch = _model_to_zip_channel(m)
     s = complex(p_set, q_set)
     return {
@@ -551,8 +577,14 @@ def _allocate_zip_on_terminals(
     comps: dict[str, complex],
     terminals: list[tuple[str, int]],
     topology: str,
+    delta_alloc: str = "H",
 ) -> None:
-    """Place ZIP components onto phase nodes for wye or delta terminal sets."""
+    """Place ZIP components onto phase nodes for wye or delta terminal sets.
+
+    ``delta_alloc``:
+      - ``H``: paper diag(V) H^T diag(H V)^{-1} map (default)
+      - ``half``: ablation — put ``s_eff/2`` on each LL terminal (no H)
+    """
     if not terminals:
         return
     topo = str(topology).lower()
@@ -570,6 +602,14 @@ def _allocate_zip_on_terminals(
 
     if topo != "delta":
         raise ValueError(f"Unknown load topology {topology!r}")
+
+    alloc = str(delta_alloc).strip().lower()
+    if alloc in ("h", "paper", "href"):
+        alloc = "h"
+    elif alloc in ("half", "/2", "div2", "equal"):
+        alloc = "half"
+    else:
+        raise ValueError(f"delta_alloc must be 'H' or 'half', got {delta_alloc!r}")
 
     # Build LL legs: 1φ → one pair; 3φ → cyclic pairs on the three terminals.
     if len(terminals) == 2:
@@ -589,9 +629,14 @@ def _allocate_zip_on_terminals(
         pk, qk = f"p_{ch}_kw", f"q_{ch}_kvar"
         for (bi, phi), (bj, phj) in legs:
             s_eff = _scale_delta_zip_setpoint(s_leg, ch, phi, phj)
-            _allocate_delta_branch(
-                out[pk], out[qk], bus_i=bi, ph_i=phi, bus_j=bj, ph_j=phj, s_d=s_eff
-            )
+            if alloc == "half":
+                half = s_eff / 2.0
+                _add_complex_to_busph(out[pk], out[qk], bi, phi, half)
+                _add_complex_to_busph(out[pk], out[qk], bj, phj, half)
+            else:
+                _allocate_delta_branch(
+                    out[pk], out[qk], bus_i=bi, ph_i=phi, bus_j=bj, ph_j=phj, s_d=s_eff
+                )
 
 
 def zip_busph_features_at_vref(
@@ -601,15 +646,16 @@ def zip_busph_features_at_vref(
     # Legacy kwargs kept so older call sites keep working; ignored (NodeRef path).
     dev_to_dss_load: dict[str, str] | None = None,
     dev_to_busph_load: dict[str, list[tuple[str, int, float]]] | None = None,
+    delta_alloc: str = "H",
 ) -> dict[str, dict[tuple[str, int], float]]:
     """
     Voltage-independent ZIP phase-node powers at paper V_ref.
 
     Terminals come from OpenDSS NodeRef→YNodeOrder (not heuristic DEVICE_TO_BUSPH):
       - phase nodes + ground ⇒ grounded-wye / LN map (equal split)
-      - ≥2 phase nodes, no ground, Conn=Delta ⇒ H / V_ref delta map
+      - ≥2 phase nodes, no ground, Conn=Delta ⇒ H / V_ref delta map (or /2 ablation)
       - Conn=Delta but only one phase + ground (IEEE34 1φ quirk) ⇒ LN on that phase
-    ZIP bins follow OpenDSS Model / ZIPV (Model 8).
+    ZIP bins follow OpenDSS Model / ZIPV (Model 8); Model 4 CVR → I/Z when exponents 1/2.
     """
     del dev_to_busph_load
     out = {
@@ -657,7 +703,13 @@ def zip_busph_features_at_vref(
             # Grounded wye, LN, or Conn=Delta with NodeRef[..., 0] (phase-to-ground).
             topology = "wye"
 
-        _allocate_zip_on_terminals(out, comps=comps, terminals=terminals, topology=topology)
+        _allocate_zip_on_terminals(
+            out,
+            comps=comps,
+            terminals=terminals,
+            topology=topology,
+            delta_alloc=delta_alloc,
+        )
 
     return out
 
@@ -710,12 +762,20 @@ def generate_ieee34_draft_dataset(
     delete_raw_node_csv_after_mvagg: bool = False,
     control_mode: str = "static",
     randomize_zip_models: bool = True,
+    delta_alloc: str = "H",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if bins_by_profile is None:
         bins_by_profile = {"load": 3, "pv": 3, "net": 3}
     mode = str(control_mode).strip().lower()
     if mode not in ("static", "off"):
         raise ValueError("control_mode must be 'static' or 'off'")
+    _da = str(delta_alloc).strip().lower()
+    if _da in ("h", "paper", "href"):
+        delta_alloc_norm = "H"
+    elif _da in ("half", "/2", "div2", "equal"):
+        delta_alloc_norm = "half"
+    else:
+        raise ValueError(f"delta_alloc must be 'H' or 'half', got {delta_alloc!r}")
     if not DSS_FILE.is_file():
         raise FileNotFoundError(DSS_FILE)
 
@@ -744,7 +804,7 @@ def generate_ieee34_draft_dataset(
     node_to_idx_all = {n: i for i, n in enumerate(node_names_all)}
     print(
         f"[ieee34-draft] nodes_all={len(node_names_all)} nodes_graph={len(node_names_graph)} "
-        f"control_mode={mode} out={out_dir}"
+        f"control_mode={mode} delta_alloc={delta_alloc_norm} out={out_dir}"
     )
 
     # Reference network-only Y at nominal taps (static edge catalog for the chunk).
@@ -947,6 +1007,7 @@ def generate_ieee34_draft_dataset(
                     # kept for call-site compatibility; H/V_ref path ignores weights
                     dev_to_dss_load=dev_to_dss_load,
                     dev_to_busph_load=dev_to_busph_load,
+                    delta_alloc=delta_alloc_norm,
                 )
 
                 try:
