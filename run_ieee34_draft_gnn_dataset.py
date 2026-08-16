@@ -643,10 +643,18 @@ def generate_ieee34_draft_dataset(
     except Exception:
         pass
 
+    # Do NOT run 8500 ohm/length enrich on Y-admittance edges: it overwrites
+    # length_unit (breaks loader heuristics) and must never rewrite R_full/X_full.
     try:
-        ds8500._enrich_edges_with_basekv_and_length_km(edge_csv, node_names_graph)
+        import pandas as _pd
+
+        _ed = _pd.read_csv(edge_csv)
+        _bmap = ds8500._node_base_kv_map(node_names_graph)
+        _ed["from_base_kv"] = _ed["from_node"].map(_bmap)
+        _ed["to_base_kv"] = _ed["to_node"].map(_bmap)
+        _ed.to_csv(edge_csv, index=False)
     except Exception as exc:
-        print(f"[ieee34-draft] basekv enrich skipped: {exc}")
+        print(f"[ieee34-draft] basekv annotate skipped: {exc}")
 
     node_to_dist = lt_dist._compute_electrical_distance_from_source(
         node_names_graph, str(edge_csv)

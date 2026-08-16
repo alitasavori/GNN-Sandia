@@ -102,6 +102,20 @@ def _load_compacted_edges(edge_csv: Path, node_to_local: dict[str, int]) -> tupl
         if c not in df.columns:
             raise ValueError(f"{edge_csv} missing {c!r}")
 
+    # Directed Y catalogs (IEEE34 draft): already list both orientations with
+    # distinct Y_ij / Y_ji. Do not mirror (that would duplicate and mix attrs).
+    already_directed = False
+    if "edge_directed" in df.columns and df["edge_directed"].fillna(0).astype(float).gt(0).any():
+        already_directed = True
+    elif "length_unit" in df.columns and df["length_unit"].astype(str).str.contains(
+        "y_admittance", case=False, na=False
+    ).any():
+        pairs = {
+            (str(a).strip(), str(b).strip())
+            for a, b in zip(df["from_node"].tolist(), df["to_node"].tolist())
+        }
+        already_directed = any((b, a) in pairs for a, b in pairs if a != b)
+
     src: list[int] = []
     dst: list[int] = []
     rs: list[float] = []
@@ -114,14 +128,25 @@ def _load_compacted_edges(edge_csv: Path, node_to_local: dict[str, int]) -> tupl
         iu, iv = node_to_local[u], node_to_local[v]
         rf = float(r.get("R_full", 0.0) or 0.0)
         xf = float(r.get("X_full", 0.0) or 0.0)
-        src.extend([iu, iv])
-        dst.extend([iv, iu])
-        rs.extend([rf, rf])
-        xs.extend([xf, xf])
+        if already_directed:
+            src.append(iu)
+            dst.append(iv)
+            rs.append(rf)
+            xs.append(xf)
+        else:
+            # Legacy undirected catalogs: mirror with identical attributes.
+            src.extend([iu, iv])
+            dst.extend([iv, iu])
+            rs.extend([rf, rf])
+            xs.extend([xf, xf])
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_attr = torch.tensor(np.column_stack([rs, xs]), dtype=torch.float32)
-    print(f"  directed edges: {edge_index.shape[1]}", flush=True)
+    print(
+        f"  directed edges: {edge_index.shape[1]}"
+        f" (catalog={'directed' if already_directed else 'undirected+mirror'})",
+        flush=True,
+    )
     return edge_index, edge_attr
 
 
