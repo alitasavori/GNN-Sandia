@@ -1,13 +1,18 @@
 """
 IEEE 34 Mirzaei dataset generation aligned with the MT-GPS paper draft.
 
-Differences vs run_original_style_dataset_ieee34_mirzaei.py:
-  - Edges from network-only nodal Y (Line/Transformer/Capacitor/Reactor YPrim),
-    attributes [Re(Y_ij), Im(Y_ij)] stored in R_full/X_full for trainer compatibility.
-  - Node operating features are voltage-independent ZIP channels at |V_ref|=1:
+Graph construction (paper §II):
+  - Directed edges from network-only nodal Y (Line/Transformer/Capacitor/Reactor =
+    lines, xfmrs, network shunts). Message j→i uses e_ji=[Re(Y_ij), Im(Y_ij)]
+    stored in R_full/X_full. Loads/PV/Vsource are excluded from Y.
+  - Node operating features: ZIP at V_ref (|V|=1, nominal angles 0/−120/+120°):
       p_P_kw, q_P_kvar, p_I_kw, q_I_kvar, p_Z_kw, q_Z_kvar, p_pv_kw
-    (OpenDSS load models 1/4→P, 5→I, 2→Z; phase allocation via existing bus–phase weights).
-  - Laplacian PE uses admittance weights w=|Y_ij|.
+    Terminals from OpenDSS NodeRef; wye/LN vs true LL-delta via ground conductor;
+    delta uses diag(V) H^T diag(H V)^{-1} with paper I/Z |HV| factors.
+    Model 8 uses ZIPV P/I/Z mix; other models map to one ZIP bin (7 splits P/Q).
+  - Laplacian PE: optional freeze via node_pe_from_csv (reuse Mirzaei/original pe_*);
+    otherwise |Y|-weighted PE from the new edge graph.
+  - Settled taps/caps/aux are meta targets; Y built at regulator tap=1.
 
 Outputs the same chunk layout expected by train_da_gps_multitask_complex_voltage_gine.py.
 """
@@ -27,13 +32,11 @@ from scipy.sparse.linalg import eigsh
 import run_injection_dataset as inj
 import run_loadtype_dataset as lt_dist
 import run_original_style_dataset_8500_unbalanced as ds8500
-import run_original_style_dataset_906_lvtestcase as ds906
 import run_original_style_dataset_ieee34_mirzaei as ie34
 
 inj = importlib.reload(inj)
 lt_dist = importlib.reload(lt_dist)
 ds8500 = importlib.reload(ds8500)
-ds906 = importlib.reload(ds906)
 ie34 = importlib.reload(ie34)
 
 try:
@@ -71,14 +74,90 @@ ZIP_FEATURE_COLS = [
 
 
 def _model_to_zip_channel(model_id: int) -> str:
-    """Map OpenDSS load model → ZIP bin used in the draft feature vector."""
+    """Map a single OpenDSS load model → one ZIP bin (non-Model-8 loads)."""
     m = int(model_id)
     if m == 2:
         return "Z"
     if m == 5:
         return "I"
-    # 1 = const-P, 4 = const-P / quad-Q (paper/Log(v) treat as P-bin), others → P
+    if m == 7:
+        # Const P, fixed-impedance Q: put Q in Z via ZIPV-style split below when possible;
+        # fallback whole-load Z would be wrong for P — keep P-bin for undifferentiated use.
+        return "P"
+    # 1 = const-P, 3/4/6 ≈ P-dominated; Model 8 handled separately
     return "P"
+
+
+def _zip_complex_components(
+    *,
+    p_set: float,
+    q_set: float,
+    model_id: int,
+) -> dict[str, complex]:
+    """
+    Split a load setpoint into paper ZIP complex powers s_P, s_I, s_Z (kW + j kvar).
+
+    Model 8 uses OpenDSS ZIPV = [Zp,Ip,Pp, Zq,Iq,Pq, Vcut].
+    Other models place the full setpoint in one bin (1/3/4/6→P, 5→I, 2→Z).
+    Model 7 (const P, fixed Z Q): P→P bin, Q→Z bin.
+    """
+    m = int(model_id)
+    z = i = p = complex(0.0, 0.0)
+    if m == 8:
+        zipv = None
+        try:
+            zipv = list(dss.Loads.ZIPV)
+        except Exception:
+            zipv = None
+        if zipv is not None and len(zipv) >= 6:
+            zp, ip, pp = float(zipv[0]), float(zipv[1]), float(zipv[2])
+            zq, iq, pq = float(zipv[3]), float(zipv[4]), float(zipv[5])
+            z = complex(p_set * zp, q_set * zq)
+            i = complex(p_set * ip, q_set * iq)
+            p = complex(p_set * pp, q_set * pq)
+            return {"P": p, "I": i, "Z": z}
+        # Fall through if ZIPV missing
+    if m == 7:
+        return {"P": complex(p_set, 0.0), "I": 0j, "Z": complex(0.0, q_set)}
+    ch = _model_to_zip_channel(m)
+    s = complex(p_set, q_set)
+    return {
+        "P": s if ch == "P" else 0j,
+        "I": s if ch == "I" else 0j,
+        "Z": s if ch == "Z" else 0j,
+    }
+
+
+def _yorder_name_map() -> list[str]:
+    return [str(x) for x in dss.Circuit.YNodeOrder()]
+
+
+def _load_phase_terminals_from_noderef() -> list[tuple[str, int]]:
+    """Active CktElement phase terminals via NodeRef → YNodeOrder (skips ground)."""
+    yorder = _yorder_name_map()
+    out: list[tuple[str, int]] = []
+    for r in np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel():
+        ri = int(r)
+        if ri <= 0:
+            continue
+        idx = ri - 1
+        if idx < 0 or idx >= len(yorder):
+            continue
+        nm = str(yorder[idx]).strip()
+        if "." not in nm:
+            continue
+        bus, ph_s = nm.rsplit(".", 1)
+        if not ph_s.isdigit():
+            continue
+        ph = int(ph_s)
+        if ph not in (1, 2, 3):
+            continue
+        out.append((bus, ph))
+    return out
+
+
+def _load_has_ground_terminal() -> bool:
+    return any(int(r) <= 0 for r in np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel())
 
 
 def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list[str]]:
@@ -137,6 +216,46 @@ def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list
     return Y.tocsr().toarray(), node_names
 
 
+def _edge_row_y(
+    *,
+    from_node: str,
+    to_node: str,
+    y: complex,
+    u_idx: int,
+    v_idx: int,
+) -> dict:
+    """One directed edge j→i with e=[Re(Y_ij), Im(Y_ij)] (paper draft)."""
+    bi, pi = from_node.rsplit(".", 1) if "." in from_node else (from_node, "")
+    bj, pj = to_node.rsplit(".", 1) if "." in to_node else (to_node, "")
+    return {
+        "from_node": from_node,
+        "to_node": to_node,
+        "from_bus": bi,
+        "to_bus": bj,
+        "phase": int(pi) if str(pi).isdigit() and str(pj).isdigit() and pi == pj else 0,
+        "line_name": "Yprim.network",
+        "linecode": "",
+        "nph_line": 0,
+        "length": 0.0,
+        "R_per_len": 0.0,
+        "X_per_len": 0.0,
+        "C_per_len": 0.0,
+        # Message j→i uses Y_ij (siemens); trainer reads R_full/X_full as edge_attr.
+        "R_full": float(np.real(y)),
+        "X_full": float(np.imag(y)),
+        "C_full": 0.0,
+        "y_re": float(np.real(y)),
+        "y_im": float(np.imag(y)),
+        "abs_y": float(abs(y)),
+        "u_idx": int(u_idx),
+        "v_idx": int(v_idx),
+        "from_base_kv": np.nan,
+        "to_base_kv": np.nan,
+        "length_unit": "y_admittance_S",
+        "edge_directed": 1,
+    }
+
+
 def export_y_edges_csv(
     Y: np.ndarray,
     node_names: list[str],
@@ -145,51 +264,24 @@ def export_y_edges_csv(
     atol: float = 0.0,
 ) -> int:
     """
-    Write undirected coupled pairs with R_full=Re(Y_ij), X_full=Im(Y_ij).
-    Trainer `_load_compacted_edges` reads R_full/X_full as edge_attr.
+    Write directed coupled pairs: from_node=j, to_node=i, R_full/X_full = Re/Im(Y_ij).
+
+    Matches the paper edge feature e_ji = [Re(Y_ij), Im(Y_ij)] for message j→i.
     """
     rows: list[dict] = []
     n = len(node_names)
     for i in range(n):
-        for j in range(i + 1, n):
-            yij = complex(Y[i, j])
-            yji = complex(Y[j, i])
-            if abs(yij) <= atol and abs(yji) <= atol:
+        for j in range(n):
+            if i == j:
                 continue
-            y = 0.5 * (yij + yji) if (abs(yij) > 0 and abs(yji) > 0) else (
-                yij if abs(yij) >= abs(yji) else yji
-            )
+            yij = complex(Y[i, j])
+            if abs(yij) <= atol:
+                continue
             ni = str(node_names[i])
             nj = str(node_names[j])
-            bi, pi = ni.rsplit(".", 1) if "." in ni else (ni, "")
-            bj, pj = nj.rsplit(".", 1) if "." in nj else (nj, "")
+            # CSV orientation: from=j (source), to=i (target) ↔ paper edge ji.
             rows.append(
-                {
-                    "from_node": ni,
-                    "to_node": nj,
-                    "from_bus": bi,
-                    "to_bus": bj,
-                    "phase": int(pi) if str(pi).isdigit() and str(pj).isdigit() and pi == pj else 0,
-                    "line_name": "Yprim.network",
-                    "linecode": "",
-                    "nph_line": 0,
-                    "length": 0.0,
-                    "R_per_len": 0.0,
-                    "X_per_len": 0.0,
-                    "C_per_len": 0.0,
-                    # Trainer edge_attr channels (draft: Re/Im Y)
-                    "R_full": float(np.real(y)),
-                    "X_full": float(np.imag(y)),
-                    "C_full": 0.0,
-                    "y_re": float(np.real(y)),
-                    "y_im": float(np.imag(y)),
-                    "abs_y": float(abs(y)),
-                    "u_idx": i,
-                    "v_idx": j,
-                    "from_base_kv": np.nan,
-                    "to_base_kv": np.nan,
-                    "length_unit": "y_admittance_S",
-                }
+                _edge_row_y(from_node=nj, to_node=ni, y=yij, u_idx=j, v_idx=i)
             )
     df = pd.DataFrame(rows)
     edge_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +297,7 @@ def compute_laplacian_pe_from_y_edges(
     seed: int = 42,
     zero_eig_tol: float = 1e-8,
 ) -> np.ndarray:
-    """Normalized Laplacian PE with affinity w = |Y| = sqrt(R_full^2 + X_full^2)."""
+    """Normalized Laplacian PE with impedance-style affinity w = |Y| (=1/|Z| for series)."""
     if k < 1:
         raise ValueError("k must be >= 1")
     n = len(node_names)
@@ -213,9 +305,8 @@ def compute_laplacian_pe_from_y_edges(
         raise ValueError(f"node_pe_k must be < N. Got k={k}, N={n}.")
     node_to_local = {str(nm): i for i, nm in enumerate(node_names)}
     df = pd.read_csv(edge_csv_path)
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[float] = []
+    # Directed catalogs list both (i,j) and (j,i); collapse to undirected affinity.
+    pair_w: dict[tuple[int, int], float] = {}
     for _, row in df.iterrows():
         u = str(row["from_node"]).strip()
         v = str(row["to_node"]).strip()
@@ -227,27 +318,35 @@ def compute_laplacian_pe_from_y_edges(
         if w <= 0.0:
             continue
         iu, iv = node_to_local[u], node_to_local[v]
+        if iu == iv:
+            continue
+        a, b = (iu, iv) if iu < iv else (iv, iu)
+        prev = pair_w.get((a, b))
+        pair_w[(a, b)] = w if prev is None else 0.5 * (prev + w)
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for (iu, iv), w in pair_w.items():
         rows.extend([iu, iv])
         cols.extend([iv, iu])
         data.extend([w, w])
     if not data:
-        raise RuntimeError("No usable Y-edges for PE.")
-    w_mat = csr_matrix((data, (rows, cols)), shape=(n, n))
-    w_mat = 0.5 * (w_mat + w_mat.T)
-    deg = np.asarray(w_mat.sum(axis=1)).ravel()
-    d_inv = np.where(deg > 0.0, 1.0 / np.sqrt(deg), 0.0)
-    l_norm = diags(d_inv) @ (diags(deg) - w_mat) @ diags(d_inv)
-    k_solve = min(n - 1, max(k + 1, k + 16))
-    np.random.seed(int(seed))
-    eigvals, eigvecs = eigsh(
-        l_norm,
-        k=int(k_solve),
-        sigma=1e-8,
-        which="LM",
-        tol=1e-6,
-        maxiter=50_000,
-        ncv=min(n - 1, max(6 * int(k_solve) + 1, 60)),
-    )
+        raise RuntimeError(f"No positive |Y| edges for PE in {edge_csv_path}")
+    W = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
+    deg = np.asarray(W.sum(axis=1)).ravel()
+    # Avoid div0 on isolated nodes
+    d_inv_sqrt = np.zeros_like(deg)
+    mask = deg > 0
+    d_inv_sqrt[mask] = 1.0 / np.sqrt(deg[mask])
+    Dmh = diags(d_inv_sqrt)
+    L = diags(np.ones(n, dtype=np.float64)) - (Dmh @ W @ Dmh)
+    # Smallest nontrivial eigenvectors of normalized Laplacian
+    k_eigs = min(n - 2, max(k + 4, k + 1))
+    try:
+        eigvals, eigvecs = eigsh(L, k=k_eigs, which="SM", seed=int(seed))
+    except TypeError:
+        # older scipy: no seed=
+        eigvals, eigvecs = eigsh(L, k=k_eigs, which="SM")
     order = np.argsort(eigvals)
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
@@ -261,19 +360,138 @@ def compute_laplacian_pe_from_y_edges(
     return pe.astype(np.float32)
 
 
+# Nominal phase angles for V_ref (radians): a=0, b=-120°, c=+120°.
+_PHASE_ANGLE_RAD = {1: 0.0, 2: -2.0 * np.pi / 3.0, 3: 2.0 * np.pi / 3.0}
+
+
+def _vref_phasor(phase: int) -> complex:
+    return complex(np.exp(1j * float(_PHASE_ANGLE_RAD[int(phase)])))
+
+
+def _add_complex_to_busph(
+    p_map: dict[tuple[str, int], float],
+    q_map: dict[tuple[str, int], float],
+    bus: str,
+    ph: int,
+    s: complex,
+) -> None:
+    key = (str(bus), int(ph))
+    p_map[key] = p_map.get(key, 0.0) + float(np.real(s))
+    q_map[key] = q_map.get(key, 0.0) + float(np.imag(s))
+
+
+def _allocate_delta_branch(
+    p_map: dict[tuple[str, int], float],
+    q_map: dict[tuple[str, int], float],
+    *,
+    bus_i: str,
+    ph_i: int,
+    bus_j: str,
+    ph_j: int,
+    s_d: complex,
+) -> None:
+    """
+    Paper delta→phase map for one oriented connection (i,j):
+      S_node = diag(V) H^T diag(H V)^{-1} s_Δ
+    with H row = [+1 at i, -1 at j], V = V_ref (|V|=1, nominal angles).
+    """
+    Vi = _vref_phasor(ph_i)
+    Vj = _vref_phasor(ph_j)
+    hv = Vi - Vj
+    if abs(hv) < 1e-14:
+        raise ZeroDivisionError(
+            f"H V_ref ≈ 0 for delta branch {bus_i}.{ph_i}-{bus_j}.{ph_j}"
+        )
+    i_br = s_d / hv
+    _add_complex_to_busph(p_map, q_map, bus_i, ph_i, Vi * i_br)
+    _add_complex_to_busph(p_map, q_map, bus_j, ph_j, Vj * (-i_br))
+
+
+def _scale_delta_zip_setpoint(s: complex, channel: str, ph_i: int, ph_j: int) -> complex:
+    """
+    Paper I/Z factors on delta nominal powers before the H map:
+      I: s ⊙ |H V| / √3
+      Z: s ⊙ |H V|^2 / 3
+    At balanced |V|=1, |H V|=√3 ⇒ both factors are 1; kept explicit for fidelity.
+    """
+    if abs(s) == 0.0:
+        return 0j
+    hv = abs(_vref_phasor(ph_i) - _vref_phasor(ph_j))
+    ch = str(channel).upper()
+    if ch == "I":
+        return s * (hv / np.sqrt(3.0))
+    if ch == "Z":
+        return s * ((hv * hv) / 3.0)
+    return s
+
+
+def _allocate_zip_on_terminals(
+    out: dict[str, dict[tuple[str, int], float]],
+    *,
+    comps: dict[str, complex],
+    terminals: list[tuple[str, int]],
+    topology: str,
+) -> None:
+    """Place ZIP components onto phase nodes for wye or delta terminal sets."""
+    if not terminals:
+        return
+    topo = str(topology).lower()
+    if topo == "wye":
+        n = float(len(terminals))
+        for ch, s_tot in comps.items():
+            if abs(s_tot) == 0.0:
+                continue
+            # At |V_ref|=1: I ⊙ |V| and Z ⊙ |V|^2 leave setpoints unchanged.
+            s_each = s_tot / n
+            pk, qk = f"p_{ch}_kw", f"q_{ch}_kvar"
+            for bus, ph in terminals:
+                _add_complex_to_busph(out[pk], out[qk], bus, ph, s_each)
+        return
+
+    if topo != "delta":
+        raise ValueError(f"Unknown load topology {topology!r}")
+
+    # Build LL legs: 1φ → one pair; 3φ → cyclic pairs on the three terminals.
+    if len(terminals) == 2:
+        legs = [(terminals[0], terminals[1])]
+        n_leg = 1.0
+    elif len(terminals) >= 3:
+        t = terminals[:3]
+        legs = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+        n_leg = 3.0
+    else:
+        raise ValueError(f"Delta load needs ≥2 phase terminals, got {terminals!r}")
+
+    for ch, s_tot in comps.items():
+        if abs(s_tot) == 0.0:
+            continue
+        s_leg = s_tot / n_leg
+        pk, qk = f"p_{ch}_kw", f"q_{ch}_kvar"
+        for (bi, phi), (bj, phj) in legs:
+            s_eff = _scale_delta_zip_setpoint(s_leg, ch, phi, phj)
+            _allocate_delta_branch(
+                out[pk], out[qk], bus_i=bi, ph_i=phi, bus_j=bj, ph_j=phj, s_d=s_eff
+            )
+
+
 def zip_busph_features_at_vref(
     *,
-    dev_to_dss_load: dict[str, str],
-    dev_to_busph_load: dict[str, list[tuple[str, int, float]]],
-    model_by_device: dict[str, int],
+    loads_dss: list[str] | None = None,
+    model_by_device: dict[str, int] | None = None,
+    # Legacy kwargs kept so older call sites keep working; ignored (NodeRef path).
+    dev_to_dss_load: dict[str, str] | None = None,
+    dev_to_busph_load: dict[str, list[tuple[str, int, float]]] | None = None,
 ) -> dict[str, dict[tuple[str, int], float]]:
     """
-    Voltage-independent ZIP phase-node powers at |V_ref|=1.
+    Voltage-independent ZIP phase-node powers at paper V_ref.
 
-    Each load's current kW/kvar setpoint is placed entirely in one ZIP bin
-    according to its OpenDSS model, then spread with the existing bus–phase
-    weights (wye / multi-phase allocation already encoded there).
+    Terminals come from OpenDSS NodeRef→YNodeOrder (not heuristic DEVICE_TO_BUSPH):
+      - phase nodes + ground ⇒ grounded-wye / LN map (equal split)
+      - ≥2 phase nodes, no ground, Conn=Delta ⇒ H / V_ref delta map
+      - Conn=Delta but only one phase + ground (IEEE34 1φ quirk) ⇒ LN on that phase
+    ZIP bins follow OpenDSS Model / ZIPV (Model 8).
     """
+    del dev_to_busph_load
     out = {
         "p_P_kw": {},
         "q_P_kvar": {},
@@ -282,20 +500,45 @@ def zip_busph_features_at_vref(
         "p_Z_kw": {},
         "q_Z_kvar": {},
     }
-    for dev_key, ln in dev_to_dss_load.items():
+    model_by_device = model_by_device or {}
+
+    if loads_dss is not None:
+        load_names = list(loads_dss)
+    elif dev_to_dss_load is not None:
+        load_names = list(dev_to_dss_load.values())
+    else:
+        load_names = list(dss.Loads.AllNames())
+
+    for ln in load_names:
         dss.Loads.Name(ln)
+        if dss.Circuit.SetActiveElement(f"Load.{ln}") < 0:
+            continue
         p_set = float(dss.Loads.kW())
         q_set = float(dss.Loads.kvar())
-        m = model_by_device.get(str(dev_key), model_by_device.get(str(dev_key).lower()))
+        if abs(complex(p_set, q_set)) == 0.0:
+            continue
+
+        key_l = str(ln).strip().lower()
+        m = model_by_device.get(key_l, model_by_device.get(str(ln)))
         if m is None:
             m = int(dss.Loads.Model())
-        ch = _model_to_zip_channel(int(m))
-        pk = f"p_{ch}_kw"
-        qk = f"q_{ch}_kvar"
-        for bus, ph, w in dev_to_busph_load.get(dev_key, []):
-            key = (str(bus), int(ph))
-            out[pk][key] = out[pk].get(key, 0.0) + p_set * float(w)
-            out[qk][key] = out[qk].get(key, 0.0) + q_set * float(w)
+        comps = _zip_complex_components(p_set=p_set, q_set=q_set, model_id=int(m))
+
+        terminals = _load_phase_terminals_from_noderef()
+        if not terminals:
+            continue
+        has_gnd = _load_has_ground_terminal()
+        is_delta = bool(dss.Loads.IsDelta())
+
+        # True LL delta: no ground conductor and at least two phase terminals.
+        if is_delta and (not has_gnd) and len(terminals) >= 2:
+            topology = "delta"
+        else:
+            # Grounded wye, LN, or Conn=Delta with NodeRef[..., 0] (phase-to-ground).
+            topology = "wye"
+
+        _allocate_zip_on_terminals(out, comps=comps, terminals=terminals, topology=topology)
+
     return out
 
 
@@ -336,6 +579,7 @@ def generate_ieee34_draft_dataset(
     node_pe_k: int = 8,
     node_pe_seed: int = 42,
     node_pe_zero_eig_tol: float = 1e-8,
+    node_pe_from_csv: str | Path | None = None,
     p_load_scale_range: tuple[float, float] = (0.95, 1.05),
     q_load_scale_range: tuple[float, float] = (0.95, 1.05),
     p_pv_scale_range: tuple[float, float] = (0.95, 1.05),
@@ -390,7 +634,7 @@ def generate_ieee34_draft_dataset(
     pd.DataFrame(
         {"matrix_index": np.arange(len(node_names_graph)), "opendss_node": node_names_graph}
     ).to_csv(y_order_csv, index=False)
-    print(f"[ieee34-draft] Y shape={Y.shape} undirected Y-edges={n_und} -> {edge_csv.name}")
+    print(f"[ieee34-draft] Y shape={Y.shape} directed Y-edges={n_und} -> {edge_csv.name}")
 
     # AdvancedTypes(True) makes TotalPower/Losses return complex scalars; restore
     # classic list APIs for the rest of the snapshot pipeline.
@@ -418,7 +662,28 @@ def generate_ieee34_draft_dataset(
             ],
         }
     )
-    if int(node_pe_k) > 0:
+    pe_src = str(node_pe_from_csv).strip() if node_pe_from_csv is not None else ""
+    if pe_src:
+        pe_path = Path(pe_src)
+        if not pe_path.is_file():
+            raise FileNotFoundError(f"node_pe_from_csv not found: {pe_path}")
+        pe_df = pd.read_csv(pe_path)
+        pe_cols = sorted([c for c in pe_df.columns if str(c).lower().startswith("pe_")])
+        if not pe_cols:
+            raise ValueError(f"No pe_* columns in {pe_path}")
+        pe_df = pe_df.copy()
+        pe_df["node"] = pe_df["node"].astype(str).str.strip().str.lower()
+        node_index_df["node"] = node_index_df["node"].astype(str).str.strip().str.lower()
+        pe_map = pe_df.set_index("node")[pe_cols]
+        aligned = pe_map.reindex(node_index_df["node"].tolist())
+        n_miss = int(aligned.isna().any(axis=1).sum())
+        for c in pe_cols:
+            node_index_df[c] = aligned[c].to_numpy(dtype=float)
+        print(
+            f"[ieee34-draft] PE frozen from {pe_path} "
+            f"({len(pe_cols)} cols; missing_nodes={n_miss} filled NaN)"
+        )
+    elif int(node_pe_k) > 0:
         pe = compute_laplacian_pe_from_y_edges(
             node_names=node_names_graph,
             edge_csv_path=edge_csv,
@@ -454,7 +719,6 @@ def generate_ieee34_draft_dataset(
     sample_id = 0
     skipped_nonconv = 0
     skipped_bad_v = 0
-    dummy_meta = ds906._dummy_cap_reg_meta()
 
     p0 = float(inj.BASELINE["P_load_total_kw"])
     q0 = float(inj.BASELINE["Q_load_total_kvar"])
@@ -550,9 +814,11 @@ def generate_ieee34_draft_dataset(
                 # Re-assert per-scenario models after setpoint write.
                 ie34._reapply_load_models(model_by_device, loads_dss)
                 zip_maps = zip_busph_features_at_vref(
+                    loads_dss=loads_dss,
+                    model_by_device=model_by_device,
+                    # kept for call-site compatibility; H/V_ref path ignores weights
                     dev_to_dss_load=dev_to_dss_load,
                     dev_to_busph_load=dev_to_busph_load,
-                    model_by_device=model_by_device,
                 )
 
                 try:
@@ -615,7 +881,6 @@ def generate_ieee34_draft_dataset(
                         **zip_shares,
                         **reg_taps,
                         **cap_fields,
-                        **dummy_meta,
                     }
                 )
 
