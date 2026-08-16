@@ -87,6 +87,25 @@ def _filter_graph_nodes(node_names: list[str]) -> list[str]:
     return out
 
 
+def _device_model_from_map(name: str, model_by_device: dict[str, int] | None = None) -> int:
+    """Resolve DSS/load-type model id with case-insensitive fallbacks (default 1)."""
+    key = str(name)
+    if model_by_device is not None:
+        m = model_by_device.get(key, model_by_device.get(key.lower()))
+        if m is not None:
+            return int(m)
+    d = lt_dist.DEVICE_TO_MODEL
+    if key in d:
+        return int(d[key])
+    kl = key.lower()
+    if kl in d:
+        return int(d[kl])
+    for k, v in d.items():
+        if str(k).lower() == kl:
+            return int(v)
+    return 1
+
+
 def _zip_p_shares_from_setpoints(
     p_by_device: dict[str, float],
     model_by_device: dict[str, int] | None = None,
@@ -94,14 +113,7 @@ def _zip_p_shares_from_setpoints(
     """Fraction of set P in each DSS load model (1/2/4/5)."""
     totals = {1: 0.0, 2: 0.0, 4: 0.0, 5: 0.0}
     for name, p in p_by_device.items():
-        if model_by_device is not None:
-            m = model_by_device.get(str(name), model_by_device.get(str(name).lower()))
-            if m is None:
-                m = int(lt_dist.DEVICE_TO_MODEL.get(str(name), 1))
-            else:
-                m = int(m)
-        else:
-            m = int(lt_dist.DEVICE_TO_MODEL.get(str(name), 1))
+        m = _device_model_from_map(name, model_by_device)
         if m not in totals:
             m = 1
         totals[m] += max(float(p), 0.0)
@@ -130,11 +142,7 @@ def _sample_and_apply_load_models(
         if randomize:
             m = int(rng.choice(allowed))
         else:
-            m = int(
-                lt_dist.DEVICE_TO_MODEL.get(
-                    key, lt_dist.DEVICE_TO_MODEL.get(key.lower(), 1)
-                )
-            )
+            m = _device_model_from_map(key, None)
             if m not in allowed:
                 m = 1
         try:

@@ -10,6 +10,8 @@ Graph construction (paper §II):
     Terminals from OpenDSS NodeRef; wye/LN vs true LL-delta via ground conductor;
     delta uses diag(V) H^T diag(H V)^{-1} with paper I/Z |HV| factors.
     Model 8 uses ZIPV P/I/Z mix; other models map to one ZIP bin (7 splits P/Q).
+    Load.Model sampling + share_m*_p match Mirzaei (randomize_zip_models=True by default).
+    p_pv_kw is post-solve actual PV (same as Mirzaei), not available Pmpp.
   - Laplacian PE: optional freeze via node_pe_from_csv (reuse Mirzaei/original pe_*);
     otherwise |Y|-weighted PE from the new edge graph.
   - Settled taps/caps/aux are meta targets; Y built at regulator tap=1.
@@ -707,7 +709,7 @@ def generate_ieee34_draft_dataset(
     write_mvagg_compat: bool = True,
     delete_raw_node_csv_after_mvagg: bool = False,
     control_mode: str = "static",
-    randomize_zip_models: bool = False,
+    randomize_zip_models: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if bins_by_profile is None:
         bins_by_profile = {"load": 3, "pv": 3, "net": 3}
@@ -965,6 +967,10 @@ def generate_ieee34_draft_dataset(
                     skipped_bad_v += 1
                     continue
 
+                # Same as Mirzaei: node p_pv is post-solve actual injection (not available Pmpp).
+                busphP_pv_act, busphQ_pv_act = inj.get_pv_actual_pq_by_busph(
+                    pv_to_dss, pv_to_busph
+                )
                 p_grid, q_grid = ds8500._grid_upstream_post_kw_kvar()
                 p_loss, q_loss = ds8500._circuit_losses_kw_kvar()
                 pv_post = ds8500._read_pv_totals_post_solve_kw_kvar(list(ie34.NATIVE_PVS))
@@ -973,6 +979,8 @@ def generate_ieee34_draft_dataset(
                     pv_post_norm.setdefault(want, (0.0, 0.0))
 
                 p_load_t = float(p_load) * float(mL[t])
+                # Re-assert models for share accounting (same as Mirzaei post-solve).
+                ie34._reapply_load_models(model_by_device, loads_dss)
                 zip_shares = ie34._zip_p_shares_from_setpoints(
                     ie34._device_p_setpoints_from_totals(p_load_t),
                     model_by_device=model_by_device,
@@ -1015,7 +1023,7 @@ def generate_ieee34_draft_dataset(
                     ph = int(ph_s)
                     pl = _busph_get(busphP_load, bus, ph)
                     ql = _busph_get(busphQ_load, bus, ph)
-                    ppv = _busph_get(busphP_pv, bus, ph)  # available DER at time t
+                    ppv = _busph_get(busphP_pv_act, bus, ph)
                     i_all = node_to_idx_all.get(n)
                     if i_all is None:
                         i_all = next(
