@@ -2814,6 +2814,22 @@ def _reg_tap_metrics_from_logits(
     return {"reg_tap_mae_pu": mae, "reg_tap_acc": acc, "reg_mean_abs_tap_err": mae}
 
 
+def _zero_if_empty_aux(
+    loss_v: torch.Tensor,
+    aux: torch.Tensor,
+    *,
+    n_targets: int,
+) -> torch.Tensor:
+    """Avoid ``0 * nan`` when cap/reg heads are empty (n_cap/n_reg == 0)."""
+    if int(n_targets) <= 0:
+        return loss_v.new_zeros(())
+    if aux is None or not torch.is_tensor(aux) or aux.numel() == 0:
+        return loss_v.new_zeros(())
+    if not torch.isfinite(aux).all():
+        return loss_v.new_zeros(())
+    return aux
+
+
 def _reg_loss_scalar(
     pred: torch.Tensor | None,
     target: torch.Tensor,
@@ -5863,7 +5879,7 @@ def _evaluate_split_losses_multi_chunks(
                     reg_logits=reg_logits_v,
                     reg_class_tables=reg_class_tables,
                 )
-                lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                lt = lam_v * lv + float(args.lambda_cap) * _zero_if_empty_aux(lv, lc, n_targets=n_cap) + float(args.lambda_reg) * _zero_if_empty_aux(lv, lr_, n_targets=n_reg)
                 lpf = _pf_loss_if_enabled(
                     pf_state,
                     v_n,
@@ -7851,6 +7867,8 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         reg_ordinal_alpha=reg_ordinal_alpha,
                         reg_cost_matrices=reg_cost_matrices_d,
                     )
+                    loss_c = _zero_if_empty_aux(loss_v, loss_c, n_targets=n_cap)
+                    loss_r = _zero_if_empty_aux(loss_v, loss_r, n_targets=n_reg)
                     loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                     loss_pf = _pf_loss_if_enabled(
                         pf_state,
@@ -8045,7 +8063,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                                 reg_logits=reg_logits_v,
                                 reg_class_tables=reg_class_tables,
                             )
-                            lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                            lt = lam_v * lv + float(args.lambda_cap) * _zero_if_empty_aux(lv, lc, n_targets=n_cap) + float(args.lambda_reg) * _zero_if_empty_aux(lv, lr_, n_targets=n_reg)
                             lpf = _pf_loss_if_enabled(
                                 pf_state,
                                 v_n,
@@ -9721,6 +9739,8 @@ def main() -> None:
                 )
                 loss_c = bce(c_log, y_cap)
                 loss_r = _reg_loss_scalar(r_p, y_reg, reg_loss)
+                loss_c = _zero_if_empty_aux(loss_v, loss_c, n_targets=n_cap)
+                loss_r = _zero_if_empty_aux(loss_v, loss_r, n_targets=n_reg)
                 loss = lam_v * loss_v + float(args.lambda_cap) * loss_c + float(args.lambda_reg) * loss_r
                 loss_pf = _pf_loss_if_enabled(
                     pf_state,
@@ -9852,7 +9872,7 @@ def main() -> None:
                         lv = mse(v_n.view_as(yb_n), yb_n)
                         lc = bce(c_log, y_cap)
                         lr_ = _reg_loss_scalar(r_p, y_reg, reg_loss)
-                        lt = lam_v * lv + float(args.lambda_cap) * lc + float(args.lambda_reg) * lr_
+                        lt = lam_v * lv + float(args.lambda_cap) * _zero_if_empty_aux(lv, lc, n_targets=n_cap) + float(args.lambda_reg) * _zero_if_empty_aux(lv, lr_, n_targets=n_reg)
                         lpf = _pf_loss_if_enabled(
                             pf_state,
                             v_n,
