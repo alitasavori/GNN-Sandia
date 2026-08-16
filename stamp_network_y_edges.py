@@ -29,6 +29,7 @@ Outputs e.g.:
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import shutil
 from pathlib import Path
@@ -287,13 +288,16 @@ def stamp_chunk_parent(
             encoding="utf-8",
         )
 
+    # Always reload draft so notebook sessions pick up NodeRef-skip fixes.
+    importlib.reload(draft)
+
     _compile_feeder(feeder)
     _force_taps_nominal()
     Y, _ = draft.assemble_network_y_on_nodes(node_names)
-    print(
-        f"[stamp-y] Y shape={Y.shape} "
-        f"nnz_offdiag={int(np.count_nonzero(Y) - np.count_nonzero(np.diag(Y)))}"
-    )
+    # Y is dense ndarray from assemble_network_y_on_nodes.
+    diag = np.diag(Y)
+    nnz_offdiag = int(np.count_nonzero(Y) - np.count_nonzero(diag))
+    print(f"[stamp-y] Y shape={Y.shape} nnz_offdiag={nnz_offdiag}")
 
     edge_work_dir = src_parent if inplace else dst_parent
     edge_work_dir.mkdir(parents=True, exist_ok=True)

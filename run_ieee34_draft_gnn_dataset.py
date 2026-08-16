@@ -160,124 +160,178 @@ def _load_has_ground_terminal() -> bool:
     return any(int(r) <= 0 for r in np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel())
 
 
+def _dss_error_number() -> int:
+    try:
+        return int(dss.Error.Number())
+    except Exception:
+        return 0
+
+
+def _dss_error_description() -> str:
+    try:
+        return str(dss.Error.Description() or "").strip()
+    except Exception:
+        return ""
+
+
 def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list[str]]:
     """
     Stamp network-only YPrim onto the given phase-node list (siemens).
     Excludes Load/Generator/PVSystem/Storage/Vsource.
 
-    Some OpenDSS elements on large feeders (esp. IEEE 8500) raise
-    ``NodeRef is not populated``; those elements are skipped with a count.
+    Some OpenDSS elements on large feeders (esp. IEEE 8500) fail with
+    ``NodeRef is not populated``. Those elements are skipped (counted), not fatal.
     """
+    # Disable auto-exceptions: otherwise one bad Line/Xfmr aborts the whole stamp.
+    prev_use_exc = True
     try:
-        dss.Basic.AdvancedTypes(True)
+        prev_use_exc = bool(dss.Error.UseExceptions())
+        dss.Error.UseExceptions(False)
     except Exception:
         pass
 
-    y_order = [str(x) for x in dss.Circuit.YNodeOrder()]
-    n = len(node_names)
-    name_to_i = {str(n).strip().lower(): i for i, n in enumerate(node_names)}
-    Y = lil_matrix((n, n), dtype=np.complex128)
-    n_ok = 0
-    n_skip = 0
-    skip_examples: list[str] = []
-
-    for element_name in dss.Circuit.AllElementNames():
-        element_class = element_name.split(".", maxsplit=1)[0].lower()
-        if element_class not in INCLUDED_Y_CLASSES:
-            continue
-        if dss.Circuit.SetActiveElement(element_name) < 0:
-            continue
+    try:
         try:
-            if hasattr(dss.CktElement, "Enabled") and (not bool(dss.CktElement.Enabled())):
-                n_skip += 1
-                continue
+            dss.Basic.AdvancedTypes(True)
         except Exception:
             pass
 
-        try:
-            node_ref = np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel()
-            y_prim = np.asarray(dss.CktElement.YPrim(), dtype=np.complex128)
-        except Exception as exc:
-            n_skip += 1
-            if len(skip_examples) < 8:
-                skip_examples.append(f"{element_name} ({type(exc).__name__}: {exc})")
-            continue
+        y_order = [str(x) for x in dss.Circuit.YNodeOrder()]
+        n = len(node_names)
+        name_to_i = {str(nm).strip().lower(): i for i, nm in enumerate(node_names)}
+        Y = lil_matrix((n, n), dtype=np.complex128)
+        n_ok = 0
+        n_skip = 0
+        skip_examples: list[str] = []
 
-        local_order = int(node_ref.size)
-        if local_order == 0 or y_prim.size == 0:
-            n_skip += 1
-            continue
-        if y_prim.ndim == 1:
-            # Classic interleaved Re/Im when AdvancedTypes is off / partial.
-            if y_prim.size == 2 * local_order * local_order:
-                raw = np.asarray(y_prim, dtype=float).ravel()
-                y_prim = (raw[0::2] + 1j * raw[1::2]).reshape(
-                    (local_order, local_order), order="F"
-                )
-            elif y_prim.size == local_order * local_order:
+        for element_name in dss.Circuit.AllElementNames():
+            element_class = element_name.split(".", maxsplit=1)[0].lower()
+            if element_class not in INCLUDED_Y_CLASSES:
+                continue
+            try:
+                if dss.Circuit.SetActiveElement(element_name) < 0:
+                    continue
+            except Exception as exc:
+                n_skip += 1
+                if len(skip_examples) < 8:
+                    skip_examples.append(f"{element_name} (SetActive: {exc})")
+                continue
+
+            try:
+                if hasattr(dss.CktElement, "Enabled") and (not bool(dss.CktElement.Enabled())):
+                    n_skip += 1
+                    continue
+            except Exception:
+                pass
+
+            # Per-element body: never let one DSS failure stop the feeder stamp.
+            try:
+                node_ref = np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel()
+                err_n = _dss_error_number()
+                if err_n != 0:
+                    desc = _dss_error_description() or f"Error.Number={err_n}"
+                    n_skip += 1
+                    if len(skip_examples) < 8:
+                        skip_examples.append(f"{element_name} (NodeRef: {desc})")
+                    continue
+
+                y_prim = np.asarray(dss.CktElement.YPrim(), dtype=np.complex128)
+                err_n = _dss_error_number()
+                if err_n != 0:
+                    desc = _dss_error_description() or f"Error.Number={err_n}"
+                    n_skip += 1
+                    if len(skip_examples) < 8:
+                        skip_examples.append(f"{element_name} (YPrim: {desc})")
+                    continue
+            except Exception as exc:
+                n_skip += 1
+                if len(skip_examples) < 8:
+                    skip_examples.append(f"{element_name} ({type(exc).__name__}: {exc})")
+                continue
+
+            local_order = int(node_ref.size)
+            if local_order == 0 or y_prim.size == 0:
+                n_skip += 1
+                continue
+            if y_prim.ndim == 1:
+                # Classic interleaved Re/Im when AdvancedTypes is off / partial.
+                if y_prim.size == 2 * local_order * local_order:
+                    raw = np.asarray(y_prim, dtype=float).ravel()
+                    y_prim = (raw[0::2] + 1j * raw[1::2]).reshape(
+                        (local_order, local_order), order="F"
+                    )
+                elif y_prim.size == local_order * local_order:
+                    y_prim = y_prim.reshape((local_order, local_order), order="F")
+                else:
+                    n_skip += 1
+                    continue
+            elif y_prim.shape != (local_order, local_order):
+                if y_prim.size != local_order * local_order:
+                    n_skip += 1
+                    continue
                 y_prim = y_prim.reshape((local_order, local_order), order="F")
+
+            active = np.flatnonzero(node_ref > 0)
+            gidx: list[int] = []
+            loci: list[int] = []
+            for loc in active:
+                yi = int(node_ref[loc]) - 1
+                if yi < 0 or yi >= len(y_order):
+                    continue
+                nm = str(y_order[yi]).strip().lower()
+                gi = name_to_i.get(nm)
+                if gi is None:
+                    continue
+                gidx.append(int(gi))
+                loci.append(int(loc))
+
+            if not gidx:
+                n_skip += 1
+                continue
+
+            stamped = False
+            for a, ia in zip(loci, gidx):
+                for b, ib in zip(loci, gidx):
+                    val = y_prim[a, b]
+                    if val != 0:
+                        Y[ia, ib] += val
+                        stamped = True
+            if stamped:
+                n_ok += 1
             else:
                 n_skip += 1
-                continue
-        elif y_prim.shape != (local_order, local_order):
-            if y_prim.size != local_order * local_order:
-                n_skip += 1
-                continue
-            y_prim = y_prim.reshape((local_order, local_order), order="F")
 
-        active = np.flatnonzero(node_ref > 0)
-        gidx: list[int] = []
-        loci: list[int] = []
-        for loc in active:
-            yi = int(node_ref[loc]) - 1
-            if yi < 0 or yi >= len(y_order):
-                continue
-            nm = str(y_order[yi]).strip().lower()
-            gi = name_to_i.get(nm)
-            if gi is None:
-                continue
-            gidx.append(int(gi))
-            loci.append(int(loc))
+        try:
+            dss.Basic.AdvancedTypes(False)
+        except Exception:
+            pass
 
-        if not gidx:
-            n_skip += 1
-            continue
-
-        stamped = False
-        for a, ia in zip(loci, gidx):
-            for b, ib in zip(loci, gidx):
-                val = y_prim[a, b]
-                if val != 0:
-                    Y[ia, ib] += val
-                    stamped = True
-        if stamped:
-            n_ok += 1
-        else:
-            n_skip += 1
-
-    try:
-        dss.Basic.AdvancedTypes(False)
-    except Exception:
-        pass
-
-    Y_csr = Y.tocsr()
-    # lil/csr: use .nnz / dense diagonal — np.count_nonzero(sparse) is ambiguous.
-    nnz_offdiag = int(Y_csr.nnz - np.count_nonzero(Y_csr.diagonal()))
-    print(
-        f"[assemble_network_y] elements_ok={n_ok} skipped={n_skip} "
-        f"N={n} nnz_offdiag={nnz_offdiag}"
-    )
-    if skip_examples:
-        print("[assemble_network_y] skip examples:")
-        for s in skip_examples:
-            print(f"  - {s}")
-    if n_ok == 0:
-        raise RuntimeError(
-            "assemble_network_y_on_nodes: no network elements stamped into Y "
-            f"(skipped={n_skip}). Check DSS compile / included classes."
+        Y_csr = Y.tocsr()
+        # lil/csr: use .nnz / dense diagonal — np.count_nonzero(sparse) is ambiguous.
+        nnz_offdiag = int(Y_csr.nnz - np.count_nonzero(Y_csr.diagonal()))
+        print(
+            f"[assemble_network_y] elements_ok={n_ok} skipped={n_skip} "
+            f"N={n} nnz_offdiag={nnz_offdiag}"
         )
+        if skip_examples:
+            print("[assemble_network_y] skip examples:")
+            for s in skip_examples:
+                print(f"  - {s}")
+        if n_ok == 0:
+            raise RuntimeError(
+                "assemble_network_y_on_nodes: no network elements stamped into Y "
+                f"(skipped={n_skip}). Check DSS compile / included classes."
+            )
 
-    return Y_csr.toarray(), node_names
+        return Y_csr.toarray(), node_names
+    finally:
+        try:
+            dss.Error.UseExceptions(bool(prev_use_exc))
+        except Exception:
+            try:
+                dss.Error.UseExceptions(True)
+            except Exception:
+                pass
 
 
 def _edge_row_y(
