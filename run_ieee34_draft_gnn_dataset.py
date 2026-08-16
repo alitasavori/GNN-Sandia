@@ -164,6 +164,9 @@ def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list
     """
     Stamp network-only YPrim onto the given phase-node list (siemens).
     Excludes Load/Generator/PVSystem/Storage/Vsource.
+
+    Some OpenDSS elements on large feeders (esp. IEEE 8500) raise
+    ``NodeRef is not populated``; those elements are skipped with a count.
     """
     try:
         dss.Basic.AdvancedTypes(True)
@@ -171,10 +174,12 @@ def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list
         pass
 
     y_order = [str(x) for x in dss.Circuit.YNodeOrder()]
-    y_lower = {str(n).strip().lower(): i for i, n in enumerate(y_order)}
     n = len(node_names)
     name_to_i = {str(n).strip().lower(): i for i, n in enumerate(node_names)}
     Y = lil_matrix((n, n), dtype=np.complex128)
+    n_ok = 0
+    n_skip = 0
+    skip_examples: list[str] = []
 
     for element_name in dss.Circuit.AllElementNames():
         element_class = element_name.split(".", maxsplit=1)[0].lower()
@@ -182,18 +187,45 @@ def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list
             continue
         if dss.Circuit.SetActiveElement(element_name) < 0:
             continue
-        node_ref = np.asarray(dss.CktElement.NodeRef(), dtype=np.int64)
-        y_prim = np.asarray(dss.CktElement.YPrim(), dtype=np.complex128)
+        try:
+            if hasattr(dss.CktElement, "Enabled") and (not bool(dss.CktElement.Enabled())):
+                n_skip += 1
+                continue
+        except Exception:
+            pass
+
+        try:
+            node_ref = np.asarray(dss.CktElement.NodeRef(), dtype=np.int64).ravel()
+            y_prim = np.asarray(dss.CktElement.YPrim(), dtype=np.complex128)
+        except Exception as exc:
+            n_skip += 1
+            if len(skip_examples) < 8:
+                skip_examples.append(f"{element_name} ({type(exc).__name__}: {exc})")
+            continue
+
         local_order = int(node_ref.size)
         if local_order == 0 or y_prim.size == 0:
+            n_skip += 1
             continue
-        if y_prim.shape != (local_order, local_order):
+        if y_prim.ndim == 1:
+            # Classic interleaved Re/Im when AdvancedTypes is off / partial.
+            if y_prim.size == 2 * local_order * local_order:
+                raw = np.asarray(y_prim, dtype=float).ravel()
+                y_prim = (raw[0::2] + 1j * raw[1::2]).reshape(
+                    (local_order, local_order), order="F"
+                )
+            elif y_prim.size == local_order * local_order:
+                y_prim = y_prim.reshape((local_order, local_order), order="F")
+            else:
+                n_skip += 1
+                continue
+        elif y_prim.shape != (local_order, local_order):
             if y_prim.size != local_order * local_order:
+                n_skip += 1
                 continue
             y_prim = y_prim.reshape((local_order, local_order), order="F")
 
         active = np.flatnonzero(node_ref > 0)
-        # Map NodeRef → YNodeOrder name → graph index
         gidx: list[int] = []
         loci: list[int] = []
         for loc in active:
@@ -207,13 +239,45 @@ def assemble_network_y_on_nodes(node_names: list[str]) -> tuple[np.ndarray, list
             gidx.append(int(gi))
             loci.append(int(loc))
 
+        if not gidx:
+            n_skip += 1
+            continue
+
+        stamped = False
         for a, ia in zip(loci, gidx):
             for b, ib in zip(loci, gidx):
                 val = y_prim[a, b]
                 if val != 0:
                     Y[ia, ib] += val
+                    stamped = True
+        if stamped:
+            n_ok += 1
+        else:
+            n_skip += 1
 
-    return Y.tocsr().toarray(), node_names
+    try:
+        dss.Basic.AdvancedTypes(False)
+    except Exception:
+        pass
+
+    Y_csr = Y.tocsr()
+    # lil/csr: use .nnz / dense diagonal — np.count_nonzero(sparse) is ambiguous.
+    nnz_offdiag = int(Y_csr.nnz - np.count_nonzero(Y_csr.diagonal()))
+    print(
+        f"[assemble_network_y] elements_ok={n_ok} skipped={n_skip} "
+        f"N={n} nnz_offdiag={nnz_offdiag}"
+    )
+    if skip_examples:
+        print("[assemble_network_y] skip examples:")
+        for s in skip_examples:
+            print(f"  - {s}")
+    if n_ok == 0:
+        raise RuntimeError(
+            "assemble_network_y_on_nodes: no network elements stamped into Y "
+            f"(skipped={n_skip}). Check DSS compile / included classes."
+        )
+
+    return Y_csr.toarray(), node_names
 
 
 def _edge_row_y(

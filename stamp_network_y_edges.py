@@ -130,24 +130,89 @@ def _compile_feeder(feeder: str) -> None:
         raise ValueError(f"Unknown feeder {feeder!r}; use 906, 8500, or ieee34")
 
 
-def _link_or_copy(src: Path, dst: Path) -> str:
-    """Prefer hardlink (same volume, no extra space); else copy2."""
+def _looks_like_google_drive(path: Path) -> bool:
+    s = str(path).replace("/", "\\").lower()
+    return (
+        "\\my drive\\" in s
+        or s.startswith("k:\\")
+        or "google drive" in s
+        or "shortcut-targets-by-id" in s
+    )
+
+
+def _chunked_copy(src: Path, dst: Path, *, chunk_bytes: int = 8 * 1024 * 1024) -> None:
+    """Buffered copy that avoids Drive File Stream failures of shutil.copy2 on large CSVs."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        dst.unlink()
+    tmp = dst.parent / f".{dst.name}.partial_{os.getpid()}"
     try:
-        os.link(src, dst)
-        return "hardlink"
-    except OSError:
-        shutil.copy2(src, dst)
-        return "copy"
+        with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+            while True:
+                buf = fsrc.read(chunk_bytes)
+                if not buf:
+                    break
+                fdst.write(buf)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """
+    Mirror one file into the sibling dataset.
+
+    Google Drive File Stream rejects hardlinks (WinError 1) and often fails
+    shutil.copy2 on large CSVs (Errno 22). Use chunked copy there; try hardlink
+    only on normal local disks.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Resume-friendly: identical size already present.
+    if dst.is_file():
+        try:
+            if dst.stat().st_size == src.stat().st_size and dst.stat().st_size > 0:
+                return "skip-exists"
+        except OSError:
+            pass
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+
+    on_drive = _looks_like_google_drive(src) or _looks_like_google_drive(dst)
+    if not on_drive:
+        try:
+            os.link(src, dst)
+            return "hardlink"
+        except OSError:
+            pass
+
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            _chunked_copy(src, dst)
+            return "copy" if attempt == 0 else f"copy-retry{attempt}"
+        except OSError as exc:
+            last_err = exc
+            # Brief backoff for Drive hydration / locks.
+            import time
+
+            time.sleep(0.5 * (attempt + 1))
+    assert last_err is not None
+    raise OSError(
+        f"Failed to copy after retries:\n  src={src}\n  dst={dst}\n  last={last_err}"
+    ) from last_err
 
 
 def _mirror_chunk_non_edges(src_run: Path, dst_run: Path, *, dry_run: bool) -> int:
     """Copy/hardlink all files except edge CSVs into dst_run."""
     n = 0
     dst_run.mkdir(parents=True, exist_ok=True)
-    for src_file in src_run.iterdir():
+    for src_file in sorted(src_run.iterdir(), key=lambda p: p.name):
         if not src_file.is_file():
             continue
         if src_file.name in _SKIP_COPY_NAMES:
@@ -159,8 +224,8 @@ def _mirror_chunk_non_edges(src_run: Path, dst_run: Path, *, dry_run: bool) -> i
             continue
         mode = _link_or_copy(src_file, dest)
         n += 1
-        if n <= 3 or src_file.name.startswith("gnn_"):
-            print(f"[stamp-y]   {mode}: {src_run.name}/{src_file.name}")
+        if n <= 5 or src_file.name.startswith("gnn_") or mode.startswith("copy"):
+            print(f"[stamp-y]   {mode}: {src_run.name}/{src_file.name}", flush=True)
     return n
 
 
