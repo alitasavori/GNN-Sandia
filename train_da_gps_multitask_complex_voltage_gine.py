@@ -5809,6 +5809,8 @@ def _evaluate_split_losses_multi_chunks(
     num_workers: int,
 ) -> dict[str, float]:
     """Mean multitask loss (tot/volt/pf) over a split, matching the training val loop."""
+    n_cap = len(cap_cols)
+    n_reg = len(reg_cols)
     tot_sum = volt_sum = pf_sum = 0.0
     n_graphs = 0
     y_mean_d = y_mean.to(device).float()
