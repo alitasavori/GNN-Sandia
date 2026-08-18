@@ -1317,6 +1317,60 @@ def _busph_key_from_node_key(key_str: str) -> tuple[str, int] | None:
         return None
 
 
+_ZIP_LOAD_COLS = (
+    "p_P_kw",
+    "q_P_kvar",
+    "p_I_kw",
+    "q_I_kvar",
+    "p_Z_kw",
+    "q_Z_kvar",
+)
+
+
+def _is_zip_node_feature_cols(col_index: dict[str, int]) -> bool:
+    return all(c in col_index for c in _ZIP_LOAD_COLS)
+
+
+def _read_load_zip_models(base_names: list[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for ln in base_names:
+        raw = str(ln).strip()
+        try:
+            dss.Loads.Name(raw)
+            out[raw.lower()] = int(dss.Loads.Model())
+        except Exception:
+            continue
+    return out
+
+
+def _fill_zip_node_features_from_dss(
+    x_step: np.ndarray,
+    node_order: list[str],
+    col_index: dict[str, int],
+    *,
+    delta_alloc: str = "H",
+    model_by_device: dict[str, int] | None = None,
+) -> None:
+    """Stamp draft ZIP@V_ref bins from current OpenDSS load kW/kvar (after daily scaling)."""
+    from run_ieee34_draft_gnn_dataset import zip_busph_features_at_vref
+
+    zmaps = zip_busph_features_at_vref(
+        model_by_device=model_by_device,
+        delta_alloc=str(delta_alloc),
+    )
+    nk_to_li = {str(nk).strip().lower(): li for li, nk in enumerate(node_order)}
+    for col in _ZIP_LOAD_COLS:
+        j = col_index.get(col)
+        if j is None:
+            continue
+        busmap = zmaps.get(col, {})
+        x_step[:, int(j)] = 0.0
+        for (bus, ph), val in busmap.items():
+            li = nk_to_li.get(f"{str(bus).strip().lower()}.{int(ph)}")
+            if li is not None:
+                x_step[int(li), int(j)] = float(val)
+
+
 def _precompute_daily_feature_tables(
     *,
     ref_x: np.ndarray,
@@ -1931,9 +1985,22 @@ def run(
     col_bess_p = col_index.get("p_bess_kw")
     col_bess_q = col_index.get("q_bess_kvar")
     der_use_bess_columns = col_bess_p is not None or col_bess_q is not None
-    if col_p is None or col_q is None:
+    zip_mode = _is_zip_node_feature_cols(col_index)
+    zip_delta_alloc = str(hp.get("delta_alloc", "H") or "H").strip()
+    if zip_delta_alloc.lower() in ("h", "paper", "href"):
+        zip_delta_alloc = "H"
+    elif zip_delta_alloc.lower() in ("half", "/2", "div2", "equal"):
+        zip_delta_alloc = "half"
+    zip_model_by_device: dict[str, int] | None = None
+    if not zip_mode and (col_p is None or col_q is None):
         raise ValueError(
             f"This daily driver expects 'p_load_kw' and 'q_load_kvar' in node_feature_cols; got {node_feature_cols!r}"
+        )
+    if zip_mode:
+        print(
+            f"[da_gps_daily] ZIP node features ({', '.join(_ZIP_LOAD_COLS)}); "
+            f"delta_alloc={zip_delta_alloc!r} from current OpenDSS load setpoints each step.",
+            flush=True,
         )
 
     z = torch.load(Path(cache_pt).resolve(), map_location="cpu", weights_only=False)
@@ -2447,6 +2514,8 @@ def run(
     base_kw = np.array([float(d["kw"]) for d in loads], dtype=np.float64)
     base_kvar = np.array([float(d["kvar"]) for d in loads], dtype=np.float64)
     base_names = [str(d["name"]) for d in loads]
+    if zip_mode and feeder_key == "ieee34" and not skip_opendss_solve:
+        zip_model_by_device = _read_load_zip_models(base_names)
     base_kw, base_kvar, load_align_meta = _align_method_a_load_bases_for_feeder(
         feeder_key,
         base_names=base_names,
@@ -2572,8 +2641,8 @@ def run(
         base_names=base_names,
         base_kw=base_kw,
         base_kvar=base_kvar,
-        col_p=col_p,
-        col_q=col_q,
+        col_p=None if zip_mode else col_p,
+        col_q=None if zip_mode else col_q,
         col_pv=col_pv,
         col_bess_p=col_bess_p,
         col_bess_q=col_bess_q,
@@ -2867,11 +2936,29 @@ def run(
             m_der_t=float(m_der_t),
             want_der=bool(want_der),
         )
+        if zip_mode:
+            _fill_zip_node_features_from_dss(
+                step_buf,
+                node_order,
+                col_index,
+                delta_alloc=zip_delta_alloc,
+                model_by_device=zip_model_by_device,
+            )
 
         if first_diag:
             first_diag = False
-            nz = int(np.sum(np.abs(step_buf[:, col_p]) + np.abs(step_buf[:, col_q]) > 1e-3))
-            print(f"[da_gps_daily] feature diag (first step): nodes with |P|+|Q|>1e-3: {nz}/{N}", flush=True)
+            if zip_mode:
+                zcols = [int(col_index[c]) for c in _ZIP_LOAD_COLS if c in col_index]
+                nz = int(
+                    np.sum(np.sum(np.abs(step_buf[:, zcols]), axis=1) > 1e-3)
+                ) if zcols else 0
+                print(
+                    f"[da_gps_daily] feature diag (first step, ZIP): nodes with |ΣZIP|>1e-3: {nz}/{N}",
+                    flush=True,
+                )
+            elif col_p is not None and col_q is not None:
+                nz = int(np.sum(np.abs(step_buf[:, col_p]) + np.abs(step_buf[:, col_q]) > 1e-3))
+                print(f"[da_gps_daily] feature diag (first step): nodes with |P|+|Q|>1e-3: {nz}/{N}", flush=True)
 
         feature_build_s_total += time.perf_counter() - t_fb0
 
@@ -3339,7 +3426,7 @@ def run(
         lab_ang = f"DA-GPS ({cfg_stem}) MAE={n_mae_ang:.3f}°" if np.isfinite(n_mae_ang) else f"DA-GPS ({cfg_stem})"
         ax1.plot(t_hours, va_gnn[:, j], "--", linewidth=1.2, label=lab_ang)
         ax1.set_xlabel("Hour of day")
-        ax1.set_ylabel("V angle (deg)")
+        ax1.set_ylabel("V angle (°)")
         if m_ang.any():
             ys_a = np.concatenate([va_dss[m_ang, j], va_gnn[m_ang, j]]).astype(np.float64, copy=False)
             ys_a = ys_a[np.isfinite(ys_a)]
@@ -3379,6 +3466,40 @@ def run(
             plt.show()
         else:
             plt.close(fig)
+
+    # Paper / notebook helper: |V| + angle timeseries for every plotted bus.phase
+    # (so IEEE trajectory figures can be composed without scraping PNGs).
+    if plot_rows:
+        def _angle_to_deg_col(a: np.ndarray) -> np.ndarray:
+            """Ensure degrees (OpenDSS is deg; guard if any path left radians)."""
+            a = np.asarray(a, dtype=np.float64)
+            fin = a[np.isfinite(a)]
+            if fin.size and float(np.nanmax(np.abs(fin))) <= (np.pi + 0.25):
+                return np.rad2deg(a)
+            return a
+
+        mon_rows: dict[str, object] = {
+            "step_idx": list(range(int(npts))),
+            "hour": np.asarray(t_hours, dtype=np.float64).tolist(),
+        }
+        for n, _n_mae, _n_mae_ang in plot_rows:
+            j = int(node_to_idx[n])
+            nk = str(n).strip().lower()
+            stem = nk.replace(".", "_")
+            mon_rows[f"{nk}__dss_vmag_pu"] = np.asarray(v_dss[:, j], dtype=np.float64).tolist()
+            mon_rows[f"{nk}__gnn_vmag_pu"] = np.asarray(v_gnn[:, j], dtype=np.float64).tolist()
+            mon_rows[f"{nk}__dss_vang_deg"] = _angle_to_deg_col(va_dss[:, j]).tolist()
+            mon_rows[f"{nk}__gnn_vang_deg"] = _angle_to_deg_col(va_gnn[:, j]).tolist()
+            mon_rows[f"{stem}__dss_vmag_pu"] = mon_rows[f"{nk}__dss_vmag_pu"]
+            mon_rows[f"{stem}__gnn_vmag_pu"] = mon_rows[f"{nk}__gnn_vmag_pu"]
+            mon_rows[f"{stem}__dss_vang_deg"] = mon_rows[f"{nk}__dss_vang_deg"]
+            mon_rows[f"{stem}__gnn_vang_deg"] = mon_rows[f"{nk}__gnn_vang_deg"]
+        mon_csv = Path(out_dir) / "daily_voltage_monitor.csv"
+        pd.DataFrame(mon_rows).to_csv(mon_csv, index=False)
+        print(
+            f"[da_gps_daily] wrote {mon_csv}  (|V|+angle[deg] for {len(plot_rows)} plotted nodes)",
+            flush=True,
+        )
 
     summary = {
         "run_dir": str(run_dir),
