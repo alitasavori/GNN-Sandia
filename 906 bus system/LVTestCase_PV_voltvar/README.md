@@ -5,13 +5,13 @@ Stock original under `OpenDSS-master/.../IEEETestCases/LVTestCase` is **unchange
 ## Files
 - `Master_snapshot_PV_voltvar.dss` — snapshot + `ControlMode=STATIC`
 - `Master_PV_voltvar.dss` — yearly demand-interval + Volt-Var
-- `PV_voltvar_906.dss` — `PVSystem.PV906` @ `906.1` + `PVSystem.PV639` @ `639.2` + InvControls
+- `PV_voltvar_906.dss` — `PVSystem.PV906` @ `906.1` + `PVSystem.PV458` @ `458.3` + InvControls
 
 ## Inverters
 | Name | Bus | Load | Notes |
 |------|-----|------|-------|
 | **PV906** | **906.1** | LOAD55 | Remote end, phase A |
-| **PV639** | **639.2** | LOAD35 | Mid-feeder site commonly paired with 906 in EU LV PV papers |
+| **PV458** | **458.3** | LOAD24 | Mid-lateral; map-far from bus 1 and 906 (replaces prior PV34 @ 34.1) |
 
 Shared Volt-Var:
 - **Pmpp = 12 kW**, **kVA = 15** each (~25% oversize)
@@ -27,4 +27,4 @@ python size_906_pv_voltvar.py
 
 Results: `outputs/906_pv_voltvar_sizing.json` / `.csv`.
 
-**Finding:** on this feeder stock voltages are already high (~1.03–1.05). Active power raises remote V; Volt-Var **absorbs Q** and cuts overvoltage vs the same-kW MPPT unit. Absolute MAE vs no-PV can still worsen if Pmpp is large — 12 kW is the balanced pick for PV906; PV639 uses the same starting size.
+**Finding:** on this feeder stock voltages are already high (~1.03–1.05). Active power raises remote V; Volt-Var **absorbs Q** and cuts overvoltage vs the same-kW MPPT unit. Absolute MAE vs no-PV can still worsen if Pmpp is large — 12 kW is the balanced pick for PV906; PV458 uses the same starting size.

@@ -10,9 +10,9 @@ PV (absorb Q). We oversize kVA vs Pmpp (IEEE34-style headroom) so |Q|_max is use
 and pick Pmpp that maximizes Volt-Var benefit vs MPPT while keeping feeder voltages
 reasonable.
 
-Note: PV_voltvar_906.dss also defines PV34 @ 34.1 (LOAD1) with the same shared
+Note: PV_voltvar_906.dss also defines PV458 @ 458.3 (LOAD24) with the same shared
 vv_curve_044 and starting size (12 kW / 15 kVA). This script still sweeps PV906 only;
-PV34 is not re-swept here.
+PV458 is not re-swept here.
 """
 from __future__ import annotations
 

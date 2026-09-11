@@ -1,8 +1,8 @@
 ! ============================================================================
-! IEEE European LV Test Feeder (906) — ADD-ON ONLY (do not edit stock LVTestCase)
+! IEEE European LV Test Feeder (906) -- ADD-ON ONLY (do not edit stock LVTestCase)
 ! Two single-phase Volt-Var PVs:
 !   - PV906 @ remote load bus 906.1 (LOAD55)
-!   - PV34  @ early-lateral load bus 34.1 (LOAD1) — map-far from 906 (near substation)
+!   - PV458 @ mid-lateral load bus 458.3 (LOAD24) -- map-far from both bus 1 and 906
 !
 ! Spec (matches 8500 PV2 / user request):
 !   - Voltage deadband: 0.98 ... 1.02 p.u.
@@ -11,10 +11,10 @@
 !
 ! Size (each): Pmpp=12 kW, kVA=15 (~25% oversize so |Q|max = 0.44*15 = 6.6 kvar).
 ! PV906 sized via size_906_pv_voltvar.py / outputs/906_pv_voltvar_sizing.json;
-! PV34 starts at the same rating (shared vv curve).
+! PV458 starts at the same rating (shared vv curve).
 ! ============================================================================
 
-! Irradiance (pu). 5-min, 288 pts — same representative day used elsewhere.
+! Irradiance (pu). 5-min, 288 pts -- same representative day used elsewhere.
 New Loadshape.IrradDay001 npts=288 interval=0.0833333333333333
 ~ mult=(file=irr_day_001.csv, col=2, header=no)
 
@@ -37,16 +37,16 @@ New InvControl.PV906_VV Mode=VOLTVAR voltage_curvex_ref=rated
 ~ VoltageChangeTolerance=0.0001
 ~ VarChangeTolerance=0.025
 
-! --- PV34: LOAD1 early lateral near substation, phase A, Volt-Var (same curve/size) ---
-New PVSystem.PV34 phases=1 Bus1=34.1 kV=0.23
+! --- PV458: LOAD24 mid lateral (clear of substation + far from 906), phase C, Volt-Var ---
+New PVSystem.PV458 phases=1 Bus1=458.3 kV=0.23
 ~ kVA=15 Pmpp=12 PF=1.0
 ~ %Cutin=0.1 %Cutout=0.1
 ~ irradiance=1.0 Temperature=25
 ~ Daily=IrradDay001
 
-New InvControl.PV34_VV Mode=VOLTVAR voltage_curvex_ref=rated
+New InvControl.PV458_VV Mode=VOLTVAR voltage_curvex_ref=rated
 ~ vvc_curve1=vv_curve_044
-~ DERList=[PVSystem.PV34]
+~ DERList=[PVSystem.PV458]
 ~ RefReactivePower=VARMAX
 ~ VoltageChangeTolerance=0.0001
 ~ VarChangeTolerance=0.025
