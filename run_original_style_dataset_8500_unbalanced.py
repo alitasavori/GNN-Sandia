@@ -7,6 +7,8 @@ Goal:
       * time selection using 3 profiles (load, pv, net)
       * per-node features: p_load_kw, q_load_kvar, p_pv_kw, q_pv_kvar
       * targets: vmag_pu, vang_deg
+  - Optional ``fixed_controller_init``: before each Solve, restore regulator TapNumber=0,
+    CapControl banks OFF, fixed (no CapControl) banks ON (no within-scenario carry-over).
   - Save artifacts in the same structure/style as run_daily_aggregate_dataset_8500.py:
       datasets_gnn2/<name>/
         - gnn_node_index_master.csv
@@ -101,7 +103,8 @@ def _compile_8500_unbalanced_daily_setup() -> None:
     dss.Text.Command("set stepsize=5m")
     dss.Text.Command("set number=1")
     dss.Text.Command("set maxiterations=30")
-    # Keep control-loop budget very modest so hard points fail fast and are skipped.
+    # Keep control-loop budget modest for carry-over solves (near previous settle).
+    # fixed_controller_init path raises this further after compile (see generate loop).
     dss.Text.Command("set maxcontroliter=30")
 
 
@@ -319,6 +322,79 @@ def _read_reg_control_state(reg_names: list[str]) -> dict[str, float]:
     return out
 
 
+def _controlled_capacitor_names() -> set[str]:
+    """Capacitor names that have a CapControl (autonomous switching)."""
+    out: set[str] = set()
+    try:
+        names = list(dss.CapControls.AllNames() or [])
+    except Exception:
+        names = []
+    if names:
+        for ctrl_nm in names:
+            try:
+                dss.CapControls.Name(str(ctrl_nm))
+                cap = str(dss.CapControls.Capacitor()).strip()
+                if cap:
+                    out.add(cap.lower())
+            except Exception:
+                continue
+        return out
+    try:
+        if dss.CapControls.First():
+            while True:
+                try:
+                    cap = str(dss.CapControls.Capacitor()).strip()
+                    if cap:
+                        out.add(cap.lower())
+                except Exception:
+                    pass
+                if not dss.CapControls.Next():
+                    break
+    except Exception:
+        out = set()
+    return out
+
+
+def _set_capacitor_steps(name: str, *, on: bool) -> None:
+    dss.Capacitors.Name(str(name))
+    n_steps = int(dss.Capacitors.NumSteps())
+    if n_steps < 1:
+        n_steps = 1
+    dss.Capacitors.States([1 if on else 0] * n_steps)
+
+
+def _reset_controllers_to_compile_defaults(
+    reg_names: list[str] | None = None,
+    cap_names: list[str] | None = None,
+    *,
+    reg_tap_number: int = 0,
+) -> None:
+    """Restore the shared fixed reference controller state before each Solve.
+
+    - All ``RegControl`` devices → TapNumber ``reg_tap_number`` (default 0 ≈ 1.0 pu).
+    - Capacitors **with** CapControl (autonomous) → all steps **OFF**.
+    - Capacitors **without** CapControl (fixed / always-on, e.g. CAPBank3) → all steps **ON**.
+
+    Call this *before* each ``Solve()`` when training labels should be independent
+    of the previous sample's settled taps/caps (no within-scenario carry-over).
+    """
+    regs = reg_names if reg_names is not None else _discover_reg_controls()
+    caps = cap_names if cap_names is not None else _discover_capacitors()
+    controlled = _controlled_capacitor_names()
+    for nm in regs:
+        try:
+            dss.RegControls.Name(str(nm))
+            dss.RegControls.TapNumber(int(reg_tap_number))
+        except Exception:
+            continue
+    for nm in caps:
+        try:
+            is_autonomous = str(nm).strip().lower() in controlled
+            _set_capacitor_steps(nm, on=not is_autonomous)
+        except Exception:
+            continue
+
+
 def _read_capacitor_sample_fields(cap_names: list[str]) -> dict[str, float | int]:
     out: dict[str, float | int] = {}
     for nm in cap_names:
@@ -376,11 +452,8 @@ def _sum_loads_post_solve_kw_kvar() -> tuple[float, float]:
 
 def _circuit_losses_kw_kvar() -> tuple[float, float]:
     loss = dss.Circuit.Losses()
-    p_l, q_l = float(loss[0]), float(loss[1])
-    if abs(p_l) > 1000.0 or abs(q_l) > 1000.0:
-        p_l /= 1000.0
-        q_l /= 1000.0
-    return p_l, q_l
+    # OpenDSS Circuit.Losses() is W/var; other power APIs are kW/kvar.
+    return float(loss[0]) / 1000.0, float(loss[1]) / 1000.0
 
 
 def _grid_upstream_post_kw_kvar() -> tuple[float, float]:
@@ -737,7 +810,16 @@ def generate_original_style_dataset_8500_unbalanced(
     vmax_safe_pu: float = 1.15,
     include_source_in_safe_band: bool = True,
     return_node_df: bool = False,
+    fixed_controller_init: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate the original-style IEEE 8500 unbalanced snapshot dataset.
+
+    When ``fixed_controller_init`` is True, every sample restores the same reference
+    controller state before ``Solve()``: regulator TapNumber 0, CapControl banks OFF,
+    and fixed (no CapControl) banks ON. Autonomous Static settling then runs from that
+    shared start rather than carrying prior taps/caps. Time selection, scenario scales,
+    and spacing rules are unchanged.
+    """
     if bins_by_profile is None:
         bins_by_profile = {"load": 10, "pv": 10, "net": 10}
 
@@ -875,6 +957,16 @@ def generate_original_style_dataset_8500_unbalanced(
 
     reg_names = _discover_reg_controls()
     cap_names = _discover_capacitors()
+    if fixed_controller_init:
+        print(
+            f"[diag] controllers: n_reg={len(reg_names)} n_cap={len(cap_names)} "
+            "fixed_controller_init=True (per-sample reset: TapNumber=0, CapControl banks OFF, fixed banks ON)"
+        )
+    else:
+        print(
+            f"[diag] controllers: n_reg={len(reg_names)} n_cap={len(cap_names)} "
+            "fixed_controller_init=False (within-scenario tap/cap carry-over)"
+        )
 
     base_p_load = float(np.sum(base_kw))
     base_q_load = float(np.sum(base_kvar))
@@ -884,6 +976,7 @@ def generate_original_style_dataset_8500_unbalanced(
     rows_sample: list[dict] = []
     sample_id = 0
     skipped_nonconv = 0
+    skipped_ctrl = 0
     skipped_bad_v = 0
     total_v_outside_band = 0
     n_node_rows_written = 0
@@ -910,6 +1003,10 @@ def generate_original_style_dataset_8500_unbalanced(
             t0_s = time.time()
             _compile_8500_unbalanced_daily_setup()
             _detach_daily_loadshape_from_loads()
+            if fixed_controller_init:
+                # Reset-from-defaults needs a longer Static control climb than carry-over.
+                # Unfinished control (hit cap / DSS control error) → do NOT save sample.
+                dss.Text.Command("set maxcontroliter=100")
 
             load_names, base_kw, base_kvar, load_to_busph = _collect_loads_and_maps()
             pv_names, base_pmpp, pv_to_busph = _collect_pv_maps()
@@ -1024,14 +1121,42 @@ def generate_original_style_dataset_8500_unbalanced(
                     rng=rng_solve,
                 )
 
+                if fixed_controller_init:
+                    # Shared reference: TapNumber=0; CapControl banks OFF; fixed banks ON.
+                    _reset_controllers_to_compile_defaults(reg_names, cap_names)
+
                 try:
                     dss.Solution.Solve()
-                except Exception:
-                    pass
+                except Exception as _solve_exc:  # noqa: BLE001
+                    msg = str(_solve_exc).lower()
+                    if fixed_controller_init and "control" in msg:
+                        skipped_ctrl += 1
+                        print(
+                            f"[skip-ctrl] scenario={s} t={t} maxcontroliter=100 err={_solve_exc!r}",
+                            flush=True,
+                        )
+                    else:
+                        skipped_nonconv += 1
+                        nonconv_this_scenario += 1
+                    continue
                 if not dss.Solution.Converged():
                     skipped_nonconv += 1
                     nonconv_this_scenario += 1
                     continue
+                if fixed_controller_init:
+                    try:
+                        n_ctrl = int(dss.Solution.ControlIterations())
+                    except Exception:
+                        n_ctrl = 999
+                    # Still mid-hunt if we sat on the iteration cap (do not contaminate dataset).
+                    if n_ctrl >= 100:
+                        skipped_ctrl += 1
+                        print(
+                            f"[skip-ctrl] scenario={s} t={t} ctrl_iters={n_ctrl}/100 "
+                            f"(not saved)",
+                            flush=True,
+                        )
+                        continue
 
                 # Actual per-PV P/Q after solve (includes VoltVar behavior where applicable).
                 pv_totals_post = _read_pv_totals_post_solve_kw_kvar(pv_names)
@@ -1073,6 +1198,7 @@ def generate_original_style_dataset_8500_unbalanced(
                         "scenario_id": s,
                         "t_index": t,
                         "t_minutes": int(t * STEP_MIN),
+                        "fixed_controller_init": int(bool(fixed_controller_init)),
                         "P_load_total_kw": float(p_load),
                         "Q_load_total_kvar": float(q_load),
                         "P_pv_total_kw": float(p_pv),
@@ -1169,7 +1295,8 @@ def generate_original_style_dataset_8500_unbalanced(
                 f"v_outside_band_this_s={outside_band_this_scenario} "
                 f"(below={below_band_this_scenario}, above={above_band_this_scenario}, pct={pct_out:.2f}%) "
                 f"N_nodes={len(node_names_all)} top_offenders=[{top_off_str}] "
-                f"skip_nonconv_total={skipped_nonconv} skip_badV_total={skipped_bad_v} "
+                f"skip_nonconv_total={skipped_nonconv} skip_ctrl_total={skipped_ctrl} "
+                f"skip_badV_total={skipped_bad_v} "
                 f"elapsed_s={time.time()-t0_s:.1f}"
             )
 
@@ -1181,8 +1308,9 @@ def generate_original_style_dataset_8500_unbalanced(
     print(f"  out_dir: {OUT_DIR}")
     print(f"  sample_meta: {SAMPLE_CSV}")
     print(f"  node_features_targets: {NODE_CSV}")
+    print(f"  fixed_controller_init: {bool(fixed_controller_init)}")
     print(f"  kept samples: {df_sample['sample_id'].nunique() if len(df_sample) else 0}")
-    print(f"  skipped_nonconv={skipped_nonconv} skipped_badV={skipped_bad_v}")
+    print(f"  skipped_nonconv={skipped_nonconv} skipped_ctrl={skipped_ctrl} skipped_badV={skipped_bad_v}")
     print(
         f"  safe_band=[{float(vmin_safe_pu):.3f}, {float(vmax_safe_pu):.3f}] "
         f"total_v_outside_safe_band={int(total_v_outside_band)}"
