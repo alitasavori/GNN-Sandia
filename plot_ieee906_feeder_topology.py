@@ -10,6 +10,8 @@ Default style:
     feeder from the substation stays thick. LineCode.txt has no NormAmps —
     size-based table.
   - All buses visible: solid grey zero-injection dots, solid black load dots
+    (``node_color_mode="injection"``). Use ``node_color_mode="black"`` for
+    uniform black phase-node circles (no injection vs zero-injection split).
   - Substation / transformer icon from ``outputs/Icons/substation.svg``
     (scale with ``icon_size_scale`` / ``device_icon_zooms['substation']``)
 
@@ -65,6 +67,9 @@ PLAIN_JUNCTION_SIZE = 55.0 * 0.75  # scatter ``s`` (points^2); 0.75× prior size
 PLAIN_LOAD_FACE = "#000000"
 PLAIN_LOAD_EDGE = "none"
 PLAIN_LOAD_SIZE = 95.0
+# Uniform black phase-node disks (``node_color_mode="black"``).
+PLAIN_NODE_FACE = "#000000"
+PLAIN_NODE_SIZE = PLAIN_JUNCTION_SIZE
 PLAIN_SOURCE_COLOR = "#000000"
 
 # European LV: Master.dss circuit-plot comment uses Max=30.
@@ -498,6 +503,7 @@ def plot_ieee906_feeder_topology(
     style: Literal["paper", "draft"] = "paper",
     show_loads: bool = True,
     show_junctions: bool = True,
+    node_color_mode: Literal["injection", "black"] = "injection",
     show_source_marker: bool = True,
     show_device_icons: bool = True,
     taper_line_width: bool = False,
@@ -576,6 +582,7 @@ def plot_ieee906_feeder_topology(
     print(f"  Linecodes:              {dict(lc_counts)}")
     print(f"  Load buses:             {len(load_buses):,}  (with coords: {len(load_with_xy):,})")
     print(f"  Junction buses:         {len(junction_buses):,}")
+    print(f"  Node color mode:        {node_color_mode}")
     print(f"  Transformers:           {len(devices['transformers']):,}")
     for xf in devices["transformers"]:
         print(f"    - {xf['name']} buses={xf['buses']} sub={xf['sub']}")
@@ -722,33 +729,55 @@ def plot_ieee906_feeder_topology(
     )
 
     # --- node markers (solid disks; sit above LineCollection) ---
-    if show_junctions and junction_buses:
-        jxy = np.array([coords[b] for b in junction_buses], dtype=float)
-        ax.scatter(
-            jxy[:, 0],
-            jxy[:, 1],
-            s=PLAIN_JUNCTION_SIZE,
-            facecolors=PLAIN_JUNCTION_COLOR,
-            edgecolors="none",
-            linewidths=0,
-            marker="o",
-            zorder=5,
-            alpha=1.0,
-        )
+    # ``injection``: grey zero-injection + black load disks.
+    # ``black``: uniform black phase-node circles (no energized/injection split).
+    black_node_buses: list[str] = []
+    if node_color_mode == "black":
+        if show_junctions or show_loads:
+            black_node_buses = [
+                b for b in sorted(coords) if sub_bus is None or b != sub_bus
+            ]
+            if black_node_buses:
+                nxy = np.array([coords[b] for b in black_node_buses], dtype=float)
+                ax.scatter(
+                    nxy[:, 0],
+                    nxy[:, 1],
+                    s=PLAIN_NODE_SIZE,
+                    facecolors=PLAIN_NODE_FACE,
+                    edgecolors="none",
+                    linewidths=0,
+                    marker="o",
+                    zorder=5,
+                    alpha=1.0,
+                )
+    else:
+        if show_junctions and junction_buses:
+            jxy = np.array([coords[b] for b in junction_buses], dtype=float)
+            ax.scatter(
+                jxy[:, 0],
+                jxy[:, 1],
+                s=PLAIN_JUNCTION_SIZE,
+                facecolors=PLAIN_JUNCTION_COLOR,
+                edgecolors="none",
+                linewidths=0,
+                marker="o",
+                zorder=5,
+                alpha=1.0,
+            )
 
-    if show_loads and load_with_xy:
-        load_xy = np.array([coords[b] for b in sorted(load_with_xy)], dtype=float)
-        ax.scatter(
-            load_xy[:, 0],
-            load_xy[:, 1],
-            s=28 if (use_taper and style == "paper") else PLAIN_LOAD_SIZE,
-            facecolors=PLAIN_LOAD_FACE,
-            edgecolors="none",
-            linewidths=0,
-            marker="o",
-            zorder=6,
-            alpha=1.0,
-        )
+        if show_loads and load_with_xy:
+            load_xy = np.array([coords[b] for b in sorted(load_with_xy)], dtype=float)
+            ax.scatter(
+                load_xy[:, 0],
+                load_xy[:, 1],
+                s=28 if (use_taper and style == "paper") else PLAIN_LOAD_SIZE,
+                facecolors=PLAIN_LOAD_FACE,
+                edgecolors="none",
+                linewidths=0,
+                marker="o",
+                zorder=6,
+                alpha=1.0,
+            )
 
     # --- device icons (only devices that exist) ---
     # Paper base is uniform; ``device_icon_zooms`` overrides absolute base zoom per kind
@@ -841,16 +870,16 @@ def plot_ieee906_feeder_topology(
         if missing:
             print(f"  PV icons skipped (no coords): {', '.join(missing)}")
         if pv_points:
-            # Prefer an explicit controllable_pv path (InvControl Volt-Var), else pv,
-            # else default paper controllable asset when available.
+            # Prefer explicit overrides; otherwise default to paper "pv"
+            # (autonomous / orange — same as IEEE 8500), not green controllable.
             if "controllable_pv" in icon_paths:
                 pv_key = "controllable_pv"
             elif "pv" in icon_paths:
                 pv_key = "pv"
-            elif _device_icon("controllable_pv") is not None:
-                pv_key = "controllable_pv"
-            else:
+            elif _device_icon("pv") is not None:
                 pv_key = "pv"
+            else:
+                pv_key = "controllable_pv"
             _add_device_icons(
                 pv_points,
                 device_key=pv_key,
@@ -898,32 +927,46 @@ def plot_ieee906_feeder_topology(
                 label=f"Lines ({len(segs)})",
             )
         )
-        if show_junctions and junction_buses:
+        if node_color_mode == "black" and black_node_buses:
             legend_items.append(
                 Line2D(
                     [0],
                     [0],
                     marker="o",
                     color="none",
-                    markerfacecolor=PLAIN_JUNCTION_COLOR,
-                    markeredgecolor=PLAIN_JUNCTION_COLOR,
+                    markerfacecolor=PLAIN_NODE_FACE,
+                    markeredgecolor=PLAIN_NODE_FACE,
                     markersize=5,
-                    label=f"Zero-injection buses ({len(junction_buses)})",
+                    label=f"Buses ({len(black_node_buses)})",
                 )
             )
-        if show_loads and load_with_xy:
-            legend_items.append(
-                Line2D(
-                    [0],
-                    [0],
-                    marker="o",
-                    color="none",
-                    markerfacecolor=PLAIN_LOAD_FACE,
-                    markeredgecolor=PLAIN_LOAD_FACE,
-                    markersize=8,
-                    label=f"Injection / load buses ({len(load_with_xy)})",
+        else:
+            if show_junctions and junction_buses:
+                legend_items.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="none",
+                        markerfacecolor=PLAIN_JUNCTION_COLOR,
+                        markeredgecolor=PLAIN_JUNCTION_COLOR,
+                        markersize=5,
+                        label=f"Zero-injection buses ({len(junction_buses)})",
+                    )
                 )
-            )
+            if show_loads and load_with_xy:
+                legend_items.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="none",
+                        markerfacecolor=PLAIN_LOAD_FACE,
+                        markeredgecolor=PLAIN_LOAD_FACE,
+                        markersize=8,
+                        label=f"Injection / load buses ({len(load_with_xy)})",
+                    )
+                )
         if placed_substation_icon:
             legend_items.append(
                 Line2D(
@@ -1086,6 +1129,15 @@ def main() -> None:
         action="store_true",
         help="Hide junction bus dots (paper-style sparse nodes).",
     )
+    p.add_argument(
+        "--node-color-mode",
+        choices=("injection", "black"),
+        default="injection",
+        help=(
+            "injection: grey zero-injection + black loads; "
+            "black: uniform black phase-node circles."
+        ),
+    )
     p.add_argument("--no-icons", action="store_true")
     p.add_argument(
         "--taper",
@@ -1109,6 +1161,7 @@ def main() -> None:
         style=args.style,
         show_loads=not args.no_loads,
         show_junctions=not args.no_junctions,
+        node_color_mode=args.node_color_mode,
         show_device_icons=not args.no_icons,
         taper_line_width=bool(args.taper),
         use_opendss_power=not args.no_opendss,
