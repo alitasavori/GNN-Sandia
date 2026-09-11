@@ -2,7 +2,7 @@
 ! IEEE European LV Test Feeder (906) — ADD-ON ONLY (do not edit stock LVTestCase)
 ! Two single-phase Volt-Var PVs:
 !   - PV906 @ remote load bus 906.1 (LOAD55)
-!   - PV639 @ mid-feeder load bus 639.2 (LOAD35) — electrically distinct from 906
+!   - PV34  @ early-lateral load bus 34.1 (LOAD1) — map-far from 906 (near substation)
 !
 ! Spec (matches 8500 PV2 / user request):
 !   - Voltage deadband: 0.98 ... 1.02 p.u.
@@ -11,7 +11,7 @@
 !
 ! Size (each): Pmpp=12 kW, kVA=15 (~25% oversize so |Q|max = 0.44*15 = 6.6 kvar).
 ! PV906 sized via size_906_pv_voltvar.py / outputs/906_pv_voltvar_sizing.json;
-! PV639 starts at the same rating (shared vv curve).
+! PV34 starts at the same rating (shared vv curve).
 ! ============================================================================
 
 ! Irradiance (pu). 5-min, 288 pts — same representative day used elsewhere.
@@ -37,16 +37,16 @@ New InvControl.PV906_VV Mode=VOLTVAR voltage_curvex_ref=rated
 ~ VoltageChangeTolerance=0.0001
 ~ VarChangeTolerance=0.025
 
-! --- PV639: LOAD35 mid-feeder, phase B, Volt-Var (same curve/size) ---
-New PVSystem.PV639 phases=1 Bus1=639.2 kV=0.23
+! --- PV34: LOAD1 early lateral near substation, phase A, Volt-Var (same curve/size) ---
+New PVSystem.PV34 phases=1 Bus1=34.1 kV=0.23
 ~ kVA=15 Pmpp=12 PF=1.0
 ~ %Cutin=0.1 %Cutout=0.1
 ~ irradiance=1.0 Temperature=25
 ~ Daily=IrradDay001
 
-New InvControl.PV639_VV Mode=VOLTVAR voltage_curvex_ref=rated
+New InvControl.PV34_VV Mode=VOLTVAR voltage_curvex_ref=rated
 ~ vvc_curve1=vv_curve_044
-~ DERList=[PVSystem.PV639]
+~ DERList=[PVSystem.PV34]
 ~ RefReactivePower=VARMAX
 ~ VoltageChangeTolerance=0.0001
 ~ VarChangeTolerance=0.025
