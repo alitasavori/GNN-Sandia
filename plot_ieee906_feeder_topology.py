@@ -525,9 +525,16 @@ def plot_ieee906_feeder_topology(
     show_title: bool = False,
     show_legend: bool = False,
     crop_margins: bool = True,
+    line_color: str | None = None,
+    line_alpha: float | None = None,
     show: bool = False,
 ) -> dict[str, Path]:
-    """Parse LVTestCase and save a paper-ready geographic topology figure."""
+    """Parse LVTestCase and save a paper-ready geographic topology figure.
+
+    Optional ``line_color`` / ``line_alpha`` override the style defaults so
+    callers (e.g. FINAL) can soften edges slightly without changing draft/paper
+    defaults globally.
+    """
     if reload_icons:
         p8500.clear_icon_caches()
 
@@ -707,14 +714,20 @@ def plot_ieee906_feeder_topology(
                 )
             )
     if style == "paper":
-        line_color = p8500.PAPER_BACKBONE_COLOR
-        line_alpha = 1.0
+        _line_color = p8500.PAPER_BACKBONE_COLOR
+        _line_alpha = 1.0
     elif use_taper:
-        line_color = "#333333"
-        line_alpha = 0.85
+        _line_color = "#333333"
+        _line_alpha = 0.85
     else:
-        line_color = PLAIN_LINE_COLOR
-        line_alpha = PLAIN_LINE_ALPHA
+        _line_color = PLAIN_LINE_COLOR
+        _line_alpha = PLAIN_LINE_ALPHA
+    if line_color is not None:
+        _line_color = str(line_color)
+    if line_alpha is not None:
+        _line_alpha = float(line_alpha)
+    line_color = _line_color
+    line_alpha = _line_alpha
 
     ax.add_collection(
         LineCollection(
