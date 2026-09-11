@@ -1,0 +1,52 @@
+! ============================================================================
+! IEEE European LV Test Feeder (906) — ADD-ON ONLY (do not edit stock LVTestCase)
+! Two single-phase Volt-Var PVs:
+!   - PV906 @ remote load bus 906.1 (LOAD55)
+!   - PV639 @ mid-feeder load bus 639.2 (LOAD35) — electrically distinct from 906
+!
+! Spec (matches 8500 PV2 / user request):
+!   - Voltage deadband: 0.98 ... 1.02 p.u.
+!   - |Q| limit = 0.44 * inverter kVA (RefReactivePower=VARMAX)
+!   - Curve: V=0.92 -> +0.44 ; 0.98/1.02 -> 0 ; 1.08 -> -0.44
+!
+! Size (each): Pmpp=12 kW, kVA=15 (~25% oversize so |Q|max = 0.44*15 = 6.6 kvar).
+! PV906 sized via size_906_pv_voltvar.py / outputs/906_pv_voltvar_sizing.json;
+! PV639 starts at the same rating (shared vv curve).
+! ============================================================================
+
+! Irradiance (pu). 5-min, 288 pts — same representative day used elsewhere.
+New Loadshape.IrradDay001 npts=288 interval=0.0833333333333333
+~ mult=(file=irr_day_001.csv, col=2, header=no)
+
+! --- Shared Volt-Var curve: deadband 0.98-1.02, |Q|/kVA = 0.44 ---
+New XYCurve.vv_curve_044 npts=4
+~ xarray=[0.92  0.98  1.02  1.08]
+~ yarray=[0.44  0.0   0.0  -0.44]
+
+! --- PV906: remote end, phase A, Volt-Var ---
+New PVSystem.PV906 phases=1 Bus1=906.1 kV=0.23
+~ kVA=15 Pmpp=12 PF=1.0
+~ %Cutin=0.1 %Cutout=0.1
+~ irradiance=1.0 Temperature=25
+~ Daily=IrradDay001
+
+New InvControl.PV906_VV Mode=VOLTVAR voltage_curvex_ref=rated
+~ vvc_curve1=vv_curve_044
+~ DERList=[PVSystem.PV906]
+~ RefReactivePower=VARMAX
+~ VoltageChangeTolerance=0.0001
+~ VarChangeTolerance=0.025
+
+! --- PV639: LOAD35 mid-feeder, phase B, Volt-Var (same curve/size) ---
+New PVSystem.PV639 phases=1 Bus1=639.2 kV=0.23
+~ kVA=15 Pmpp=12 PF=1.0
+~ %Cutin=0.1 %Cutout=0.1
+~ irradiance=1.0 Temperature=25
+~ Daily=IrradDay001
+
+New InvControl.PV639_VV Mode=VOLTVAR voltage_curvex_ref=rated
+~ vvc_curve1=vv_curve_044
+~ DERList=[PVSystem.PV639]
+~ RefReactivePower=VARMAX
+~ VoltageChangeTolerance=0.0001
+~ VarChangeTolerance=0.025

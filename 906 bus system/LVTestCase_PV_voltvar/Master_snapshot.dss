@@ -1,0 +1,31 @@
+clear
+
+! Snapshot-only LVTestCase master for Log(v) / OpenDSS fixed-state compares.
+! Omits Master.dss yearly 1440-step DemandInterval solve (timing + state pollution).
+
+Set DefaultBaseFrequency=50  ! for European system
+
+New circuit.LVTest
+Edit Vsource.Source BasekV=11 pu=1.05  ISC3=3000  ISC1=5
+Redirect LineCode.txt
+Redirect LoadShapes.txt
+batchedit loadshape..* useactual=no
+Redirect Lines.txt
+Redirect Transformers.txt
+Redirect Loads.txt
+Redirect Monitors.txt
+
+New energymeter.m1 LINE.LINE1 1
+
+Set voltagebases=[11  .416]
+Calcvoltagebases
+
+buscoords buscoords.txt
+
+Set Mode=Snapshot
+Set ControlMode=OFF
+Set Number=1
+Set Hour=0
+Set Sec=0
+Set LoadMult=1
+solve
