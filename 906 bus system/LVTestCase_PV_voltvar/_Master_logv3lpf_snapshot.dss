@@ -1,4 +1,6 @@
 clear
+! Log(v) snapshot master for LVTestCase + Volt-Var PVs (PV906, PV458).
+! Mirrors Master_snapshot_PV_voltvar.dss without monitors / energymeter.
 Set DefaultBaseFrequency=50
 New circuit.LVTest
 Edit Vsource.Source BasekV=11 pu=1.05  ISC3=3000  ISC1=5
@@ -8,7 +10,14 @@ batchedit loadshape..* useactual=no
 Redirect Lines.txt
 Redirect Transformers.txt
 Redirect Loads.txt
+Redirect PV_voltvar_906.dss
 Set voltagebases=[11  .416]
 Calcvoltagebases
 buscoords buscoords.txt
+Set Mode=Snapshot
+Set ControlMode=STATIC
+Set Number=1
+Set Hour=0
+Set Sec=0
+Set LoadMult=1
 solve

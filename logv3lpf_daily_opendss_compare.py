@@ -25,6 +25,8 @@ from typing import Any
 
 import numpy as np
 
+from logv3lpf_daily_demo import _angle_diff_deg
+
 try:
     from scipy.sparse import SparseEfficiencyWarning
 
@@ -38,7 +40,8 @@ DEFAULT_PLOT_NODES = {
     # Distal / spot-load + regulated buses (P/Z/I models + LTC secondary).
     "ieee34": ["890.1", "844.1", "840.1", "814r.1", "852r.1"],
     # LVTestCase shapes are Yearly= (not Daily=); bus 1 is near the stiff source.
-    "906": ["817.1", "860.1", "896.1", "906.1"],
+    # Distal LV + both Volt-Var PV buses (PV906 @ 906.1, PV458 @ 458.3).
+    "906": ["817.1", "860.1", "896.1", "906.1", "458.3"],
     "8500": ["l2841632.1", "190-8593.1"],
 }
 DEFAULT_REG_COLS = {
@@ -614,6 +617,7 @@ def run_daily_opendss_vs_logv3lpf(
     time_speed: bool = False,
     time_od_cold_snapshot: bool = True,
     report_every: int | None = None,
+    fixedctrlinit: bool | None = None,
 ) -> dict[str, Any]:
     """Daily OpenDSS vs Log(v) for ``feeder`` in {ieee34, 906, 8500}.
 
@@ -622,6 +626,10 @@ def run_daily_opendss_vs_logv3lpf(
         Log(v); rebuild ``A`` when OD taps change (fair same-state compare).
       - ``off``: OD ControlMode=OFF; Log(v) uses frozen DSS taps (rebuild once).
       - ``static``: OD Static; Log(v) runs own RegControl (caps/PV still synced from OD).
+
+    ``fixedctrlinit``: when True, reset each PV to ``PF=1 kvar=0`` before every
+      Static solve (matches 906 PV Volt-Var dataset generation). Default True for
+      906 feeders with InvControl present, else False.
 
     ``time_speed``: time FastLogv vs OpenDSS on each daily sample.
       With ``synced``/``off``, Fast tracks the baked ``A`` and its voltages drive
@@ -639,6 +647,7 @@ def run_daily_opendss_vs_logv3lpf(
         FEEDERS,
         compile_cmd,
         ensure_logv3lpf,
+        reset_invcontrol_pv_to_pf1,
         resolve_feeder,
         run_logv_autonomous,
         _apply_opendss_cap_pv_to_logv,
@@ -658,6 +667,10 @@ def run_daily_opendss_vs_logv3lpf(
     if mode not in ("off", "synced", "static"):
         raise ValueError("control_mode must be off|synced|static")
     dss_path = Path(FEEDERS[key]["dss"](repo)).resolve()
+    do_fixedctrl = fixedctrlinit
+    if do_fixedctrl is None:
+        # Default on for 906 PV Volt-Var masters (dataset parity).
+        do_fixedctrl = key in ("906",) and "PV_voltvar" in str(dss_path)
     if plot_nodes is None:
         plot_nodes = list(DEFAULT_PLOT_NODES.get(key, ["1.1"]))
     if reg_cols is None:
@@ -890,6 +903,8 @@ def run_daily_opendss_vs_logv3lpf(
         },
         "mae_vm_all_nodes": np.full(npts, np.nan),
         "rmse_vm_all_nodes": np.full(npts, np.nan),
+        "mae_va_all_nodes": np.full(npts, np.nan),
+        "rmse_va_all_nodes": np.full(npts, np.nan),
         "t_opendss_apply_s": np.full(npts, np.nan),
         "t_opendss_reassert_s": np.full(npts, np.nan),
         "t_opendss_solve_s": np.full(npts, np.nan),
@@ -928,6 +943,7 @@ def run_daily_opendss_vs_logv3lpf(
             + ", ".join(f"{k}×{len(v)}" for k, v in sorted(load_model_nodes.items()))
         )
     print(f"  time_speed (FastLogv): {time_speed}")
+    print(f"  fixedctrlinit (PV PF=1/kvar=0 before Static): {bool(do_fixedctrl)}")
     do_od_cold = bool(time_speed) and bool(time_od_cold_snapshot)
     if do_od_cold:
         print(
@@ -970,6 +986,9 @@ def run_daily_opendss_vs_logv3lpf(
         t_reassert1 = time.perf_counter()
         open_reassert_s_total += t_reassert1 - t_reassert0
         series["t_opendss_reassert_s"][i] = t_reassert1 - t_reassert0
+
+        if do_fixedctrl and mode in ("static", "synced"):
+            reset_invcontrol_pv_to_pf1(pv_names if pv_names else None)
 
         t_solve0 = time.perf_counter()
         dss.Solution.Solve()
@@ -1155,9 +1174,13 @@ def run_daily_opendss_vs_logv3lpf(
             series["caps"][cn]["logv_kvar"][i] = float(st.get("kvar", np.nan))
 
         errs = []
+        va_errs = []
         vm_od_map = (case.results.get("openDSS") or {}).get("vm") or {}
+        va_od_map = (case.results.get("openDSS") or {}).get("va") or {}
+        va_lv_map = (case.results.get("logv3lpf") or {}).get("va") or {}
         # Case-insensitive bus lookup (OpenDSS vs Log(v) key casing can differ).
         od_by_lower = {str(b).lower(): v for b, v in vm_od_map.items()}
+        va_od_by_lower = {str(b).lower(): v for b, v in va_od_map.items()}
         for bus, vm_l in case.results.get("logv3lpf", {}).get("vm", {}).items():
             vm_o = vm_od_map.get(bus)
             if vm_o is None:
@@ -1173,10 +1196,33 @@ def run_daily_opendss_vs_logv3lpf(
             d = d[np.isfinite(d)]
             if d.size:
                 errs.append(d)
+            va_l = va_lv_map.get(bus)
+            if va_l is None:
+                va_l = va_lv_map.get(
+                    next((k for k in va_lv_map if str(k).lower() == str(bus).lower()), bus)
+                )
+            va_o = va_od_map.get(bus)
+            if va_o is None:
+                va_o = va_od_by_lower.get(str(bus).lower())
+            if va_l is None or va_o is None:
+                continue
+            al = np.asarray(va_l, float)
+            ao = np.asarray(va_o, float)
+            m = min(n, len(al), len(ao))
+            if m <= 0:
+                continue
+            da = np.abs(_angle_diff_deg(al[:m], ao[:m]))
+            da = da[np.isfinite(da)]
+            if da.size:
+                va_errs.append(da)
         if errs:
             e = np.concatenate(errs)
             series["mae_vm_all_nodes"][i] = float(np.mean(e))
             series["rmse_vm_all_nodes"][i] = float(np.sqrt(np.mean(e ** 2)))
+        if va_errs:
+            de = np.concatenate(va_errs)
+            series["mae_va_all_nodes"][i] = float(np.mean(de))
+            series["rmse_va_all_nodes"][i] = float(np.sqrt(np.mean(de ** 2)))
 
         # |V| MAE at buses served by each DSS load model (P / Z / I / exp / ZIP)
         for lab, nodes_g in load_model_nodes.items():
@@ -1220,6 +1266,9 @@ def run_daily_opendss_vs_logv3lpf(
     print(f"  mean |V| MAE  : {np.nanmean(series['mae_vm_all_nodes']):.6f} pu")
     print(f"  mean |V| RMSE : {np.nanmean(series['rmse_vm_all_nodes']):.6f} pu")
     print(f"  max  |V| MAE  : {np.nanmax(series['mae_vm_all_nodes']):.6f} pu")
+    print(f"  mean angle MAE: {np.nanmean(series['mae_va_all_nodes']):.6f} deg")
+    print(f"  mean angle RMSE: {np.nanmean(series['rmse_va_all_nodes']):.6f} deg")
+    print(f"  max  angle MAE: {np.nanmax(series['mae_va_all_nodes']):.6f} deg")
     for node in plot_nodes:
         nd = series["nodes"][node]
         m = np.isfinite(nd["opendss_vm"]) & np.isfinite(nd["logv_vm"])
@@ -1300,6 +1349,8 @@ def run_daily_opendss_vs_logv3lpf(
                 "hour",
                 "mae_vm",
                 "rmse_vm",
+                "mae_va",
+                "rmse_va",
                 "t_opendss_apply_s",
                 "t_opendss_reassert_s",
                 "t_opendss_solve_s",
@@ -1334,6 +1385,8 @@ def run_daily_opendss_vs_logv3lpf(
                     float(t_hours[i]),
                     float(series["mae_vm_all_nodes"][i]),
                     float(series["rmse_vm_all_nodes"][i]),
+                    float(series["mae_va_all_nodes"][i]),
+                    float(series["rmse_va_all_nodes"][i]),
                     float(series["t_opendss_apply_s"][i]),
                     float(series["t_opendss_reassert_s"][i]),
                     float(series["t_opendss_solve_s"][i]),
@@ -1595,6 +1648,9 @@ def run_daily_opendss_vs_logv3lpf(
         "mean_mae_vm": float(np.nanmean(series["mae_vm_all_nodes"])),
         "mean_rmse_vm": float(np.nanmean(series["rmse_vm_all_nodes"])),
         "max_mae_vm": float(np.nanmax(series["mae_vm_all_nodes"])),
+        "mean_mae_va": float(np.nanmean(series["mae_va_all_nodes"])),
+        "mean_rmse_va": float(np.nanmean(series["rmse_va_all_nodes"])),
+        "max_mae_va": float(np.nanmax(series["mae_va_all_nodes"])),
         "n_ok": n_ok_steps,
         "n_bad": int(n_bad),
         "wall_s": float(wall),
