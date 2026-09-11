@@ -446,31 +446,68 @@ def _apply_snapshot_with_pv(
     return totals, busphP_load, busphQ_load, busphP_pv_nominal
 
 
+_MVAGG_PREFERRED_COLS: tuple[str, ...] = (
+    "sample_id",
+    "node",
+    "node_idx",
+    "bus",
+    "phase",
+    "p_load_kw",
+    "q_load_kvar",
+    "p_pv_kw",
+    "vmag_pu",
+    "vang_deg",
+)
+_MVAGG_DROP_COLS: frozenset[str] = frozenset({"p_bess_kw", "q_bess_kvar"})
+
+
 def _write_mvagg_compat_from_raw(node_csv: Path, mvagg_csv: Path) -> None:
-    """Copy raw node CSV to *_mvagg.csv, dropping BESS cols (no real MV aggregation on 906)."""
-    df = pd.read_csv(node_csv)
-    drop_cols = [c for c in ("p_bess_kw", "q_bess_kvar") if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    # Ensure p_pv_kw exists.
-    if "p_pv_kw" not in df.columns:
-        df["p_pv_kw"] = 0.0
-    else:
-        df["p_pv_kw"] = df["p_pv_kw"].fillna(0.0).astype(float)
-    preferred = [
-        "sample_id",
-        "node",
-        "node_idx",
-        "bus",
-        "phase",
-        "p_load_kw",
-        "q_load_kvar",
-        "p_pv_kw",
-        "vmag_pu",
-        "vang_deg",
-    ]
-    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
-    df[cols].to_csv(mvagg_csv, index=False)
+    """Stream-copy raw node CSV to *_mvagg.csv, dropping BESS cols (no real MV aggregation).
+
+    Avoids ``pd.read_csv`` of the full ~400MB/chunk file (OOM / Drive hang that looked like
+    generation stopping after the first chunk).
+    """
+    t0 = time.time()
+    tmp_path = mvagg_csv.with_name(mvagg_csv.name + f".{os.getpid()}.tmp")
+    n_rows = 0
+    try:
+        with open(node_csv, "r", newline="", encoding="utf-8") as fin:
+            reader = csv.DictReader(fin)
+            if not reader.fieldnames:
+                raise RuntimeError(f"Empty node CSV (no header): {node_csv}")
+            keep = [c for c in reader.fieldnames if c not in _MVAGG_DROP_COLS]
+            if "p_pv_kw" not in keep:
+                keep.append("p_pv_kw")
+            cols = [c for c in _MVAGG_PREFERRED_COLS if c in keep] + [
+                c for c in keep if c not in _MVAGG_PREFERRED_COLS
+            ]
+            with open(tmp_path, "w", newline="", encoding="utf-8") as fout:
+                writer = csv.DictWriter(fout, fieldnames=cols, extrasaction="ignore")
+                writer.writeheader()
+                for row in reader:
+                    if not row.get("p_pv_kw"):
+                        row["p_pv_kw"] = "0.0"
+                    writer.writerow(row)
+                    n_rows += 1
+                    if n_rows % 500_000 == 0:
+                        print(
+                            f"[diag] mvagg stream progress rows={n_rows} "
+                            f"elapsed_s={time.time() - t0:.1f}",
+                            flush=True,
+                        )
+        os.replace(tmp_path, mvagg_csv)
+    except Exception:
+        if tmp_path.is_file():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    print(
+        f"[diag] wrote compat mvagg (streamed identity, no aggregation): {mvagg_csv} "
+        f"| rows={n_rows} | elapsed_s={time.time() - t0:.1f}",
+        flush=True,
+    )
 
 
 def generate_original_style_dataset_906_lvtestcase(
@@ -661,22 +698,34 @@ def generate_original_style_dataset_906_lvtestcase(
     n_node_rows_written = 0
     dummy_meta = _dummy_cap_reg_meta()
 
-    node_fieldnames = [
-        "sample_id",
-        "node",
-        "node_idx",
-        "bus",
-        "phase",
-        "p_load_kw",
-        "q_load_kvar",
-        "p_pv_kw",
-        "p_bess_kw",
-        "q_bess_kvar",
-        "vmag_pu",
-        "vang_deg",
-    ]
-    with open(NODE_CSV, "w", newline="", encoding="utf-8") as f_node:
-        node_writer = csv.DictWriter(f_node, fieldnames=node_fieldnames)
+    # When training only needs *_mvagg.csv, write that format directly and skip the
+    # raw→pandas→mvagg round-trip (that path OOMs / hangs on Google Drive ~400MB/chunk).
+    write_mvagg_direct = bool(write_mvagg_compat) and bool(delete_raw_node_csv_after_mvagg)
+    if write_mvagg_direct:
+        node_out_path = MVAGG_CSV
+        node_fieldnames = list(_MVAGG_PREFERRED_COLS)
+        print(
+            f"[diag] writing mvagg-format node CSV directly (skip raw): {node_out_path}",
+            flush=True,
+        )
+    else:
+        node_out_path = NODE_CSV
+        node_fieldnames = [
+            "sample_id",
+            "node",
+            "node_idx",
+            "bus",
+            "phase",
+            "p_load_kw",
+            "q_load_kvar",
+            "p_pv_kw",
+            "p_bess_kw",
+            "q_bess_kvar",
+            "vmag_pu",
+            "vang_deg",
+        ]
+    with open(node_out_path, "w", newline="", encoding="utf-8") as f_node:
+        node_writer = csv.DictWriter(f_node, fieldnames=node_fieldnames, extrasaction="ignore")
         node_writer.writeheader()
 
         for s in range(n_scenarios):
@@ -959,32 +1008,54 @@ def generate_original_style_dataset_906_lvtestcase(
     df_sample = pd.DataFrame(rows_sample)
     df_sample.to_csv(SAMPLE_CSV, index=False)
 
-    if write_mvagg_compat:
+    if write_mvagg_compat and not write_mvagg_direct:
+        print(f"[diag] streaming raw -> mvagg (avoid full pandas load): {NODE_CSV}", flush=True)
         _write_mvagg_compat_from_raw(NODE_CSV, MVAGG_CSV)
-        print(f"[diag] wrote compat mvagg (identity, no aggregation): {MVAGG_CSV}")
         if delete_raw_node_csv_after_mvagg and NODE_CSV.is_file():
             NODE_CSV.unlink()
-            print(f"[diag] deleted raw node CSV: {NODE_CSV.name}")
+            print(f"[diag] deleted raw node CSV: {NODE_CSV.name}", flush=True)
+    elif write_mvagg_direct:
+        print(
+            f"[diag] wrote compat mvagg (direct identity, no aggregation): {MVAGG_CSV}",
+            flush=True,
+        )
+        if NODE_CSV.is_file() and NODE_CSV.resolve() != MVAGG_CSV.resolve():
+            # Stale raw from a previous interrupted run.
+            try:
+                NODE_CSV.unlink()
+                print(f"[diag] removed stale raw node CSV: {NODE_CSV.name}", flush=True)
+            except OSError as exc:
+                print(f"[diag] could not remove stale raw {NODE_CSV.name}: {exc}", flush=True)
 
-    df_node = pd.read_csv(NODE_CSV) if (return_node_df and NODE_CSV.is_file()) else pd.DataFrame()
+    node_read_path = NODE_CSV if NODE_CSV.is_file() else MVAGG_CSV
+    df_node = (
+        pd.read_csv(node_read_path)
+        if (return_node_df and node_read_path.is_file())
+        else pd.DataFrame()
+    )
 
-    print("\n[ORIGINAL-STYLE 906 LVTESTCASE DATASET] saved.")
-    print(f"  out_dir: {OUT_DIR}")
-    print(f"  use_pv_voltvar: {bool(use_pv_voltvar)}")
-    print(f"  fixed_controller_init: {bool(fixed_controller_init)}")
-    print(f"  sample_meta: {SAMPLE_CSV}")
-    print(f"  node_features_targets: {NODE_CSV if NODE_CSV.is_file() else '(deleted after mvagg)'}")
-    print(f"  mvagg: {MVAGG_CSV if write_mvagg_compat else '(skipped)'}")
-    print(f"  kept samples: {df_sample['sample_id'].nunique() if len(df_sample) else 0}")
+    print("\n[ORIGINAL-STYLE 906 LVTESTCASE DATASET] saved.", flush=True)
+    print(f"  out_dir: {OUT_DIR}", flush=True)
+    print(f"  use_pv_voltvar: {bool(use_pv_voltvar)}", flush=True)
+    print(f"  fixed_controller_init: {bool(fixed_controller_init)}", flush=True)
+    print(f"  sample_meta: {SAMPLE_CSV}", flush=True)
+    print(
+        f"  node_features_targets: {NODE_CSV if NODE_CSV.is_file() else '(deleted/skipped raw)'}",
+        flush=True,
+    )
+    print(f"  mvagg: {MVAGG_CSV if write_mvagg_compat else '(skipped)'}", flush=True)
+    print(f"  kept samples: {df_sample['sample_id'].nunique() if len(df_sample) else 0}", flush=True)
     print(
         f"  skipped_nonconv={skipped_nonconv} skipped_badV={skipped_bad_v} "
-        f"skipped_ctrl={skipped_ctrl}"
+        f"skipped_ctrl={skipped_ctrl}",
+        flush=True,
     )
     print(
         f"  safe_band=[{float(vmin_safe_pu):.3f}, {float(vmax_safe_pu):.3f}] "
-        f"total_v_outside_safe_band={int(total_v_outside_band)}"
+        f"total_v_outside_safe_band={int(total_v_outside_band)}",
+        flush=True,
     )
-    print(f"  node_rows_written={int(n_node_rows_written)}")
+    print(f"  node_rows_written={int(n_node_rows_written)}", flush=True)
     return df_sample, df_node
 
 
