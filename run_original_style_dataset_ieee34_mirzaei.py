@@ -16,7 +16,12 @@ Targets:       vmag_pu, vang_deg
 Sample meta includes:
   - dummy 8500 TARGET_* cap/reg columns (trainer heads; keep lambda_cap/reg=0)
   - real system tokens: grid P/Q, PV850/860 post P/Q, ZIP/load-model P shares,
-    fixed capacitor kvar, native regulator transformer taps (no RegControl)
+    fixed capacitor kvar, regulator transformer taps (RegControl present in DSS)
+
+Optional ``fixed_controller_init`` (per-sample, before each Solve):
+  - RegControl TapNumber=0; CapControl banks OFF; fixed banks ON (8500 pattern)
+  - InvControl PV (PV850 Volt-Var) reset to PF=1 / kvar=0 (906 pattern); PV860 unity PF
+  then Static settle — no within-scenario tap/cap/InvControl Q carry-over.
 """
 from __future__ import annotations
 
@@ -39,6 +44,9 @@ inj = importlib.reload(inj)
 lt_dist = importlib.reload(lt_dist)
 ds8500 = importlib.reload(ds8500)
 ds906 = importlib.reload(ds906)
+
+# Match 8500 / 906 fixedctrlinit: shared start + reject unfinished Static climbs.
+FIXED_CTRL_MAXCONTROLITER = 100
 
 try:
     REPO_ROOT = Path(__file__).resolve().parent
@@ -214,6 +222,20 @@ def _busph_get(d: dict, bus: str, ph: int, default: float = 0.0) -> float:
     return float(default)
 
 
+def _reset_ieee34_controllers_for_fixed_init(
+    reg_names: list[str] | None = None,
+    cap_names: list[str] | None = None,
+    pv_names: list[str] | None = None,
+) -> None:
+    """Shared fixed reference before each Solve (regs/caps + InvControl PV Q)."""
+    ds8500._reset_controllers_to_compile_defaults(reg_names, cap_names)
+    # PV850 has InvControl Volt-Var; PV860 is unity PF — reset both for a clean start.
+    names = pv_names
+    if names is None:
+        names = list(NATIVE_PVS)
+    ds906._reset_invcontrol_pv_to_compile_defaults([str(n) for n in names])
+
+
 def generate_original_style_dataset_ieee34_mirzaei(
     *,
     n_scenarios: int = 50,
@@ -239,8 +261,14 @@ def generate_original_style_dataset_ieee34_mirzaei(
     delete_raw_node_csv_after_mvagg: bool = False,
     control_mode: str = "static",
     randomize_zip_models: bool = True,
+    fixed_controller_init: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Generate original-style IEEE34 Mirzaei chunk for DA-GPS."""
+    """Generate original-style IEEE34 Mirzaei chunk for DA-GPS.
+
+    ``fixed_controller_init=True`` resets RegControl taps, capacitor steps, and
+    InvControl PV Q (PF=1 / kvar=0) before every ``Solve`` so Static settle does
+    not inherit prior-sample controller state within a scenario.
+    """
     if bins_by_profile is None:
         bins_by_profile = {"load": 3, "pv": 3, "net": 3}
     if k_snapshots_per_scenario_total < 1:
@@ -251,15 +279,20 @@ def generate_original_style_dataset_ieee34_mirzaei(
     mode = str(control_mode).strip().lower()
     if mode not in ("static", "off"):
         raise ValueError("control_mode must be 'static' or 'off'")
+    if fixed_controller_init and mode != "static":
+        raise ValueError("fixed_controller_init requires control_mode='static'")
 
     if not DSS_FILE.is_file():
         raise FileNotFoundError(DSS_FILE)
 
     dss_path = inj.compile_once()
     inj.setup_daily()
+    max_ctrl_default = (
+        FIXED_CTRL_MAXCONTROLITER if fixed_controller_init else int(inj.MAX_CONTROL_ITER)
+    )
     try:
         dss.Text.Command(f"Set ControlMode={'Static' if mode == 'static' else 'OFF'}")
-        dss.Text.Command(f"Set MaxControlIter={int(inj.MAX_CONTROL_ITER)}")
+        dss.Text.Command(f"Set MaxControlIter={int(max_ctrl_default)}")
     except Exception:
         pass
 
@@ -268,10 +301,26 @@ def generate_original_style_dataset_ieee34_mirzaei(
     if not node_names_graph:
         raise RuntimeError("No graph nodes after filtering upstream buses.")
     node_to_idx_all = {n: i for i, n in enumerate(node_names_all)}
+    reg_names0 = ds8500._discover_reg_controls()
+    cap_names0 = ds8500._discover_capacitors()
     print(
         f"[ieee34] nodes_all={len(node_names_all)} nodes_graph={len(node_names_graph)} "
         f"control_mode={mode}"
     )
+    print(
+        f"[ieee34] controllers: n_reg={len(reg_names0)} n_cap={len(cap_names0)} "
+        f"n_pv={len(NATIVE_PVS)} fixed_controller_init={bool(fixed_controller_init)}"
+    )
+    if fixed_controller_init:
+        print(
+            "[ieee34] fixed_controller_init=True "
+            "(per-sample: TapNumber=0, fixed caps ON, PV PF=1 kvar=0, then Static)"
+        )
+    else:
+        print(
+            "[ieee34] fixed_controller_init=False "
+            "(within-scenario reg / InvControl Q carry-over)"
+        )
 
     inj.extract_static_phase_edges_to_csv(
         node_names_master=node_names_graph,
@@ -353,30 +402,45 @@ def generate_original_style_dataset_ieee34_mirzaei(
     sample_id = 0
     skipped_nonconv = 0
     skipped_bad_v = 0
+    skipped_ctrl = 0
     dummy_meta = ds906._dummy_cap_reg_meta()
 
     p0 = float(inj.BASELINE["P_load_total_kw"])
     q0 = float(inj.BASELINE["Q_load_total_kvar"])
     pv0 = float(inj.BASELINE["P_pv_total_kw"])
 
-    node_fieldnames = [
-        "sample_id",
-        "node",
-        "node_idx",
-        "bus",
-        "phase",
-        "p_load_kw",
-        "q_load_kvar",
-        "p_pv_kw",
-        "p_bess_kw",
-        "q_bess_kvar",
-        "vmag_pu",
-        "vang_deg",
-    ]
+    # When training only needs *_mvagg.csv, write that format directly and skip the
+    # raw→stream-copy round-trip (avoids Drive hang / OOM on large chunk CSVs).
+    write_mvagg_direct = bool(write_mvagg_compat) and bool(delete_raw_node_csv_after_mvagg)
+    if write_mvagg_direct:
+        node_out_path = MVAGG_CSV
+        node_fieldnames = list(ds906._MVAGG_PREFERRED_COLS)
+        print(
+            f"[ieee34] writing mvagg-format node CSV directly (skip raw): {node_out_path}",
+            flush=True,
+        )
+    else:
+        node_out_path = NODE_CSV
+        node_fieldnames = [
+            "sample_id",
+            "node",
+            "node_idx",
+            "bus",
+            "phase",
+            "p_load_kw",
+            "q_load_kvar",
+            "p_pv_kw",
+            "p_bess_kw",
+            "q_bess_kvar",
+            "vmag_pu",
+            "vang_deg",
+        ]
     graph_node_to_idx = {n: i for i, n in enumerate(node_names_graph)}
 
-    with open(NODE_CSV, "w", newline="", encoding="utf-8") as f_node:
-        node_writer = csv.DictWriter(f_node, fieldnames=node_fieldnames)
+    with open(node_out_path, "w", newline="", encoding="utf-8") as f_node:
+        node_writer = csv.DictWriter(
+            f_node, fieldnames=node_fieldnames, extrasaction="ignore"
+        )
         node_writer.writeheader()
 
         for s in range(int(n_scenarios)):
@@ -389,7 +453,7 @@ def generate_original_style_dataset_ieee34_mirzaei(
                 dss.Text.Command(
                     f"Set ControlMode={'Static' if mode == 'static' else 'OFF'}"
                 )
-                dss.Text.Command(f"Set MaxControlIter={int(inj.MAX_CONTROL_ITER)}")
+                dss.Text.Command(f"Set MaxControlIter={int(max_ctrl_default)}")
             except Exception:
                 pass
 
@@ -398,6 +462,15 @@ def generate_original_style_dataset_ieee34_mirzaei(
                 bus_to_phases
             )
             pv_dss, pv_to_dss, pv_to_busph = inj.build_pv_device_maps()
+            reg_names = ds8500._discover_reg_controls()
+            cap_names = ds8500._discover_capacitors()
+            # Prefer live DSS PV names; fall back to known Mirzaei tokens.
+            try:
+                pv_reset_names = [str(n) for n in (dss.PVsystems.AllNames() or [])]
+            except Exception:
+                pv_reset_names = []
+            if not pv_reset_names:
+                pv_reset_names = list(NATIVE_PVS)
 
             p_load = p0 * float(rng_master.uniform(*p_load_scale_range))
             q_load = q0 * float(rng_master.uniform(*q_load_scale_range))
@@ -451,13 +524,40 @@ def generate_original_style_dataset_ieee34_mirzaei(
                         rng=rng_solve,
                     )
                 )
+                if fixed_controller_init:
+                    _reset_ieee34_controllers_for_fixed_init(
+                        reg_names, cap_names, pv_reset_names
+                    )
                 try:
                     dss.Solution.Solve()
-                except Exception:
-                    pass
+                except Exception as _solve_exc:  # noqa: BLE001
+                    msg = str(_solve_exc).lower()
+                    if fixed_controller_init and "control" in msg:
+                        skipped_ctrl += 1
+                        print(
+                            f"[skip-ctrl] scenario={s} t={t} "
+                            f"maxcontroliter={max_ctrl_default} err={_solve_exc!r}",
+                            flush=True,
+                        )
+                    else:
+                        skipped_nonconv += 1
+                    continue
                 if not dss.Solution.Converged():
                     skipped_nonconv += 1
                     continue
+                if fixed_controller_init:
+                    try:
+                        n_ctrl = int(dss.Solution.ControlIterations())
+                    except Exception:
+                        n_ctrl = 999
+                    if n_ctrl >= int(max_ctrl_default):
+                        skipped_ctrl += 1
+                        print(
+                            f"[skip-ctrl] scenario={s} t={t} "
+                            f"ctrl_iters={n_ctrl}/{max_ctrl_default} (not saved)",
+                            flush=True,
+                        )
+                        continue
 
                 vm, va = inj.get_all_node_voltage_pu_and_angle_filtered(node_names_all)
                 vm_a = np.asarray(vm, float)
@@ -499,6 +599,7 @@ def generate_original_style_dataset_ieee34_mirzaei(
                     "t_index": int(t),
                     "t_minutes": float(t * STEP_MIN),
                     "control_mode": mode,
+                    "fixed_controller_init": int(bool(fixed_controller_init)),
                     "P_load_total_kw": float(p_load),
                     "Q_load_total_kvar": float(q_load),
                     "P_pv_total_kw": float(p_pv),
@@ -566,27 +667,40 @@ def generate_original_style_dataset_ieee34_mirzaei(
 
     df_sample = pd.DataFrame(rows_sample)
     df_sample.to_csv(SAMPLE_CSV, index=False)
-    if write_mvagg_compat:
+    if write_mvagg_compat and not write_mvagg_direct:
         ds906._write_mvagg_compat_from_raw(NODE_CSV, MVAGG_CSV)
         if delete_raw_node_csv_after_mvagg and NODE_CSV.is_file():
             try:
                 NODE_CSV.unlink()
             except Exception:
                 pass
+    elif write_mvagg_direct:
+        print(
+            f"[ieee34] wrote compat mvagg (direct identity, no aggregation): {MVAGG_CSV}",
+            flush=True,
+        )
+        if NODE_CSV.is_file() and NODE_CSV.resolve() != MVAGG_CSV.resolve():
+            try:
+                NODE_CSV.unlink()
+                print(f"[ieee34] removed stale raw node CSV: {NODE_CSV.name}", flush=True)
+            except OSError as exc:
+                print(f"[ieee34] could not remove stale raw {NODE_CSV.name}: {exc}", flush=True)
 
     print(
         f"[ieee34] done samples={len(df_sample)} skipped_nonconv={skipped_nonconv} "
-        f"skipped_bad_v={skipped_bad_v}"
+        f"skipped_bad_v={skipped_bad_v} skipped_ctrl={skipped_ctrl}"
     )
+    print(f"  fixed_controller_init: {bool(fixed_controller_init)}")
     print(f"  sample_meta: {SAMPLE_CSV}")
-    print(f"  nodes: {NODE_CSV if NODE_CSV.is_file() else '(deleted after mvagg)'}")
+    print(f"  nodes: {NODE_CSV if NODE_CSV.is_file() else '(deleted/skipped raw)'}")
     print(f"  mvagg: {MVAGG_CSV if write_mvagg_compat else '(skipped)'}")
     print(f"  edges: {EDGE_CSV}")
     print(f"  index: {NODE_INDEX_CSV}")
 
+    node_read_path = NODE_CSV if NODE_CSV.is_file() else MVAGG_CSV
     df_node = pd.DataFrame()
-    if return_node_df and NODE_CSV.is_file():
-        df_node = pd.read_csv(NODE_CSV)
+    if return_node_df and node_read_path.is_file():
+        df_node = pd.read_csv(node_read_path)
     return df_sample, df_node
 
 
@@ -597,4 +711,5 @@ if __name__ == "__main__":
         master_seed=3420230,
         write_mvagg_compat=True,
         delete_raw_node_csv_after_mvagg=False,
+        fixed_controller_init=False,
     )
