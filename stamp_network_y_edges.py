@@ -284,6 +284,32 @@ def stamp_chunk_parent(
     print(f"[stamp-y] DST={dst_parent}  (inplace={dst_parent.exists()})")
     print(f"[stamp-y] chunks={len(runs)} N={len(node_names)} ref={ref_chunk.name}")
 
+    # Resume-friendly: if every source run already has a non-empty stamped edge CSV, skip.
+    if not inplace and not dry_run and dst_parent.is_dir():
+        missing_edges: list[str] = []
+        for src_run in runs:
+            dest_edge = dst_parent / src_run.name / _EDGE_NAME
+            try:
+                if not dest_edge.is_file() or dest_edge.stat().st_size <= 0:
+                    missing_edges.append(src_run.name)
+            except OSError:
+                missing_edges.append(src_run.name)
+        if not missing_edges:
+            print(
+                f"[stamp-y] already stamped, skipping ({len(runs)} chunks under {dst_parent})",
+                flush=True,
+            )
+            return {
+                "feeder": feeder,
+                "src_chunk_parent": str(src_parent),
+                "dst_chunk_parent": str(dst_parent),
+                "inplace": bool(inplace),
+                "n_nodes": len(node_names),
+                "n_edges": -1,
+                "n_chunks_written": 0,
+                "skipped": True,
+            }
+
     if not dry_run and not inplace:
         dst_parent.mkdir(parents=True, exist_ok=True)
         manifest = dst_parent / "STAMP_Y_EDGES_README.txt"
