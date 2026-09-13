@@ -30,6 +30,7 @@ import csv
 import importlib
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -183,6 +184,101 @@ def _read_irradiance_profile_1min(irr_csv: Path = IRR_CSV, npts_1min: int = NPTS
     return up[:npts_1min].astype(float)
 
 
+def _daily_profile_probe(profile_dir: Path) -> Path | None:
+    """Return path to load_profile_1.txt if present (case variants), else None."""
+    for name in ("load_profile_1.txt", "Load_profile_1.txt"):
+        p = profile_dir / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _ensure_dss_daily_profiles_link(model_dir: Path) -> bool:
+    """Link ``model_dir/Daily_1min_100profiles`` -> stock profiles when missing.
+
+    ``LVTestCase_PV_voltvar/LoadShapes.txt`` uses relative
+    ``Daily_1min_100profiles/load_profile_*.txt`` paths. That folder is gitignored
+    under the PV copy; Colab clones only have stock profiles under
+    ``IEEETestCases/LVTestCase/``. Returns True if relative paths will resolve.
+    """
+    dest = model_dir / "Daily_1min_100profiles"
+    if _daily_profile_probe(dest) is not None:
+        return True
+
+    src = PROFILE_DIR
+    if _daily_profile_probe(src) is None:
+        raise FileNotFoundError(
+            f"Missing stock Daily_1min_100profiles under {src} "
+            f"(needed because {dest} has no load_profile_1.txt)."
+        )
+
+    src_abs = src.resolve()
+    if dest.is_symlink() or dest.exists():
+        try:
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            elif dest.is_dir() and not any(dest.iterdir()):
+                dest.rmdir()
+        except OSError:
+            pass
+
+    if dest.exists():
+        # Non-empty dir without probe file — do not clobber; use abs-path fallback.
+        return False
+
+    try:
+        if os.name == "nt":
+            # Junction works without admin; symlink often does not on Windows.
+            r = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(dest), str(src_abs)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            ok = r.returncode == 0 and _daily_profile_probe(dest) is not None
+        else:
+            dest.symlink_to(src_abs, target_is_directory=True)
+            ok = _daily_profile_probe(dest) is not None
+    except OSError:
+        ok = False
+
+    if ok:
+        print(f"[diag] linked {dest} -> {src_abs}", flush=True)
+    return ok
+
+
+def _redirect_loadshapes(model_dir: Path) -> None:
+    """Redirect LoadShapes.txt, or define Shape_* from stock absolute paths."""
+    dest = model_dir / "Daily_1min_100profiles"
+    if _daily_profile_probe(dest) is not None:
+        dss.Text.Command("Redirect LoadShapes.txt")
+        return
+
+    src = PROFILE_DIR
+    if _daily_profile_probe(src) is None:
+        raise FileNotFoundError(
+            f"LoadShapes not available: no profiles under {dest} or stock {src}."
+        )
+    print(
+        f"[diag] no Daily_1min under {model_dir}; "
+        f"defining loadshapes from stock {src.resolve()}",
+        flush=True,
+    )
+    for i in range(1, N_LOADS_NOMINAL + 1):
+        path = src / f"load_profile_{i}.txt"
+        if not path.is_file():
+            alt = src / f"Load_profile_{i}.txt"
+            if alt.is_file():
+                path = alt
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing load profile: {path}")
+        fp = str(path.resolve()).replace("\\", "/")
+        dss.Text.Command(
+            f"New Loadshape.Shape_{i} npts={NPTS} minterval={STEP_MIN} "
+            f'mult=(file="{fp}") useactual=true'
+        )
+
+
 def _compile_906_lvtestcase_snapshot_setup(
     *,
     use_pv_voltvar: bool = False,
@@ -203,13 +299,16 @@ def _compile_906_lvtestcase_snapshot_setup(
     if use_pv_voltvar and not (MODEL_DIR / "PV_voltvar_906.dss").is_file():
         raise FileNotFoundError(f"Missing PV add-on: {MODEL_DIR / 'PV_voltvar_906.dss'}")
 
+    # PV copy LoadShapes.txt needs Daily_1min next to it (Colab: link stock).
+    _ensure_dss_daily_profiles_link(MODEL_DIR)
+
     dss.Basic.ClearAll()
     dss.Text.Command(f'cd "{os.path.abspath(str(MODEL_DIR))}"')
     dss.Text.Command("Set DefaultBaseFrequency=50")
     dss.Text.Command("New circuit.LVTest")
     dss.Text.Command("Edit Vsource.Source BasekV=11 pu=1.05 ISC3=3000 ISC1=5")
     dss.Text.Command("Redirect LineCode.txt")
-    dss.Text.Command("Redirect LoadShapes.txt")
+    _redirect_loadshapes(MODEL_DIR)
     dss.Text.Command("batchedit loadshape..* useactual=no")
     dss.Text.Command("Redirect Lines.txt")
     dss.Text.Command("Redirect Transformers.txt")

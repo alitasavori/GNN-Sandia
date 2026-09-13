@@ -2,6 +2,8 @@
 
 Stock original under `OpenDSS-master/.../IEEETestCases/LVTestCase` is **unchanged**.
 
+`LoadShapes.txt` still references `Daily_1min_100profiles/` relatively. That folder is **gitignored** here (avoid duplicating 100 profiles); compile helpers link or abs-path to the stock `IEEETestCases/LVTestCase/Daily_1min_100profiles` so Colab clones work without a local copy.
+
 ## Files
 - `Master_snapshot_PV_voltvar.dss` — snapshot + `ControlMode=STATIC`
 - `Master_PV_voltvar.dss` — yearly demand-interval + Volt-Var
