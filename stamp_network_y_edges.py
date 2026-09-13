@@ -112,10 +112,10 @@ def _force_taps_nominal() -> None:
         pass
 
 
-def _compile_feeder(feeder: str) -> None:
+def _compile_feeder(feeder: str, *, use_pv_voltvar: bool = False) -> None:
     f = feeder.strip().lower()
     if f == "906":
-        ds906._compile_906_lvtestcase_snapshot_setup()
+        ds906._compile_906_lvtestcase_snapshot_setup(use_pv_voltvar=bool(use_pv_voltvar))
     elif f == "8500":
         ds8500._compile_8500_unbalanced_daily_setup()
     elif f in ("ieee34", "34"):
@@ -238,6 +238,7 @@ def stamp_chunk_parent(
     inplace: bool = False,
     dry_run: bool = False,
     atol: float = 0.0,
+    use_pv_voltvar: bool | None = None,
 ) -> dict:
     src_parent = Path(chunk_parent)
     if not src_parent.is_dir():
@@ -245,6 +246,12 @@ def stamp_chunk_parent(
     runs = _sorted_run_dirs(src_parent)
     if not runs:
         raise FileNotFoundError(f"No run_* under {src_parent}")
+
+    if use_pv_voltvar is None:
+        # Auto: PV Volt-Var chunk parents (fixedctrlinit or otherwise).
+        use_pv_voltvar = "pv_voltvar" in src_parent.name.lower() or "pv_voltvar" in str(
+            out_chunk_parent or ""
+        ).lower()
 
     if inplace:
         dst_parent = src_parent
@@ -272,7 +279,7 @@ def stamp_chunk_parent(
     if node_names is None or ref_chunk is None:
         raise RuntimeError(f"Could not resolve graph node order under {src_parent}")
 
-    print(f"[stamp-y] feeder={feeder}")
+    print(f"[stamp-y] feeder={feeder} use_pv_voltvar={bool(use_pv_voltvar)}")
     print(f"[stamp-y] SRC={src_parent}")
     print(f"[stamp-y] DST={dst_parent}  (inplace={dst_parent.exists()})")
     print(f"[stamp-y] chunks={len(runs)} N={len(node_names)} ref={ref_chunk.name}")
@@ -284,14 +291,15 @@ def stamp_chunk_parent(
             "Sibling dataset with draft network-Y edges.\n"
             f"Source (unchanged): {src_parent}\n"
             "Node features / PE / meta: mirrored from source.\n"
-            "Edges: R_full/X_full = Re(Y_ij)/Im(Y_ij) [siemens], taps≈1, network-only Y.\n",
+            "Edges: R_full/X_full = Re(Y_ij)/Im(Y_ij) [siemens], taps≈1, network-only Y.\n"
+            f"use_pv_voltvar={bool(use_pv_voltvar)}\n",
             encoding="utf-8",
         )
 
     # Always reload draft so notebook sessions pick up NodeRef-skip fixes.
     importlib.reload(draft)
 
-    _compile_feeder(feeder)
+    _compile_feeder(feeder, use_pv_voltvar=bool(use_pv_voltvar))
     _force_taps_nominal()
     Y, _ = draft.assemble_network_y_on_nodes(node_names)
     # Y is dense ndarray from assemble_network_y_on_nodes.
