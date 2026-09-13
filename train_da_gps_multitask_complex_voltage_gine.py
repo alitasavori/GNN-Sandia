@@ -61,6 +61,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import time
 import warnings
@@ -6125,6 +6126,34 @@ def _write_da_gps_run_manifest(
     print(f"Wrote run manifest (for daily compare / mid-train snapshots): {path}", flush=True)
 
 
+def _capture_rng_state() -> dict[str, object]:
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: object) -> None:
+    if not isinstance(state, dict):
+        return
+    py = state.get("python")
+    if py is not None:
+        random.setstate(py)
+    np_state = state.get("numpy")
+    if np_state is not None:
+        np.random.set_state(np_state)
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def _save_periodic_training_checkpoint(
     path: Path,
     base_model: nn.Module,
@@ -6140,6 +6169,7 @@ def _save_periodic_training_checkpoint(
     best_epoch: int | None = None,
     best_val_r2_mean: float | None = None,
     best_val_r2_min: float | None = None,
+    best_es: float | None = None,
 ) -> None:
     """Atomic write: same architecture metadata as ``da_gps_multitask_best.pt`` plus resume fields."""
     payload: dict[str, object] = {
@@ -6151,11 +6181,13 @@ def _save_periodic_training_checkpoint(
         "best_epoch": int(best_epoch) if best_epoch is not None else int(epoch),
         "best_val_r2_mean": float(best_val_r2_mean) if best_val_r2_mean is not None else None,
         "best_val_r2_min": float(best_val_r2_min) if best_val_r2_min is not None else None,
+        "best_es": float(best_es) if best_es is not None else float(best_val),
         "optimizer_state_dict": opt.state_dict(),
         "scheduler_state_dict": sch.state_dict(),
         "best_model_state_dict": (
             {k: v.detach().cpu().clone() for k, v in best_state.items()} if best_state is not None else None
         ),
+        "rng_state": _capture_rng_state(),
     }
     if scaler is not None:
         payload["scaler_state_dict"] = scaler.state_dict()  # type: ignore[union-attr]
@@ -6163,6 +6195,121 @@ def _save_periodic_training_checkpoint(
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)
+
+
+def _resolve_resume_checkpoint_path(args: argparse.Namespace, out_dir: Path) -> Path | None:
+    """Resolve ``--resume_checkpoint`` or ``--resume`` -> ``out_dir/training_last.pt``."""
+    raw = str(getattr(args, "resume_checkpoint", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    if bool(getattr(args, "resume", False)):
+        return (out_dir / "training_last.pt").resolve()
+    return None
+
+
+@dataclass
+class _TrainingResumeState:
+    start_epoch: int
+    best_val: float
+    best_es: float
+    bad: int
+    best_epoch: int
+    best_val_r2_mean: float
+    best_val_r2_min: float
+    best_state: dict[str, torch.Tensor] | None
+
+
+def _load_training_resume_checkpoint(
+    *,
+    path: Path,
+    base_model: nn.Module,
+    opt: torch.optim.Optimizer,
+    sch: object,
+    scaler: object | None,
+    epochs: int,
+) -> _TrainingResumeState:
+    """Restore full training state from ``training_last.pt`` (not weights-only fine-tune)."""
+    if not path.is_file():
+        raise FileNotFoundError(f"--resume_checkpoint / --resume not found: {path}")
+    pack = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(pack, dict):
+        raise ValueError(f"resume checkpoint must be a dict payload, got {type(pack)}")
+
+    sd = pack.get("model_state_dict")
+    if sd is None:
+        raise ValueError(f"resume checkpoint missing model_state_dict: {path}")
+    missing, unexpected = base_model.load_state_dict(sd, strict=True)
+    if missing or unexpected:
+        print(
+            f"resume model_state_dict: missing={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
+
+    opt_sd = pack.get("optimizer_state_dict")
+    if opt_sd is None:
+        raise ValueError(f"resume checkpoint missing optimizer_state_dict: {path}")
+    opt.load_state_dict(opt_sd)
+
+    sch_sd = pack.get("scheduler_state_dict")
+    if sch_sd is None:
+        raise ValueError(f"resume checkpoint missing scheduler_state_dict: {path}")
+    sch.load_state_dict(sch_sd)  # type: ignore[union-attr]
+
+    if scaler is not None and pack.get("scaler_state_dict") is not None:
+        scaler.load_state_dict(pack["scaler_state_dict"])  # type: ignore[union-attr]
+    elif scaler is not None and pack.get("scaler_state_dict") is None:
+        print("resume: checkpoint has no scaler_state_dict; keeping fresh GradScaler", flush=True)
+
+    last_epoch = int(pack.get("epoch", 0) or 0)
+    if last_epoch < 1:
+        raise ValueError(f"resume checkpoint has invalid epoch={last_epoch}: {path}")
+    start_epoch = last_epoch + 1
+
+    best_val = float(pack.get("best_val", float("inf")))
+    best_epoch = int(pack.get("best_epoch", last_epoch) or last_epoch)
+    bad = int(pack.get("bad", 0) or 0)
+    best_val_r2_mean = float(pack["best_val_r2_mean"]) if pack.get("best_val_r2_mean") is not None else float("nan")
+    best_val_r2_min = float(pack["best_val_r2_min"]) if pack.get("best_val_r2_min") is not None else float("nan")
+    if pack.get("best_es") is not None:
+        best_es = float(pack["best_es"])
+    else:
+        # Older checkpoints omitted best_es; approximate with best_val so patience does not reset.
+        best_es = float(best_val) if best_val == best_val else float("inf")
+
+    best_raw = pack.get("best_model_state_dict")
+    best_state: dict[str, torch.Tensor] | None = None
+    if isinstance(best_raw, dict) and best_raw:
+        best_state = {k: v.detach().cpu().clone() if torch.is_tensor(v) else v for k, v in best_raw.items()}
+
+    if "rng_state" in pack:
+        _restore_rng_state(pack.get("rng_state"))
+        print("resume: restored RNG state from checkpoint", flush=True)
+    else:
+        print("resume: checkpoint has no rng_state (epoch shuffle remains seed+epoch deterministic)", flush=True)
+
+    print(
+        f"Resumed training from {path}\n"
+        f"  last_completed_epoch={last_epoch} -> start_epoch={start_epoch} "
+        f"(target epochs={int(epochs)})\n"
+        f"  best_val={best_val:.6g} best_epoch={best_epoch} bad={bad} best_es={best_es:.6g}",
+        flush=True,
+    )
+    if start_epoch > int(epochs):
+        print(
+            f"resume: start_epoch {start_epoch} > --epochs {int(epochs)}; "
+            "skipping train loop and writing final report from restored best weights.",
+            flush=True,
+        )
+    return _TrainingResumeState(
+        start_epoch=start_epoch,
+        best_val=best_val,
+        best_es=best_es,
+        bad=bad,
+        best_epoch=best_epoch,
+        best_val_r2_mean=best_val_r2_mean,
+        best_val_r2_min=best_val_r2_min,
+        best_state=best_state,
+    )
 
 
 _SAVE_ONLY_IMPROVE_METRICS = ("mae_vmag_pu", "mae_angle_deg", "mse_ri_normalized")
@@ -7120,6 +7267,16 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if not out_dir.is_absolute():
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    resume_ckpt_path = _resolve_resume_checkpoint_path(args, out_dir)
+    if resume_ckpt_path is not None:
+        print(f"resume_checkpoint: {resume_ckpt_path}", flush=True)
+        if init_ckpt_path is not None:
+            print(
+                "NOTE: --resume/--resume_checkpoint takes precedence over --init_checkpoint "
+                "(init weights-only load skipped; training state restored from resume).",
+                flush=True,
+            )
+            init_ckpt_path = None
     if str(args.cache_dir).strip():
         cache_dir = Path(args.cache_dir).resolve()
         print(f"chunk_parent cache override via --cache_dir: {cache_dir}", flush=True)
@@ -7575,7 +7732,17 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
-    if init_ckpt_path is not None:
+    resume_state: _TrainingResumeState | None = None
+    if resume_ckpt_path is not None:
+        resume_state = _load_training_resume_checkpoint(
+            path=resume_ckpt_path,
+            base_model=base_model,
+            opt=opt,
+            sch=sch,
+            scaler=scaler,
+            epochs=int(args.epochs),
+        )
+    elif init_ckpt_path is not None:
         _load_init_checkpoint(
             base_model,
             init_ckpt_path,
@@ -7765,13 +7932,23 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
     best_epoch = 0
     best_val_r2_mean = float("nan")
     best_val_r2_min = float("nan")
+    start_epoch = 1
+    if resume_state is not None:
+        start_epoch = int(resume_state.start_epoch)
+        best_val = float(resume_state.best_val)
+        best_es = float(resume_state.best_es)
+        bad = int(resume_state.bad)
+        best_epoch = int(resume_state.best_epoch)
+        best_val_r2_mean = float(resume_state.best_val_r2_mean)
+        best_val_r2_min = float(resume_state.best_val_r2_min)
+        best_state = resume_state.best_state
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
     last_addon_val_epoch_metrics: dict[str, float] | None = None
     last_epoch_val_counterfactual: dict[str, object] | None = None
     addon_epoch_history: list[dict[str, object]] = []
 
-    for ep in range(1, args.epochs + 1):
+    for ep in range(start_epoch, args.epochs + 1):
         model.train()
         train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = train_pf_sum = 0.0
         train_n = 0
@@ -8462,6 +8639,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                 best_epoch=best_epoch,
                 best_val_r2_mean=best_val_r2_mean,
                 best_val_r2_min=best_val_r2_min,
+                best_es=best_es,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if do_eval and not args.no_early_stop and bad >= args.patience:
@@ -8488,6 +8666,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                     best_epoch=best_epoch,
                     best_val_r2_mean=best_val_r2_mean,
                     best_val_r2_min=best_val_r2_min,
+                    best_es=best_es,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
@@ -8521,6 +8700,7 @@ def main_multi_chunk(args: argparse.Namespace, repo: Path) -> None:
                         best_epoch=best_epoch,
                         best_val_r2_mean=best_val_r2_mean,
                         best_val_r2_min=best_val_r2_min,
+                        best_es=best_es,
                     )
                     print(f"  periodic checkpoint (interactive stop) -> {_ck}", flush=True)
                 break
@@ -9208,7 +9388,21 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Path to da_gps_multitask_best.pt (or training_last.pt) to load before training. "
-        "Uses strict=False by default so minor head mismatches are tolerated.",
+        "Uses strict=False by default so minor head mismatches are tolerated. "
+        "Weights-only: epoch/optimizer reset. For true resume use --resume / --resume_checkpoint.",
+    )
+    p.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default="",
+        help="Path to training_last.pt to resume training (model + optimizer + scheduler + "
+        "epoch/best_val/best_epoch/bad/best weights). Continues from epoch+1 in the same --out_dir. "
+        "Takes precedence over --init_checkpoint.",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from --out_dir/training_last.pt (same as --resume_checkpoint <out_dir>/training_last.pt).",
     )
     p.add_argument(
         "--init_run_dir",
@@ -9408,6 +9602,16 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = (repo / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    resume_ckpt_path = _resolve_resume_checkpoint_path(args, out_dir)
+    if resume_ckpt_path is not None:
+        print(f"resume_checkpoint: {resume_ckpt_path}", flush=True)
+        if init_ckpt_path is not None:
+            print(
+                "NOTE: --resume/--resume_checkpoint takes precedence over --init_checkpoint "
+                "(init weights-only load skipped; training state restored from resume).",
+                flush=True,
+            )
+            init_ckpt_path = None
 
     cap_cols = _resolve_target_cols(getattr(args, "cap_cols", None), TARGET_CAP_COLS)
     reg_cols = _resolve_target_cols(getattr(args, "reg_cols", None), TARGET_REG_COLS)
@@ -9671,6 +9875,23 @@ def main() -> None:
     if args.gradient_checkpointing:
         print("gradient_checkpointing: per-block recompute (training only)", flush=True)
 
+    resume_state: _TrainingResumeState | None = None
+    if resume_ckpt_path is not None:
+        resume_state = _load_training_resume_checkpoint(
+            path=resume_ckpt_path,
+            base_model=base_model,
+            opt=opt,
+            sch=sch,
+            scaler=scaler,
+            epochs=int(args.epochs),
+        )
+    elif init_ckpt_path is not None:
+        _load_init_checkpoint(
+            base_model,
+            init_ckpt_path,
+            strict=bool(getattr(args, "init_checkpoint_strict", False)),
+        )
+
     reg_col_hop_mapping = None
     if model_type != "mlp":
         reg_col_hop_mapping = _configure_reg_territory_bias(
@@ -9691,13 +9912,23 @@ def main() -> None:
     best_epoch = 0
     best_val_r2_mean = float("nan")
     best_val_r2_min = float("nan")
+    start_epoch = 1
+    if resume_state is not None:
+        start_epoch = int(resume_state.start_epoch)
+        best_val = float(resume_state.best_val)
+        best_es = float(resume_state.best_es)
+        bad = int(resume_state.bad)
+        best_epoch = int(resume_state.best_epoch)
+        best_val_r2_mean = float(resume_state.best_val_r2_mean)
+        best_val_r2_min = float(resume_state.best_val_r2_min)
+        best_state = resume_state.best_state
     t0 = time.perf_counter()
     last_addon_epoch_metrics: dict[str, float] | None = None
     last_addon_val_epoch_metrics: dict[str, float] | None = None
     last_epoch_val_counterfactual: dict[str, object] | None = None
     addon_epoch_history: list[dict[str, object]] = []
 
-    for ep in range(1, args.epochs + 1):
+    for ep in range(start_epoch, args.epochs + 1):
         model.train()
         train_loss_sum = train_v_sum = train_c_sum = train_r_sum = train_pv_sum = train_pf_sum = 0.0
         train_n = 0
@@ -10121,6 +10352,7 @@ def main() -> None:
                 best_epoch=best_epoch,
                 best_val_r2_mean=best_val_r2_mean,
                 best_val_r2_min=best_val_r2_min,
+                best_es=best_es,
             )
             print(f"  periodic checkpoint -> {_ck}", flush=True)
         if do_eval and not args.no_early_stop and bad >= args.patience:
@@ -10147,6 +10379,7 @@ def main() -> None:
                     best_epoch=best_epoch,
                     best_val_r2_mean=best_val_r2_mean,
                     best_val_r2_min=best_val_r2_min,
+                    best_es=best_es,
                 )
                 print(f"  periodic checkpoint (early stop) -> {_ck}", flush=True)
             break
@@ -10180,6 +10413,7 @@ def main() -> None:
                         best_epoch=best_epoch,
                         best_val_r2_mean=best_val_r2_mean,
                         best_val_r2_min=best_val_r2_min,
+                        best_es=best_es,
                     )
                     print(f"  periodic checkpoint (interactive stop) -> {_ck}", flush=True)
                 break
